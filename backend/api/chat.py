@@ -1,0 +1,161 @@
+import uuid
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from database import get_db
+from models.db_models import Conversation, Message, User
+from models.schemas import ChatRequest, ConversationOut, MessageOut
+from core.rag_pipeline import run_rag_stream
+from core.deps import get_accessible_kb_ids, require_permission
+from core.permissions import CHAT_USE
+
+router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+@router.post("/send")
+async def send_message(
+    payload: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(CHAT_USE)),
+):
+    # 流式开始前校验请求的知识库都在可访问范围内（accessible 为 None 表示全部）
+    accessible = await get_accessible_kb_ids(user, db)
+    if accessible is not None and not set(payload.knowledge_base_ids).issubset(set(accessible)):
+        raise HTTPException(status_code=403, detail="无权访问部分知识库")
+
+    # 获取或创建会话
+    if payload.conversation_id:
+        conv = await db.get(Conversation, payload.conversation_id)
+        # 复用已有会话时校验归属：非超管不可操作他人会话
+        if conv and not user.is_superadmin and conv.user_id != user.id:
+            raise HTTPException(status_code=404, detail="会话不存在")
+    else:
+        conv = None
+
+    if not conv:
+        conv = Conversation(title=payload.question[:50], user_id=user.id)
+        db.add(conv)
+        await db.commit()
+        await db.refresh(conv)
+
+    # 保存用户消息
+    user_msg = Message(
+        conversation_id=conv.id,
+        role="user",
+        content=payload.question,
+    )
+    db.add(user_msg)
+    await db.commit()
+
+    search_config = payload.search_config.model_dump()
+
+    async def generate():
+        import json as _json
+        full_response = []
+        sources = []
+        tokens = None
+        try:
+            async for chunk in run_rag_stream(
+                question=payload.question,
+                kb_ids=payload.knowledge_base_ids,
+                search_config=search_config,
+                conversation_id=str(conv.id),
+                db=db,
+            ):
+                yield chunk
+                if '"type": "text_delta"' in chunk:
+                    try:
+                        data = _json.loads(chunk.removeprefix("data: ").strip())
+                        full_response.append(data.get("content", ""))
+                    except Exception:
+                        pass
+                if '"type": "search_results"' in chunk:
+                    try:
+                        data = _json.loads(chunk.removeprefix("data: ").strip())
+                        sources = data.get("results", [])[:5]
+                    except Exception:
+                        pass
+                if '"type": "usage"' in chunk:
+                    try:
+                        data = _json.loads(chunk.removeprefix("data: ").strip())
+                        tokens = data.get("total_tokens")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[chat/stream error] {type(e).__name__}: {e}")
+            yield f"data: {_json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {_json.dumps({'type': 'done', 'conversation_id': str(conv.id)})}\n\n"
+            return
+
+        # 保存 AI 回复
+        from database import AsyncSessionLocal
+        async with AsyncSessionLocal() as save_db:
+            ai_msg = Message(
+                conversation_id=conv.id,
+                role="assistant",
+                content="".join(full_response),
+                sources=sources,
+                tokens=tokens,
+            )
+            save_db.add(ai_msg)
+            await save_db.commit()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@router.get("/history", response_model=list[ConversationOut])
+async def get_history(
+    page: int = 1,
+    page_size: int = 20,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(CHAT_USE)),
+):
+    offset = (page - 1) * page_size
+    stmt = select(Conversation).order_by(Conversation.created_at.desc())
+    # 非超管只看自己的会话；超管可见全部
+    if not user.is_superadmin:
+        stmt = stmt.where(Conversation.user_id == user.id)
+    rows = (await db.execute(
+        stmt.offset(offset).limit(page_size)
+    )).scalars().all()
+    return rows
+
+
+@router.get("/{conv_id}/messages", response_model=list[MessageOut])
+async def get_messages(
+    conv_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(CHAT_USE)),
+):
+    conv = await db.get(Conversation, conv_id)
+    if not conv or (not user.is_superadmin and conv.user_id != user.id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    rows = (await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conv_id)
+        .order_by(Message.created_at)
+    )).scalars().all()
+    return rows
+
+
+@router.delete("/{conv_id}")
+async def delete_conversation(
+    conv_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(CHAT_USE)),
+):
+    conv = await db.get(Conversation, conv_id)
+    if not conv or (not user.is_superadmin and conv.user_id != user.id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+    await db.delete(conv)
+    await db.commit()
+    return {"message": "删除成功"}

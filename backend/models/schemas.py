@@ -1,0 +1,204 @@
+import uuid
+from datetime import datetime
+from typing import Any
+from pydantic import BaseModel, Field
+
+
+# ── Knowledge Base ──────────────────────────────────────────────
+class KnowledgeBaseCreate(BaseModel):
+    name: str = Field(..., max_length=100)
+    description: str | None = None
+    icon_color: str = "#3B82F6"
+
+
+class KnowledgeBaseOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: str | None
+    icon_color: str
+    doc_count: int = 0   # 非持久化字段，由接口按真实文档行数填充
+    created_by: uuid.UUID | None = None
+    created_by_name: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ── Document ─────────────────────────────────────────────────────
+class DocumentOut(BaseModel):
+    id: uuid.UUID
+    kb_id: uuid.UUID
+    filename: str
+    file_type: str | None
+    raw_content: str | None = None
+    source_url: str | None = None
+    image_url: str | None = None
+    chunk_count: int
+    status: str
+    is_active: bool = True
+    tags: list[str] = []
+    created_at: datetime
+    updated_at: datetime | None = None
+    created_by_name: str | None = None
+    updated_by_name: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Chat ─────────────────────────────────────────────────────────
+class SearchConfig(BaseModel):
+    method: str = "hybrid"       # hybrid | vector | keyword
+    rerank: bool = True
+    top_k: int = 5
+    tags: list[str] = []         # 用户手动勾选的标签，对命中文档做检索软加权
+
+
+class ChatRequest(BaseModel):
+    question: str
+    conversation_id: uuid.UUID | None = None
+    knowledge_base_ids: list[uuid.UUID] = []
+    search_config: SearchConfig = SearchConfig()
+
+
+class MessageOut(BaseModel):
+    id: uuid.UUID
+    conversation_id: uuid.UUID
+    role: str
+    content: str
+    sources: list | None
+    tokens: int | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ConversationOut(BaseModel):
+    id: uuid.UUID
+    title: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ── Search ───────────────────────────────────────────────────────
+class SearchRequest(BaseModel):
+    query: str
+    knowledge_base_ids: list[uuid.UUID] = []
+    method: str = "hybrid"
+    top_k: int = 5
+    rerank: bool = True
+    tags: list[str] = []         # 标签软加权（命中文档排序分上浮，不硬过滤）
+
+
+class SearchResultItem(BaseModel):
+    id: uuid.UUID
+    content: str
+    filename: str
+    file_type: str | None
+    score: float
+    chunk_index: int
+    metadata: dict | None
+    tags: list[str] = []
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResultItem]
+    total: int
+    search_meta: dict[str, Any]
+
+
+# ── Auth ─────────────────────────────────────────────────────────
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class MeOut(BaseModel):
+    id: uuid.UUID
+    username: str
+    display_name: str | None = None
+    is_superadmin: bool
+    role_name: str | None = None
+    permissions: list[str] = []
+    menus: list[str] = []
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: MeOut
+
+
+# ── User ─────────────────────────────────────────────────────────
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    display_name: str | None = None
+    role_id: uuid.UUID | None = None
+    is_active: bool = True
+
+
+class UserOut(BaseModel):
+    id: uuid.UUID
+    username: str
+    display_name: str | None = None
+    is_active: bool
+    is_superadmin: bool
+    role_id: uuid.UUID | None = None
+    role_name: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class UserUpdate(BaseModel):
+    display_name: str | None = None
+    role_id: uuid.UUID | None = None
+    is_active: bool | None = None
+    password: str | None = None
+
+
+# ── Role ─────────────────────────────────────────────────────────
+class RoleCreate(BaseModel):
+    name: str
+    description: str | None = None
+    permissions: list[str] = []
+    kb_ids: list[uuid.UUID] = []
+
+
+class RoleOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: str | None = None
+    is_system: bool
+    permissions: list[str] = []
+    kb_ids: list[uuid.UUID] = []
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RoleUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    permissions: list[str] | None = None
+    kb_ids: list[uuid.UUID] | None = None
+
+
+# ── Login Log ────────────────────────────────────────────────────
+class LoginLogOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID | None = None
+    username: str
+    success: bool
+    ip: str | None = None
+    user_agent: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class LoginLogPage(BaseModel):
+    items: list[LoginLogOut]
+    total: int
+

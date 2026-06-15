@@ -1,0 +1,16 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+*.log
+
+# 用户上传的文件（运行时数据，非代码）
+uploads/
+
+# OMC 本地 agent 状态
+.omc/

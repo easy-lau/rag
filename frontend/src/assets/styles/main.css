@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { @apply h-full; }
+  body { @apply h-full m-0 font-sans; }
+  #app  { @apply h-full; }
+}
+
+/* ── Markdown body ─────────────────────────────────── */
+.markdown-body { @apply leading-relaxed; }
+.markdown-body > *:first-child { @apply mt-0; }
+.markdown-body > *:last-child  { @apply mb-0; }
+
+.markdown-body h1 { @apply text-xl font-bold mb-3 mt-5 pb-1 border-b border-gray-200 dark:border-gray-700; }
+.markdown-body h2 { @apply text-lg font-bold mb-2 mt-4 pb-1 border-b border-gray-200 dark:border-gray-700; }
+.markdown-body h3 { @apply text-base font-semibold mb-2 mt-3; }
+.markdown-body h4 { @apply text-sm font-semibold mb-1 mt-2; }
+
+.markdown-body p  { @apply mb-1.5 leading-7; }
+
+.markdown-body ul { @apply list-disc pl-6 mb-3 space-y-1; }
+.markdown-body ol { @apply list-decimal pl-6 mb-3 space-y-1; }
+.markdown-body li > ul,
+.markdown-body li > ol { @apply mt-1 mb-0; }
+
+.markdown-body strong { @apply font-semibold; }
+.markdown-body em     { @apply italic; }
+
+.markdown-body a { @apply text-blue-500 hover:text-blue-600 underline underline-offset-2; }
+
+.markdown-body hr { @apply border-gray-200 dark:border-gray-700 my-4; }
+
+/* Inline code */
+.markdown-body code:not(pre code) {
+  @apply font-mono text-[0.82em] bg-gray-100 dark:bg-gray-700/80
+         text-rose-600 dark:text-rose-400 px-1.5 py-0.5 rounded;
+}
+
+/* Code blocks */
+.markdown-body .code-block-wrapper {
+  @apply my-3 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700;
+}
+.markdown-body .code-block-header {
+  @apply flex items-center justify-between px-3.5 py-1.5
+         bg-gray-100 dark:bg-gray-700/60
+         text-xs font-mono text-gray-500 dark:text-gray-400;
+}
+.markdown-body .code-block-header .copy-btn {
+  @apply cursor-pointer bg-transparent border-0 p-0 text-inherit
+         hover:text-gray-700 dark:hover:text-gray-200 transition-colors;
+}
+
+.markdown-body pre {
+  @apply my-3 px-3.5 py-3 rounded-lg overflow-x-auto;
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+/* <pre> 在 wrapper 内部时，圆角与外边距交给外层容器 */
+.markdown-body .code-block-wrapper pre {
+  @apply m-0 rounded-none;
+}
+.markdown-body pre code {
+  @apply font-mono bg-transparent text-inherit p-0;
+}
+
+/* Tables */
+.markdown-body table { @apply w-full border-collapse text-sm mb-3; }
+.markdown-body th {
+  @apply border border-gray-300 dark:border-gray-600
+         bg-gray-50 dark:bg-gray-700 px-3 py-2 text-left font-semibold;
+}
+.markdown-body td { @apply border border-gray-300 dark:border-gray-600 px-3 py-2; }
+.markdown-body tr:nth-child(even) td { @apply bg-gray-50/50 dark:bg-gray-700/30; }
+
+/* Blockquote */
+.markdown-body blockquote {
+  @apply border-l-4 border-blue-400 pl-4 my-3
+         text-gray-600 dark:text-gray-400 italic;
+}
+
+/* ── highlight.js theme（仅配色，布局交给 .markdown-body pre）──── */
+/* light */
+.hljs { background: #f6f8fa; color: #24292e; }
+
+/* dark override */
+.dark .hljs { background: #1e2433; color: #cdd6f4; }
+.dark .hljs-keyword,
+.dark .hljs-selector-tag  { color: #cba6f7; }
+.dark .hljs-string,
+.dark .hljs-attr          { color: #a6e3a1; }
+.dark .hljs-number,
+.dark .hljs-literal       { color: #fab387; }
+.dark .hljs-comment       { color: #6c7086; font-style: italic; }
+.dark .hljs-built_in,
+.dark .hljs-type          { color: #89dceb; }
+.dark .hljs-title,
+.dark .hljs-name          { color: #89b4fa; }
+.dark .hljs-variable,
+.dark .hljs-template-variable { color: #f38ba8; }
