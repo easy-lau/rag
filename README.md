@@ -38,7 +38,7 @@ docker compose up --build -d            # 构建并启动 postgres + 后端 + �
 docker compose exec backend alembic upgrade head   # 执行数据库迁移
 ```
 
-访问 `http://<服务器IP>`（前端 80 端口），用户名 `admin` / 密码 = `ADMIN_INIT_PASSWORD`。
+访问 `http://<服务器IP>:8001`（前端 8001 端口），用户名 `admin` / 密码 = `ADMIN_INIT_PASSWORD`。
 
 常用命令：
 
