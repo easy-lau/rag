@@ -19,25 +19,13 @@ docker-compose.db.yml   仅起数据库（本地开发用）
 
 ## 环境变量
 
-复制 `.env.example` 为 `.env` 并填写（`.env` 已被 gitignore，切勿提交）：
+复制 `.env.example` 为 `.env`，按文件内注释填写（`.env` 已被 gitignore，切勿提交）。**必填三项**：
 
-```
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.openai.com/v1
-CHAT_MODEL=gpt-4o
-EMBEDDING_MODEL=text-embedding-3-small
+- `POSTGRES_PASSWORD` —— ⚠️ 只用字母和数字，**不要含 `@ : / ? # %` 等符号**（会破坏数据库连接串，导致后端连不上库）
+- `JWT_SECRET` —— 随机长字符串（`openssl rand -hex 32`）
+- `ADMIN_INIT_PASSWORD` —— 初始管理员密码（用户名固定 `admin`；仅首次初始化数据库时生效）
 
-POSTGRES_USER=rag
-POSTGRES_PASSWORD=<强密码>
-POSTGRES_DB=rag_db
-
-# 后端连库地址（docker compose 内用服务名 postgres；本地开发填实际地址）
-DATABASE_URL=postgresql+asyncpg://rag:<强密码>@postgres:5432/rag_db
-
-# 生产务必修改：JWT 密钥与初始管理员密码
-JWT_SECRET=<随机长字符串>
-ADMIN_INIT_PASSWORD=<初始管理员密码>
-```
+模型相关（`LLM_*` / `EMBEDDING_*` / `VISION_*`）可留空，部署后在「设置」页里填。docker 部署**不要**手动设 `DATABASE_URL`，compose 会自动指向 `postgres` 容器。
 
 ## 部署到一台新服务器（Docker，推荐）
 
