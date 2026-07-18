@@ -7,6 +7,7 @@ from database import get_db
 from models.db_models import SystemSetting, User
 from config import get_settings
 from pydantic import BaseModel
+from core.audit import AuditLogger, get_audit
 from core.deps import require_permission
 from core.permissions import SETTINGS_READ, SETTINGS_WRITE
 
@@ -185,6 +186,7 @@ async def upload_logo(
 async def update_settings(
     payload: SettingsUpdate,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_permission(SETTINGS_WRITE)),
 ):
     updates = payload.model_dump(exclude_none=True)
@@ -201,6 +203,11 @@ async def update_settings(
             row.value = str(value)
         else:
             db.add(SystemSetting(key=key, value=str(value)))
+
+    # 审计：只记被修改的键名（密钥类仅出现 key 名，绝不记其值）
+    if updates:
+        audit.log(db, "settings.update", target_type="settings",
+                  detail={"changed": sorted(updates.keys())})
     await db.commit()
 
     # 刷新内存配置

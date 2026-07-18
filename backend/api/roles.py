@@ -7,10 +7,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from core.audit import AuditLogger, get_audit
 from core.deps import require_permission
 from core.permissions import ALL_PERMISSIONS, MENUS, ROLE_MANAGE
 from database import get_db
-from models.db_models import Role, RoleKnowledgeBase, RolePermission, User
+from models.db_models import KnowledgeBase, Role, RoleKnowledgeBase, RolePermission, User
 from models.schemas import RoleCreate, RoleOut, RoleUpdate
 
 router = APIRouter(prefix="/roles", tags=["roles"])
@@ -52,6 +53,7 @@ async def list_roles(
 async def create_role(
     payload: RoleCreate,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_permission(ROLE_MANAGE)),
 ):
     exists = (await db.execute(
@@ -66,6 +68,9 @@ async def create_role(
     for kb_id in set(payload.kb_ids):
         role.knowledge_bases.append(RoleKnowledgeBase(kb_id=kb_id))
     db.add(role)
+    await db.flush()  # 取得 role.id 以记审计
+    audit.log(db, "role.create", target_type="role", target_id=role.id, target_name=role.name,
+              detail={"permissions": len(set(payload.permissions)), "kb_ids": len(set(payload.kb_ids))})
     await db.commit()
     await db.refresh(role, attribute_names=["permissions", "knowledge_bases"])
     return _to_out(role)
@@ -76,6 +81,7 @@ async def update_role(
     role_id: uuid.UUID,
     payload: RoleUpdate,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_permission(ROLE_MANAGE)),
 ):
     role = (await db.execute(
@@ -85,6 +91,33 @@ async def update_role(
     )).scalar_one_or_none()
     if role is None:
         raise HTTPException(status_code=404, detail="角色不存在")
+
+    # 计算真实变更（含前后值）：前端保存通常带全字段，需与旧值对比，空保存才不记日志。
+    # 必须在下方 clear/重写关系前快照旧值。
+    old_perms = {p.permission_key for p in role.permissions}
+    old_kbs = {k.kb_id for k in role.knowledge_bases}
+    changes: dict = {}
+    if payload.name is not None and payload.name != role.name:
+        changes["name"] = {"from": role.name, "to": payload.name}
+    if payload.description is not None and payload.description != role.description:
+        changes["description"] = {"from": role.description, "to": payload.description}
+    if payload.permissions is not None:
+        new_perms = set(payload.permissions)
+        added, removed = sorted(new_perms - old_perms), sorted(old_perms - new_perms)
+        if added or removed:
+            changes["permissions"] = {"added": added, "removed": removed}
+    if payload.kb_ids is not None:
+        new_kbs = set(payload.kb_ids)
+        added_kb, removed_kb = new_kbs - old_kbs, old_kbs - new_kbs
+        if added_kb or removed_kb:
+            # 把知识库 id 解析成名称，日志更可读
+            name_map = dict((await db.execute(
+                select(KnowledgeBase.id, KnowledgeBase.name).where(KnowledgeBase.id.in_(added_kb | removed_kb))
+            )).all())
+            changes["kb_ids"] = {
+                "added": [name_map.get(i, str(i)) for i in added_kb],
+                "removed": [name_map.get(i, str(i)) for i in removed_kb],
+            }
 
     if payload.name is not None:
         role.name = payload.name
@@ -105,6 +138,9 @@ async def update_role(
         for kb_id in set(payload.kb_ids):
             role.knowledge_bases.append(RoleKnowledgeBase(kb_id=kb_id))
 
+    if changes:  # 空保存（与原值一致）不记审计
+        audit.log(db, "role.update", target_type="role", target_id=role.id,
+                  target_name=role.name, detail={"changes": changes})
     await db.commit()
     await db.refresh(role, attribute_names=["permissions", "knowledge_bases"])
     return _to_out(role)
@@ -114,6 +150,7 @@ async def update_role(
 async def delete_role(
     role_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_permission(ROLE_MANAGE)),
 ):
     role = await db.get(Role, role_id)
@@ -132,6 +169,7 @@ async def delete_role(
             detail=f"该角色下还有 {in_use} 个用户，请先改派这些用户的角色后再删除",
         )
 
+    audit.log(db, "role.delete", target_type="role", target_id=role.id, target_name=role.name)
     await db.delete(role)
     await db.commit()
     return {"message": "删除成功"}

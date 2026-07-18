@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 from database import get_db
 from models.db_models import KnowledgeBase, Document, User
 from models.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
+from core.audit import AuditLogger, get_audit
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import KB_READ, KB_WRITE
 
@@ -88,6 +89,7 @@ async def list_document_tags(
 async def create_knowledge_base(
     payload: KnowledgeBaseCreate,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_permission(KB_WRITE)),
 ):
     kb = KnowledgeBase(
@@ -97,6 +99,8 @@ async def create_knowledge_base(
         created_by=user.id,
     )
     db.add(kb)
+    await db.flush()  # 取得 kb.id 以记审计
+    audit.log(db, "kb.create", target_type="knowledge_base", target_id=kb.id, target_name=kb.name)
     await db.commit()
     await db.refresh(kb)
     # 创建场景下创建人即当前 user，直接取名避免再次查询关系
@@ -110,6 +114,7 @@ async def update_knowledge_base(
     kb_id: uuid.UUID,
     payload: KnowledgeBaseCreate,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_permission(KB_WRITE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
@@ -118,6 +123,7 @@ async def update_knowledge_base(
     kb.name = payload.name
     kb.description = payload.description
     kb.icon_color = payload.icon_color
+    audit.log(db, "kb.update", target_type="knowledge_base", target_id=kb.id, target_name=kb.name)
     await db.commit()
     await db.refresh(kb, attribute_names=["creator"])
     kb.created_by_name = _name(kb.creator)
@@ -129,6 +135,7 @@ async def update_knowledge_base(
 async def delete_knowledge_base(
     kb_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_permission(KB_WRITE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
@@ -143,6 +150,7 @@ async def delete_knowledge_base(
             status_code=400,
             detail=f"该知识库下还有 {doc_count} 个文档，请先删除全部文档后再删除知识库",
         )
+    audit.log(db, "kb.delete", target_type="knowledge_base", target_id=kb.id, target_name=kb.name)
     await db.delete(kb)
     await db.commit()
     return {"message": "删除成功"}

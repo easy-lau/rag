@@ -12,6 +12,7 @@ from models.db_models import Document, DocumentChunk, KnowledgeBase, User, now_u
 from models.schemas import DocumentOut
 from core.document_parser import parse_file, parse_markdown_content, excel_to_markdown, docx_to_markdown
 from core.embeddings import embed_batch
+from core.audit import AuditLogger, get_audit
 from core.deps import require_kb_access
 from core.permissions import DOC_READ, DOC_WRITE
 from config import get_settings
@@ -82,6 +83,7 @@ async def upload_document(
     file: UploadFile = File(...),
     tags: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_kb_access(DOC_WRITE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
@@ -101,6 +103,9 @@ async def upload_document(
     doc = Document(kb_id=kb_id, filename=file.filename, file_type=ext, status="processing",
                    tags=_parse_tags(tags), created_by=user.id)
     db.add(doc)
+    await db.flush()
+    audit.log(db, "doc.upload", target_type="document", target_id=doc.id, target_name=doc.filename,
+              detail={"kb_id": str(kb_id), "file_type": ext})
     await db.commit()
     await db.refresh(doc)
 
@@ -114,6 +119,7 @@ async def upload_image_document(
     file: UploadFile = File(...),
     tags: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_kb_access(DOC_WRITE)),
 ):
     """上传图片/截图：保存原图 → 多模态模型转写为 Markdown → 分块入库；
@@ -142,6 +148,9 @@ async def upload_image_document(
         tags=_parse_tags(tags), created_by=user.id,
     )
     db.add(doc)
+    await db.flush()
+    audit.log(db, "doc.upload_image", target_type="document", target_id=doc.id, target_name=doc.filename,
+              detail={"kb_id": str(kb_id), "file_type": ext})
     await db.commit()
     await db.refresh(doc)
 
@@ -165,6 +174,7 @@ async def create_text_document(
     kb_id: uuid.UUID,
     body: TextDocumentIn,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_kb_access(DOC_WRITE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
@@ -175,6 +185,9 @@ async def create_text_document(
                    source_url=body.source_url, status="processing",
                    tags=_normalize_tags(body.tags), created_by=user.id)
     db.add(doc)
+    await db.flush()
+    audit.log(db, "doc.create_text", target_type="document", target_id=doc.id, target_name=doc.filename,
+              detail={"kb_id": str(kb_id)})
     await db.commit()
     await db.refresh(doc)
 
@@ -208,6 +221,7 @@ async def update_text_document(
     doc_id: uuid.UUID,
     body: TextDocumentIn,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_kb_access(DOC_WRITE)),
 ):
     doc = await db.get(Document, doc_id)
@@ -228,6 +242,8 @@ async def update_text_document(
     doc.tags = _normalize_tags(body.tags)
     doc.updated_by = user.id
     doc.updated_at = now_utc()
+    audit.log(db, "doc.update", target_type="document", target_id=doc.id, target_name=doc.filename,
+              detail={"kb_id": str(kb_id)})
     await db.commit()
     await db.refresh(doc)
 
@@ -278,11 +294,14 @@ async def delete_document(
     kb_id: uuid.UUID,
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     _: User = Depends(require_kb_access(DOC_WRITE)),
 ):
     doc = await db.get(Document, doc_id)
     if not doc or doc.kb_id != kb_id:
         raise HTTPException(status_code=404, detail="文档不存在")
+    audit.log(db, "doc.delete", target_type="document", target_id=doc.id, target_name=doc.filename,
+              detail={"kb_id": str(kb_id)})
     await db.delete(doc)
     await db.commit()
     return {"message": "删除成功"}

@@ -16,7 +16,7 @@ const routes = [
       { path: 'search-test', component: () => import('@/views/SearchTestView.vue'),       name: 'search-test', meta: { permission: 'menu:search_test' } },
       { path: 'users',       component: () => import('@/views/admin/UsersView.vue'),      name: 'users',       meta: { permission: 'menu:users' } },
       { path: 'roles',       component: () => import('@/views/admin/RolesView.vue'),      name: 'roles',       meta: { permission: 'menu:roles' } },
-      { path: 'login-logs',  component: () => import('@/views/admin/LoginLogsView.vue'),  name: 'login-logs',  meta: { permission: 'menu:login_logs' } },
+      { path: 'audit-logs',  component: () => import('@/views/admin/AuditLogsView.vue'),   name: 'audit-logs',  meta: { permission: 'menu:login_logs' } },
       { path: 'settings',    component: () => import('@/views/SettingsView.vue'),         name: 'settings',    meta: { permission: 'menu:settings' } },
     ]
   }

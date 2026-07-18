@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from api import chat, knowledge, document, search, settings, auth, users, roles, login_logs
+from api import chat, knowledge, document, search, settings, auth, users, roles, login_logs, operation_logs
 from config import get_settings
 
 logging.basicConfig(
@@ -41,6 +41,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 app.include_router(roles.router, prefix="/api")
 app.include_router(login_logs.router, prefix="/api")
+app.include_router(operation_logs.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(knowledge.router, prefix="/api")
 app.include_router(document.router, prefix="/api")

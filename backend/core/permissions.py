@@ -64,5 +64,5 @@ MENUS: list[dict] = [
     {"key": MENU_SETTINGS, "route": "settings", "title": "系统设置", "permission": MENU_SETTINGS},
     {"key": MENU_USERS, "route": "users", "title": "用户管理", "permission": MENU_USERS},
     {"key": MENU_ROLES, "route": "roles", "title": "角色管理", "permission": MENU_ROLES},
-    {"key": MENU_LOGIN_LOGS, "route": "login-logs", "title": "登录日志", "permission": MENU_LOGIN_LOGS},
+    {"key": MENU_LOGIN_LOGS, "route": "audit-logs", "title": "审计日志", "permission": MENU_LOGIN_LOGS},
 ]

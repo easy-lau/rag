@@ -191,6 +191,7 @@ class LoginLogOut(BaseModel):
     user_id: uuid.UUID | None = None
     username: str
     success: bool
+    fail_reason: str | None = None
     ip: str | None = None
     user_agent: str | None = None
     created_at: datetime
@@ -200,5 +201,26 @@ class LoginLogOut(BaseModel):
 
 class LoginLogPage(BaseModel):
     items: list[LoginLogOut]
+    total: int
+
+
+class OperationLogOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID | None = None
+    username: str
+    action: str
+    target_type: str | None = None
+    target_id: str | None = None
+    target_name: str | None = None
+    detail: dict | None = None
+    ip: str | None = None
+    user_agent: str | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class OperationLogPage(BaseModel):
+    items: list[OperationLogOut]
     total: int
 

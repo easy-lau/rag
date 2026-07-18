@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from core.audit import AuditLogger, get_audit
 from core.deps import _load_permissions, get_current_user
 from core.security import create_access_token, hash_password, verify_password
 from database import get_db
@@ -51,17 +52,20 @@ async def login(payload: LoginRequest, request: Request, db: AsyncSession = Depe
 
     # 用户不存在：写失败日志（user_id 空），再抛 401
     if user is None:
-        db.add(LoginLog(user_id=None, username=payload.username, success=False, ip=ip, user_agent=user_agent))
+        db.add(LoginLog(user_id=None, username=payload.username, success=False,
+                        fail_reason="用户不存在", ip=ip, user_agent=user_agent))
         await db.commit()
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     # 密码错误：写失败日志，再抛 401
     if not verify_password(payload.password, user.password_hash):
-        db.add(LoginLog(user_id=user.id, username=user.username, success=False, ip=ip, user_agent=user_agent))
+        db.add(LoginLog(user_id=user.id, username=user.username, success=False,
+                        fail_reason="密码错误", ip=ip, user_agent=user_agent))
         await db.commit()
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     # 用户被禁用：写失败日志，再抛 403
     if not user.is_active:
-        db.add(LoginLog(user_id=user.id, username=user.username, success=False, ip=ip, user_agent=user_agent))
+        db.add(LoginLog(user_id=user.id, username=user.username, success=False,
+                        fail_reason="账号已禁用", ip=ip, user_agent=user_agent))
         await db.commit()
         raise HTTPException(status_code=403, detail="用户已禁用")
 
@@ -91,10 +95,12 @@ async def change_password(
     body: ChangePasswordIn,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
 ):
     """校验旧密码后更新为新密码。"""
     if not verify_password(body.old_password, user.password_hash):
         raise HTTPException(status_code=400, detail="原密码错误")
     user.password_hash = hash_password(body.new_password)
+    audit.log(db, "auth.change_password", target_type="user", target_id=user.id, target_name=user.username)
     await db.commit()
     return {"message": "密码修改成功"}

@@ -11,7 +11,7 @@ export const MENU_ITEMS = [
   { to: '/search-test', label: '检索测试',   icon: SearchOutline, permission: 'menu:search_test' },
   { to: '/users',       label: '用户管理',   icon: PeopleOutline, permission: 'menu:users' },
   { to: '/roles',       label: '角色管理',   icon: ShieldOutline, permission: 'menu:roles' },
-  { to: '/login-logs',  label: '登录日志',   icon: TimeOutline, permission: 'menu:login_logs' },
+  { to: '/audit-logs',  label: '审计日志',   icon: TimeOutline, permission: 'menu:login_logs' },
   { to: '/settings',    label: '系统设置',   icon: SettingsOutline, permission: 'menu:settings' },
 ]
 

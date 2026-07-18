@@ -173,6 +173,33 @@ class LoginLog(Base):
     )
     username: Mapped[str] = mapped_column(String(64))
     success: Mapped[bool] = mapped_column(Boolean)
+    # 登录失败原因（用户不存在 / 密码错误 / 账号已禁用）；成功时为空
+    fail_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64))
+    user_agent: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class OperationLog(Base):
+    """操作审计日志：记录会改数据的关键动作（用户/角色/知识库/文档/设置/改密等）。
+
+    target_* 与 username 均为冗余快照，确保被操作对象或操作人被删除后仍可追溯；
+    detail 存结构化细节（改了哪些字段、批量数量等），绝不写入密码 / API Key 等敏感值。
+    """
+
+    __tablename__ = "operation_logs"
+    __table_args__ = (Index("ix_operation_logs_created_at", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    username: Mapped[str] = mapped_column(String(64))          # 操作人（冗余，防删用户后失溯）
+    action: Mapped[str] = mapped_column(String(64))            # 动作码，如 user.create / doc.delete
+    target_type: Mapped[str | None] = mapped_column(String(32), nullable=True)   # 对象类型
+    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)     # 对象 ID
+    target_name: Mapped[str | None] = mapped_column(String(255), nullable=True)  # 对象名称（冗余）
+    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)            # 结构化细节
     ip: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
