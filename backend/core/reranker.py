@@ -1,5 +1,8 @@
+import logging
 from core.openai_client import get_client
 from config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 async def rerank(query: str, results: list[dict]) -> list[dict]:
@@ -37,7 +40,8 @@ async def rerank(query: str, results: list[dict]) -> list[dict]:
         for i, r in enumerate(results):
             r["score"] = scores.get(i + 1, r.get("score", 0.5))
         results.sort(key=lambda x: x["score"], reverse=True)
-    except Exception:
-        pass
+    except Exception as e:
+        # 重排失败不致命：保留检索原始排序继续走后续流程
+        logger.warning("[重排] 调用失败，保留检索原始排序: %s: %s", type(e).__name__, e)
 
     return results

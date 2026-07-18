@@ -1,6 +1,8 @@
 import json
+import time
 import uuid
 import asyncio
+import logging
 from decimal import Decimal
 from typing import AsyncGenerator
 from sqlalchemy import text as sa_text
@@ -9,6 +11,8 @@ from core.retriever import hybrid_search
 from core.reranker import rerank
 from core.openai_client import get_client
 from config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _step_event(step: str, status: str) -> str:
@@ -125,6 +129,7 @@ async def _needs_retrieval(question: str) -> bool:
     闲聊/问候/寒暄/与资料无关的请求 → False；涉及业务/制度/流程/文档内容 → True。
     出错时保守返回 True（宁可多检索，也不漏答真问题）。"""
     s = get_settings()
+    t0 = time.perf_counter()
     try:
         resp = await get_client().chat.completions.create(
             model=s.chat_model,
@@ -143,8 +148,18 @@ async def _needs_retrieval(question: str) -> bool:
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content)
-        return bool(data.get("need_retrieval", True))
-    except Exception:
+        need = bool(data.get("need_retrieval", True))
+        logger.info(
+            "[意图判断] 模型=%s 结果=%s 耗时=%.0fms",
+            s.chat_model, "需要检索" if need else "无需检索（闲聊/问候）",
+            (time.perf_counter() - t0) * 1000,
+        )
+        return need
+    except Exception as e:
+        logger.warning(
+            "[意图判断] 调用失败，保守按需要检索处理: %s: %s（耗时=%.0fms）",
+            type(e).__name__, e, (time.perf_counter() - t0) * 1000,
+        )
         return True
 
 
@@ -156,10 +171,17 @@ async def run_rag_stream(
     db: AsyncSession,
 ) -> AsyncGenerator[str, None]:
     s = get_settings()
+    t_total = time.perf_counter()
+    logger.info(
+        "[提问] conv=%s 知识库数=%d 问题=%.80s",
+        conversation_id, len(kb_ids), question,
+    )
 
     # Step 1: 问题分析（顺带判断是否真的需要查知识库，闲聊/问候直接跳过检索）
     yield _step_event("analyze", "active")
     need_retrieval = bool(kb_ids) and await _needs_retrieval(question)
+    if not kb_ids:
+        logger.info("[意图判断] 未选择知识库，跳过检索")
     yield _step_event("analyze", "done")
 
     # Step 2: 查询扩展
@@ -172,35 +194,70 @@ async def run_rag_stream(
 
     # Step 3: 检索（扩大召回，给重排留足候选）；无需检索时跳过，results 保持为空
     yield _step_event("retrieve", "active")
-    results = await hybrid_search(
-        db=db,
-        query=question,
-        kb_ids=kb_ids,
-        top_k=candidate_k,
-        method=search_config.get("method", "hybrid"),
-    ) if need_retrieval else []
+    method = search_config.get("method", "hybrid")
+    if need_retrieval:
+        t0 = time.perf_counter()
+        results = await hybrid_search(
+            db=db,
+            query=question,
+            kb_ids=kb_ids,
+            top_k=candidate_k,
+            method=method,
+        )
+        logger.info(
+            "[检索] 方式=%s 候选上限=%d 召回=%d条 耗时=%.0fms",
+            method, candidate_k, len(results), (time.perf_counter() - t0) * 1000,
+        )
+    else:
+        results = []
+        logger.info("[检索] 跳过（无需查库）")
     yield _step_event("retrieve", "done")
 
     # Step 4: 重排（大候选池上重排后，按相关度过滤+截断，剔除不相关文档）
     reranked = False
     if search_config.get("rerank", s.rerank_enabled) and results:
         yield _step_event("rerank", "active")
+        t0 = time.perf_counter()
         results = await rerank(question, results)
         reranked = True
+        scores = [float(r.get("score") or 0) for r in results]
+        logger.info(
+            "[重排] %d条 分数区间=%.2f~%.2f 耗时=%.0fms",
+            len(results), min(scores), max(scores), (time.perf_counter() - t0) * 1000,
+        )
         yield _step_event("rerank", "done")
     else:
+        if results:
+            logger.info("[重排] 已关闭，跳过")
         yield _step_event("rerank", "done")
 
     # 标签软加权：命中用户所选标签的文档上浮排序（不改语义分、不排除未命中）
-    results = apply_tag_boost(results, search_config.get("tags") or [])
+    selected_tags = search_config.get("tags") or []
+    results = apply_tag_boost(results, selected_tags)
+    if selected_tags:
+        logger.info("[标签加权] 所选标签=%s", selected_tags)
 
+    before_filter = len(results)
     results = _select_relevant(results, top_k, reranked)
+    if need_retrieval:
+        logger.info(
+            "[相关度过滤] 阈值=%s 过滤前=%d条 保留=%d条 命中文档=%s",
+            RELEVANCE_THRESHOLD if reranked else "未启用（未重排）",
+            before_filter, len(results),
+            sorted({r.get("filename") or "" for r in results}) or "无",
+        )
     yield _results_event(results)
 
     # Step 5: LLM 生成
     yield _step_event("generate", "active")
 
     context = await _build_context(db, results)
+    if need_retrieval:
+        logger.info(
+            "[上下文] 长度=%d字符 模式=%s",
+            len(context),
+            "有相关内容" if context else "知识库无相关内容（按未找到回答）",
+        )
     if context:
         # 有相关内容：依据文档作答
         system_prompt = (
@@ -242,6 +299,8 @@ async def run_rag_stream(
         stream = await get_client().chat.completions.create(**create_kwargs)
 
     usage = None
+    t_gen = time.perf_counter()
+    answer_chars = 0
     async for chunk in stream:
         # 末尾的用量统计块 choices 为空，需先取 usage、再判空取增量
         if getattr(chunk, "usage", None):
@@ -249,10 +308,23 @@ async def run_rag_stream(
         if chunk.choices:
             delta = chunk.choices[0].delta.content or ""
             if delta:
+                answer_chars += len(delta)
                 yield _delta_event(delta)
 
     # 生成完成，标记最后一步为完成（否则前端步骤条会一直停在蓝色转圈）
     yield _step_event("generate", "done")
     if usage:
         yield _usage_event(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+        logger.info(
+            "[生成] 模型=%s 回答=%d字符 tokens(输入/输出/合计)=%d/%d/%d 生成耗时=%.1fs 全程耗时=%.1fs",
+            s.chat_model, answer_chars,
+            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens,
+            time.perf_counter() - t_gen, time.perf_counter() - t_total,
+        )
+    else:
+        logger.info(
+            "[生成] 模型=%s 回答=%d字符（服务未返回token用量） 生成耗时=%.1fs 全程耗时=%.1fs",
+            s.chat_model, answer_chars,
+            time.perf_counter() - t_gen, time.perf_counter() - t_total,
+        )
     yield _done_event(conversation_id)

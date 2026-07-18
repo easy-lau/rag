@@ -1,12 +1,22 @@
+import time
+import logging
 from core.openai_client import get_embedding_client
 from config import get_settings
+
+logger = logging.getLogger(__name__)
 
 
 async def embed_text(text: str) -> list[float]:
     s = get_settings()
+    t0 = time.perf_counter()
     resp = await get_embedding_client().embeddings.create(
         model=s.embedding_model,
         input=text,
+    )
+    logger.info(
+        "[向量化] 模型=%s 输入=%d字符 维度=%d 耗时=%.0fms",
+        s.embedding_model, len(text), len(resp.data[0].embedding),
+        (time.perf_counter() - t0) * 1000,
     )
     return resp.data[0].embedding
 
