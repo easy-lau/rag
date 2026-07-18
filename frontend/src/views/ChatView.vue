@@ -2,7 +2,12 @@
   <div class="flex h-full">
     <!-- Main chat area -->
     <div class="flex flex-col flex-1 min-w-0">
-      <div class="px-6 py-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-end">
+      <div class="px-4 sm:px-6 py-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between gap-2">
+        <n-button v-if="ui.isMobile" text size="small" @click="showResults = true">
+          <template #icon><n-icon><SearchOutline /></n-icon></template>
+          检索结果
+        </n-button>
+        <span v-else></span>
         <n-button text size="small" @click="chatStore.newConversation()">
           <template #icon><n-icon><AddOutline /></n-icon></template>
           新对话
@@ -10,7 +15,7 @@
       </div>
 
       <!-- Messages -->
-      <div ref="msgList" class="flex-1 overflow-y-auto px-6 py-4">
+      <div ref="msgList" class="flex-1 overflow-y-auto px-4 sm:px-6 py-4">
         <div v-if="!chatStore.messages.length" class="flex flex-col items-center justify-center h-full text-gray-400">
           <n-icon :size="48" class="mb-3 text-blue-300"><HardwareChipOutline /></n-icon>
           <p class="text-base font-medium mb-1 text-gray-500 dark:text-gray-400">RAG 知识库问答</p>
@@ -26,16 +31,21 @@
       </div>
 
       <!-- Input -->
-      <div class="px-6 py-4 border-t border-gray-200 dark:border-gray-700">
+      <div class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-700">
         <ChatInput />
       </div>
     </div>
 
-    <!-- Right panel -->
-    <SearchResultPanel />
+    <!-- 右侧检索结果：桌面内联，移动端抽屉（顶部按钮触发） -->
+    <div v-if="!ui.isMobile" class="w-80 shrink-0">
+      <SearchResultPanel />
+    </div>
+    <n-drawer v-else v-model:show="showResults" :width="320" placement="right" to="#app">
+      <SearchResultPanel />
+    </n-drawer>
 
     <!-- 来源文档只读预览（当前页弹窗，不跳转） -->
-    <n-modal v-model:show="showPreview" to="#app" preset="card" :title="previewTitle" class="w-[780px]">
+    <n-modal v-model:show="showPreview" to="#app" preset="card" :title="previewTitle" style="width: 90vw; max-width: 780px">
       <div class="relative" style="height: 70vh">
         <div v-if="previewLoading" class="absolute inset-0 flex items-center justify-center">
           <n-spin size="large" />
@@ -58,10 +68,11 @@
 
 <script setup>
 import { ref, watch, nextTick, onMounted, computed } from 'vue'
-import { NButton, NIcon, NModal, NSpin, useMessage } from 'naive-ui'
-import { AddOutline, HardwareChipOutline } from '@vicons/ionicons5'
+import { NButton, NIcon, NModal, NSpin, NDrawer, useMessage } from 'naive-ui'
+import { AddOutline, HardwareChipOutline, SearchOutline } from '@vicons/ionicons5'
 import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
+import { useUiStore } from '@/stores/ui'
 import { getDocument } from '@/api/document'
 import { renderDocMarkdown } from '@/utils/markdown'
 import ChatMessage from '@/components/chat/ChatMessage.vue'
@@ -70,8 +81,12 @@ import SearchResultPanel from '@/components/search/SearchResultPanel.vue'
 
 const chatStore = useChatStore()
 const settingsStore = useSettingsStore()
+const ui = useUiStore()
 const msg = useMessage()
 const msgList = ref(null)
+
+// 移动端：检索结果抽屉开关
+const showResults = ref(false)
 
 // 来源文档只读预览
 const showPreview = ref(false)

@@ -1,5 +1,5 @@
 <template>
-  <aside class="w-52 flex flex-col bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700 shrink-0">
+  <aside class="w-full h-full flex flex-col bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
     <!-- Logo -->
     <div class="px-4 py-4 border-b border-gray-200 dark:border-gray-700">
       <div class="flex items-center gap-2">
@@ -24,6 +24,7 @@
       <router-link
         v-for="item in navItems" :key="item.to"
         :to="item.to"
+        @click="ui.mobileNavOpen = false"
         class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer"
         :class="(item.match || [item.to]).some(p => $route.path.startsWith(p))
           ? 'bg-blue-500 text-white'
@@ -49,7 +50,7 @@
           :class="conv.id === chatStore.currentConvId
             ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
             : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'"
-          @click="chatStore.loadConversation(conv.id)"
+          @click="chatStore.loadConversation(conv.id); ui.mobileNavOpen = false"
         >
           <span class="truncate flex-1">{{ conv.title || '未命名对话' }}</span>
           <n-button
@@ -92,11 +93,13 @@ import { TrashOutline, LogOutOutline } from '@vicons/ionicons5'
 import { useChatStore } from '@/stores/chat'
 import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
+import { useUiStore } from '@/stores/ui'
 import { accessibleMenus } from '@/router/menus'
 
 const chatStore = useChatStore()
 const authStore = useAuthStore()
 const siteStore = useSiteStore()
+const ui = useUiStore()
 
 // 数据驱动菜单：按当前用户权限过滤（guide 公开常显）。
 // /documents 没有独立菜单项，归属于「知识库管理」（其 match 覆盖 /documents）。

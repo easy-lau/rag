@@ -1,5 +1,5 @@
 <template>
-  <div class="p-6 h-full overflow-y-auto">
+  <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="flex items-center justify-end mb-6">
       <n-button v-if="authStore.hasPerm('kb:write')" type="primary" @click="showCreate = true">
         <template #icon><n-icon><AddOutline /></n-icon></template>
@@ -16,7 +16,7 @@
       <div v-else class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
         <div
           v-for="kb in kbStore.list" :key="kb.id"
-          class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-4 hover:shadow-md transition-shadow"
+          class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-4 shadow-sm hover:shadow-md transition-shadow"
         >
           <div class="flex items-center justify-between mb-2">
             <div class="flex items-center gap-2 min-w-0">
@@ -52,7 +52,7 @@
       </div>
     </n-spin>
 
-    <n-modal v-model:show="showCreate" to="#app" preset="card" title="创建知识库" class="w-96">
+    <n-modal v-model:show="showCreate" to="#app" preset="card" title="创建知识库" style="width: 90vw; max-width: 384px">
       <n-form :model="form" label-placement="top">
         <n-form-item label="名称" required>
           <n-input v-model:value="form.name" placeholder="请输入知识库名称" />
@@ -83,7 +83,7 @@
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showEdit" to="#app" preset="card" title="编辑知识库" style="width:360px">
+    <n-modal v-model:show="showEdit" to="#app" preset="card" title="编辑知识库" style="width: 90vw; max-width: 360px">
       <n-form :model="editForm" label-placement="top">
         <n-form-item label="名称" required>
           <n-input v-model:value="editForm.name" placeholder="请输入知识库名称" />

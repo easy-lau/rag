@@ -1,5 +1,5 @@
 <template>
-  <div class="p-6 h-full overflow-y-auto">
+  <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="max-w-3xl space-y-4">
       <n-input v-model:value="query" type="textarea" :rows="3" placeholder="输入测试查询语句..." />
       <div class="flex flex-wrap gap-3">

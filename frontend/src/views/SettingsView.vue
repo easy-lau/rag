@@ -1,11 +1,11 @@
 <template>
-  <div class="p-6 h-full overflow-y-auto">
+  <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <n-spin :show="settingsStore.loading">
       <div class="max-w-6xl mx-auto">
         <!-- 模型配置：左右两列 -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <!-- 大语言模型 -->
-          <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
+          <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6">
             <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
               <span class="w-2 h-2 rounded-full bg-blue-500 inline-block"></span>
               大语言模型
@@ -32,7 +32,7 @@
           </div>
 
           <!-- 向量模型 -->
-          <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6">
+          <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6">
             <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
               <span class="w-2 h-2 rounded-full bg-purple-500 inline-block"></span>
               向量模型
@@ -52,7 +52,7 @@
         </div>
 
         <!-- 多模态模型（图片识别） -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 mt-6">
+        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mt-6">
           <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-orange-500 inline-block"></span>
             多模态模型（图片识别）
@@ -74,7 +74,7 @@
         </div>
 
         <!-- 检索参数 -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 mt-6">
+        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mt-6">
           <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
             检索参数
@@ -123,7 +123,7 @@
         </div>
 
         <!-- 站点设置 -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 mt-6">
+        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mt-6">
           <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-pink-500 inline-block"></span>
             站点设置

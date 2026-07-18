@@ -5,9 +5,9 @@
       <n-icon><HardwareChipOutline /></n-icon>
     </div>
 
-    <div class="max-w-[75%]">
+    <div class="max-w-[85%] sm:max-w-[75%] min-w-0">
       <!-- User bubble -->
-      <div v-if="isUser" class="bg-blue-500 text-white px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed">
+      <div v-if="isUser" class="bg-blue-500 text-white px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed break-words">
         {{ message.content }}
       </div>
 

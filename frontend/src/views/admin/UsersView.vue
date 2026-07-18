@@ -1,5 +1,5 @@
 <template>
-  <div class="p-6 h-full overflow-y-auto">
+  <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="flex items-center justify-end mb-6">
       <n-button type="primary" @click="openCreate">
         <template #icon><n-icon><AddOutline /></n-icon></template>
@@ -9,12 +9,12 @@
 
     <n-data-table
       :columns="columns" :data="users" :loading="loading"
-      :pagination="pagination"
-      class="bg-white dark:bg-gray-800 rounded-xl"
+      :pagination="pagination" :scroll-x="ui.isMobile ? 900 : undefined"
+      class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
     />
 
     <!-- Create / Edit modal -->
-    <n-modal v-model:show="showModal" to="#app" preset="card" :title="editingId ? '编辑用户' : '新建用户'" class="w-96">
+    <n-modal v-model:show="showModal" to="#app" preset="card" :title="editingId ? '编辑用户' : '新建用户'" style="width: 90vw; max-width: 384px">
       <n-form :model="form" label-placement="top">
         <n-form-item label="用户名" required>
           <n-input v-model:value="form.username" :disabled="!!editingId" placeholder="登录用户名" />
@@ -52,7 +52,9 @@ import { NButton, NIcon, NDataTable, NModal, NForm, NFormItem, NInput, NSelect, 
 import { AddOutline } from '@vicons/ionicons5'
 import { getUsers, createUser, updateUser, deleteUser } from '@/api/users'
 import { getRoles } from '@/api/roles'
+import { useUiStore } from '@/stores/ui'
 
+const ui = useUiStore()
 const msg = useMessage()
 const users = ref([])
 const roles = ref([])
@@ -102,6 +104,7 @@ const columns = [
     ])
   }
 ]
+columns.forEach(c => { c.titleAlign = 'center'; c.align = 'center' })  // 表头 + 内容统一居中
 
 onMounted(async () => {
   await Promise.all([loadUsers(), loadRoles()])

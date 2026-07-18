@@ -8,6 +8,20 @@
   #app  { @apply h-full; }
 }
 
+/* ── Naive 数据表格 ───────────────────────────────────── */
+/* 分页区（共 N 条 + 翻页）默认贴着卡片底边，补足上下内边距留出呼吸空间 */
+.n-data-table .n-data-table__pagination {
+  margin-top: 0;
+  padding: 16px 18px;
+}
+/* 拉满分页器宽度，让"共 N 条"靠最左、翻页器与每页条数靠最右 */
+.n-data-table .n-data-table__pagination .n-pagination {
+  width: 100%;
+}
+.n-data-table .n-data-table__pagination .n-pagination .n-pagination-prefix {
+  margin-right: auto;
+}
+
 /* ── Markdown body ─────────────────────────────────── */
 .markdown-body { @apply leading-relaxed; }
 .markdown-body > *:first-child { @apply mt-0; }
@@ -36,6 +50,7 @@
 .markdown-body code:not(pre code) {
   @apply font-mono text-[0.82em] bg-gray-100 dark:bg-gray-700/80
          text-rose-600 dark:text-rose-400 px-1.5 py-0.5 rounded;
+  overflow-wrap: anywhere;  /* 长 token（如 a.b.c.d）在窄屏换行而非撑破气泡 */
 }
 
 /* Code blocks */
@@ -56,7 +71,12 @@
   @apply my-3 px-3.5 py-3 rounded-lg overflow-x-auto;
   font-size: 0.82rem;
   line-height: 1.6;
+  -webkit-overflow-scrolling: touch;  /* iOS 惯性滚动 */
+  scrollbar-width: thin;              /* Firefox 细滚动条 */
 }
+/* 代码块横向滚动条常显（移动端默认隐藏，用户看不出能滑），让"可滑动"有视觉提示 */
+.markdown-body pre::-webkit-scrollbar { height: 6px; }
+.markdown-body pre::-webkit-scrollbar-thumb { @apply bg-gray-300 dark:bg-gray-600 rounded-full; }
 /* <pre> 在 wrapper 内部时，圆角与外边距交给外层容器 */
 .markdown-body .code-block-wrapper pre {
   @apply m-0 rounded-none;

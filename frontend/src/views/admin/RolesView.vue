@@ -1,5 +1,5 @@
 <template>
-  <div class="p-6 h-full overflow-y-auto">
+  <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="flex items-center justify-end mb-6">
       <n-button type="primary" @click="openCreate">
         <template #icon><n-icon><AddOutline /></n-icon></template>
@@ -9,15 +9,15 @@
 
     <n-data-table
       :columns="columns" :data="roles" :loading="loading"
-      :pagination="pagination"
-      class="bg-white dark:bg-gray-800 rounded-xl"
+      :pagination="pagination" :scroll-x="ui.isMobile ? 820 : undefined"
+      class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
     />
 
     <!-- Create / Edit modal -->
     <n-modal v-model:show="showModal" to="#app" preset="card"
       :title="editingId ? '编辑角色' : '新建角色'" style="width: 720px; max-width: 92vw">
       <n-form :model="form" label-placement="top">
-        <div class="grid grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <n-form-item label="角色名称" required>
             <n-input v-model:value="form.name" :disabled="editingIsSystem" placeholder="角色名称" />
           </n-form-item>
@@ -62,7 +62,9 @@ import { NButton, NIcon, NDataTable, NModal, NForm, NFormItem, NInput, NSelect, 
 import { AddOutline } from '@vicons/ionicons5'
 import { getRoles, createRole, updateRole, deleteRole, getPermissionCatalog } from '@/api/roles'
 import { getKnowledgeBases } from '@/api/knowledge'
+import { useUiStore } from '@/stores/ui'
 
+const ui = useUiStore()
 const msg = useMessage()
 const roles = ref([])
 const allPermissions = ref([])
@@ -103,7 +105,7 @@ const PERM_LABELS = {
   'doc:read': '文档·读', 'doc:write': '文档·写',
   'settings:read': '设置·读', 'settings:write': '设置·写',
   'user:manage': '用户管理', 'role:manage': '角色管理',
-  'log:read': '查看登录日志',
+  'log:read': '查看审计日志（登录 / 操作）',
 }
 function permLabel(key) {
   if (PERM_LABELS[key]) return PERM_LABELS[key]
@@ -143,6 +145,7 @@ const columns = [
     ])
   }
 ]
+columns.forEach(c => { c.titleAlign = 'center'; c.align = 'center' })  // 表头 + 内容统一居中
 
 onMounted(async () => {
   await Promise.all([loadRoles(), loadCatalog(), loadKbs()])

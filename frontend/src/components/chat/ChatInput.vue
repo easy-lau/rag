@@ -9,8 +9,8 @@
       class="text-sm"
       @keydown.enter.exact.prevent="handleSend"
     />
-    <div class="flex items-center justify-between mt-2 pt-2 border-t border-gray-100 dark:border-gray-700">
-      <div class="flex items-center gap-3 flex-1 min-w-0">
+    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mt-2 pt-2 border-t border-gray-100 dark:border-gray-700">
+      <div class="flex flex-wrap items-center gap-2 sm:gap-3 flex-1 min-w-0">
         <n-select
           v-model:value="chatStore.selectedKbIds"
           :options="kbOptions"
@@ -18,14 +18,14 @@
           multiple
           clearable
           placeholder="选择知识库"
-          class="w-44"
+          class="w-full sm:w-44"
           :max-tag-count="1"
         />
         <n-select
           v-model:value="chatStore.searchConfig.method"
           :options="methodOptions"
           size="small"
-          class="w-40"
+          class="w-full sm:w-40"
         />
         <n-select
           v-if="tagOptions.length"
@@ -35,7 +35,7 @@
           multiple
           clearable
           placeholder="标签（软加权）"
-          class="w-40"
+          class="w-full sm:w-40"
           :max-tag-count="1"
         />
         <div class="flex items-center gap-1.5 text-sm text-gray-500 dark:text-gray-400 shrink-0">
@@ -53,7 +53,7 @@
           <n-switch v-model:value="chatStore.searchConfig.rerank" size="small" />
         </div>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex items-center justify-end gap-2 shrink-0">
         <n-button v-if="chatStore.isStreaming" size="small" @click="chatStore.stopStreaming()">
           <template #icon><n-icon><StopOutline /></n-icon></template>
           停止

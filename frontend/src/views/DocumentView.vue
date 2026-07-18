@@ -1,12 +1,12 @@
 <template>
-  <div class="p-6 h-full overflow-y-auto">
-    <div class="flex items-center justify-between mb-4">
+  <div class="p-4 sm:p-6 h-full overflow-y-auto">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
       <div class="flex items-center gap-1.5">
         <n-button text size="small" title="返回知识库管理" @click="$router.push({ name: 'knowledge' })">
           <template #icon><n-icon><ArrowBackOutline /></n-icon></template>
         </n-button>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <n-select v-model:value="selectedKbId" :options="kbOptions" placeholder="选择知识库" class="w-48" clearable />
         <template v-if="authStore.hasPerm('doc:write')">
           <n-button :disabled="!selectedKbId" @click="showUpload = true">
@@ -45,13 +45,13 @@
       <n-data-table
         :columns="columns" :data="docs" :loading="loading"
         :row-key="rowKey" v-model:checked-row-keys="checkedRowKeys"
-        :pagination="pagination"
-        class="bg-white dark:bg-gray-800 rounded-xl"
+        :pagination="pagination" :scroll-x="ui.isMobile ? 1300 : undefined"
+        class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
       />
     </template>
 
     <!-- Upload modal -->
-    <n-modal v-model:show="showUpload" to="#app" preset="card" title="上传文档" class="w-[480px]" :mask-closable="!uploading">
+    <n-modal v-model:show="showUpload" to="#app" preset="card" title="上传文档" style="width: 90vw; max-width: 480px" :mask-closable="!uploading">
       <div class="relative">
         <div
           v-if="uploading"
@@ -93,7 +93,7 @@
     </n-modal>
 
     <!-- Image upload modal -->
-    <n-modal v-model:show="showImageUpload" to="#app" preset="card" title="上传图片" class="w-[480px]" :mask-closable="!imageUploading">
+    <n-modal v-model:show="showImageUpload" to="#app" preset="card" title="上传图片" style="width: 90vw; max-width: 480px" :mask-closable="!imageUploading">
       <div class="relative">
         <div
           v-if="imageUploading"
@@ -167,10 +167,8 @@
 
           <!-- 数据来源链接：开启后，问答检索的参考来源会把该文档标题渲染成可点击外链 -->
           <div class="flex items-center gap-3 shrink-0">
-            <div class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300 shrink-0">
-              <span>数据来源链接</span>
-              <n-switch v-model:value="sourceUrlEnabled" size="small" />
-            </div>
+            <span class="w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">数据来源链接</span>
+            <n-switch v-model:value="sourceUrlEnabled" size="small" />
             <n-input
               v-if="sourceUrlEnabled"
               v-model:value="sourceUrl"
@@ -182,7 +180,7 @@
 
           <!-- 文档标签：问答时用户勾选这些标签会让本文档命中的片段排序上浮（软加权） -->
           <div class="flex items-center gap-3 shrink-0">
-            <span class="text-sm text-gray-600 dark:text-gray-300 shrink-0">标签</span>
+            <span class="w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">标签</span>
             <n-select
               v-model:value="editTags" :options="tagSelectOptions"
               multiple filterable tag clearable size="small"
@@ -192,7 +190,7 @@
 
           <!-- 原图对照：上传图片转写而来的文档，展示原图便于校对识别结果 -->
           <div v-if="editingImageUrl" class="flex items-center gap-3 shrink-0">
-            <span class="text-sm text-gray-600 dark:text-gray-300 shrink-0">原图对照</span>
+            <span class="w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">原图对照</span>
             <n-image
               :src="editingImageUrl" width="56" height="56" object-fit="cover"
               class="rounded border border-gray-200 dark:border-gray-700"
@@ -281,7 +279,7 @@
     </n-modal>
 
     <!-- 标签快捷编辑：仅改标签，不重新解析/嵌入文档 -->
-    <n-modal v-model:show="showTagEditor" to="#app" preset="card" title="编辑标签" class="w-[440px]">
+    <n-modal v-model:show="showTagEditor" to="#app" preset="card" title="编辑标签" style="width: 90vw; max-width: 440px">
       <div class="space-y-2">
         <div class="text-xs text-gray-500">
           {{ tagEditDoc?.filename }}
@@ -313,12 +311,14 @@ import { CloudUploadOutline, TrashOutline, CreateOutline, CloseOutline, PencilOu
 import { renderDocMarkdown } from '@/utils/markdown'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useAuthStore } from '@/stores/auth'
+import { useUiStore } from '@/stores/ui'
 import { getAllDocuments, uploadDocument, uploadImageDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, updateTextDocument, updateDocumentTags } from '@/api/document'
 import { getDocumentTags } from '@/api/knowledge'
 
 const route = useRoute()
 const kbStore = useKnowledgeStore()
 const authStore = useAuthStore()
+const ui = useUiStore()
 const msg = useMessage()
 const dialog = useDialog()
 const canWrite = computed(() => authStore.hasPerm('doc:write'))
@@ -455,7 +455,7 @@ const columns = computed(() => [
   {
     title: '标签', key: 'tags', minWidth: 140,
     render: row => (row.tags && row.tags.length)
-      ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:4px' },
+      ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:4px;justify-content:center' },
           row.tags.map(t => h(NTag, { size: 'small', type: 'info', bordered: false }, () => t)))
       : h('span', { class: 'text-xs text-gray-400' }, '—')
   },
@@ -490,7 +490,7 @@ const columns = computed(() => [
         ])
       : h('span', { class: 'text-xs text-gray-400' }, '—')
   }
-])
+].map(c => ({ ...c, titleAlign: 'center', align: 'center' })))  // 表头 + 内容统一居中
 
 onMounted(async () => {
   await kbStore.fetchList()

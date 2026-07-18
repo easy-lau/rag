@@ -1,7 +1,12 @@
 <template>
   <header class="h-12 flex items-center justify-between px-4 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 shrink-0">
-    <div class="text-sm font-medium text-gray-700 dark:text-gray-200">
-      {{ currentPageTitle }}
+    <div class="flex items-center gap-2 min-w-0">
+      <n-button v-if="ui.isMobile" text size="small" title="菜单" @click="ui.mobileNavOpen = true">
+        <template #icon><n-icon :size="20"><MenuOutline /></n-icon></template>
+      </n-button>
+      <div class="text-sm font-medium text-gray-700 dark:text-gray-200 truncate">
+        {{ currentPageTitle }}
+      </div>
     </div>
     <div class="flex items-center gap-3">
       <n-button text size="small" @click="ui.toggleTheme()">
@@ -23,7 +28,7 @@
     </div>
 
     <!-- 修改密码弹窗 -->
-    <n-modal v-model:show="showPwd" preset="card" title="修改密码" style="max-width: 400px">
+    <n-modal v-model:show="showPwd" preset="card" title="修改密码" style="width: 90vw; max-width: 400px">
       <n-form ref="pwdFormRef" :model="pwdForm" :rules="pwdRules" label-placement="top">
         <n-form-item label="当前密码" path="old_password">
           <n-input v-model:value="pwdForm.old_password" type="password" show-password-on="click" placeholder="请输入当前密码" />
@@ -49,7 +54,7 @@
 import { computed, ref, h } from 'vue'
 import { useRoute } from 'vue-router'
 import { NButton, NIcon, NDropdown, NModal, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
-import { MoonOutline, SunnyOutline, ChevronDownOutline, KeyOutline, LogOutOutline } from '@vicons/ionicons5'
+import { MoonOutline, SunnyOutline, ChevronDownOutline, KeyOutline, LogOutOutline, MenuOutline } from '@vicons/ionicons5'
 import { useUiStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
 import { changePassword } from '@/api/auth'
@@ -62,7 +67,7 @@ const msg = useMessage()
 const titles = {
   chat: '问答对话', knowledge: '知识库管理', documents: '文档管理',
   'search-test': '检索测试', settings: '系统设置',
-  users: '用户管理', roles: '角色管理', 'login-logs': '登录日志'
+  users: '用户管理', roles: '角色管理', 'audit-logs': '审计日志'
 }
 const currentPageTitle = computed(() => titles[route.name] || 'RAG 检索系统')
 
