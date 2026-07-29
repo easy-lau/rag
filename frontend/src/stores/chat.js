@@ -8,6 +8,7 @@ export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentConvId = ref(null)
   const isStreaming = ref(false)
+  const isConversationLoading = ref(false)
   const searchConfig = ref({ method: 'hybrid', rerank: true, top_k: 5, tags: [] })
 
   const _savedKbIds = localStorage.getItem('selectedKbIds')
@@ -17,9 +18,14 @@ export const useChatStore = defineStore('chat', () => {
 
   let abortFn = null
   let aborted = false
+  // 用户快速切换历史对话时，只接收最后一次请求的响应，避免旧响应覆盖当前会话。
+  let conversationRequestId = 0
+  // 停止生成后使旧 SSE 事件失效，避免其 done 事件把已新建的空会话切回旧会话。
+  let streamRunId = 0
 
   async function sendMessage(question) {
     if (isStreaming.value || !question.trim()) return
+    const runId = ++streamRunId
 
     const searchStore = useSearchStore()
     searchStore.resetSteps()
@@ -49,25 +55,49 @@ export const useChatStore = defineStore('chat', () => {
         throw new Error(detail)
       }
 
+      // 新会话在后端已提交；先从响应头绑定 ID，避免用户刚开始生成就停止时丢失会话上下文。
+      const startedConversationId = res.headers.get('X-Conversation-ID')
+      if (startedConversationId && runId === streamRunId) currentConvId.value = startedConversationId
+
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
+      let sseBuffer = ''
+
+      // fetch 的每个 read() 不保证对应一条完整 SSE 事件；保留残片，避免 JSON 被拆包后静默丢失。
+      const processSseEvent = (rawEvent) => {
+        const rawData = rawEvent
+          .split(/\r?\n/)
+          .filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).trimStart())
+          .join('\n')
+        if (!rawData) return
+        try {
+          handleEvent(JSON.parse(rawData), aiMsg, searchStore, runId)
+        } catch {}
+      }
+      const flushCompleteSseEvents = () => {
+        const events = sseBuffer.split(/\r?\n\r?\n/)
+        sseBuffer = events.pop() || ''
+        events.forEach(processSseEvent)
+      }
 
       while (true) {
         const { done, value } = await reader.read()
-        if (done) break
-
-        const lines = decoder.decode(value).split('\n')
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          try {
-            const data = JSON.parse(line.slice(6))
-            handleEvent(data, aiMsg, searchStore)
-          } catch {}
+        if (value) {
+          sseBuffer += decoder.decode(value, { stream: true })
+          flushCompleteSseEvents()
+        }
+        if (done) {
+          sseBuffer += decoder.decode()
+          if (sseBuffer.trim()) processSseEvent(sseBuffer)
+          break
         }
       }
     } catch (e) {
+      if (runId !== streamRunId) return
       if (e.name !== 'AbortError') aiMsg.content += `\n\n[${e.message || '请求出错，请重试'}]`
     } finally {
+      if (runId !== streamRunId) return
       isStreaming.value = false
       abortFn = null
       searchStore.finishSteps()
@@ -76,13 +106,16 @@ export const useChatStore = defineStore('chat', () => {
         aiMsg.stopped = true
         aborted = false
       } else {
-        await loadHistory()
+        await loadHistory().catch(() => {})
       }
     }
   }
 
-  function handleEvent(data, aiMsg, searchStore) {
-    if (data.type === 'intent') {
+  function handleEvent(data, aiMsg, searchStore, runId) {
+    if (runId !== streamRunId) return
+    if (data.type === 'conversation_started') {
+      if (data.conversation_id) currentConvId.value = data.conversation_id
+    } else if (data.type === 'intent') {
       searchStore.setIntentDecision(data.decision || data)
     } else if (data.type === 'search_step') {
       searchStore.updateStep(data.step, data.status)
@@ -102,38 +135,63 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function stopStreaming() {
+    if (!isStreaming.value) return
     aborted = true
+    streamRunId += 1
     abortFn?.()
+    abortFn = null
     isStreaming.value = false
+    const lastAssistantMessage = [...messages.value].reverse().find(m => m.role === 'assistant')
+    if (lastAssistantMessage) lastAssistantMessage.stopped = true
+    useSearchStore().finishSteps()
+    // 后端在流式开始前已保存会话；停止后刷新侧栏，保留这次未完成的记录入口。
+    loadHistory().catch(() => {})
   }
 
   async function loadHistory() {
     conversations.value = await getChatHistory()
-    if (conversations.value.length && !currentConvId.value) {
-      await loadConversation(conversations.value[0].id)
-    }
   }
 
   async function loadConversation(convId) {
+    if (isStreaming.value) return
+    const requestId = ++conversationRequestId
     currentConvId.value = convId
-    messages.value = await getMessages(convId)
+    messages.value = []
+    isConversationLoading.value = true
+    try {
+      const loadedMessages = await getMessages(convId)
+      if (requestId !== conversationRequestId || currentConvId.value !== convId) return
+      messages.value = loadedMessages
+    } catch (error) {
+      // 仅处理当前仍被选中的请求；旧请求失败不应打断后来已切换的会话。
+      if (requestId !== conversationRequestId || currentConvId.value !== convId) return
+      currentConvId.value = null
+      messages.value = []
+      throw error
+    } finally {
+      if (requestId === conversationRequestId) isConversationLoading.value = false
+    }
   }
 
   function newConversation() {
+    if (isStreaming.value) return
+    conversationRequestId += 1
     currentConvId.value = null
     messages.value = []
+    isConversationLoading.value = false
     const searchStore = useSearchStore()
     searchStore.resetSteps()
   }
 
   async function removeConversation(convId) {
+    if (isStreaming.value) return
     await deleteConversation(convId)
     conversations.value = conversations.value.filter(c => c.id !== convId)
     if (currentConvId.value === convId) newConversation()
   }
 
   return {
-    messages, conversations, currentConvId, isStreaming,
+    messages, conversations, currentConvId, isStreaming, isConversationLoading,
     searchConfig, selectedKbIds,
     sendMessage, stopStreaming, loadHistory, loadConversation,
     newConversation, removeConversation,

@@ -1,23 +1,30 @@
 <template>
   <div>
-    <!-- 筛选条 -->
-    <div class="flex flex-wrap items-center gap-2 mb-3">
-      <n-select
-        v-model:value="moduleFilter" :options="moduleOptions"
-        placeholder="全部模块" clearable size="small" class="w-40"
-        @update:value="onFilterChange"
-      />
-      <n-input
-        v-model:value="usernameFilter" placeholder="按操作人筛选" clearable size="small" class="w-44"
-        @keyup.enter="onFilterChange" @clear="onFilterChange"
-      />
-      <n-button size="small" @click="onFilterChange">筛选</n-button>
+    <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+      <div>
+        <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200">管理操作审计</h3>
+        <p class="mt-1 text-xs text-gray-400">列表展示可读摘要；动作码、对象 ID 与完整变更信息在详情中保留。</p>
+      </div>
+
+      <!-- 筛选条 -->
+      <div class="flex flex-wrap items-center gap-2">
+        <n-select
+          v-model:value="moduleFilter" :options="moduleOptions"
+          placeholder="全部模块" clearable size="small" class="w-40"
+          @update:value="onFilterChange"
+        />
+        <n-input
+          v-model:value="usernameFilter" placeholder="按操作人筛选" clearable size="small" class="w-44"
+          @keyup.enter="onFilterChange" @clear="onFilterChange"
+        />
+        <n-button size="small" @click="onFilterChange">筛选</n-button>
+      </div>
     </div>
 
     <n-data-table
       remote
       :columns="columns" :data="logs" :loading="loading"
-      :pagination="pagination" :scroll-x="ui.isMobile ? 1100 : undefined"
+      :pagination="pagination" :scroll-x="1040"
       class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
     />
 
@@ -28,11 +35,10 @@
         <n-descriptions-item label="动作">
           <n-tag :type="actionType(current.action)" size="small">{{ actionLabel(current.action) }}</n-tag>
         </n-descriptions-item>
-        <n-descriptions-item label="对象类型">{{ targetLabel(current.target_type) }}</n-descriptions-item>
-        <n-descriptions-item label="对象名称">{{ current.target_name || '—' }}</n-descriptions-item>
+        <n-descriptions-item label="操作对象">{{ targetText(current) }}</n-descriptions-item>
         <n-descriptions-item label="变更明细">
-          <div v-if="changeRows(current.detail)" class="space-y-1">
-            <div v-for="row in changeRows(current.detail)" :key="row.label" class="text-sm break-all">
+          <div v-if="detailRows(current.detail)" class="space-y-1">
+            <div v-for="row in detailRows(current.detail)" :key="row.label" class="text-sm break-all">
               <span class="text-gray-500 dark:text-gray-400">{{ row.label }}：</span>
               <span class="text-gray-700 dark:text-gray-200">{{ row.text }}</span>
             </div>
@@ -49,6 +55,9 @@
         </n-descriptions-item>
         <n-descriptions-item label="日志 ID">
           <span class="text-xs font-mono break-all text-gray-500 dark:text-gray-400">{{ current.id }}</span>
+        </n-descriptions-item>
+        <n-descriptions-item label="事件代码">
+          <span class="text-xs font-mono break-all text-gray-500 dark:text-gray-400">{{ current.action || '—' }}</span>
         </n-descriptions-item>
       </n-descriptions>
     </n-modal>
@@ -76,6 +85,7 @@ const moduleOptions = [
   { label: '角色', value: 'role' },
   { label: '知识库', value: 'kb' },
   { label: '文档', value: 'doc' },
+  { label: '智能路由', value: 'intent_router' },
   { label: '系统设置', value: 'settings' },
   { label: '账户安全', value: 'auth' },
 ]
@@ -89,16 +99,31 @@ const ACTION_LABELS = {
   'doc.update': '编辑文档', 'doc.delete': '删除文档',
   'settings.update': '修改系统设置',
   'auth.change_password': '修改密码',
+  'intent_router.config.update': '更新路由策略',
+  'intent_router.category.create': '新增意图分类',
+  'intent_router.category.update': '修改意图分类',
+  'intent_router.category.delete': '删除意图分类',
+  'intent_router.log.feedback': '标注路由结果',
 }
 const TARGET_LABELS = {
   user: '用户', role: '角色', knowledge_base: '知识库',
   document: '文档', settings: '系统设置', conversation: '会话',
+  intent_router_config: '智能路由策略', intent_category: '意图分类',
+  intent_route_log: '路由记录',
 }
 // 变更字段 → 中文
 const FIELD_LABELS = {
   display_name: '显示名', role: '角色', is_active: '状态', password: '密码',
   name: '名称', description: '描述', permissions: '权限', kb_ids: '可访问知识库',
+  enabled: '启用状态', mode: '判定模式', intent_model: '意图模型',
+  confidence_threshold: '置信度阈值', fallback_intent_code: '兜底意图',
+  allow_general_chat: '通用问答开关', examples: '示例问题', action: '路由动作',
+  priority: '优先级', code: '意图编码', feedback: '反馈结果', file_type: '文件类型',
 }
+const INTENT_ACTION_LABELS = {
+  retrieve: '知识库检索', chat: '通用回答', writing: '写作 / 润色', system_help: '系统使用帮助',
+}
+const FEEDBACK_LABELS = { correct: '标注为正确', incorrect: '标注为有误' }
 
 const actionLabel = (a) => ACTION_LABELS[a] || a || '—'
 const targetLabel = (t) => TARGET_LABELS[t] || t || '—'
@@ -117,11 +142,16 @@ const prettyDetail = (d) => {
 // 单个字段值的友好显示
 function fmtFieldVal(field, v) {
   if (field === 'is_active') return v ? '启用' : '禁用'
+  if (field === 'enabled') return v ? '开启' : '关闭'
+  if (field === 'action') return INTENT_ACTION_LABELS[v] || String(v)
+  if (field === 'feedback') return FEEDBACK_LABELS[v] || String(v)
   if (v === null || v === '' || v === undefined) return '空'
   if (v === true) return '是'
   if (v === false) return '否'
   return String(v)
 }
+
+const fieldLabel = field => FIELD_LABELS[field] || field
 
 // 把 detail.changes 解析成 [{label, text}] —— 展示"怎么改的"
 function changeRows(detail) {
@@ -129,7 +159,7 @@ function changeRows(detail) {
   if (!c) return null
   const rows = []
   for (const [field, val] of Object.entries(c)) {
-    const label = FIELD_LABELS[field] || field
+    const label = fieldLabel(field)
     if (val && typeof val === 'object' && ('added' in val || 'removed' in val)) {
       const parts = []
       if (val.added && val.added.length) parts.push('新增：' + val.added.join('、'))
@@ -144,15 +174,40 @@ function changeRows(detail) {
   return rows
 }
 
+// 非 diff 类型的 detail 同样转成可读行：智能路由的配置、分类与反馈都属于这种结构。
+function detailRows(detail) {
+  if (!detail || typeof detail !== 'object') return null
+  const changes = changeRows(detail)
+  if (changes) return changes
+
+  const rows = []
+  if (Array.isArray(detail.changed)) {
+    rows.push({ label: '修改项', text: detail.changed.map(fieldLabel).join('、') || '—' })
+  }
+
+  for (const [field, value] of Object.entries(detail)) {
+    if (field === 'changed') continue
+    if (Array.isArray(value)) {
+      rows.push({ label: fieldLabel(field), text: value.map(item => String(item)).join('、') || '—' })
+    } else if (value && typeof value === 'object') {
+      rows.push({ label: fieldLabel(field), text: prettyDetail(value) })
+    } else {
+      rows.push({ label: fieldLabel(field), text: fmtFieldVal(field, value) })
+    }
+  }
+  return rows.length ? rows : null
+}
+
 // 列表里的一行变更摘要（紧凑）
 function summaryText(row) {
-  const d = row.detail
-  if (!d) return ''
-  const rows = changeRows(d)
-  if (rows) return rows.map(r => `${r.label} ${r.text}`).join('；')
-  if (Array.isArray(d.changed)) return `修改 ${d.changed.length} 项`
-  if (d.file_type) return String(d.file_type).toUpperCase()
-  return ''
+  const rows = detailRows(row.detail)
+  return rows ? rows.map(item => `${item.label}：${item.text}`).join('；') : ''
+}
+
+function targetText(row) {
+  const type = targetLabel(row.target_type)
+  const name = row.target_name || (row.target_type === 'intent_category' ? row.detail?.code : '')
+  return name ? `${type} · ${name}` : type
 }
 
 const pagination = reactive({
@@ -167,30 +222,29 @@ const pagination = reactive({
 })
 
 const columns = [
-  { title: '时间', key: 'created_at', width: 165, render: r => fmtTime(r.created_at) },
-  { title: '操作人', key: 'username', width: 110, ellipsis: { tooltip: true } },
+  { title: '时间', key: 'created_at', width: 172, align: 'center', render: r => fmtTime(r.created_at) },
+  { title: '操作人', key: 'username', width: 96, align: 'center', ellipsis: { tooltip: true } },
   {
-    title: '动作', key: 'action', width: 120,
-    render: r => h(NTag, { type: actionType(r.action), size: 'small' }, () => actionLabel(r.action))
+    title: '动作', key: 'action', width: 122, align: 'center',
+    render: r => h(NTag, { type: actionType(r.action), size: 'small', style: { whiteSpace: 'nowrap' } }, () => actionLabel(r.action))
   },
   {
-    title: '对象', key: 'target', width: 190, ellipsis: { tooltip: true },
-    render: r => {
-      const t = targetLabel(r.target_type)
-      return r.target_name ? `${t}：${r.target_name}` : t
-    }
+    title: '对象', key: 'target', width: 180, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
+    render: r => targetText(r)
   },
   {
-    title: '变更摘要', key: 'summary', ellipsis: { tooltip: true },
+    title: '变更 / 结果', key: 'summary', minWidth: 240, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
     render: r => summaryText(r) || h('span', { class: 'text-gray-300 dark:text-gray-600' }, '—')
   },
-  { title: 'IP', key: 'ip', width: 140, render: r => r.ip || '—' },
+  { title: 'IP', key: 'ip', width: 130, align: 'center', render: r => r.ip || '—' },
   {
     title: '操作', key: 'actions', width: 96, align: 'center',
     render: row => h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openDetail(row) }, () => '查看详细')
   },
 ]
-columns.forEach(c => { c.titleAlign = 'center'; c.align = 'center' })  // 表头 + 内容统一居中
+columns.forEach(c => {
+  if (!c.titleAlign) c.titleAlign = 'center'
+})
 
 function openDetail(row) {
   current.value = row

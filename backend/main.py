@@ -47,6 +47,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Conversation-ID"],
 )
 
 app.include_router(auth.router, prefix="/api")

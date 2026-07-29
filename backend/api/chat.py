@@ -68,6 +68,8 @@ async def send_message(
         full_response = []
         sources = []
         tokens = None
+        # 会话和用户消息已提交。先告知前端会话 ID，用户在首条回答完成前停止时也能继续该会话。
+        yield f"data: {_json.dumps({'type': 'conversation_started', 'conversation_id': str(conv.id)})}\n\n"
         try:
             async for chunk in run_rag_stream(
                 question=payload.question,
@@ -122,6 +124,8 @@ async def send_message(
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
+            # 首条 SSE 数据到达前，前端也可从响应头立即绑定会话，降低刚开始就停止时丢失会话 ID 的概率。
+            "X-Conversation-ID": str(conv.id),
         },
     )
 

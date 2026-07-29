@@ -99,14 +99,15 @@
 
 <script setup>
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { NForm, NFormItem, NInput, NButton, NIcon, useMessage } from 'naive-ui'
 import { PersonOutline, LockClosedOutline } from '@vicons/ionicons5'
 import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
-import { firstAccessibleRoute } from '@/router/menus'
+import { defaultWorkspaceRoute } from '@/router/menus'
 
 const router = useRouter()
+const route = useRoute()
 const message = useMessage()
 const authStore = useAuthStore()
 const siteStore = useSiteStore()
@@ -128,7 +129,14 @@ async function handleLogin() {
   loading.value = true
   try {
     await authStore.login(form.value.username, form.value.password)
-    router.push(firstAccessibleRoute(authStore))
+    const redirect = route.query.redirect
+    const target = typeof redirect === 'string'
+      && redirect.startsWith('/')
+      && !redirect.startsWith('//')
+      && !redirect.startsWith('/login')
+      ? redirect
+      : defaultWorkspaceRoute(authStore)
+    router.push(target)
   } catch (e) {
     const detail = e?.response?.data?.detail
     message.error(detail || '登录失败，请检查用户名或密码')
