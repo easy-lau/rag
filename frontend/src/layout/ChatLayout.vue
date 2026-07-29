@@ -1,11 +1,18 @@
 <template>
   <div class="flex h-screen overflow-hidden bg-gray-50 dark:bg-gray-900">
-    <!-- 桌面端：问答专用侧栏；移动端由顶栏的菜单按钮打开抽屉。 -->
-    <div v-if="!ui.isMobile" class="w-64 shrink-0">
+    <!-- 宽屏保留常驻会话栏；1024px 以下改为抽屉，避免主对话区被两侧栏挤压。 -->
+    <div v-if="!ui.isCompact" class="w-64 shrink-0">
       <ChatSidebar />
     </div>
-    <n-drawer v-else v-model:show="ui.mobileNavOpen" :width="280" placement="left" to="#app">
-      <ChatSidebar />
+    <n-drawer
+      v-else
+      v-model:show="ui.mobileNavOpen"
+      :width="ui.isMobile ? 280 : 304"
+      placement="left"
+      to="#app"
+      @update:show="updateNavDrawer"
+    >
+      <ChatSidebar in-drawer @close-drawer="closeNavDrawer" />
     </n-drawer>
 
     <div class="flex flex-col flex-1 min-w-0">
@@ -24,7 +31,7 @@
 </template>
 
 <script setup>
-import { watch } from 'vue'
+import { onBeforeUnmount, watch } from 'vue'
 import { NDrawer } from 'naive-ui'
 import { useRoute } from 'vue-router'
 import AppHeader from './AppHeader.vue'
@@ -38,6 +45,24 @@ const route = useRoute()
 
 // 两套布局共用移动端抽屉状态；切换路由时主动收起，避免从后台返回后仍遮住问答页。
 watch(() => route.fullPath, () => {
-  ui.mobileNavOpen = false
+  closeNavDrawer()
 })
+
+// 从紧凑屏切回宽屏时，抽屉已经不再渲染，不能留下一个跨布局的打开状态。
+watch(() => ui.isCompact, isCompact => {
+  if (!isCompact) closeNavDrawer()
+})
+
+// 检索结果只属于当前问答工作台；离开后不应带入下一次进入或后台页面。
+onBeforeUnmount(() => {
+  ui.closeChatSearch()
+})
+
+function updateNavDrawer(show) {
+  ui.mobileNavOpen = show
+}
+
+function closeNavDrawer() {
+  ui.mobileNavOpen = false
+}
 </script>

@@ -9,6 +9,9 @@ export const useChatStore = defineStore('chat', () => {
   const currentConvId = ref(null)
   const isStreaming = ref(false)
   const isConversationLoading = ref(false)
+  // 加载失败时保留当前会话 ID 与深链，供页面提供明确的重试/返回选择；
+  // 不能把网络或服务端临时错误误当成“会话不存在”。
+  const conversationLoadError = ref(null)
   const searchConfig = ref({ method: 'hybrid', rerank: true, top_k: 5, tags: [] })
 
   const _savedKbIds = localStorage.getItem('selectedKbIds')
@@ -154,19 +157,29 @@ export const useChatStore = defineStore('chat', () => {
 
   async function loadConversation(convId) {
     if (isStreaming.value) return
+    const conversationId = String(convId)
     const requestId = ++conversationRequestId
-    currentConvId.value = convId
+    currentConvId.value = conversationId
     messages.value = []
     isConversationLoading.value = true
+    conversationLoadError.value = null
+    // 右侧检索面板只描述当前这次实时提问；历史会话没有可恢复的完整检索过程，
+    // 切换时必须清空，不能沿用上一个会话的命中片段和路由信息。
+    useSearchStore().resetSteps()
     try {
-      const loadedMessages = await getMessages(convId)
-      if (requestId !== conversationRequestId || currentConvId.value !== convId) return
+      const loadedMessages = await getMessages(conversationId)
+      if (requestId !== conversationRequestId || currentConvId.value !== conversationId) return
       messages.value = loadedMessages
+      conversationLoadError.value = null
     } catch (error) {
       // 仅处理当前仍被选中的请求；旧请求失败不应打断后来已切换的会话。
-      if (requestId !== conversationRequestId || currentConvId.value !== convId) return
-      currentConvId.value = null
+      if (requestId !== conversationRequestId || currentConvId.value !== conversationId) return
       messages.value = []
+      conversationLoadError.value = {
+        status: Number.isFinite(Number(error?.response?.status)) ? Number(error.response.status) : null,
+        detail: typeof error?.response?.data?.detail === 'string' ? error.response.data.detail : '',
+        code: typeof error?.code === 'string' ? error.code : '',
+      }
       throw error
     } finally {
       if (requestId === conversationRequestId) isConversationLoading.value = false
@@ -179,6 +192,7 @@ export const useChatStore = defineStore('chat', () => {
     currentConvId.value = null
     messages.value = []
     isConversationLoading.value = false
+    conversationLoadError.value = null
     const searchStore = useSearchStore()
     searchStore.resetSteps()
   }
@@ -199,7 +213,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   return {
-    messages, conversations, currentConvId, isStreaming, isConversationLoading,
+    messages, conversations, currentConvId, isStreaming, isConversationLoading, conversationLoadError,
     searchConfig, selectedKbIds,
     sendMessage, stopStreaming, loadHistory, loadConversation,
     newConversation, renameConversation, removeConversation,

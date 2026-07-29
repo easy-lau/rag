@@ -1,22 +1,33 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="flex items-center justify-end mb-6">
-      <n-button type="primary" @click="openCreate">
-        <template #icon><n-icon><AddOutline /></n-icon></template>
-        新建角色
-      </n-button>
+    <div class="max-w-6xl mx-auto space-y-5">
+      <PageHeader title="角色管理" description="按岗位配置菜单与操作权限，内建角色只允许调整可编辑项。">
+        <template #actions>
+          <n-button type="primary" @click="openCreate">
+            <template #icon><n-icon><AddOutline /></n-icon></template>
+            新建角色
+          </n-button>
+        </template>
+      </PageHeader>
+
+      <SurfaceCard padding="none" class="overflow-hidden">
+        <n-data-table
+          :columns="columns" :data="roles" :loading="loading"
+          :pagination="pagination" :scroll-x="ui.isCompact ? 700 : undefined"
+          class="admin-data-table"
+        />
+      </SurfaceCard>
     </div>
 
-    <n-data-table
-      :columns="columns" :data="roles" :loading="loading"
-      :pagination="pagination" :scroll-x="ui.isMobile ? 820 : undefined"
-      class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
-    />
-
     <!-- Create / Edit modal -->
-    <n-modal v-model:show="showModal" to="#app" preset="card"
-      :title="editingId ? '编辑角色' : '新建角色'" style="width: 720px; max-width: 92vw">
-      <n-form :model="form" label-placement="top">
+    <AppModal
+      v-model:show="showModal"
+      :title="editingId ? '编辑角色' : '新建角色'"
+      width="min(92vw, 720px)"
+      :loading="saving"
+    >
+      <div class="role-form-scroll">
+        <n-form :model="form" label-placement="top">
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <n-form-item label="角色名称" required>
             <n-input v-model:value="form.name" :disabled="editingIsSystem" placeholder="角色名称" />
@@ -45,24 +56,40 @@
             placeholder="选择可访问的知识库（含 kb:access_all 权限可访问全部）" clearable
           />
         </n-form-item>
-      </n-form>
+        </n-form>
+      </div>
       <template #footer>
         <div class="flex justify-end gap-2">
-          <n-button @click="showModal = false">取消</n-button>
+          <n-button :disabled="saving" @click="showModal = false">取消</n-button>
           <n-button type="primary" :loading="saving" @click="handleSave">保存</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
+
+    <DangerConfirm
+      v-model:show="showDeleteConfirm"
+      title="永久删除角色？"
+      :subject="pendingDelete?.name || ''"
+      description="删除后，该角色及其权限配置无法恢复；请先确认没有账号仍依赖此角色。"
+      :loading="deleting"
+      @confirm="confirmDelete"
+      @cancel="pendingDelete = null"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted, watch, h } from 'vue'
-import { NButton, NIcon, NDataTable, NModal, NForm, NFormItem, NInput, NSelect, NCheckbox, NCheckboxGroup, NTag, NPopconfirm, useMessage } from 'naive-ui'
+import { NButton, NIcon, NDataTable, NForm, NFormItem, NInput, NSelect, NCheckbox, NCheckboxGroup, NTag, useMessage } from 'naive-ui'
 import { AddOutline } from '@vicons/ionicons5'
 import { getRoles, createRole, updateRole, deleteRole, getPermissionCatalog } from '@/api/roles'
 import { getKnowledgeBases } from '@/api/knowledge'
 import { useUiStore } from '@/stores/ui'
+import PageHeader from '@/components/ui/PageHeader.vue'
+import SurfaceCard from '@/components/ui/SurfaceCard.vue'
+import RowActions from '@/components/ui/RowActions.vue'
+import DangerConfirm from '@/components/ui/DangerConfirm.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 
 const ui = useUiStore()
 const msg = useMessage()
@@ -77,6 +104,9 @@ const showModal = ref(false)
 const editingId = ref(null)
 const editingIsSystem = ref(false)
 const form = ref({ name: '', description: '', permissions: [], kb_ids: [] })
+const showDeleteConfirm = ref(false)
+const pendingDelete = ref(null)
+const deleting = ref(false)
 
 const pagination = reactive({
   page: 1,
@@ -128,26 +158,24 @@ const permissionGroups = computed(() => {
 })
 
 const columns = [
-  { title: '名称', key: 'name', ellipsis: { tooltip: true } },
-  { title: '描述', key: 'description', render: r => r.description || '—' },
-  { title: '权限数', key: 'perm_count', width: 90, render: r => (r.permissions?.length || 0) },
-  { title: '知识库数', key: 'kb_count', width: 90, render: r => (r.kb_ids?.length || 0) },
+  { title: '名称', key: 'name', minWidth: 150, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
+  { title: '描述', key: 'description', minWidth: 210, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true }, render: r => r.description || '—' },
+  { title: '权限数', key: 'perm_count', width: 90, align: 'center', titleAlign: 'center', render: r => (r.permissions?.length || 0) },
+  { title: '知识库数', key: 'kb_count', width: 90, align: 'center', titleAlign: 'center', render: r => (r.kb_ids?.length || 0) },
   {
-    title: '类型', key: 'is_system', width: 90,
+    title: '类型', key: 'is_system', width: 90, align: 'center', titleAlign: 'center',
     render: r => r.is_system ? h(NTag, { type: 'info', size: 'small' }, () => '内建') : h(NTag, { size: 'small' }, () => '自定义')
   },
   {
-    title: '操作', key: 'actions', width: 160,
-    render: row => h('div', { style: 'display:flex;gap:8px;align-items:center' }, [
-      h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openEdit(row) }, () => '编辑'),
-      h(NPopconfirm, { onPositiveClick: () => handleDelete(row) }, {
-        trigger: () => h(NButton, { text: true, type: 'error', size: 'small', disabled: row.is_system }, () => '删除'),
-        default: () => '确定删除该角色？',
-      }),
-    ])
+    title: '操作', key: 'actions', width: 136, align: 'center', titleAlign: 'center',
+    render: row => h(RowActions, { label: `角色 ${row.name} 操作` }, {
+      default: () => [
+        h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openEdit(row) }, () => '编辑'),
+        h(NButton, { text: true, type: 'error', size: 'small', disabled: row.is_system, onClick: () => openDelete(row) }, () => '删除'),
+      ],
+    })
   }
 ]
-columns.forEach(c => { c.titleAlign = 'center'; c.align = 'center' })  // 表头 + 内容统一居中
 
 onMounted(async () => {
   await Promise.all([loadRoles(), loadCatalog(), loadKbs()])
@@ -214,13 +242,33 @@ async function handleSave() {
   }
 }
 
-async function handleDelete(row) {
+function openDelete(row) {
+  pendingDelete.value = row
+  showDeleteConfirm.value = true
+}
+
+async function confirmDelete() {
+  const row = pendingDelete.value
+  if (!row) return
+  deleting.value = true
   try {
     await deleteRole(row.id)
     roles.value = roles.value.filter(r => r.id !== row.id)
     msg.success('角色已删除')
+    showDeleteConfirm.value = false
+    pendingDelete.value = null
   } catch (e) {
     msg.error(e?.response?.data?.detail || '删除失败，请重试')
+  } finally {
+    deleting.value = false
   }
 }
 </script>
+
+<style scoped>
+.role-form-scroll {
+  max-height: calc(82vh - 166px);
+  padding-right: 4px;
+  overflow-y: auto;
+}
+</style>

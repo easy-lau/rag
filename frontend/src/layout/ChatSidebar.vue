@@ -2,20 +2,34 @@
   <aside class="w-full h-full flex flex-col bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
     <!-- 品牌 -->
     <div class="px-4 py-4 border-b border-gray-200 dark:border-gray-700">
-      <div class="flex items-center gap-2">
-        <img
-          v-if="siteStore.site_logo"
-          :src="siteStore.site_logo"
-          class="w-8 h-8 rounded-lg object-cover shrink-0"
-          alt="logo"
-        />
-        <div v-else class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center text-white font-bold text-sm shrink-0">
-          {{ (siteStore.site_title || 'R')[0] }}
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex min-w-0 items-center gap-2">
+          <img
+            v-if="siteStore.site_logo"
+            :src="siteStore.site_logo"
+            class="w-8 h-8 rounded-lg object-cover shrink-0"
+            alt="logo"
+          />
+          <div v-else class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center text-white font-bold text-sm shrink-0">
+            {{ (siteStore.site_title || 'R')[0] }}
+          </div>
+          <div class="min-w-0">
+            <div class="font-bold text-gray-800 dark:text-white text-sm truncate">{{ siteStore.site_title }}</div>
+            <div class="text-xs text-gray-500 dark:text-gray-400 truncate">问答工作台</div>
+          </div>
         </div>
-        <div class="min-w-0">
-          <div class="font-bold text-gray-800 dark:text-white text-sm truncate">{{ siteStore.site_title }}</div>
-          <div class="text-xs text-gray-500 truncate">问答工作台</div>
-        </div>
+        <n-button
+          v-if="inDrawer"
+          quaternary
+          circle
+          size="small"
+          class="chat-sidebar__drawer-close shrink-0"
+          aria-label="关闭会话菜单"
+          title="关闭菜单"
+          @click="closeDrawer"
+        >
+          <template #icon><n-icon :size="18"><CloseOutline /></n-icon></template>
+        </n-button>
       </div>
     </div>
 
@@ -54,11 +68,9 @@
             <span class="block truncate">{{ conv.title || '未命名对话' }}</span>
           </button>
           <n-dropdown
-            class="chat-sidebar__history-menu"
             trigger="click"
             placement="bottom-end"
             :options="conversationActionOptions"
-            :theme-overrides="historyMenuThemeOverrides"
             @select="action => handleConversationAction(action, conv)"
           >
             <n-button
@@ -77,7 +89,7 @@
       <button
         type="button"
         class="group flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors hover:bg-blue-50 dark:hover:bg-blue-900/20"
-        :title="ui.isMobile ? '进入管理后台' : '在新标签打开管理后台'"
+        :title="ui.isCompact ? '进入管理后台' : '在新标签打开管理后台'"
         @click="openAdmin"
       >
         <span class="w-7 h-7 rounded-lg flex items-center justify-center bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-300 group-hover:bg-white dark:group-hover:bg-gray-700 group-hover:text-blue-500 transition-colors">
@@ -92,14 +104,12 @@
     </div>
   </aside>
 
-  <n-modal
+  <AppModal
     v-model:show="showRenameModal"
-    preset="card"
     title="重命名会话"
-    style="width: 90vw; max-width: 420px"
-    :mask-closable="!isRenaming"
-    :closable="!isRenaming"
-    to="#app"
+    width="min(90vw, 420px)"
+    :loading="isRenaming"
+    @close="closeRenameModal"
   >
     <p class="mb-3 text-sm text-gray-500 dark:text-gray-400">为这段对话设置一个便于查找的名称。</p>
     <n-input
@@ -112,56 +122,40 @@
       @keydown.enter="handleRenameEnter"
     />
     <template #footer>
-      <div class="flex justify-end gap-2">
-        <n-button :disabled="isRenaming" @click="showRenameModal = false">取消</n-button>
-        <n-button type="primary" :loading="isRenaming" @click="submitRename">保存</n-button>
-      </div>
+      <n-button :disabled="isRenaming" @click="closeRenameModal">取消</n-button>
+      <n-button type="primary" :loading="isRenaming" @click="submitRename">保存</n-button>
     </template>
-  </n-modal>
+  </AppModal>
 
-  <n-modal
+  <DangerConfirm
     v-model:show="showDeleteModal"
-    :mask-closable="!isDeleting"
-    :close-on-esc="!isDeleting"
-    to="#app"
-  >
-    <section class="chat-delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-conversation-title">
-      <div class="chat-delete-dialog__header">
-        <span class="chat-delete-dialog__icon" aria-hidden="true">
-          <n-icon :size="21"><TrashOutline /></n-icon>
-        </span>
-        <div class="min-w-0">
-          <p class="chat-delete-dialog__eyebrow">危险操作</p>
-          <h2 id="delete-conversation-title">删除这段对话？</h2>
-        </div>
-      </div>
-
-      <p class="chat-delete-dialog__description">
-        将永久删除 <strong>「{{ pendingDeleteTitle }}」</strong> 及其中的全部问答内容。
-      </p>
-      <div class="chat-delete-dialog__notice">
-        <n-icon :size="16" aria-hidden="true"><AlertCircleOutline /></n-icon>
-        <span>此操作无法撤销。</span>
-      </div>
-
-      <div class="chat-delete-dialog__actions">
-        <n-button class="chat-delete-dialog__cancel" :disabled="isDeleting" @click="closeDeleteModal">取消</n-button>
-        <n-button class="chat-delete-dialog__confirm" type="error" :loading="isDeleting" @click="submitDelete">永久删除</n-button>
-      </div>
-    </section>
-  </n-modal>
+    :loading="isDeleting"
+    title="删除这段对话？"
+    :subject="`「${pendingDeleteTitle}」`"
+    description="其中的全部问答内容也会被永久删除，且无法恢复。"
+    confirm-text="永久删除"
+    @confirm="submitDelete"
+    @cancel="clearPendingDelete"
+  />
 </template>
 
 <script setup>
 import { computed, h, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NDropdown, NIcon, NInput, NModal, useMessage } from 'naive-ui'
-import { AddOutline, AlertCircleOutline, ChevronForwardOutline, EllipsisHorizontalOutline, PencilOutline, SettingsOutline, TrashOutline } from '@vicons/ionicons5'
+import { NButton, NDropdown, NIcon, NInput, useMessage } from 'naive-ui'
+import { AddOutline, ChevronForwardOutline, CloseOutline, EllipsisHorizontalOutline, PencilOutline, SettingsOutline, TrashOutline } from '@vicons/ionicons5'
 import { hasAdminAccess } from '@/router/menus'
 import { useAuthStore } from '@/stores/auth'
 import { useChatStore } from '@/stores/chat'
 import { useSiteStore } from '@/stores/site'
 import { useUiStore } from '@/stores/ui'
+import DangerConfirm from '@/components/ui/DangerConfirm.vue'
+import AppModal from '@/components/ui/AppModal.vue'
+
+const props = defineProps({
+  inDrawer: { type: Boolean, default: false },
+})
+const emit = defineEmits(['close-drawer'])
 
 const router = useRouter()
 const route = useRoute()
@@ -193,14 +187,6 @@ const conversationActionOptions = [
     props: { class: 'chat-sidebar__history-delete-option' },
   },
 ]
-const historyMenuThemeOverrides = {
-  borderRadius: '14px',
-  padding: '5px',
-  peers: {
-    Popover: { boxShadow: '0 14px 32px rgba(35, 61, 98, .14)' },
-  },
-}
-
 onMounted(() => {
   if (authStore.hasPerm('menu:chat')) {
     chatStore.loadHistory().catch(() => message.error('加载对话历史失败，请刷新重试'))
@@ -209,7 +195,8 @@ onMounted(() => {
 
 function startNewConversation() {
   if (chatStore.isStreaming) return
-  ui.mobileNavOpen = false
+  ui.closeChatSearch()
+  closeDrawer()
 
   const query = { ...route.query }
   if (!Object.prototype.hasOwnProperty.call(query, 'conversation')) {
@@ -222,7 +209,8 @@ function startNewConversation() {
 
 function selectConversation(conversationId) {
   if (chatStore.isStreaming) return
-  ui.mobileNavOpen = false
+  ui.closeChatSearch()
+  closeDrawer()
   if (String(route.query.conversation || '') === String(conversationId)) return
   router.push({
     name: 'chat',
@@ -242,6 +230,11 @@ function handleRenameEnter(event) {
   if (event.isComposing) return
   event.preventDefault()
   submitRename()
+}
+
+function closeRenameModal() {
+  if (isRenaming.value) return
+  showRenameModal.value = false
 }
 
 async function submitRename() {
@@ -272,9 +265,8 @@ function confirmDeleteConversation(conversation) {
   showDeleteModal.value = true
 }
 
-function closeDeleteModal() {
-  if (isDeleting.value) return
-  showDeleteModal.value = false
+function clearPendingDelete() {
+  if (!isDeleting.value) pendingDeleteConversation.value = null
 }
 
 async function submitDelete() {
@@ -289,6 +281,7 @@ async function submitDelete() {
   try {
     await chatStore.removeConversation(conversation.id)
     showDeleteModal.value = false
+    pendingDeleteConversation.value = null
     message.success('对话已删除')
   } catch (error) {
     message.error(error?.response?.data?.detail || '删除对话失败，请稍后重试')
@@ -309,12 +302,17 @@ function handleConversationAction(action, conversation) {
 
 function openAdmin() {
   if (!canEnterAdmin.value) return
-  if (ui.isMobile) {
-    ui.mobileNavOpen = false
+  if (ui.isCompact) {
+    closeDrawer()
     router.push('/admin')
     return
   }
   window.open('/admin', '_blank', 'noopener')
+}
+
+function closeDrawer() {
+  if (!props.inDrawer) return
+  emit('close-drawer')
 }
 </script>
 
@@ -325,13 +323,13 @@ function openAdmin() {
   font-size: 13px;
   font-weight: 650;
   letter-spacing: .015em;
-  box-shadow: 0 10px 18px rgba(53, 111, 213, .22);
+  box-shadow: var(--ui-shadow-card);
   transition: transform .18s ease, box-shadow .18s ease;
 }
 
 :deep(.chat-sidebar__new.n-button:not(.n-button--disabled):hover) {
   transform: translateY(-1px);
-  box-shadow: 0 13px 22px rgba(53, 111, 213, .28);
+  box-shadow: var(--ui-shadow-float);
 }
 
 :deep(.chat-sidebar__history-action.n-button) {
@@ -339,11 +337,19 @@ function openAdmin() {
   --n-width: 30px !important;
   --n-icon-size: 16px !important;
   --n-border-radius: 10px !important;
-  --n-color-hover: #eef4ff !important;
-  --n-color-pressed: #e4efff !important;
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-color-pressed: var(--ui-surface-pressed) !important;
   margin-right: 2px;
   opacity: .5;
   transition: opacity .18s ease, color .18s ease, background-color .18s ease;
+}
+
+:deep(.chat-sidebar__drawer-close.n-button) {
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-color-pressed: var(--ui-surface-pressed) !important;
+  --n-icon-color: var(--ui-icon) !important;
+  --n-icon-color-hover: var(--ui-primary) !important;
+  border-radius: 10px;
 }
 
 .group:hover :deep(.chat-sidebar__history-action.n-button),
@@ -351,146 +357,16 @@ function openAdmin() {
   opacity: 1;
 }
 
-:global(.chat-sidebar__history-menu.n-dropdown-menu) {
-  --n-border-radius: 14px !important;
-  border-radius: 14px !important;
-  overflow: hidden;
+:global(.chat-sidebar__history-delete-option) {
+  color: var(--ui-danger) !important;
 }
 
-:global(.chat-sidebar__history-menu .chat-sidebar__history-delete-option) {
-  color: #dc2626 !important;
+:global(.chat-sidebar__history-delete-option .n-dropdown-option-body__prefix) {
+  color: var(--ui-danger) !important;
 }
 
-:global(.chat-sidebar__history-menu .chat-sidebar__history-delete-option .n-dropdown-option-body__prefix) {
-  color: #dc2626 !important;
+:global(.chat-sidebar__history-delete-option.n-dropdown-option-body--pending::before) {
+  background-color: var(--ui-danger-subtle) !important;
 }
 
-:global(.chat-sidebar__history-menu .chat-sidebar__history-delete-option.n-dropdown-option-body--pending::before) {
-  background-color: #fef2f2 !important;
-}
-
-:global(.dark .chat-sidebar__history-menu .chat-sidebar__history-delete-option),
-:global(.dark .chat-sidebar__history-menu .chat-sidebar__history-delete-option .n-dropdown-option-body__prefix) {
-  color: #f87171 !important;
-}
-
-:global(.dark .chat-sidebar__history-menu .chat-sidebar__history-delete-option.n-dropdown-option-body--pending::before) {
-  background-color: rgba(127, 29, 29, .32) !important;
-}
-
-.chat-delete-dialog {
-  width: min(420px, calc(100vw - 32px));
-  box-sizing: border-box;
-  border: 1px solid #e3eaf3;
-  border-radius: 20px;
-  background: linear-gradient(145deg, #ffffff 0%, #fbfcff 100%);
-  box-shadow: 0 24px 60px rgba(30, 54, 92, .20), 0 4px 14px rgba(30, 54, 92, .08);
-  padding: 22px;
-}
-
-.chat-delete-dialog__header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.chat-delete-dialog__icon {
-  display: inline-flex;
-  width: 42px;
-  height: 42px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid #ffd9d9;
-  border-radius: 14px;
-  color: #d84a4a;
-  background: #fff2f2;
-}
-
-.chat-delete-dialog__eyebrow {
-  margin: 0 0 3px;
-  color: #c85a5a;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: .06em;
-}
-
-.chat-delete-dialog h2 {
-  margin: 0;
-  color: #20304a;
-  font-size: 17px;
-  font-weight: 720;
-  line-height: 1.35;
-}
-
-.chat-delete-dialog__description {
-  margin: 18px 0 12px;
-  color: #61718a;
-  font-size: 13px;
-  line-height: 1.75;
-}
-
-.chat-delete-dialog__description strong {
-  color: #354a68;
-  font-weight: 700;
-  overflow-wrap: anywhere;
-}
-
-.chat-delete-dialog__notice {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid #f6dddd;
-  border-radius: 11px;
-  color: #b85a5a;
-  background: #fff8f8;
-  padding: 9px 10px;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.chat-delete-dialog__actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 9px;
-  margin-top: 21px;
-}
-
-:deep(.chat-delete-dialog__cancel.n-button),
-:deep(.chat-delete-dialog__confirm.n-button) {
-  --n-height: 38px !important;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 650;
-}
-
-:deep(.chat-delete-dialog__cancel.n-button) {
-  --n-color: #f6f8fc !important;
-  --n-color-hover: #eef3f9 !important;
-  --n-color-pressed: #e8eef6 !important;
-  --n-border: 1px solid #dfe7f1 !important;
-  --n-border-hover: 1px solid #c7d5e6 !important;
-  --n-text-color: #53657e !important;
-}
-
-:deep(.chat-delete-dialog__confirm.n-button) {
-  --n-color: #db5757 !important;
-  --n-color-hover: #cc4747 !important;
-  --n-color-pressed: #bb3f3f !important;
-  --n-border: 1px solid #db5757 !important;
-  --n-border-hover: 1px solid #cc4747 !important;
-  box-shadow: 0 8px 16px rgba(207, 71, 71, .21);
-}
-
-.dark .chat-delete-dialog {
-  border-color: #3d4c62;
-  background: linear-gradient(145deg, #202c3d 0%, #1c2736 100%);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, .38), 0 4px 14px rgba(0, 0, 0, .18);
-}
-
-.dark .chat-delete-dialog h2 { color: #e7eef8; }
-.dark .chat-delete-dialog__description { color: #aebdd0; }
-.dark .chat-delete-dialog__description strong { color: #e1eaf7; }
-.dark .chat-delete-dialog__icon { border-color: #71454c; color: #ff9696; background: #41292f; }
-.dark .chat-delete-dialog__notice { border-color: #603f47; color: #f3a0a0; background: #35282f; }
 </style>

@@ -29,16 +29,18 @@
         <!-- 知识库来源：点击标题在当前页只读预览（所有命中文档都列出） -->
         <div v-if="message.content && sources.length && showSources" class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <span class="text-xs text-gray-400">知识库来源：</span>
-          <a
+          <button
             v-for="(src, i) in sources"
             :key="i"
-            class="inline-flex items-center gap-1 max-w-[200px] text-xs text-blue-500 hover:text-blue-600 hover:underline cursor-pointer"
+            type="button"
+            class="inline-flex max-w-[200px] items-center gap-1 text-left text-xs text-blue-500 hover:text-blue-600 hover:underline focus:outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-blue-400/60 dark:text-blue-300 dark:hover:text-blue-200"
             :title="src.filename"
+            :aria-label="`预览知识库来源：${src.filename || '未命名文档'}`"
             @click="openSource(src)"
           >
             <n-icon :size="13"><DocumentTextOutline /></n-icon>
             <span class="truncate">{{ src.filename }}</span>
-          </a>
+          </button>
         </div>
 
         <!-- 参考来源：仅列出带数据来源链接的文档，点击新标签页打开外部 URL；没有则整行不显示 -->
@@ -47,7 +49,7 @@
           <a
             v-for="(src, i) in urlSources"
             :key="i"
-            class="inline-flex items-center gap-1 max-w-[220px] text-xs text-blue-500 hover:text-blue-600 hover:underline cursor-pointer"
+            class="inline-flex items-center gap-1 max-w-[220px] text-xs text-blue-500 hover:text-blue-600 hover:underline focus:outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-blue-400/60 dark:text-blue-300 dark:hover:text-blue-200"
             :href="src.source_url"
             target="_blank"
             rel="noopener noreferrer"
@@ -64,7 +66,7 @@
             <template #icon><n-icon><CopyOutline /></n-icon></template>
             复制
           </n-button>
-          <n-button text size="tiny" @click="$emit('retry')">
+          <n-button text size="tiny" :disabled="chatStore.isStreaming" @click="$emit('retry', message)">
             <template #icon><n-icon><RefreshOutline /></n-icon></template>
             重新生成
           </n-button>
@@ -91,6 +93,7 @@ import { CopyOutline, RefreshOutline, HardwareChipOutline, PersonOutline, Docume
 import { useClipboard } from '@vueuse/core'
 import { renderMarkdown } from '@/utils/markdown'
 import { useSettingsStore } from '@/stores/settings'
+import { useChatStore } from '@/stores/chat'
 
 const props = defineProps({ message: Object })
 const emit = defineEmits(['retry', 'preview'])
@@ -98,6 +101,7 @@ const emit = defineEmits(['retry', 'preview'])
 const msg = useMessage()
 const { copy: copyText } = useClipboard()
 const settingsStore = useSettingsStore()
+const chatStore = useChatStore()
 
 const isUser = computed(() => props.message.role === 'user')
 // 系统设置「显示参考来源」总开关：关闭则隐藏所有来源行（默认显示）
@@ -143,6 +147,7 @@ function copy() {
 }
 
 function handleMarkdownClick(e) {
+  if (!(e.target instanceof Element)) return
   const btn = e.target.closest('.copy-btn')
   if (!btn) return
   const code = btn.closest('.code-block-wrapper')?.querySelector('code')

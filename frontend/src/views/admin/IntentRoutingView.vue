@@ -1,30 +1,28 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="max-w-6xl mx-auto space-y-6">
-      <div class="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h2 class="text-lg font-semibold text-gray-800 dark:text-gray-100">智能路由</h2>
-          <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-            先识别问题意图，再以受控规则选择检索、通用回答或写作等固定处理流程。
-          </p>
-        </div>
-        <n-tag :type="routingActive ? 'success' : 'default'" :bordered="false" round>
-          {{ canRead ? (routingActive ? '路由已启用' : '路由未启用') : '无访问权限' }}
-        </n-tag>
-      </div>
+      <PageHeader title="智能路由" description="先识别问题意图，再以受控策略选择检索、通用回答或写作等固定处理流程。">
+        <template #meta>
+          <n-tag :type="routingActive ? 'success' : 'default'" :bordered="false" round>
+            {{ canRead ? (routingActive ? '路由已启用' : '路由未启用') : '无访问权限' }}
+          </n-tag>
+        </template>
+      </PageHeader>
 
-      <div
+      <SurfaceCard
         v-if="!canRead"
-        class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm px-6 py-12 text-center"
+        class="px-6 py-12 text-center"
       >
         <n-icon :size="30" class="text-gray-400"><LockClosedOutline /></n-icon>
         <div class="mt-3 text-sm font-medium text-gray-700 dark:text-gray-200">暂无查看智能路由的权限</div>
         <p class="mt-1 text-xs text-gray-400">请联系管理员为当前角色授予 <code>intent:read</code> 权限。</p>
-      </div>
+      </SurfaceCard>
 
       <n-spin v-else :show="initialLoading">
-        <!-- 路由策略 -->
-        <section class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-5 sm:p-6">
+        <!-- NSpin 不会为多个 slot 子项自动添加间距；统一由此容器管理页面模块的纵向节奏。 -->
+        <div class="space-y-6">
+          <!-- 路由策略 -->
+          <SurfaceCard>
           <div class="flex flex-wrap items-start justify-between gap-3 mb-5">
             <div>
               <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200 flex items-center gap-2">
@@ -79,10 +77,10 @@
               </n-form-item>
             </div>
           </n-form>
-        </section>
+          </SurfaceCard>
 
-        <!-- 意图分类 -->
-        <section class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden">
+          <!-- 意图分类 -->
+          <SurfaceCard padding="none" class="overflow-hidden">
           <div class="px-5 sm:px-6 py-5 flex flex-wrap items-start justify-between gap-3 border-b border-gray-100 dark:border-gray-700">
             <div>
               <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200 flex items-center gap-2">
@@ -99,14 +97,14 @@
 
           <n-data-table
             :columns="categoryColumns" :data="categories" :loading="categoriesLoading"
-            :scroll-x="ui.isMobile ? 880 : undefined"
+            :scroll-x="ui.isCompact ? 880 : undefined"
             class="intent-routing-table"
           />
-        </section>
+          </SurfaceCard>
 
-        <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
           <!-- 在线测试 -->
-          <section class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-5 sm:p-6">
+          <SurfaceCard>
             <div class="flex items-start justify-between gap-3 mb-4">
               <div>
                 <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200 flex items-center gap-2">
@@ -154,7 +152,7 @@
                 {{ testReason }}
               </p>
             </div>
-          </section>
+          </SurfaceCard>
 
           <!-- 运行说明 -->
           <section class="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-gray-800 dark:to-gray-800 rounded-xl border border-blue-100 dark:border-gray-700 p-5 sm:p-6">
@@ -165,10 +163,10 @@
               <div class="flex gap-3"><span class="text-blue-500 font-semibold">3</span><span>低置信度和异常结果统一按兜底意图处理；知识库权限仍在实际检索前校验。</span></div>
             </div>
           </section>
-        </div>
+          </div>
 
-        <!-- 路由日志 -->
-        <section class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden">
+          <!-- 路由日志 -->
+          <SurfaceCard padding="none" class="overflow-hidden">
           <div class="px-5 sm:px-6 py-5 flex flex-wrap items-start justify-between gap-3 border-b border-gray-100 dark:border-gray-700">
             <div>
               <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200 flex items-center gap-2">
@@ -182,16 +180,19 @@
 
           <n-data-table
             remote :columns="logColumns" :data="logs" :loading="logsLoading"
-            :pagination="logPagination" :scroll-x="ui.isMobile ? 1040 : undefined"
+            :pagination="logPagination" :scroll-x="ui.isCompact ? 1040 : undefined"
             class="intent-routing-table"
           />
-        </section>
+          </SurfaceCard>
+        </div>
       </n-spin>
     </div>
 
-    <n-modal
-      v-model:show="categoryModalVisible" to="#app" preset="card"
-      :title="editingCategoryId ? '编辑意图分类' : '新增意图分类'" style="width: 680px; max-width: 92vw"
+    <AppModal
+      v-model:show="categoryModalVisible"
+      :title="editingCategoryId ? '编辑意图分类' : '新增意图分类'"
+      width="min(92vw, 680px)"
+      :loading="savingCategory"
     >
       <n-form :model="categoryForm" label-placement="top">
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
@@ -229,11 +230,21 @@
       </n-form>
       <template #footer>
         <div class="flex justify-end gap-2">
-          <n-button @click="categoryModalVisible = false">取消</n-button>
+          <n-button :disabled="savingCategory" @click="categoryModalVisible = false">取消</n-button>
           <n-button type="primary" :loading="savingCategory" @click="saveCategory">保存</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
+
+    <DangerConfirm
+      v-model:show="showCategoryDeleteConfirm"
+      title="永久删除意图分类？"
+      :subject="pendingCategoryDelete?.name || ''"
+      description="删除后，分类说明、示例问题和路由动作配置都无法恢复。"
+      :loading="deletingCategory"
+      @confirm="confirmDeleteCategory"
+      @cancel="pendingCategoryDelete = null"
+    />
   </div>
 </template>
 
@@ -241,7 +252,7 @@
 import { computed, h, onMounted, reactive, ref } from 'vue'
 import {
   NButton, NDataTable, NForm, NFormItem, NIcon, NInput, NInputNumber,
-  NModal, NPopconfirm, NSelect, NSpin, NSwitch, NTag, useMessage,
+  NSelect, NSpin, NSwitch, NTag, useMessage,
 } from 'naive-ui'
 import { AddOutline, LockClosedOutline } from '@vicons/ionicons5'
 import {
@@ -251,6 +262,11 @@ import {
 } from '@/api/intentRouting'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
+import PageHeader from '@/components/ui/PageHeader.vue'
+import SurfaceCard from '@/components/ui/SurfaceCard.vue'
+import RowActions from '@/components/ui/RowActions.vue'
+import DangerConfirm from '@/components/ui/DangerConfirm.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 
 const msg = useMessage()
 const authStore = useAuthStore()
@@ -280,6 +296,9 @@ const testResult = ref(null)
 const categoryModalVisible = ref(false)
 const editingCategoryId = ref(null)
 const categoryForm = ref(newCategoryForm())
+const showCategoryDeleteConfirm = ref(false)
+const pendingCategoryDelete = ref(null)
+const deletingCategory = ref(false)
 
 const canRead = computed(() => authStore.hasPerm('intent:read'))
 const canManage = computed(() => authStore.hasPerm('intent:manage'))
@@ -323,40 +342,38 @@ const logPagination = reactive({
 })
 
 const categoryColumns = [
-  { title: '名称', key: 'name', width: 150, ellipsis: { tooltip: true } },
+  { title: '名称', key: 'name', width: 150, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
   {
-    title: '编码', key: 'code', width: 150,
+    title: '编码', key: 'code', width: 150, align: 'left', titleAlign: 'left',
     render: row => h('code', { class: 'text-xs text-blue-600 dark:text-blue-400' }, row.code),
   },
   {
-    title: '说明 / 示例', key: 'description', minWidth: 220, ellipsis: { tooltip: true },
+    title: '说明 / 示例', key: 'description', minWidth: 220, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
     render: row => row.description || (row.examples?.length ? `示例：${row.examples[0]}` : '—'),
   },
   {
-    title: '动作', key: 'action', width: 125,
+    title: '动作', key: 'action', width: 125, align: 'center', titleAlign: 'center',
     render: row => h(NTag, { size: 'small', type: actionTagType(row.action), bordered: false }, () => actionLabel(row.action)),
   },
   {
-    title: '示例数', key: 'examples', width: 90,
+    title: '示例数', key: 'examples', width: 90, align: 'center', titleAlign: 'center',
     render: row => row.examples?.length || 0,
   },
   {
-    title: '状态', key: 'enabled', width: 90,
+    title: '状态', key: 'enabled', width: 90, align: 'center', titleAlign: 'center',
     render: row => h(NTag, { size: 'small', type: row.enabled ? 'success' : 'default', bordered: false }, () => row.enabled ? '启用' : '停用'),
   },
-  { title: '优先级', key: 'priority', width: 85, render: row => row.priority ?? 0 },
+  { title: '优先级', key: 'priority', width: 85, align: 'center', titleAlign: 'center', render: row => row.priority ?? 0 },
   {
-    title: '操作', key: 'actions', width: 140,
-    render: row => h('div', { style: 'display:flex;justify-content:center;gap:8px;align-items:center' }, [
-      h(NButton, { text: true, type: 'primary', size: 'small', disabled: !canManage.value, onClick: () => openEditCategory(row) }, () => '编辑'),
-      h(NPopconfirm, { disabled: !canManage.value, onPositiveClick: () => removeCategory(row) }, {
-        trigger: () => h(NButton, { text: true, type: 'error', size: 'small', disabled: !canManage.value }, () => '删除'),
-        default: () => `确定删除意图「${row.name}」？`,
-      }),
-    ]),
+    title: '操作', key: 'actions', width: 140, align: 'center', titleAlign: 'center',
+    render: row => h(RowActions, { label: `意图 ${row.name} 操作` }, {
+      default: () => [
+        h(NButton, { text: true, type: 'primary', size: 'small', disabled: !canManage.value, onClick: () => openEditCategory(row) }, () => '编辑'),
+        h(NButton, { text: true, type: 'error', size: 'small', disabled: !canManage.value, onClick: () => openDeleteCategory(row) }, () => '删除'),
+      ],
+    }),
   },
 ]
-categoryColumns.forEach(column => { column.titleAlign = 'center'; column.align = 'center' })
 
 const logColumns = [
   { title: '时间', key: 'created_at', width: 165, render: row => formatTime(row.created_at) },
@@ -558,14 +575,26 @@ async function saveCategory() {
   }
 }
 
-async function removeCategory(category) {
+function openDeleteCategory(category) {
   if (!canManage.value) return
+  pendingCategoryDelete.value = category
+  showCategoryDeleteConfirm.value = true
+}
+
+async function confirmDeleteCategory() {
+  const category = pendingCategoryDelete.value
+  if (!category || !canManage.value) return
+  deletingCategory.value = true
   try {
     await deleteIntentCategory(category.id)
     msg.success('意图分类已删除')
     await loadCategories()
+    showCategoryDeleteConfirm.value = false
+    pendingCategoryDelete.value = null
   } catch (error) {
     showError(error, '删除意图分类失败')
+  } finally {
+    deletingCategory.value = false
   }
 }
 

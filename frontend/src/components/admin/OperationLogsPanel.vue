@@ -1,20 +1,18 @@
 <template>
-  <div>
-    <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-      <div>
-        <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200">管理操作审计</h3>
-        <p class="mt-1 text-xs text-gray-400">列表展示可读摘要；动作码、对象 ID 与完整变更信息在详情中保留。</p>
-      </div>
-
-      <!-- 筛选条 -->
+  <div class="space-y-4">
+    <!-- 筛选条 -->
+    <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <p class="max-w-xl text-xs leading-5 text-slate-500 dark:text-slate-400">
+        列表只保留可扫读的摘要；完整动作代码、对象 ID 与变更明细可在右侧详情查看。
+      </p>
       <div class="flex flex-wrap items-center gap-2">
         <n-select
           v-model:value="moduleFilter" :options="moduleOptions"
-          placeholder="全部模块" clearable size="small" class="w-40"
+          placeholder="全部模块" clearable size="small" class="w-40 max-w-full"
           @update:value="onFilterChange"
         />
         <n-input
-          v-model:value="usernameFilter" placeholder="按操作人筛选" clearable size="small" class="w-44"
+          v-model:value="usernameFilter" placeholder="按操作人筛选" clearable size="small" class="w-44 max-w-full"
           @keyup.enter="onFilterChange" @clear="onFilterChange"
         />
         <n-button size="small" @click="onFilterChange">筛选</n-button>
@@ -24,52 +22,60 @@
     <n-data-table
       remote
       :columns="columns" :data="logs" :loading="loading"
-      :pagination="pagination" :scroll-x="1040"
-      class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
+      :pagination="pagination" :scroll-x="ui.isCompact ? 940 : 1060"
+      class="admin-data-table"
     />
 
-    <!-- 详情弹窗 -->
-    <n-modal v-model:show="showDetail" to="#app" preset="card" title="操作日志详情" style="width: 600px; max-width: 92vw">
-      <n-descriptions v-if="current" :column="1" label-placement="left" bordered label-style="width: 96px">
-        <n-descriptions-item label="操作人">{{ current.username || '—' }}</n-descriptions-item>
-        <n-descriptions-item label="动作">
-          <n-tag :type="actionType(current.action)" size="small">{{ actionLabel(current.action) }}</n-tag>
-        </n-descriptions-item>
-        <n-descriptions-item label="操作对象">{{ targetText(current) }}</n-descriptions-item>
-        <n-descriptions-item label="变更明细">
-          <div v-if="detailRows(current.detail)" class="space-y-1">
-            <div v-for="row in detailRows(current.detail)" :key="row.label" class="text-sm break-all">
-              <span class="text-gray-500 dark:text-gray-400">{{ row.label }}：</span>
-              <span class="text-gray-700 dark:text-gray-200">{{ row.text }}</span>
+    <AuditDetailDrawer v-model:show="showDetail" title="操作日志详情" subtitle="完整事件信息仅用于审计和问题定位。">
+      <div v-if="current" class="audit-detail space-y-4">
+        <section class="audit-detail__surface">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <div class="audit-detail__label">操作对象</div>
+              <div class="mt-1 text-sm font-semibold text-slate-800 dark:text-slate-100">{{ targetText(current) }}</div>
             </div>
+            <n-tag :type="actionType(current.action)" size="small" round>{{ actionLabel(current.action) }}</n-tag>
           </div>
-          <pre v-else-if="current.detail" class="text-xs font-mono whitespace-pre-wrap break-all text-gray-600 dark:text-gray-300 m-0">{{ prettyDetail(current.detail) }}</pre>
-          <span v-else class="text-gray-400">—</span>
-        </n-descriptions-item>
-        <n-descriptions-item label="IP 地址">{{ current.ip || '—' }}</n-descriptions-item>
-        <n-descriptions-item label="浏览器">{{ parseUA(current.user_agent).browser }}</n-descriptions-item>
-        <n-descriptions-item label="操作系统">{{ parseUA(current.user_agent).os }}</n-descriptions-item>
-        <n-descriptions-item label="操作时间">{{ fmtTime(current.created_at) }}</n-descriptions-item>
-        <n-descriptions-item label="对象 ID">
-          <span class="text-xs font-mono break-all text-gray-500 dark:text-gray-400">{{ current.target_id || '—' }}</span>
-        </n-descriptions-item>
-        <n-descriptions-item label="日志 ID">
-          <span class="text-xs font-mono break-all text-gray-500 dark:text-gray-400">{{ current.id }}</span>
-        </n-descriptions-item>
-        <n-descriptions-item label="事件代码">
-          <span class="text-xs font-mono break-all text-gray-500 dark:text-gray-400">{{ current.action || '—' }}</span>
-        </n-descriptions-item>
-      </n-descriptions>
-    </n-modal>
+          <dl class="audit-detail__grid mt-5">
+            <div><dt>操作人</dt><dd>{{ current.username || '—' }}</dd></div>
+            <div><dt>操作时间</dt><dd class="tabular-nums">{{ fmtTime(current.created_at) }}</dd></div>
+            <div><dt>IP 地址</dt><dd>{{ current.ip || '—' }}</dd></div>
+            <div><dt>浏览器 / 系统</dt><dd>{{ parseUA(current.user_agent).browser }} · {{ parseUA(current.user_agent).os }}</dd></div>
+          </dl>
+        </section>
+
+        <section class="audit-detail__surface">
+          <h3 class="audit-detail__section-title">变更明细</h3>
+          <dl v-if="detailRows(current.detail)" class="audit-detail__changes">
+            <div v-for="row in detailRows(current.detail)" :key="row.label">
+              <dt>{{ row.label }}</dt>
+              <dd>{{ row.text }}</dd>
+            </div>
+          </dl>
+          <pre v-else-if="current.detail" class="audit-detail__json">{{ prettyDetail(current.detail) }}</pre>
+          <p v-else class="text-sm text-slate-400">本次操作没有可展示的字段变更。</p>
+        </section>
+
+        <section class="audit-detail__surface">
+          <h3 class="audit-detail__section-title">审计标识</h3>
+          <dl class="audit-detail__identifiers">
+            <div><dt>事件代码</dt><dd>{{ current.action || '—' }}</dd></div>
+            <div><dt>对象 ID</dt><dd>{{ current.target_id || '—' }}</dd></div>
+            <div><dt>日志 ID</dt><dd>{{ current.id || '—' }}</dd></div>
+          </dl>
+        </section>
+      </div>
+    </AuditDetailDrawer>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, onMounted, h } from 'vue'
-import { NDataTable, NTag, NButton, NModal, NSelect, NInput, NDescriptions, NDescriptionsItem } from 'naive-ui'
+import { NDataTable, NTag, NButton, NSelect, NInput } from 'naive-ui'
 import { getOperationLogs } from '@/api/operationLogs'
 import { parseUA } from '@/utils/ua'
 import { useUiStore } from '@/stores/ui'
+import AuditDetailDrawer from '@/components/ui/AuditDetailDrawer.vue'
 
 const ui = useUiStore()
 const logs = ref([])
@@ -125,6 +131,11 @@ const INTENT_ACTION_LABELS = {
 }
 const FEEDBACK_LABELS = { correct: '标注为正确', incorrect: '标注为有误' }
 
+const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+})
+
 const actionLabel = (a) => ACTION_LABELS[a] || a || '—'
 const targetLabel = (t) => TARGET_LABELS[t] || t || '—'
 const actionType = (a) => {
@@ -134,7 +145,21 @@ const actionType = (a) => {
   if (a.includes('update') || a.includes('upload') || a.includes('password')) return 'warning'
   return 'info'
 }
-const fmtTime = (v) => v ? new Date(v).toLocaleString('zh-CN') : '—'
+const fmtTime = (v) => {
+  if (!v) return '—'
+  const date = new Date(v)
+  if (Number.isNaN(date.getTime())) return String(v)
+  const parts = Object.fromEntries(dateTimeFormatter.formatToParts(date)
+    .filter(part => part.type !== 'literal')
+    .map(part => [part.type, part.value]))
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+}
+
+const timeParts = (v) => {
+  const formatted = fmtTime(v)
+  const [date = formatted, time = ''] = formatted.split(' ')
+  return { date, time }
+}
 const prettyDetail = (d) => {
   try { return JSON.stringify(d, null, 2) } catch { return String(d) }
 }
@@ -201,7 +226,16 @@ function detailRows(detail) {
 // 列表里的一行变更摘要（紧凑）
 function summaryText(row) {
   const rows = detailRows(row.detail)
-  return rows ? rows.map(item => `${item.label}：${item.text}`).join('；') : ''
+  if (!rows?.length) return ''
+  const compact = rows.slice(0, 2)
+    .map(item => `${item.label}：${compactText(item.text, 42)}`)
+    .join(' · ')
+  return rows.length > 2 ? `${compact} 等 ${rows.length} 项` : compact
+}
+
+function compactText(value, maxLength) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text
 }
 
 function targetText(row) {
@@ -222,29 +256,35 @@ const pagination = reactive({
 })
 
 const columns = [
-  { title: '时间', key: 'created_at', width: 172, align: 'center', render: r => fmtTime(r.created_at) },
-  { title: '操作人', key: 'username', width: 96, align: 'center', ellipsis: { tooltip: true } },
   {
-    title: '动作', key: 'action', width: 122, align: 'center',
+    title: '时间', key: 'created_at', width: 158, align: 'center', titleAlign: 'center',
+    render: row => {
+      const time = timeParts(row.created_at)
+      return h('div', { class: 'audit-time' }, [
+        h('span', { class: 'audit-time__date' }, time.date),
+        h('span', { class: 'audit-time__value' }, time.time),
+      ])
+    },
+  },
+  { title: '操作人', key: 'username', width: 112, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
+  {
+    title: '动作', key: 'action', width: 126, align: 'center', titleAlign: 'center',
     render: r => h(NTag, { type: actionType(r.action), size: 'small', style: { whiteSpace: 'nowrap' } }, () => actionLabel(r.action))
   },
   {
-    title: '对象', key: 'target', width: 180, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
+    title: '对象', key: 'target', width: 178, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
     render: r => targetText(r)
   },
   {
-    title: '变更 / 结果', key: 'summary', minWidth: 240, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
-    render: r => summaryText(r) || h('span', { class: 'text-gray-300 dark:text-gray-600' }, '—')
+    title: '变更摘要', key: 'summary', minWidth: 280, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
+    render: r => summaryText(r) || h('span', { class: 'text-slate-300 dark:text-slate-600' }, '—')
   },
-  { title: 'IP', key: 'ip', width: 130, align: 'center', render: r => r.ip || '—' },
+  { title: 'IP', key: 'ip', width: 130, align: 'center', titleAlign: 'center', render: r => r.ip || '—' },
   {
-    title: '操作', key: 'actions', width: 96, align: 'center',
-    render: row => h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openDetail(row) }, () => '查看详细')
+    title: '操作', key: 'actions', width: 88, align: 'center', titleAlign: 'center',
+    render: row => h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openDetail(row) }, () => '详情')
   },
 ]
-columns.forEach(c => {
-  if (!c.titleAlign) c.titleAlign = 'center'
-})
 
 function openDetail(row) {
   current.value = row
@@ -272,3 +312,114 @@ async function loadLogs() {
   }
 }
 </script>
+
+<style scoped>
+.audit-time {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  color: var(--ui-text-secondary, #64748b);
+  font-size: 12px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.audit-time__date { color: var(--ui-text-secondary, #64748b); }
+.audit-time__value { color: var(--ui-text, #1e293b); }
+
+.audit-detail__surface {
+  padding: 16px;
+  background: var(--ui-surface, #ffffff);
+  border: 1px solid var(--ui-border, #e2e8f0);
+  border-radius: var(--ui-radius-card, 16px);
+}
+
+.audit-detail__label,
+.audit-detail dt {
+  color: var(--ui-text-tertiary, #94a3b8);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.audit-detail__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.audit-detail dd {
+  min-width: 0;
+  margin: 5px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--ui-text, #1e293b);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.audit-detail__section-title {
+  margin: 0 0 12px;
+  color: var(--ui-text, #1e293b);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.audit-detail__changes {
+  display: grid;
+  gap: 10px;
+}
+
+.audit-detail__changes > div {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.38fr) minmax(0, 1fr);
+  gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ui-border, #e2e8f0);
+}
+
+.audit-detail__changes > div:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.audit-detail__changes dd { margin-top: 0; }
+
+.audit-detail__json {
+  max-height: 320px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  color: var(--ui-text-secondary, #64748b);
+  background: var(--ui-surface-muted, #f8fafc);
+  border-radius: var(--ui-radius-control, 10px);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.audit-detail__identifiers {
+  display: grid;
+  gap: 10px;
+}
+
+.audit-detail__identifiers > div {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.audit-detail__identifiers dd {
+  margin: 0;
+  color: var(--ui-text-secondary, #64748b);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+@media (max-width: 639px) {
+  .audit-detail__grid { grid-template-columns: 1fr; gap: 12px; }
+  .audit-detail__changes > div { grid-template-columns: 1fr; gap: 4px; }
+}
+</style>

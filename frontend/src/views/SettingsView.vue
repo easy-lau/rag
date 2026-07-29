@@ -1,7 +1,21 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <n-spin :show="settingsStore.loading">
-      <div class="max-w-6xl mx-auto">
+      <div class="max-w-6xl mx-auto space-y-5">
+        <PageHeader
+          title="系统设置"
+          description="统一管理模型服务、检索策略与站点品牌信息。敏感配置仅对有权限的管理员开放。"
+        >
+          <template #meta>
+            <n-tag :type="canWrite ? 'success' : 'warning'" :bordered="false" round>
+              {{ canWrite ? '可编辑' : '仅查看' }}
+            </n-tag>
+          </template>
+        </PageHeader>
+        <div v-if="!canWrite" class="mb-5 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200">
+          <n-icon :size="17"><LockClosedOutline /></n-icon>
+          当前账号仅可查看系统设置，不能修改或上传站点资源。
+        </div>
         <!-- 模型配置：左右两列 -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <!-- 大语言模型 -->
@@ -10,7 +24,7 @@
               <span class="w-2 h-2 rounded-full bg-blue-500 inline-block"></span>
               大语言模型
             </h3>
-            <n-form :model="form" label-placement="top" class="space-y-1">
+            <n-form :model="form" :disabled="!canWrite" label-placement="top" class="space-y-1">
               <n-form-item label="API Key">
                 <n-input v-model:value="llmKey" type="password" show-password-on="click" :placeholder="llmKeyPlaceholder" />
               </n-form-item>
@@ -37,7 +51,7 @@
               <span class="w-2 h-2 rounded-full bg-purple-500 inline-block"></span>
               向量模型
             </h3>
-            <n-form :model="form" label-placement="top" class="space-y-1">
+            <n-form :model="form" :disabled="!canWrite" label-placement="top" class="space-y-1">
               <n-form-item label="API Key">
                 <n-input v-model:value="embKey" type="password" show-password-on="click" :placeholder="embKeyPlaceholder" />
               </n-form-item>
@@ -58,7 +72,7 @@
             多模态模型（图片识别）
           </h3>
           <p class="text-xs text-gray-400 mb-4">用于把上传的图片 / 截图通过视觉模型转写为可编辑文本（如 gpt-4o、qwen-vl-max）</p>
-          <n-form :model="form" label-placement="top">
+          <n-form :model="form" :disabled="!canWrite" label-placement="top">
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <n-form-item label="API Key">
                 <n-input v-model:value="visionKey" type="password" show-password-on="click" :placeholder="visionKeyPlaceholder" />
@@ -79,7 +93,7 @@
             <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
             检索参数
           </h3>
-          <n-form :model="form" label-placement="top">
+          <n-form :model="form" :disabled="!canWrite" label-placement="top">
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
               <n-form-item label="Top K（召回数量）">
                 <n-input-number v-model:value="form.top_k" :min="1" :max="20" class="w-full" />
@@ -129,7 +143,7 @@
             站点设置
           </h3>
           <p class="text-xs text-gray-400 mb-4">配置左上角的标题、图标、描述，浏览器标签标题，以及页面底部版权（所有人可见）</p>
-          <n-form :model="form" label-placement="top">
+          <n-form :model="form" :disabled="!canWrite" label-placement="top">
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <n-form-item label="网站标题">
                 <n-input v-model:value="form.site_title" placeholder="RAG 检索系统" />
@@ -155,17 +169,18 @@
                     :show-file-list="false"
                     accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml,image/x-icon,.ico"
                     :custom-request="handleLogoUpload"
+                    :disabled="!canWrite"
                   >
-                    <n-button size="small">{{ form.site_logo ? '更换图标' : '上传图标' }}</n-button>
+                    <n-button size="small" :disabled="!canWrite">{{ form.site_logo ? '更换图标' : '上传图标' }}</n-button>
                   </n-upload>
-                  <n-button v-if="form.site_logo" text size="small" type="error" @click="form.site_logo = ''">清除</n-button>
+                  <n-button v-if="form.site_logo" text size="small" type="error" :disabled="!canWrite" @click="form.site_logo = ''">清除</n-button>
                 </div>
               </n-form-item>
             </div>
           </n-form>
         </div>
 
-        <div v-if="authStore.hasPerm('settings:write')" class="flex justify-end mt-6">
+        <div v-if="canWrite" class="flex justify-end mt-6">
           <n-button type="primary" size="large" class="px-10" :loading="saving" @click="handleSave">保存设置</n-button>
         </div>
       </div>
@@ -175,12 +190,13 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { NForm, NFormItem, NInput, NInputNumber, NSwitch, NButton, NSpin, NTooltip, NIcon, NUpload, useMessage } from 'naive-ui'
-import { HelpCircleOutline } from '@vicons/ionicons5'
+import { NForm, NFormItem, NInput, NInputNumber, NSwitch, NButton, NSpin, NTooltip, NIcon, NTag, NUpload, useMessage } from 'naive-ui'
+import { HelpCircleOutline, LockClosedOutline } from '@vicons/ionicons5'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
 import { uploadLogo } from '@/api/settings'
+import PageHeader from '@/components/ui/PageHeader.vue'
 
 const settingsStore = useSettingsStore()
 const authStore = useAuthStore()
@@ -188,6 +204,7 @@ const siteStore = useSiteStore()
 const msg = useMessage()
 const saving = ref(false)
 const form = ref({ ...settingsStore.data })
+const canWrite = computed(() => authStore.hasPerm('settings:write'))
 
 // API Key 单独管理：输入框始终为空，只有填写了才会提交，避免把掩码回写覆盖真实 Key
 const llmKey = ref('')
@@ -210,6 +227,10 @@ onMounted(async () => {
 })
 
 async function handleLogoUpload({ file, onFinish, onError }) {
+  if (!canWrite.value) {
+    onError()
+    return
+  }
   try {
     const { url } = await uploadLogo(file.file)
     form.value.site_logo = url
@@ -222,6 +243,7 @@ async function handleLogoUpload({ file, onFinish, onError }) {
 }
 
 async function handleSave() {
+  if (!canWrite.value) return
   saving.value = true
   try {
     // 不提交掩码后的 Key 字段；仅在用户输入新 Key 时才包含

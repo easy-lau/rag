@@ -1,26 +1,32 @@
 <template>
   <div class="flex h-screen overflow-hidden bg-slate-100 dark:bg-slate-950">
     <!-- 桌面端后台导航 -->
-    <div v-if="!ui.isMobile" class="w-64 shrink-0 shadow-xl shadow-slate-900/10 z-10">
+    <div v-if="!ui.isCompact" class="w-64 shrink-0 shadow-xl shadow-slate-900/10 z-10">
       <AdminSidebar />
     </div>
 
-    <!-- 移动端后台导航 -->
-    <n-drawer v-else v-model:show="ui.mobileNavOpen" :width="272" placement="left" to="#app">
-      <AdminSidebar />
+    <!-- 紧凑屏后台导航：平板和手机统一改为抽屉，避免内容区被侧栏挤压。 -->
+    <n-drawer v-else v-model:show="ui.mobileNavOpen" :width="288" placement="left" to="#app">
+      <n-drawer-content
+        title="管理导航"
+        closable
+        :native-scrollbar="false"
+        :header-style="drawerHeaderStyle"
+        :body-content-style="drawerBodyStyle"
+      >
+        <AdminSidebar />
+      </n-drawer-content>
     </n-drawer>
 
     <div class="min-w-0 flex-1 flex flex-col">
       <header class="h-16 shrink-0 flex items-center justify-between px-4 sm:px-6 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800">
         <div class="flex items-center min-w-0 gap-3">
-          <n-button v-if="ui.isMobile" quaternary circle size="small" aria-label="打开后台菜单" @click="ui.mobileNavOpen = true">
+          <n-button v-if="ui.isCompact" quaternary circle size="small" aria-label="打开后台菜单" @click="ui.mobileNavOpen = true">
             <template #icon><n-icon :size="20"><MenuOutline /></n-icon></template>
           </n-button>
-          <div class="min-w-0">
-            <div class="text-[11px] leading-4 text-slate-400 dark:text-slate-500">后台管理</div>
-            <h1 class="text-sm sm:text-base leading-5 font-semibold text-slate-800 dark:text-slate-100 truncate">
-              {{ currentPageTitle }}
-            </h1>
+          <div class="min-w-0 flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-blue-500 shadow-sm shadow-blue-500/40" aria-hidden="true"></span>
+            <span class="text-sm leading-5 font-semibold text-slate-700 dark:text-slate-200">管理后台</span>
           </div>
         </div>
 
@@ -67,7 +73,13 @@
       </footer>
     </div>
 
-    <n-modal v-model:show="showPasswordModal" preset="card" title="修改密码" style="width: 90vw; max-width: 400px" to="#app">
+    <AppModal
+      v-model:show="showPasswordModal"
+      title="修改密码"
+      width="min(90vw, 400px)"
+      :loading="savingPassword"
+      @close="closePasswordModal"
+    >
       <n-form ref="passwordFormRef" :model="passwordForm" :rules="passwordRules" label-placement="top">
         <n-form-item label="当前密码" path="old_password">
           <n-input v-model:value="passwordForm.old_password" type="password" show-password-on="click" placeholder="请输入当前密码" />
@@ -81,11 +93,11 @@
       </n-form>
       <template #footer>
         <div class="flex justify-end gap-2">
-          <n-button @click="showPasswordModal = false">取消</n-button>
+          <n-button :disabled="savingPassword" @click="closePasswordModal">取消</n-button>
           <n-button type="primary" :loading="savingPassword" @click="changeCurrentPassword">确定</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
   </div>
 </template>
 
@@ -95,12 +107,12 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   NButton,
   NDrawer,
+  NDrawerContent,
   NDropdown,
   NForm,
   NFormItem,
   NIcon,
   NInput,
-  NModal,
   useMessage,
 } from 'naive-ui'
 import {
@@ -113,6 +125,7 @@ import {
   SunnyOutline,
 } from '@vicons/ionicons5'
 import AdminSidebar from './AdminSidebar.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 import { changePassword } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
@@ -125,21 +138,11 @@ const siteStore = useSiteStore()
 const ui = useUiStore()
 const message = useMessage()
 
-const PAGE_TITLES = {
-  knowledge: '知识库管理',
-  documents: '文档管理',
-  'search-test': '检索测试',
-  'intent-routing': '智能路由',
-  users: '用户管理',
-  roles: '角色管理',
-  'audit-logs': '审计日志',
-  settings: '系统设置',
-}
-
-const currentPageTitle = computed(() => PAGE_TITLES[route.name] || '后台管理')
 const userName = computed(() => authStore.user?.display_name || authStore.user?.username || '用户')
 const userInitial = computed(() => userName.value.slice(0, 1))
 const canReturnToChat = computed(() => authStore.hasPerm('menu:chat'))
+const drawerHeaderStyle = { padding: '16px 18px', borderBottom: '1px solid var(--ui-border)' }
+const drawerBodyStyle = { padding: 0 }
 
 // 两套布局共用移动端抽屉状态；切换路由时主动收起，避免抽屉跨布局残留。
 watch(() => route.fullPath, () => {
@@ -181,6 +184,11 @@ function handleUserMenu(key) {
     passwordForm.value = { old_password: '', new_password: '', confirm: '' }
     showPasswordModal.value = true
   }
+}
+
+function closePasswordModal() {
+  if (savingPassword.value) return
+  showPasswordModal.value = false
 }
 
 async function changeCurrentPassword() {

@@ -14,11 +14,9 @@
     <div class="chat-composer__footer">
       <div class="chat-composer__config" aria-label="检索配置">
         <n-popover
-          class="composer-settings-popover"
           trigger="click"
           placement="top-start"
           :show-arrow="false"
-          :theme-overrides="composerPopoverThemeOverrides"
         >
           <template #trigger>
             <button type="button" class="composer-setting composer-setting--kb" aria-label="配置知识库范围">
@@ -41,18 +39,14 @@
               placeholder="选择知识库"
               class="composer-popover__select"
               :input-props="{ 'aria-label': '选择知识库' }"
-              :menu-props="composerSelectMenuProps"
-              :theme-overrides="composerSelectThemeOverrides"
               :max-tag-count="1"
             />
           </div>
         </n-popover>
         <n-popover
-          class="composer-settings-popover"
           trigger="click"
           placement="top-start"
           :show-arrow="false"
-          :theme-overrides="composerPopoverThemeOverrides"
         >
           <template #trigger>
             <button type="button" class="composer-setting composer-setting--method" aria-label="配置检索方式">
@@ -73,18 +67,14 @@
               placeholder="选择检索方式"
               class="composer-popover__select"
               :input-props="{ 'aria-label': '选择检索方式' }"
-              :menu-props="composerSelectMenuProps"
-              :theme-overrides="composerSelectThemeOverrides"
             />
           </div>
         </n-popover>
         <n-popover
           v-if="tagOptions.length"
-          class="composer-settings-popover"
           trigger="click"
           placement="top-start"
           :show-arrow="false"
-          :theme-overrides="composerPopoverThemeOverrides"
         >
           <template #trigger>
             <button type="button" class="composer-setting composer-setting--tag" aria-label="按标签筛选">
@@ -107,8 +97,6 @@
               placeholder="不限标签"
               class="composer-popover__select"
               :input-props="{ 'aria-label': '按标签筛选' }"
-              :menu-props="composerSelectMenuProps"
-              :theme-overrides="composerSelectThemeOverrides"
               :max-tag-count="1"
             />
           </div>
@@ -164,18 +152,6 @@ const chatStore = useChatStore()
 const kbStore = useKnowledgeStore()
 const text = ref('')
 const inputRef = ref(null)
-const composerPopoverThemeOverrides = {
-  borderRadius: '16px',
-  padding: '14px',
-  boxShadow: '0 16px 36px rgba(35, 61, 98, .14)',
-}
-const composerSelectThemeOverrides = {
-  peers: {
-    InternalSelectMenu: { borderRadius: '12px' },
-  },
-}
-const composerSelectMenuProps = { class: 'composer-select-menu' }
-
 const kbOptions = computed(() =>
   kbStore.list.map(kb => ({ label: kb.name, value: kb.id }))
 )
@@ -270,29 +246,29 @@ defineExpose({ setText, focus })
 
 <style scoped>
 .chat-composer {
-  border: 1px solid #dce5f1;
-  border-radius: 18px;
-  background: linear-gradient(145deg, #ffffff 0%, #fbfdff 100%);
-  box-shadow: 0 12px 30px rgba(38, 75, 130, .08), 0 1px 2px rgba(38, 75, 130, .04);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-card);
+  background: var(--ui-surface);
+  box-shadow: var(--ui-shadow-card);
   padding: 14px 14px 11px;
   transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
 }
 
 .chat-composer:focus-within {
-  border-color: #8fb5f7;
-  box-shadow: 0 0 0 3px rgba(76, 132, 236, .10), 0 16px 34px rgba(38, 75, 130, .10);
+  border-color: var(--ui-border-focus);
+  box-shadow: var(--ui-focus-ring), var(--ui-shadow-card);
 }
 
 .chat-composer__input :deep(.n-input__textarea-el) {
   min-height: 58px !important;
   padding: 1px 2px 6px;
-  color: #20304a;
+  color: var(--ui-text);
   font-size: 14px;
   line-height: 1.75;
 }
 
 .chat-composer__input :deep(.n-input__placeholder) {
-  color: #9aa9bd;
+  color: var(--ui-placeholder);
 }
 
 .chat-composer__footer {
@@ -302,7 +278,7 @@ defineExpose({ setText, focus })
   gap: 12px;
   margin-top: 9px;
   padding-top: 10px;
-  border-top: 1px solid #edf1f6;
+  border-top: 1px solid var(--ui-divider);
 }
 
 .chat-composer__config {
@@ -321,10 +297,10 @@ defineExpose({ setText, focus })
   min-width: 0;
   height: 38px;
   padding: 0 9px;
-  border: 1px solid #e1e8f1;
-  border-radius: 11px;
-  color: #5b6e88;
-  background: #f8fafd;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-control);
+  color: var(--ui-text-secondary);
+  background: var(--ui-surface-muted);
   cursor: pointer;
   font: inherit;
   text-align: left;
@@ -332,17 +308,17 @@ defineExpose({ setText, focus })
 }
 
 .composer-setting:hover {
-  border-color: #bdd2f5;
-  background: #f2f6fd;
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-hover);
 }
 
 .composer-setting:focus-visible {
   outline: 0;
-  border-color: #78a6ed;
-  box-shadow: 0 0 0 3px rgba(76, 132, 236, .13);
+  border-color: var(--ui-border-focus);
+  box-shadow: var(--ui-focus-ring);
 }
 
-.composer-setting > :deep(.n-icon) { flex: 0 0 auto; color: #5d91e8; }
+.composer-setting > :deep(.n-icon) { flex: 0 0 auto; color: var(--ui-primary); }
 .composer-setting--kb { flex: 0 1 182px; max-width: 220px; }
 .composer-setting--method { flex: 0 1 164px; max-width: 195px; }
 .composer-setting--tag { flex: 0 1 150px; max-width: 185px; }
@@ -356,7 +332,7 @@ defineExpose({ setText, focus })
 }
 
 .composer-setting__label {
-  color: #7a8ba2;
+  color: var(--ui-text-tertiary);
   font-size: 10px;
   font-weight: 680;
   letter-spacing: .035em;
@@ -366,7 +342,7 @@ defineExpose({ setText, focus })
 
 .composer-setting__value {
   overflow: hidden;
-  color: #3c5270;
+  color: var(--ui-text-secondary);
   font-size: 11px;
   font-weight: 600;
   line-height: 1.2;
@@ -377,29 +353,21 @@ defineExpose({ setText, focus })
 .composer-setting__chevron {
   flex: 0 0 auto;
   margin-left: auto;
-  color: #9aabc0 !important;
+  color: var(--ui-icon) !important;
 }
 
 .composer-setting--rerank.is-active {
-  border-color: #c8daf8;
-  background: #edf4ff;
+  border-color: var(--ui-border-focus);
+  background: var(--ui-primary-subtle);
 }
 
-.composer-setting--rerank.is-active > :deep(.n-icon) { color: #3f7fe0; }
-.composer-setting--rerank.is-active .composer-setting__value { color: #3978d6; }
+.composer-setting--rerank.is-active > :deep(.n-icon) { color: var(--ui-primary); }
+.composer-setting--rerank.is-active .composer-setting__value { color: var(--ui-primary); }
 
 .composer-popover { width: min(280px, calc(100vw - 32px)); padding: 2px; }
-.composer-popover p { margin: 0; color: #243a5a; font-size: 13px; font-weight: 700; }
-.composer-popover > span { display: block; margin-top: 5px; color: #7d8da3; font-size: 11px; line-height: 1.55; }
+.composer-popover p { margin: 0; color: var(--ui-text); font-size: 13px; font-weight: 700; }
+.composer-popover > span { display: block; margin-top: 5px; color: var(--ui-text-secondary); font-size: 11px; line-height: 1.55; }
 .composer-popover__select { width: 100%; margin-top: 11px; }
-.composer-popover__select :deep(.n-base-selection) {
-  --n-border: 1px solid #dde6f1 !important;
-  --n-border-hover: 1px solid #9fc0f5 !important;
-  --n-border-active: 1px solid #5d91e8 !important;
-  --n-box-shadow-active: 0 0 0 3px rgba(76, 132, 236, .12) !important;
-  --n-color: #fbfcfe !important;
-  border-radius: 10px;
-}
 
 .chat-composer__actions {
   display: flex;
@@ -409,73 +377,26 @@ defineExpose({ setText, focus })
 }
 
 .chat-composer__shortcut {
-  color: #a1adbd;
+  color: var(--ui-text-tertiary);
   font-size: 11px;
   white-space: nowrap;
 }
 
 :deep(.chat-composer__stop.n-button) {
-  --n-border: 1px solid #dbe4ef !important;
-  --n-color-hover: #f7f9fc !important;
-  --n-border-hover: 1px solid #bdcfe7 !important;
+  --n-border: 1px solid var(--ui-border) !important;
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-border-hover: 1px solid var(--ui-border-strong) !important;
   border-radius: 9px;
 }
 
 .chat-composer__send {
-  box-shadow: 0 7px 14px rgba(52, 112, 218, .25);
+  box-shadow: var(--ui-shadow-card);
   transition: transform .18s ease, box-shadow .18s ease;
 }
 
 .chat-composer__send:not(.n-button--disabled):hover {
   transform: translateY(-1px);
-  box-shadow: 0 10px 19px rgba(52, 112, 218, .32);
-}
-
-.dark .chat-composer {
-  border-color: #3a4b65;
-  background: linear-gradient(145deg, #1f2937 0%, #1b2533 100%);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, .18);
-}
-
-.dark .chat-composer:focus-within {
-  border-color: #4c79bd;
-  box-shadow: 0 0 0 3px rgba(76, 132, 236, .16), 0 16px 34px rgba(0, 0, 0, .22);
-}
-
-.dark .chat-composer__input :deep(.n-input__textarea-el) { color: #e5edf8; }
-.dark .chat-composer__input :deep(.n-input__placeholder) { color: #718197; }
-.dark .chat-composer__footer { border-color: #334155; }
-.dark .composer-setting { border-color: #3a4a62; color: #afbed0; background: #263242; }
-.dark .composer-setting:hover { border-color: #4c6b98; background: #2c3a4f; }
-.dark .composer-setting__label { color: #8e9db2; }
-.dark .composer-setting__value { color: #d1dbe8; }
-.dark .composer-setting__chevron { color: #7f8da1 !important; }
-.dark .composer-setting--rerank.is-active { border-color: #42669d; background: #243b60; }
-.dark .composer-setting--rerank.is-active .composer-setting__value { color: #9cc2ff; }
-.dark .composer-popover p { color: #dce7f5; }
-.dark .composer-popover > span { color: #95a6bc; }
-.dark .composer-popover__select :deep(.n-base-selection) {
-  --n-border: 1px solid #465a76 !important;
-  --n-border-hover: 1px solid #5c7fb0 !important;
-  --n-border-active: 1px solid #75a6ef !important;
-  --n-box-shadow-active: 0 0 0 3px rgba(111, 162, 238, .16) !important;
-  --n-color: #202c3d !important;
-  --n-color-active: #28384f !important;
-  --n-text-color: #d8e3f0 !important;
-  --n-placeholder-color: #7f91a9 !important;
-  --n-arrow-color: #9aaec9 !important;
-}
-.dark .chat-composer__shortcut { color: #718096; }
-
-:global(.composer-settings-popover.n-popover) {
-  --n-border-radius: 16px !important;
-  border-radius: 16px !important;
-}
-
-:global(.composer-select-menu.n-base-select-menu) {
-  --n-border-radius: 12px !important;
-  border-radius: 12px !important;
-  overflow: hidden;
+  box-shadow: var(--ui-shadow-float);
 }
 
 @media (max-width: 860px) {
@@ -484,7 +405,7 @@ defineExpose({ setText, focus })
 }
 
 @media (max-width: 639px) {
-  .chat-composer { border-radius: 15px; padding: 12px 12px 10px; }
+  .chat-composer { padding: 12px 12px 10px; }
   .chat-composer__input :deep(.n-input__textarea-el) { min-height: 52px !important; }
   .chat-composer__footer { align-items: stretch; flex-direction: column; }
   .chat-composer__config { flex-wrap: nowrap; gap: 6px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }

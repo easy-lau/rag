@@ -1,7 +1,7 @@
 <template>
-  <aside class="w-full h-full flex flex-col bg-[#26384d] text-slate-200">
+  <aside class="admin-sidebar w-full h-full flex flex-col">
     <!-- 独立后台品牌区 -->
-    <div class="px-5 pt-5 pb-4 border-b border-slate-500/35">
+    <div class="admin-sidebar__brand px-5 pt-5 pb-4">
       <router-link v-if="canReturnToChat" to="/chat" class="flex items-center gap-3 group" @click="closeMobileNav">
         <img
           v-if="siteStore.site_logo"
@@ -16,10 +16,10 @@
           {{ (siteStore.site_title || 'R')[0] }}
         </div>
         <div class="min-w-0">
-          <div class="text-sm font-semibold text-white truncate group-hover:text-blue-200 transition-colors">
+          <div class="text-sm font-semibold text-white truncate group-hover:text-blue-100 transition-colors">
             {{ siteStore.site_title || 'RAG 检索系统' }}
           </div>
-          <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-400">
+          <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-300/80">
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
             管理后台
           </div>
@@ -40,7 +40,7 @@
         </div>
         <div class="min-w-0">
           <div class="text-sm font-semibold text-white truncate">{{ siteStore.site_title || 'RAG 检索系统' }}</div>
-          <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-400">
+          <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-300/80">
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
             管理后台
           </div>
@@ -49,23 +49,24 @@
     </div>
 
     <!-- 按业务域分组的后台菜单；具体可见项由 accessibleAdminMenus 统一按权限过滤。 -->
-    <nav class="flex-1 overflow-y-auto px-3 py-5 space-y-3">
-      <section v-for="group in groupedMenus" :key="group.key">
-        <div class="px-3 mb-1.5 text-[11px] font-semibold tracking-[0.1em] text-slate-400">
-          {{ group.title }}
+    <nav class="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-5">
+      <section v-for="group in groupedMenus" :key="group.key" class="admin-sidebar__group">
+        <div class="admin-sidebar__group-title px-3 mb-1.5 text-[11px] font-semibold tracking-[0.1em]">
+          {{ group.label }}
         </div>
-        <div class="space-y-1">
+        <div class="space-y-1.5">
           <router-link
             v-for="item in group.items"
             :key="item.to"
             :to="item.to"
-            class="group flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all duration-150"
+            class="admin-sidebar__item group flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all duration-150"
             :class="isActive(item)
-              ? 'bg-blue-500 text-white shadow-lg shadow-blue-950/35'
-              : 'text-slate-200 hover:bg-white/10 hover:text-white'"
+              ? 'admin-sidebar__item--active'
+              : 'admin-sidebar__item--idle'"
+            :aria-current="isActive(item) ? 'page' : undefined"
             @click="closeMobileNav"
           >
-            <n-icon :size="18" :class="isActive(item) ? 'text-white' : 'text-slate-400 group-hover:text-blue-300'">
+            <n-icon :size="18" :class="isActive(item) ? 'text-white' : 'text-slate-300/75 group-hover:text-white'">
               <component :is="item.icon" />
             </n-icon>
             <span class="truncate">{{ item.label }}</span>
@@ -78,22 +79,11 @@
         </div>
       </section>
 
-      <div v-if="!groupedMenus.length" class="px-3 py-8 text-center text-xs leading-6 text-slate-500">
+      <div v-if="!groupedMenus.length" class="px-3 py-8 text-center text-xs leading-6 text-slate-300/70">
         当前账号暂无后台管理权限
       </div>
     </nav>
 
-    <div class="px-5 py-4 border-t border-slate-500/35">
-      <router-link
-        v-if="canReturnToChat"
-        to="/chat"
-        class="flex items-center gap-2 text-xs text-slate-400 hover:text-white transition-colors"
-        @click="closeMobileNav"
-      >
-        <n-icon :size="15"><ChatbubbleEllipsesOutline /></n-icon>
-        返回智能问答
-      </router-link>
-    </div>
   </aside>
 </template>
 
@@ -101,7 +91,6 @@
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { NIcon } from 'naive-ui'
-import { ChatbubbleEllipsesOutline } from '@vicons/ionicons5'
 import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
 import { useUiStore } from '@/stores/ui'
@@ -131,3 +120,62 @@ function closeMobileNav() {
   ui.mobileNavOpen = false
 }
 </script>
+
+<style scoped>
+.admin-sidebar {
+  color: rgb(226 232 240);
+  background:
+    radial-gradient(circle at 16% -8%, rgb(96 165 250 / 0.22), transparent 34%),
+    linear-gradient(180deg, #314963 0%, #253c54 52%, #20364c 100%);
+}
+
+.admin-sidebar__brand {
+  border-color: rgb(226 232 240 / 0.16);
+}
+
+/* 业务域之间用分隔线和留白区分，避免「智能路由」与系统管理项视觉上连成一组。 */
+.admin-sidebar__group + .admin-sidebar__group {
+  padding-top: 14px;
+  border-top: 1px solid rgb(226 232 240 / 0.14);
+}
+
+.admin-sidebar__group-title {
+  color: rgb(203 213 225 / 0.72);
+}
+
+.admin-sidebar__item {
+  position: relative;
+  min-height: 42px;
+  color: rgb(226 232 240);
+  border: 1px solid transparent;
+}
+
+.admin-sidebar__item--idle:hover {
+  color: #fff;
+  background: rgb(255 255 255 / 0.1);
+}
+
+.admin-sidebar__item--active {
+  color: #fff;
+  background: linear-gradient(135deg, rgb(96 165 250 / 0.96), rgb(79 70 229 / 0.9));
+  border-color: rgb(191 219 254 / 0.32);
+  box-shadow: 0 8px 18px rgb(15 23 42 / 0.22), inset 3px 0 0 rgb(255 255 255 / 0.72);
+}
+
+.admin-sidebar__item--active::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 10px;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 0.95);
+  box-shadow: 0 0 0 3px rgb(255 255 255 / 0.12);
+  transform: translateY(-50%);
+}
+
+.admin-sidebar__item--active > span:last-child {
+  display: none;
+}
+</style>

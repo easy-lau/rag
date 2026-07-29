@@ -1,20 +1,26 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="flex items-center justify-end mb-6">
-      <n-button type="primary" @click="openCreate">
-        <template #icon><n-icon><AddOutline /></n-icon></template>
-        新建用户
-      </n-button>
+    <div class="max-w-6xl mx-auto space-y-5">
+      <PageHeader title="用户管理" description="维护账号、角色归属与启用状态；高风险删除需二次确认。">
+        <template #actions>
+          <n-button type="primary" @click="openCreate">
+            <template #icon><n-icon><AddOutline /></n-icon></template>
+            新建用户
+          </n-button>
+        </template>
+      </PageHeader>
+
+      <SurfaceCard padding="none" class="overflow-hidden">
+        <n-data-table
+          :columns="columns" :data="users" :loading="loading"
+          :pagination="pagination" :scroll-x="ui.isCompact ? 760 : undefined"
+          class="admin-data-table"
+        />
+      </SurfaceCard>
     </div>
 
-    <n-data-table
-      :columns="columns" :data="users" :loading="loading"
-      :pagination="pagination" :scroll-x="ui.isMobile ? 900 : undefined"
-      class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
-    />
-
     <!-- Create / Edit modal -->
-    <n-modal v-model:show="showModal" to="#app" preset="card" :title="editingId ? '编辑用户' : '新建用户'" style="width: 90vw; max-width: 384px">
+    <AppModal v-model:show="showModal" :title="editingId ? '编辑用户' : '新建用户'" width="min(92vw, 384px)" :loading="saving">
       <n-form :model="form" label-placement="top">
         <n-form-item label="用户名" required>
           <n-input v-model:value="form.username" :disabled="!!editingId" placeholder="登录用户名" />
@@ -38,21 +44,36 @@
       </n-form>
       <template #footer>
         <div class="flex justify-end gap-2">
-          <n-button @click="showModal = false">取消</n-button>
+          <n-button :disabled="saving" @click="showModal = false">取消</n-button>
           <n-button type="primary" :loading="saving" @click="handleSave">保存</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
+
+    <DangerConfirm
+      v-model:show="showDeleteConfirm"
+      title="永久删除用户？"
+      :subject="pendingDelete?.username || ''"
+      description="删除后，该账号无法恢复，也无法继续登录系统。"
+      :loading="deleting"
+      @confirm="confirmDelete"
+      @cancel="pendingDelete = null"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted, watch, h } from 'vue'
-import { NButton, NIcon, NDataTable, NModal, NForm, NFormItem, NInput, NSelect, NSwitch, NTag, NPopconfirm, useMessage } from 'naive-ui'
+import { NButton, NIcon, NDataTable, NForm, NFormItem, NInput, NSelect, NSwitch, NTag, useMessage } from 'naive-ui'
 import { AddOutline } from '@vicons/ionicons5'
 import { getUsers, createUser, updateUser, deleteUser } from '@/api/users'
 import { getRoles } from '@/api/roles'
 import { useUiStore } from '@/stores/ui'
+import PageHeader from '@/components/ui/PageHeader.vue'
+import SurfaceCard from '@/components/ui/SurfaceCard.vue'
+import RowActions from '@/components/ui/RowActions.vue'
+import DangerConfirm from '@/components/ui/DangerConfirm.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 
 const ui = useUiStore()
 const msg = useMessage()
@@ -64,6 +85,9 @@ const saving = ref(false)
 const showModal = ref(false)
 const editingId = ref(null)
 const form = ref({ username: '', password: '', display_name: '', role_id: null, is_active: true })
+const showDeleteConfirm = ref(false)
+const pendingDelete = ref(null)
+const deleting = ref(false)
 
 const pagination = reactive({
   page: 1,
@@ -84,27 +108,25 @@ const roleOptions = computed(() => roles.value.map(r => ({ label: r.name, value:
 const roleName = (id) => roles.value.find(r => r.id === id)?.name || '—'
 
 const columns = [
-  { title: '用户名', key: 'username', ellipsis: { tooltip: true } },
-  { title: '显示名', key: 'display_name', render: r => r.display_name || '—' },
-  { title: '角色', key: 'role', render: r => r.role_name || roleName(r.role_id) },
+  { title: '用户名', key: 'username', minWidth: 140, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
+  { title: '显示名', key: 'display_name', minWidth: 130, align: 'left', titleAlign: 'left', render: r => r.display_name || '—' },
+  { title: '角色', key: 'role', minWidth: 130, align: 'left', titleAlign: 'left', render: r => r.role_name || roleName(r.role_id) },
   {
-    title: '状态', key: 'is_active', width: 100,
+    title: '状态', key: 'is_active', width: 96, align: 'center', titleAlign: 'center',
     render: r => h(NTag, { type: r.is_active ? 'success' : 'default', size: 'small' }, () => r.is_active ? '启用' : '禁用')
   },
   {
-    title: '操作', key: 'actions', width: 220,
-    render: row => h('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, [
-      h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openEdit(row) }, () => '编辑'),
-      h(NButton, { text: true, size: 'small', disabled: row.is_superadmin, onClick: () => toggleActive(row) },
-        () => row.is_active ? '禁用' : '启用'),
-      h(NPopconfirm, { onPositiveClick: () => handleDelete(row) }, {
-        trigger: () => h(NButton, { text: true, type: 'error', size: 'small', disabled: row.is_superadmin }, () => '删除'),
-        default: () => '确定删除该用户？',
-      }),
-    ])
+    title: '操作', key: 'actions', width: 208, align: 'center', titleAlign: 'center',
+    render: row => h(RowActions, { label: `用户 ${row.username} 操作` }, {
+      default: () => [
+        h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openEdit(row) }, () => '编辑'),
+        h(NButton, { text: true, size: 'small', disabled: row.is_superadmin, onClick: () => toggleActive(row) },
+          () => row.is_active ? '禁用' : '启用'),
+        h(NButton, { text: true, type: 'error', size: 'small', disabled: row.is_superadmin, onClick: () => openDelete(row) }, () => '删除'),
+      ],
+    })
   }
 ]
-columns.forEach(c => { c.titleAlign = 'center'; c.align = 'center' })  // 表头 + 内容统一居中
 
 onMounted(async () => {
   await Promise.all([loadUsers(), loadRoles()])
@@ -181,13 +203,25 @@ async function toggleActive(row) {
   }
 }
 
-async function handleDelete(row) {
+function openDelete(row) {
+  pendingDelete.value = row
+  showDeleteConfirm.value = true
+}
+
+async function confirmDelete() {
+  const row = pendingDelete.value
+  if (!row) return
+  deleting.value = true
   try {
     await deleteUser(row.id)
     users.value = users.value.filter(u => u.id !== row.id)
     msg.success('用户已删除')
+    showDeleteConfirm.value = false
+    pendingDelete.value = null
   } catch (e) {
     msg.error(e?.response?.data?.detail || '删除失败，请重试')
+  } finally {
+    deleting.value = false
   }
 }
 </script>

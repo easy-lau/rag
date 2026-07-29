@@ -1,0 +1,125 @@
+/*
+ * UI design tokens
+ *
+ * Keep values semantic here instead of recreating palettes in individual pages.
+ * Tokens live on :root (rather than only #app) so Naive UI content that is
+ * teleported to body still receives the same light / dark values.
+ */
+:root {
+  color-scheme: light;
+
+  --ui-bg: #f5f8fc;
+  --ui-bg-subtle: #f9fbfe;
+  --ui-surface: #ffffff;
+  --ui-surface-raised: #ffffff;
+  --ui-surface-muted: #f4f7fb;
+  --ui-surface-hover: #edf3fa;
+  --ui-surface-pressed: #e5eef9;
+  --ui-surface-disabled: #f1f4f8;
+
+  --ui-text: #1b2a42;
+  --ui-text-secondary: #5e708b;
+  --ui-text-tertiary: #8190a5;
+  --ui-text-disabled: #a8b4c4;
+  --ui-placeholder: #98a6b9;
+  --ui-icon: #71819a;
+
+  --ui-border: #dce5f0;
+  --ui-border-strong: #c7d4e3;
+  --ui-border-focus: #4c84ec;
+  --ui-divider: #e8eef5;
+
+  --ui-primary: #3b82f6;
+  --ui-primary-hover: #256fe5;
+  --ui-primary-pressed: #1d5fca;
+  --ui-primary-subtle: #eaf2ff;
+
+  --ui-info: #3b82f6;
+  --ui-info-hover: #256fe5;
+  --ui-info-pressed: #1d5fca;
+  --ui-success: #209a6b;
+  --ui-success-hover: #17855a;
+  --ui-success-pressed: #126e4a;
+  --ui-warning: #d9891c;
+  --ui-warning-hover: #bd7212;
+  --ui-warning-pressed: #9d5d0e;
+  --ui-danger: #d84e5b;
+  --ui-danger-hover: #c53d4b;
+  --ui-danger-pressed: #ab303d;
+  --ui-danger-subtle: #fff0f1;
+
+  --ui-focus-outline: rgba(76, 132, 236, 0.75);
+  --ui-focus-ring: 0 0 0 3px rgba(76, 132, 236, 0.18);
+  --ui-overlay-mask: rgba(16, 31, 53, 0.42);
+
+  --ui-shadow-card: 0 1px 2px rgba(25, 48, 82, 0.04), 0 8px 22px rgba(25, 48, 82, 0.045);
+  --ui-shadow-float: 0 14px 36px rgba(27, 51, 86, 0.14), 0 2px 7px rgba(27, 51, 86, 0.06);
+  --ui-shadow-dialog: 0 28px 76px rgba(18, 37, 66, 0.22), 0 5px 18px rgba(18, 37, 66, 0.1);
+
+  --ui-radius-control: 10px;
+  --ui-radius-popover: 12px;
+  --ui-radius-card: 16px;
+  --ui-radius-dialog: 20px;
+  --ui-radius-pill: 999px;
+
+  --ui-control-height-tiny: 28px;
+  --ui-control-height-compact: 32px;
+  --ui-control-height: 36px;
+  --ui-control-height-large: 42px;
+}
+
+/* VueUse's useColorMode applies .dark to <html>. The body selector also keeps
+ * embedded shells correct if a host application owns the theme class. */
+html.dark,
+body.dark,
+#app.dark {
+  color-scheme: dark;
+
+  --ui-bg: #111a28;
+  --ui-bg-subtle: #151f2e;
+  --ui-surface: #1a2636;
+  --ui-surface-raised: #202e40;
+  --ui-surface-muted: #182535;
+  --ui-surface-hover: #26374c;
+  --ui-surface-pressed: #2c4058;
+  --ui-surface-disabled: #1c2939;
+
+  --ui-text: #e7eef8;
+  --ui-text-secondary: #b2c0d2;
+  --ui-text-tertiary: #8fa0b6;
+  --ui-text-disabled: #687a91;
+  --ui-placeholder: #7e90a8;
+  --ui-icon: #a6b5c9;
+
+  --ui-border: #33465e;
+  --ui-border-strong: #435a76;
+  --ui-border-focus: #78a9f5;
+  --ui-divider: #2b3c52;
+
+  --ui-primary: #5d98f4;
+  --ui-primary-hover: #78a9f5;
+  --ui-primary-pressed: #3f7fdf;
+  --ui-primary-subtle: #233d66;
+
+  --ui-info: #68a1f5;
+  --ui-info-hover: #84b4fa;
+  --ui-info-pressed: #4d89e7;
+  --ui-success: #49bf8d;
+  --ui-success-hover: #63ce9f;
+  --ui-success-pressed: #35a979;
+  --ui-warning: #eab35a;
+  --ui-warning-hover: #f0c470;
+  --ui-warning-pressed: #d59839;
+  --ui-danger: #ed727d;
+  --ui-danger-hover: #f18a92;
+  --ui-danger-pressed: #d95b67;
+  --ui-danger-subtle: #482a35;
+
+  --ui-focus-outline: rgba(126, 175, 250, 0.9);
+  --ui-focus-ring: 0 0 0 3px rgba(111, 162, 238, 0.22);
+  --ui-overlay-mask: rgba(3, 10, 21, 0.62);
+
+  --ui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.14), 0 8px 24px rgba(0, 0, 0, 0.12);
+  --ui-shadow-float: 0 16px 38px rgba(0, 0, 0, 0.32), 0 2px 8px rgba(0, 0, 0, 0.18);
+  --ui-shadow-dialog: 0 30px 82px rgba(0, 0, 0, 0.46), 0 5px 18px rgba(0, 0, 0, 0.28);
+}

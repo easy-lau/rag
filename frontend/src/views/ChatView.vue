@@ -2,42 +2,12 @@
   <div class="flex h-full">
     <!-- Main chat area -->
     <div class="flex flex-col flex-1 min-w-0">
-      <div class="chat-toolbar">
-        <div class="chat-toolbar__leading">
-          <div class="chat-toolbar__context" aria-label="问答工作台">
-            <span class="chat-toolbar__context-dot" aria-hidden="true"></span>
-            <span>对话工作台</span>
-          </div>
-          <!-- 桌面端已在侧栏提供主入口；移动端侧栏隐藏时保留新对话。 -->
-          <n-button
-            v-if="ui.isMobile"
-            class="chat-toolbar__new"
-            type="primary"
-            size="small"
-            :disabled="chatStore.isStreaming"
-            title="生成中请先停止回答"
-            @click="startNewConversation"
-          >
-            <template #icon><n-icon><AddOutline /></n-icon></template>
-            新对话
-          </n-button>
-        </div>
-        <n-button
-          class="chat-toolbar__results"
-          :class="{ 'is-active': showResults }"
-          size="small"
-          @click="showResults = ui.isMobile ? true : !showResults"
-        >
-          <template #icon><n-icon><SearchOutline /></n-icon></template>
-          {{ showResults ? '收起检索结果' : '展开检索结果' }}
-        </n-button>
-      </div>
-
       <!-- 空会话以欢迎态引导提问；首条消息发送后切换到正常消息流。 -->
       <div
         ref="msgList"
         class="flex-1 overflow-y-auto px-4 sm:px-6 py-4"
         :class="showWelcome ? 'flex items-center' : ''"
+        @scroll.passive="handleMessageScroll"
       >
         <ChatWelcome
           v-if="showWelcome"
@@ -54,6 +24,18 @@
           <n-spin size="large" />
         </div>
 
+        <div v-else-if="chatStore.conversationLoadError" class="flex h-full items-center justify-center py-8">
+          <section class="chat-conversation-load-error" aria-live="polite">
+            <p class="chat-conversation-load-error__title">暂时无法加载这段历史对话</p>
+            <p class="chat-conversation-load-error__description">{{ conversationLoadErrorMessage }}</p>
+            <p v-if="conversationLoadErrorMeta" class="chat-conversation-load-error__meta">{{ conversationLoadErrorMeta }}</p>
+            <div class="chat-conversation-load-error__actions">
+              <n-button type="primary" @click="retryConversationLoad">重新加载</n-button>
+              <n-button @click="openNewConversation">新建对话</n-button>
+            </div>
+          </section>
+        </div>
+
         <!-- 与底部输入区共用内容宽度，避免消息流在宽屏贴近页面两侧。 -->
         <div v-else class="w-full max-w-4xl mx-auto">
           <ChatMessage
@@ -67,23 +49,37 @@
       </div>
 
       <!-- 已开始的会话固定使用底部输入框，避免与欢迎态的输入框重复。 -->
-      <div v-if="!showWelcome && !chatStore.isConversationLoading" class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-700">
+      <div v-if="!showWelcome && !chatStore.isConversationLoading && !chatStore.conversationLoadError" class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-700">
         <div class="max-w-4xl mx-auto">
           <ChatInput />
         </div>
       </div>
     </div>
 
-    <!-- 检索结果默认收起：桌面端内联展开，移动端以抽屉显示 -->
-    <div v-if="!ui.isMobile && showResults" class="w-80 shrink-0">
-      <SearchResultPanel />
+    <!-- 仅在 ≥1280px 常驻右栏；其余宽度统一在抽屉中查看，给对话内容留出可读宽度。 -->
+    <div v-if="isResultsInline && ui.chatSearchOpen" id="chat-search-results" class="w-80 shrink-0">
+      <SearchResultPanel @preview="openSourcePreview" />
     </div>
-    <n-drawer v-else v-model:show="showResults" :width="320" placement="right" to="#app">
-      <SearchResultPanel />
+    <n-drawer
+      v-else
+      :show="ui.chatSearchOpen"
+      :width="ui.isMobile ? 320 : 360"
+      placement="right"
+      to="#app"
+      @update:show="updateResultsDrawer"
+    >
+      <SearchResultPanel in-drawer @close="closeResults" @preview="openSourcePreview" />
     </n-drawer>
 
     <!-- 来源文档只读预览（当前页弹窗，不跳转） -->
-    <n-modal v-model:show="showPreview" to="#app" preset="card" :title="previewTitle" style="width: 90vw; max-width: 780px">
+    <AppModal
+      v-model:show="showPreview"
+      :title="previewTitle"
+      width="min(90vw, 780px)"
+      :loading="previewLoading"
+      @close="closePreview"
+    >
+      <p class="mb-3 text-sm leading-6 text-gray-500 dark:text-gray-400">查看命中文档原文，不会离开当前对话。</p>
       <div class="relative" style="height: 70vh">
         <div v-if="previewLoading" class="absolute inset-0 flex items-center justify-center">
           <n-spin size="large" />
@@ -95,20 +91,20 @@
         />
       </div>
       <template #footer>
-        <div class="flex items-center justify-between">
+        <div class="flex w-full items-center justify-between gap-3">
           <span class="text-xs text-gray-400">仅供预览</span>
-          <n-button @click="showPreview = false">关闭</n-button>
+          <n-button :disabled="previewLoading" @click="closePreview">关闭</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
   </div>
 </template>
 
 <script setup>
-import { ref, watch, nextTick, onMounted, computed } from 'vue'
+import { ref, watch, nextTick, onBeforeUnmount, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NIcon, NModal, NSpin, NDrawer, useMessage } from 'naive-ui'
-import { AddOutline, SearchOutline } from '@vicons/ionicons5'
+import { NButton, NSpin, NDrawer, useMessage } from 'naive-ui'
+import { useMediaQuery } from '@vueuse/core'
 import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
 import { useUiStore } from '@/stores/ui'
@@ -120,6 +116,7 @@ import ChatMessage from '@/components/chat/ChatMessage.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
 import ChatWelcome from '@/components/chat/ChatWelcome.vue'
 import SearchResultPanel from '@/components/search/SearchResultPanel.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 
 const chatStore = useChatStore()
 const settingsStore = useSettingsStore()
@@ -133,17 +130,40 @@ const msgList = ref(null)
 const welcomeInputRef = ref(null)
 
 const showWelcome = computed(() =>
-  !chatStore.messages.length && !chatStore.isStreaming && !chatStore.isConversationLoading
+  !chatStore.currentConvId &&
+  !chatStore.messages.length &&
+  !chatStore.isStreaming &&
+  !chatStore.isConversationLoading &&
+  !chatStore.conversationLoadError
 )
 const siteName = computed(() => siteStore.site_title || '知识工作台')
 const userName = computed(() => authStore.user?.display_name || authStore.user?.username || '')
+const conversationLoadErrorMessage = computed(() => {
+  const error = chatStore.conversationLoadError
+  if (error?.status === 403) return '当前账号没有查看这段会话的权限。'
+  if (error?.status && error.status >= 500) return '服务暂时无法读取对话内容，请稍后重新加载。'
+  if (!error?.status) return '无法连接后端服务或网络异常，请确认后端已启动后重新加载。'
+  return error?.detail || '网络连接或服务响应异常。已保留当前链接，你可以重新加载或新建对话。'
+})
+const conversationLoadErrorMeta = computed(() => {
+  const error = chatStore.conversationLoadError
+  if (error?.status) return `请求状态：HTTP ${error.status}`
+  if (error?.code === 'ECONNABORTED') return '请求状态：连接超时'
+  if (error?.code) return `请求状态：${error.code}`
+  return ''
+})
 
-// 检索结果默认收起：桌面端控制右栏，移动端控制抽屉
-const showResults = ref(false)
+// 检索结果默认收起：顶栏控制开关；只有超宽屏才常驻右栏，其他尺寸用抽屉保留主内容宽度。
+const isResultsInline = useMediaQuery('(min-width: 1280px)')
 
-// 从历史会话回到欢迎态时收起右侧检索信息；用户仍可在欢迎态手动展开查看。
+// 从历史会话回到欢迎态时收起右侧检索信息，避免上一次问答的命中内容遗留在新会话里。
 watch(showWelcome, visible => {
-  if (visible) showResults.value = false
+  if (visible) closeResults()
+})
+
+// 断点切换时不把已打开的固定栏突然变成抽屉（或反向），由用户按需重新打开。
+watch(isResultsInline, () => {
+  closeResults()
 })
 
 function normalizeConversationId(value) {
@@ -162,8 +182,21 @@ function replaceConversationInRoute(conversationId) {
   router.replace({ name: 'chat', query }).catch(() => {})
 }
 
+// 来源文档预览状态必须先于带 immediate 的路由监听器初始化。
+// 否则刷新深链时 restoreConversationFromRoute() 会先调用 resetPreview()，
+// 而 previewRequestId 仍处于 TDZ（暂时性死区）。
+const showPreview = ref(false)
+const previewLoading = ref(false)
+const previewTitle = ref('')
+const previewContent = ref('')
+const previewRendered = computed(() => renderDocMarkdown(previewContent.value))
+let previewRequestId = 0
+
 // 地址栏是当前会话的可恢复来源：刷新、复制链接、浏览器前进/后退都能回到同一段对话。
+let routeRestoreRequestId = 0
+
 async function restoreConversationFromRoute(value) {
+  const requestId = ++routeRestoreRequestId
   const conversationId = normalizeConversationId(value)
   if (chatStore.isStreaming) {
     replaceConversationInRoute(chatStore.currentConvId)
@@ -175,17 +208,38 @@ async function restoreConversationFromRoute(value) {
       replaceConversationInRoute(null)
     }
     if (chatStore.currentConvId || chatStore.messages.length || chatStore.isConversationLoading) {
-      chatStore.newConversation()
+      openNewConversation()
     }
     return
   }
 
-  if (conversationId === chatStore.currentConvId && !chatStore.isConversationLoading) return
+  // 正常的同一路由重复触发无需重复请求；但错误态必须允许用户点击「重新加载」再次请求。
+  if (
+    conversationId === chatStore.currentConvId &&
+    !chatStore.isConversationLoading &&
+    !chatStore.conversationLoadError
+  ) return
+
+  // 这两项仅是当前页面 UI 清理，不属于历史接口请求；不要把任何 UI 运行时错误
+  // 伪装成“历史对话无法加载”。
+  closeResults()
+  resetPreview()
   try {
     await chatStore.loadConversation(conversationId)
-  } catch {
-    msg.error('该历史对话无法加载，已回到新对话')
-    replaceConversationInRoute(null)
+  } catch (error) {
+    // 路由已切换时，旧请求的失败不能覆盖用户刚刚打开的新会话。
+    if (requestId !== routeRestoreRequestId || normalizeConversationId(route.query.conversation) !== conversationId) return
+
+    const status = Number(error?.response?.status)
+    // 只有明确不存在或链接格式无效时才清空 URL；网络、403、5xx 都应保留深链供重试。
+    if (status === 404 || status === 422) {
+      msg.warning('该历史对话不存在或链接已失效，已回到新对话')
+      openNewConversation()
+      return
+    }
+
+    console.error('[chat] 加载历史对话失败', { conversationId, status, error })
+    msg.error('历史对话暂时无法加载，已保留当前链接，可重新加载重试')
   }
 }
 
@@ -196,177 +250,184 @@ watch(() => chatStore.currentConvId, conversationId => {
   replaceConversationInRoute(conversationId)
 })
 
-// 来源文档只读预览
-const showPreview = ref(false)
-const previewLoading = ref(false)
-const previewTitle = ref('')
-const previewContent = ref('')
-const previewRendered = computed(() => renderDocMarkdown(previewContent.value))
-
 async function openSourcePreview(src) {
   if (!src?.kb_id || !src?.doc_id) {
     msg.warning('该来源缺少文档信息，无法预览')
     return
   }
+  const requestId = ++previewRequestId
   showPreview.value = true
   previewLoading.value = true
   previewTitle.value = src.filename || '文档预览'
   previewContent.value = ''
   try {
     const doc = await getDocument(src.kb_id, src.doc_id)
+    if (requestId !== previewRequestId) return
     previewContent.value = doc.raw_content || '（暂无可预览内容）'
   } catch {
+    if (requestId !== previewRequestId) return
     msg.error('加载文档内容失败')
     showPreview.value = false
   } finally {
-    previewLoading.value = false
+    if (requestId === previewRequestId) previewLoading.value = false
   }
 }
 
-function scrollToBottom() {
+function closePreview() {
+  if (previewLoading.value) return
+  resetPreview()
+}
+
+function resetPreview() {
+  previewRequestId += 1
+  showPreview.value = false
+  previewLoading.value = false
+  previewContent.value = ''
+}
+
+function closeResults() {
+  ui.closeChatSearch()
+}
+
+function updateResultsDrawer(show) {
+  ui.chatSearchOpen = show
+}
+
+function openNewConversation() {
+  closeResults()
+  resetPreview()
+  chatStore.newConversation()
+  replaceConversationInRoute(null)
+}
+
+function retryConversationLoad() {
+  const conversationId = normalizeConversationId(route.query.conversation) || normalizeConversationId(chatStore.currentConvId)
+  if (!conversationId) {
+    openNewConversation()
+    return
+  }
+  restoreConversationFromRoute(conversationId)
+}
+
+const autoFollowLatest = ref(true)
+const AUTO_SCROLL_BOTTOM_THRESHOLD = 96
+let scrollFrameId = null
+let scrollQueued = false
+let forceScrollQueued = false
+
+function isNearMessageListBottom() {
+  const list = msgList.value
+  if (!list) return true
+  return list.scrollHeight - list.scrollTop - list.clientHeight <= AUTO_SCROLL_BOTTOM_THRESHOLD
+}
+
+function handleMessageScroll() {
+  autoFollowLatest.value = isNearMessageListBottom()
+}
+
+// 流式增量会非常频繁：一帧最多滚动一次；用户上翻后不再强行把视角拉回底部。
+function scheduleScrollToBottom({ force = false } = {}) {
+  if (!force && !autoFollowLatest.value) return
+  forceScrollQueued ||= force
+  if (scrollQueued) return
+  scrollQueued = true
+
   nextTick(() => {
-    if (msgList.value) msgList.value.scrollTop = msgList.value.scrollHeight
+    scrollFrameId = requestAnimationFrame(() => {
+      scrollFrameId = null
+      scrollQueued = false
+      const shouldScroll = forceScrollQueued || autoFollowLatest.value
+      forceScrollQueued = false
+      if (!shouldScroll || !msgList.value) return
+      msgList.value.scrollTop = msgList.value.scrollHeight
+    })
   })
 }
 
 // 进入页面（重新挂载）时，已有历史消息也直接定位到最新一条，而不是停在最早；
 // 同时拉取系统设置，确保「显示参考来源」开关在刷新后仍生效
 onMounted(() => {
-  scrollToBottom()
+  scheduleScrollToBottom({ force: true })
   settingsStore.fetch()
 })
 
-// 新增消息时滚到底
-watch(() => chatStore.messages.length, scrollToBottom)
+onBeforeUnmount(() => {
+  if (scrollFrameId !== null) cancelAnimationFrame(scrollFrameId)
+  closeResults()
+})
 
-// 切换会话时滚到底（消息条数恰好相同时 length 不变，这里兜底）
-watch(() => chatStore.currentConvId, scrollToBottom)
+// 新增消息、切换会话和主动发送都会回到底部；正常流式输出只在用户仍停留在底部时跟随。
+watch(() => chatStore.messages.length, () => scheduleScrollToBottom())
+watch(() => chatStore.currentConvId, () => {
+  autoFollowLatest.value = true
+  scheduleScrollToBottom({ force: true })
+})
+watch(() => chatStore.isStreaming, (isStreaming, wasStreaming) => {
+  if (isStreaming && !wasStreaming) {
+    autoFollowLatest.value = true
+    scheduleScrollToBottom({ force: true })
+  }
+})
 
-// 流式输出时持续滚到底
-watch(() => chatStore.messages[chatStore.messages.length - 1]?.content, scrollToBottom)
+watch(() => chatStore.messages[chatStore.messages.length - 1]?.content, () => scheduleScrollToBottom())
 
-function handleRetry() {
+function handleRetry(answerMessage) {
+  if (chatStore.isStreaming) return
   const msgs = chatStore.messages
-  const lastUser = [...msgs].reverse().find(m => m.role === 'user')
-  if (lastUser) chatStore.sendMessage(lastUser.content)
+  const answerIndex = msgs.findIndex(message => message.id === answerMessage?.id)
+  const targetUser = answerIndex > -1
+    ? [...msgs.slice(0, answerIndex)].reverse().find(message => message.role === 'user')
+    : null
+  if (!targetUser?.content) {
+    msg.warning('未找到这条回答对应的问题')
+    return
+  }
+  autoFollowLatest.value = true
+  chatStore.sendMessage(targetUser.content)
 }
 
 function setWelcomeQuestion(question) {
   welcomeInputRef.value?.setText(question)
 }
 
-function startNewConversation() {
-  showResults.value = false
-  if (chatStore.isStreaming) return
-
-  const query = { ...route.query }
-  if (!Object.prototype.hasOwnProperty.call(query, 'conversation')) {
-    chatStore.newConversation()
-    return
-  }
-  delete query.conversation
-  router.push({ name: 'chat', query }).catch(() => {})
-}
 </script>
 
 <style scoped>
-.chat-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 58px;
-  padding: 0 20px;
-  border-bottom: 1px solid #e7edf5;
-  background: rgba(255, 255, 255, .82);
-  backdrop-filter: blur(12px);
+.chat-conversation-load-error {
+  width: min(100%, 480px);
+  padding: 24px;
+  color: var(--ui-text);
+  text-align: center;
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-card);
 }
 
-.chat-toolbar__leading {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 10px;
-}
-
-.chat-toolbar__context {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: #50637e;
-  font-size: 12px;
-  font-weight: 680;
-  letter-spacing: .015em;
-}
-
-.chat-toolbar__context-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #5a94eb;
-  box-shadow: 0 0 0 4px rgba(90, 148, 235, .12);
-}
-
-:deep(.chat-toolbar__new.n-button),
-:deep(.chat-toolbar__results.n-button) {
-  height: 34px;
-  border-radius: 10px;
-  font-size: 12px;
+.chat-conversation-load-error__title {
+  margin: 0;
+  font-size: 16px;
   font-weight: 650;
-  letter-spacing: .01em;
+  line-height: 1.5;
 }
 
-:deep(.chat-toolbar__new.n-button) {
-  box-shadow: 0 7px 15px rgba(60, 118, 220, .24);
+.chat-conversation-load-error__description {
+  margin: 8px 0 0;
+  color: var(--ui-text-secondary);
+  font-size: 13px;
+  line-height: 1.65;
 }
 
-:deep(.chat-toolbar__results.n-button) {
-  --n-color: #f7f9fc !important;
-  --n-color-hover: #eef4fe !important;
-  --n-color-pressed: #e6effd !important;
-  --n-border: 1px solid #e0e8f2 !important;
-  --n-border-hover: 1px solid #bcd0ef !important;
-  --n-border-pressed: 1px solid #9cbce8 !important;
-  --n-text-color: #536781 !important;
-  --n-text-color-hover: #3f70b9 !important;
-  --n-text-color-pressed: #315e9f !important;
+.chat-conversation-load-error__meta {
+  margin: 8px 0 0;
+  color: var(--ui-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
-:deep(.chat-toolbar__results.is-active.n-button) {
-  --n-color: #eaf2ff !important;
-  --n-color-hover: #e4efff !important;
-  --n-border: 1px solid #c6d9f7 !important;
-  --n-text-color: #376ebd !important;
-}
-
-.dark .chat-toolbar {
-  border-color: #334155;
-  background: rgba(31, 41, 55, .84);
-}
-
-.dark .chat-toolbar__context { color: #afbdd0; }
-.dark .chat-toolbar__context-dot { background: #73a9fa; box-shadow: 0 0 0 4px rgba(115, 169, 250, .12); }
-
-.dark :deep(.chat-toolbar__results.n-button) {
-  --n-color: #263242 !important;
-  --n-color-hover: #2e3e55 !important;
-  --n-color-pressed: #334763 !important;
-  --n-border: 1px solid #3a4a62 !important;
-  --n-border-hover: 1px solid #54709a !important;
-  --n-border-pressed: 1px solid #6386b8 !important;
-  --n-text-color: #b3c1d4 !important;
-  --n-text-color-hover: #b9d3ff !important;
-  --n-text-color-pressed: #c7dcff !important;
-}
-
-.dark :deep(.chat-toolbar__results.is-active.n-button) {
-  --n-color: #263d62 !important;
-  --n-border: 1px solid #42679f !important;
-  --n-text-color: #a9caff !important;
-}
-
-@media (max-width: 639px) {
-  .chat-toolbar { min-height: 54px; padding: 0 12px; }
-  .chat-toolbar__context { font-size: 11px; }
-  :deep(.chat-toolbar__results.n-button) { padding-right: 9px; padding-left: 9px; }
+.chat-conversation-load-error__actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
 }
 </style>

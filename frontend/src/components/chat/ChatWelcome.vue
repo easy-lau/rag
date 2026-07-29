@@ -8,7 +8,7 @@
           <n-icon :size="20"><ChatbubbleEllipsesOutline /></n-icon>
         </div>
         <div class="min-w-0">
-          <p class="text-xs font-semibold tracking-[0.16em] text-blue-600 uppercase dark:text-blue-300">智能问答工作台</p>
+          <p class="text-xs font-semibold tracking-[0.16em] text-blue-600 uppercase dark:text-blue-300">智能助手</p>
           <h2 id="chat-welcome-title" class="mt-1 text-xl font-semibold tracking-tight text-gray-900 dark:text-white sm:text-2xl">
             {{ greeting }}，今天想解决什么问题？
           </h2>

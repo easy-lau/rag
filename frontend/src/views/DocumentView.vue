@@ -1,12 +1,13 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
-      <div class="flex items-center gap-1.5">
-        <n-button text size="small" title="返回知识库管理" @click="$router.push({ name: 'knowledge' })">
-          <template #icon><n-icon><ArrowBackOutline /></n-icon></template>
-        </n-button>
-      </div>
-      <div class="flex flex-wrap items-center gap-2">
+    <div class="max-w-6xl mx-auto space-y-5">
+      <PageHeader title="文档管理" description="上传、审阅和维护知识库中的文档内容与检索标签。">
+        <template #actions>
+          <div class="flex flex-wrap items-center gap-2">
+            <n-button secondary size="small" aria-label="返回知识库管理" @click="$router.push({ name: 'knowledge' })">
+              <template #icon><n-icon><ArrowBackOutline /></n-icon></template>
+              <span class="hidden sm:inline">返回知识库</span>
+            </n-button>
         <n-select v-model:value="selectedKbId" :options="kbOptions" placeholder="选择知识库" class="w-48" clearable />
         <template v-if="authStore.hasPerm('doc:write')">
           <n-button :disabled="!selectedKbId" @click="showUpload = true">
@@ -22,36 +23,39 @@
             手动输入
           </n-button>
         </template>
-      </div>
-    </div>
+          </div>
+        </template>
+      </PageHeader>
 
     <!-- 未选知识库时的友好空状态（正常从知识库卡片进入会带 kb，不会到这里） -->
-    <div v-if="!selectedKbId" class="flex flex-col items-center justify-center py-24 text-gray-400">
+    <SurfaceCard v-if="!selectedKbId" class="flex flex-col items-center justify-center py-24 text-center">
       <n-icon :size="40" class="mb-3"><LibraryOutline /></n-icon>
       <p class="text-sm text-gray-500 dark:text-gray-400 mb-1">请选择一个知识库来管理其文档</p>
       <p class="text-xs mb-4">文档归属于知识库，可在上方下拉选择，或从知识库管理进入</p>
       <n-button size="small" @click="$router.push({ name: 'knowledge' })">前往知识库管理</n-button>
-    </div>
+    </SurfaceCard>
 
     <template v-else>
       <div v-if="canWrite && checkedRowKeys.length" class="flex items-center gap-3 mb-3">
         <span class="text-sm text-gray-500 dark:text-gray-400">已选 {{ checkedRowKeys.length }} 项</span>
-        <n-button size="small" type="error" @click="handleBatchDelete">
+        <n-button size="small" type="error" @click="openBatchDelete">
           <template #icon><n-icon><TrashOutline /></n-icon></template>
           批量删除
         </n-button>
         <n-button size="small" text @click="checkedRowKeys = []">取消选择</n-button>
       </div>
-      <n-data-table
-        :columns="columns" :data="docs" :loading="loading"
-        :row-key="rowKey" v-model:checked-row-keys="checkedRowKeys"
-        :pagination="pagination" :scroll-x="ui.isMobile ? 1300 : undefined"
-        class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden"
-      />
+      <SurfaceCard padding="none" class="overflow-hidden">
+        <n-data-table
+          :columns="columns" :data="docs" :loading="loading"
+          :row-key="rowKey" v-model:checked-row-keys="checkedRowKeys"
+          :pagination="pagination" :scroll-x="ui.isCompact ? 1040 : undefined"
+          class="admin-data-table"
+        />
+      </SurfaceCard>
     </template>
 
     <!-- Upload modal -->
-    <n-modal v-model:show="showUpload" to="#app" preset="card" title="上传文档" style="width: 90vw; max-width: 480px" :mask-closable="!uploading">
+    <AppModal v-model:show="showUpload" title="上传文档" width="min(90vw, 480px)" :loading="uploading">
       <div class="relative">
         <div
           v-if="uploading"
@@ -90,10 +94,10 @@
           <n-button type="primary" :loading="uploading" @click="submitUpload">上传</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
 
     <!-- Image upload modal -->
-    <n-modal v-model:show="showImageUpload" to="#app" preset="card" title="上传图片" style="width: 90vw; max-width: 480px" :mask-closable="!imageUploading">
+    <AppModal v-model:show="showImageUpload" title="上传图片" width="min(90vw, 480px)" :loading="imageUploading">
       <div class="relative">
         <div
           v-if="imageUploading"
@@ -136,18 +140,23 @@
           <n-button type="primary" :loading="imageUploading" @click="submitImageUpload">上传识别</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
 
     <!-- Markdown text editor modal -->
-    <n-modal v-model:show="showTextEditor" to="#app" :mask-closable="false" :auto-focus="false">
+    <n-modal
+      v-model:show="showTextEditor"
+      to="#app"
+      :mask-closable="false"
+      :close-on-esc="!submittingText"
+    >
       <div
-        class="flex flex-col bg-white dark:bg-gray-800 rounded-xl shadow-2xl overflow-hidden"
+        class="document-editor-modal flex flex-col bg-white dark:bg-gray-800 rounded-[var(--ui-radius-card)] shadow-2xl overflow-hidden"
         style="width: 92vw; max-width: 1240px; height: 86vh"
       >
         <!-- Header -->
-        <div class="flex items-center justify-between px-6 py-3.5 border-b border-gray-200 dark:border-gray-700 shrink-0">
+        <div class="flex items-center justify-between px-4 sm:px-6 py-3.5 border-b border-gray-200 dark:border-gray-700 shrink-0">
           <span class="text-base font-semibold text-gray-800 dark:text-gray-100">{{ editingDocId ? '编辑文档' : '手动输入文档' }}</span>
-          <n-button text @click="showTextEditor = false">
+          <n-button text aria-label="关闭文档编辑器" :disabled="submittingText" @click="showTextEditor = false">
             <template #icon><n-icon :size="20"><CloseOutline /></n-icon></template>
           </n-button>
         </div>
@@ -155,42 +164,42 @@
         <!-- Processing overlay -->
         <div
           v-if="submittingText"
-          class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm rounded-xl"
+          class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm rounded-[var(--ui-radius-card)]"
         >
           <n-spin size="large" />
           <span class="text-sm text-gray-600 dark:text-gray-300 font-medium">{{ processingStatus }}</span>
         </div>
 
         <!-- Body -->
-        <div class="flex-1 min-h-0 flex flex-col gap-3 px-6 py-4">
+        <div class="flex-1 min-h-0 flex flex-col gap-3 px-4 sm:px-6 py-4">
           <n-input v-model:value="textTitle" placeholder="文档标题" class="shrink-0" size="large" />
 
           <!-- 数据来源链接：开启后，问答检索的参考来源会把该文档标题渲染成可点击外链 -->
-          <div class="flex items-center gap-3 shrink-0">
-            <span class="w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">数据来源链接</span>
+          <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3 shrink-0">
+            <span class="sm:w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">数据来源链接</span>
             <n-switch v-model:value="sourceUrlEnabled" size="small" />
             <n-input
               v-if="sourceUrlEnabled"
               v-model:value="sourceUrl"
               placeholder="https:// 原文链接，问答来源将显示为可点击标题"
               size="small"
-              class="flex-1"
+              class="w-full sm:flex-1"
             />
           </div>
 
           <!-- 文档标签：问答时用户勾选这些标签会让本文档命中的片段排序上浮（软加权） -->
-          <div class="flex items-center gap-3 shrink-0">
-            <span class="w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">标签</span>
+          <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3 shrink-0">
+            <span class="sm:w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">标签</span>
             <n-select
               v-model:value="editTags" :options="tagSelectOptions"
               multiple filterable tag clearable size="small"
-              placeholder="选择已有标签，或输入后回车新建" class="flex-1"
+              placeholder="选择已有标签，或输入后回车新建" class="w-full sm:flex-1"
             />
           </div>
 
           <!-- 原图对照：上传图片转写而来的文档，展示原图便于校对识别结果 -->
-          <div v-if="editingImageUrl" class="flex items-center gap-3 shrink-0">
-            <span class="w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">原图对照</span>
+          <div v-if="editingImageUrl" class="flex flex-wrap items-center gap-3 shrink-0">
+            <span class="sm:w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">原图对照</span>
             <n-image
               :src="editingImageUrl" width="56" height="56" object-fit="cover"
               class="rounded border border-gray-200 dark:border-gray-700"
@@ -198,9 +207,26 @@
             <span class="text-xs text-gray-400">点击图片可放大，对照原图校对识别结果</span>
           </div>
 
-          <div class="grid grid-cols-2 gap-4 flex-1 min-h-0">
+          <div class="flex lg:hidden shrink-0 rounded-[var(--ui-radius-control)] border border-gray-200 dark:border-gray-700 p-1 text-xs">
+            <button
+              type="button"
+              class="flex-1 rounded-lg px-3 py-2 transition-colors"
+              :class="mobileEditorPane === 'editor' ? 'bg-blue-500 text-white shadow-sm' : 'text-gray-500 dark:text-gray-400'"
+              :aria-pressed="mobileEditorPane === 'editor'"
+              @click="mobileEditorPane = 'editor'"
+            >编辑</button>
+            <button
+              type="button"
+              class="flex-1 rounded-lg px-3 py-2 transition-colors"
+              :class="mobileEditorPane === 'preview' ? 'bg-blue-500 text-white shadow-sm' : 'text-gray-500 dark:text-gray-400'"
+              :aria-pressed="mobileEditorPane === 'preview'"
+              @click="mobileEditorPane = 'preview'"
+            >预览</button>
+          </div>
+
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1 min-h-0">
             <!-- Editor -->
-            <div class="flex flex-col min-h-0">
+            <div :class="[mobileEditorPane === 'editor' ? 'flex' : 'hidden', 'lg:flex', 'flex-col min-h-0']">
               <div class="flex items-center gap-1.5 text-xs font-medium text-gray-500 mb-1.5 px-1 shrink-0">
                 <span class="w-1.5 h-1.5 rounded-full bg-blue-500"></span>Markdown 编辑
               </div>
@@ -212,7 +238,7 @@
               />
             </div>
             <!-- Preview -->
-            <div class="flex flex-col min-h-0">
+            <div :class="[mobileEditorPane === 'preview' ? 'flex' : 'hidden', 'lg:flex', 'flex-col min-h-0']">
               <div class="flex items-center justify-between mb-1.5 px-1 shrink-0">
                 <div class="flex items-center gap-1.5 text-xs font-medium text-gray-500">
                   <span class="w-1.5 h-1.5 rounded-full" :class="previewMode === 'markdown' ? 'bg-green-500' : 'bg-purple-500'"></span>
@@ -261,10 +287,10 @@
         </div>
 
         <!-- Footer -->
-        <div class="flex items-center justify-between px-6 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between px-4 sm:px-6 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
           <span class="text-xs text-gray-400">{{ textContent.length }} 字符 · 按标题自动分块入库</span>
-          <div class="flex gap-2">
-            <n-button @click="showTextEditor = false">取消</n-button>
+          <div class="flex justify-end gap-2">
+            <n-button :disabled="submittingText" @click="showTextEditor = false">取消</n-button>
             <n-button
               type="primary"
               :loading="submittingText"
@@ -279,7 +305,7 @@
     </n-modal>
 
     <!-- 标签快捷编辑：仅改标签，不重新解析/嵌入文档 -->
-    <n-modal v-model:show="showTagEditor" to="#app" preset="card" title="编辑标签" style="width: 90vw; max-width: 440px">
+    <AppModal v-model:show="showTagEditor" title="编辑标签" width="min(90vw, 440px)" :loading="savingTags">
       <div class="space-y-2">
         <div class="text-xs text-gray-500">
           {{ tagEditDoc?.filename }}
@@ -299,14 +325,25 @@
           <n-button type="primary" :loading="savingTags" @click="saveTags">保存</n-button>
         </div>
       </template>
-    </n-modal>
+    </AppModal>
+
+    <DangerConfirm
+      v-model:show="showDeleteConfirm"
+      :title="deleteConfirmTitle"
+      :subject="deleteConfirmSubject"
+      :description="deleteConfirmDescription"
+      :loading="deleting"
+      @confirm="confirmDelete"
+      @cancel="deleteTarget = null"
+    />
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, reactive, computed, onMounted, watch, h } from 'vue'
 import { useRoute } from 'vue-router'
-import { NButton, NIcon, NSelect, NDataTable, NModal, NUpload, NUploadDragger, NTag, NInput, NSpin, NSwitch, NImage, useMessage, useDialog } from 'naive-ui'
+import { NButton, NIcon, NSelect, NDataTable, NModal, NUpload, NUploadDragger, NTag, NInput, NSpin, NSwitch, NImage, useMessage } from 'naive-ui'
 import { CloudUploadOutline, TrashOutline, CreateOutline, CloseOutline, PencilOutline, LibraryOutline, ArrowBackOutline, ImageOutline, PricetagsOutline } from '@vicons/ionicons5'
 import { renderDocMarkdown } from '@/utils/markdown'
 import { useKnowledgeStore } from '@/stores/knowledge'
@@ -314,19 +351,36 @@ import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
 import { getAllDocuments, uploadDocument, uploadImageDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, updateTextDocument, updateDocumentTags } from '@/api/document'
 import { getDocumentTags } from '@/api/knowledge'
+import PageHeader from '@/components/ui/PageHeader.vue'
+import SurfaceCard from '@/components/ui/SurfaceCard.vue'
+import RowActions from '@/components/ui/RowActions.vue'
+import DangerConfirm from '@/components/ui/DangerConfirm.vue'
+import AppModal from '@/components/ui/AppModal.vue'
 
 const route = useRoute()
 const kbStore = useKnowledgeStore()
 const authStore = useAuthStore()
 const ui = useUiStore()
 const msg = useMessage()
-const dialog = useDialog()
 const canWrite = computed(() => authStore.hasPerm('doc:write'))
 const selectedKbId = ref(null)
 const docs = ref([])
 const loading = ref(false)
 const checkedRowKeys = ref([])
 const rowKey = (row) => row.id
+const showDeleteConfirm = ref(false)
+const deleteTarget = ref(null)
+const deleting = ref(false)
+const deleteConfirmTitle = computed(() => deleteTarget.value?.kind === 'batch' ? '永久删除选中文档？' : '永久删除文档？')
+const deleteConfirmSubject = computed(() => {
+  if (!deleteTarget.value) return ''
+  if (deleteTarget.value.kind === 'batch') return `已选择 ${deleteTarget.value.ids.length} 个文档`
+  return deleteTarget.value.row.filename
+})
+const deleteConfirmDescription = computed(() => deleteTarget.value?.kind === 'batch'
+  ? '删除后，所选文档及其已生成的检索内容都无法恢复。'
+  : '删除后，该文档及其已生成的检索内容都无法恢复。'
+)
 const pagination = reactive({
   page: 1,
   pageSize: 10,                      // 默认每页 10 条
@@ -387,6 +441,7 @@ const editTags = ref([])
 const renderedMarkdown = computed(() => renderDocMarkdown(textContent.value || ''))
 
 const previewMode = ref('markdown')
+const mobileEditorPane = ref('editor')
 
 function _splitText(text) {
   const CHUNK_SIZE = 500
@@ -449,21 +504,25 @@ const statusTag = (s) => {
   return h(NTag, { type, size: 'small' }, () => text)
 }
 
+const fmtTime = value => value ? new Intl.DateTimeFormat('zh-CN', {
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+}).format(new Date(value)).replaceAll('/', '-') : '—'
+
 const columns = computed(() => [
-  ...(canWrite.value ? [{ type: 'selection' }] : []),
-  { title: '文件名', key: 'filename', ellipsis: { tooltip: true } },
+  ...(canWrite.value ? [{ type: 'selection', align: 'center', titleAlign: 'center' }] : []),
+  { title: '文件名', key: 'filename', minWidth: 190, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
   {
-    title: '标签', key: 'tags', minWidth: 140,
+    title: '标签', key: 'tags', minWidth: 150, align: 'left', titleAlign: 'left',
     render: row => (row.tags && row.tags.length)
-      ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:4px;justify-content:center' },
+      ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:4px' },
           row.tags.map(t => h(NTag, { size: 'small', type: 'info', bordered: false }, () => t)))
       : h('span', { class: 'text-xs text-gray-400' }, '—')
   },
-  { title: '类型', key: 'file_type', width: 80 },
-  { title: '分块数', key: 'chunk_count', width: 80 },
-  { title: '状态', key: 'status', width: 100, render: row => row.is_active ? statusTag(row.status) : h(NTag, { type: 'default', size: 'small' }, () => '停用') },
+  { title: '类型', key: 'file_type', width: 82, align: 'center', titleAlign: 'center' },
+  { title: '分块数', key: 'chunk_count', width: 82, align: 'center', titleAlign: 'center' },
+  { title: '状态', key: 'status', width: 96, align: 'center', titleAlign: 'center', render: row => row.is_active ? statusTag(row.status) : h(NTag, { type: 'default', size: 'small' }, () => '停用') },
   {
-    title: '启用', key: 'is_active', width: 80,
+    title: '启用', key: 'is_active', width: 80, align: 'center', titleAlign: 'center',
     render: row => h(NSwitch, {
       value: row.is_active,
       size: 'small',
@@ -471,26 +530,28 @@ const columns = computed(() => [
       onUpdateValue: () => handleToggle(row),
     })
   },
-  { title: '上传时间', key: 'created_at', width: 150, render: r => new Date(r.created_at).toLocaleString('zh-CN') },
+  { title: '上传时间', key: 'created_at', width: 168, align: 'center', titleAlign: 'center', render: r => fmtTime(r.created_at) },
   // 未实际修改过时，修改时间默认取创建时间
-  { title: '最近修改', key: 'updated_at', width: 150, render: r => new Date(r.updated_at || r.created_at).toLocaleString('zh-CN') },
-  { title: '创建人', key: 'created_by_name', width: 100, render: r => r.created_by_name || '—' },
+  { title: '最近修改', key: 'updated_at', width: 168, align: 'center', titleAlign: 'center', render: r => fmtTime(r.updated_at || r.created_at) },
+  { title: '创建人', key: 'created_by_name', width: 100, align: 'left', titleAlign: 'left', render: r => r.created_by_name || '—' },
   // 未实际修改过时，修改人默认取创建人
-  { title: '修改人', key: 'updated_by_name', width: 100, render: r => r.updated_by_name || r.created_by_name || '—' },
+  { title: '修改人', key: 'updated_by_name', width: 100, align: 'left', titleAlign: 'left', render: r => r.updated_by_name || r.created_by_name || '—' },
   {
-    title: '操作', key: 'actions', width: 120,
+    title: '操作', key: 'actions', width: 132, align: 'center', titleAlign: 'center',
     render: row => canWrite.value
-      ? h('div', { style: 'display:flex;gap:8px;align-items:center' }, [
-          h(NButton, { text: true, type: 'primary', size: 'small', title: '编辑标签', onClick: () => openTagEditor(row) },
+      ? h(RowActions, { label: `文档 ${row.filename} 操作` }, {
+          default: () => [
+          h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑标签', title: '编辑标签', onClick: () => openTagEditor(row) },
             { icon: () => h(NIcon, null, () => h(PricetagsOutline)) }),
-          h(NButton, { text: true, type: 'primary', size: 'small', title: '编辑内容', onClick: () => openEditEditor(row) },
+          h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑内容', title: '编辑内容', onClick: () => openEditEditor(row) },
             { icon: () => h(NIcon, null, () => h(PencilOutline)) }),
-          h(NButton, { text: true, type: 'error', size: 'small', title: '删除', onClick: () => handleDelete(row) },
+          h(NButton, { text: true, type: 'error', size: 'small', 'aria-label': '删除文档', title: '删除文档', onClick: () => openDelete(row) },
             { icon: () => h(NIcon, null, () => h(TrashOutline)) }),
-        ])
+          ],
+        })
       : h('span', { class: 'text-xs text-gray-400' }, '—')
   }
-].map(c => ({ ...c, titleAlign: 'center', align: 'center' })))  // 表头 + 内容统一居中
+])
 
 onMounted(async () => {
   await kbStore.fetchList()
@@ -512,31 +573,30 @@ async function handleToggle(row) {
   msg.success(updated.is_active ? '文档已启用' : '文档已停用')
 }
 
-function handleDelete(row) {
-  dialog.warning({
-    title: '删除文档',
-    content: `确定删除文档「${row.filename}」？删除后不可恢复。`,
-    positiveText: '删除',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      await deleteDocument(selectedKbId.value, row.id)
-      docs.value = docs.value.filter(d => d.id !== row.id)
-      checkedRowKeys.value = checkedRowKeys.value.filter(id => id !== row.id)
-      msg.success('删除成功')
-      await loadKbTags()
-    },
-  })
+function openDelete(row) {
+  deleteTarget.value = { kind: 'single', row }
+  showDeleteConfirm.value = true
 }
 
-function handleBatchDelete() {
+function openBatchDelete() {
   const ids = [...checkedRowKeys.value]
   if (!ids.length) return
-  dialog.warning({
-    title: '批量删除文档',
-    content: `确定删除选中的 ${ids.length} 个文档？删除后不可恢复。`,
-    positiveText: '删除',
-    negativeText: '取消',
-    onPositiveClick: async () => {
+  deleteTarget.value = { kind: 'batch', ids }
+  showDeleteConfirm.value = true
+}
+
+async function confirmDelete() {
+  const target = deleteTarget.value
+  if (!target || !selectedKbId.value) return
+  deleting.value = true
+  try {
+    if (target.kind === 'single') {
+      await deleteDocument(selectedKbId.value, target.row.id)
+      docs.value = docs.value.filter(d => d.id !== target.row.id)
+      checkedRowKeys.value = checkedRowKeys.value.filter(id => id !== target.row.id)
+      msg.success('文档已删除')
+    } else {
+      const ids = target.ids
       const results = await Promise.allSettled(ids.map(id => deleteDocument(selectedKbId.value, id)))
       const okIds = ids.filter((_, i) => results[i].status === 'fulfilled')
       const okSet = new Set(okIds)
@@ -545,9 +605,15 @@ function handleBatchDelete() {
       const failed = ids.length - okIds.length
       if (failed) msg.warning(`${okIds.length} 个已删除，${failed} 个删除失败`)
       else msg.success(`已删除 ${okIds.length} 个文档`)
-      await loadKbTags()
-    },
-  })
+    }
+    await loadKbTags()
+    showDeleteConfirm.value = false
+    deleteTarget.value = null
+  } catch (error) {
+    msg.error(error?.response?.data?.detail || '删除失败，请重试')
+  } finally {
+    deleting.value = false
+  }
 }
 
 async function submitUpload() {
@@ -589,6 +655,7 @@ function handleUpload({ file, onFinish }) { onFinish() }
 
 function openTextEditor() {
   editingDocId.value = null
+  mobileEditorPane.value = 'editor'
   editingImageUrl.value = null
   textTitle.value = ''
   textContent.value = ''
@@ -602,6 +669,7 @@ async function openEditEditor(row) {
   try {
     const doc = await getDocument(selectedKbId.value, row.id)
     editingDocId.value = row.id
+    mobileEditorPane.value = 'editor'
     editingImageUrl.value = doc.image_url || null
     textTitle.value = doc.filename
     textContent.value = doc.raw_content || ''

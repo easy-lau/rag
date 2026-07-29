@@ -1,43 +1,47 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-3xl space-y-4">
-      <n-input v-model:value="query" type="textarea" :rows="3" placeholder="输入测试查询语句..." />
-      <div class="flex flex-wrap gap-3">
-        <n-select v-model:value="config.method" :options="methodOptions" class="w-48" />
-        <n-input-number v-model:value="config.top_k" :min="1" :max="20" class="w-28">
-          <template #prefix>Top K:</template>
-        </n-input-number>
-        <div class="flex items-center gap-1.5">
-          <span class="text-sm text-gray-600 dark:text-gray-400">重排</span>
-          <n-tooltip trigger="hover" placement="top">
-            <template #trigger>
-              <n-icon :size="15" class="text-gray-400 cursor-help"><HelpCircleOutline /></n-icon>
-            </template>
-            <div class="max-w-xs text-xs leading-relaxed">
-              重排（Rerank）：先快速召回一批候选片段，再用大模型逐条评估它们与查询的相关度并重新排序，把最相关的排前、剔除不相关的。<br>
-              · 开启：结果更精准，但多一次模型调用、略慢。<br>
-              · 关闭：直接用初步检索结果，更快但可能掺入不相关内容。
-            </div>
-          </n-tooltip>
-          <n-switch v-model:value="config.rerank" />
-        </div>
-        <n-select v-model:value="config.knowledge_base_ids" :options="kbOptions" multiple placeholder="选择知识库" class="w-52" />
-        <n-select
-          v-if="tagOptions.length"
-          v-model:value="config.tags" :options="tagOptions"
-          multiple clearable placeholder="标签（软加权，可选）" class="w-52"
-        />
-        <n-button type="primary" :loading="loading" @click="runSearch">开始检索</n-button>
-      </div>
-      <p v-if="tagOptions.length" class="text-xs text-gray-400 -mt-1">
-        勾选标签后再检索，可对比同一查询「选标签 vs 不选」的排序差异：命中标签的文档片段会被上浮（软加权，不排除其他结果）。
-      </p>
+    <div class="max-w-5xl mx-auto space-y-5">
+      <PageHeader title="检索测试" description="使用指定知识库、检索方式和标签，快速验证召回与重排效果。" />
 
-      <div v-if="results.length">
+      <SurfaceCard class="space-y-4">
+        <n-input v-model:value="query" type="textarea" :rows="3" placeholder="输入测试查询语句..." />
+        <div class="flex flex-wrap items-center gap-3">
+          <n-select v-model:value="config.method" :options="methodOptions" class="w-36" />
+          <n-input-number v-model:value="config.top_k" :min="1" :max="20" class="w-40">
+            <template #prefix>Top K:</template>
+          </n-input-number>
+          <div class="flex items-center gap-1.5">
+            <span class="text-sm text-gray-600 dark:text-gray-400">重排</span>
+            <n-tooltip trigger="hover" placement="top">
+              <template #trigger>
+                <n-icon :size="15" class="text-gray-400 cursor-help"><HelpCircleOutline /></n-icon>
+              </template>
+              <div class="max-w-xs text-xs leading-relaxed">
+                重排（Rerank）：先快速召回一批候选片段，再用大模型逐条评估它们与查询的相关度并重新排序，把最相关的排前、剔除不相关的。<br>
+                · 开启：结果更精准，但多一次模型调用、略慢。<br>
+                · 关闭：直接用初步检索结果，更快但可能掺入不相关内容。
+              </div>
+            </n-tooltip>
+            <n-switch v-model:value="config.rerank" />
+          </div>
+          <n-select v-model:value="config.knowledge_base_ids" :options="kbOptions" multiple placeholder="选择知识库" class="w-52" />
+          <n-select
+            v-if="tagOptions.length"
+            v-model:value="config.tags" :options="tagOptions"
+            multiple clearable placeholder="标签（软加权，可选）" class="w-52"
+          />
+          <n-button type="primary" :loading="loading" @click="runSearch">开始检索</n-button>
+        </div>
+        <p v-if="tagOptions.length" class="text-xs leading-5 text-gray-400">
+          勾选标签后再检索，可对比同一查询「选标签 vs 不选」的排序差异：命中标签的文档片段会被上浮（软加权，不排除其他结果）。
+        </p>
+      </SurfaceCard>
+
+      <SurfaceCard v-if="results.length" class="space-y-4">
         <div class="text-sm text-gray-500 mb-2">共 {{ results.length }} 条结果，耗时 {{ elapsed }}ms</div>
         <div class="space-y-3">
-          <div v-for="(r, i) in results" :key="r.id"
-            class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl p-4">
+          <article v-for="(r, i) in results" :key="r.id"
+            class="rounded-[var(--ui-radius-card)] border border-[var(--ui-border)] bg-[var(--ui-surface-muted)] p-4">
             <div class="flex items-center justify-between mb-2">
               <div class="flex items-center gap-2">
                 <span class="text-xs font-bold text-gray-400">#{{ i + 1 }}</span>
@@ -54,9 +58,9 @@
                 :bordered="false"
               >{{ t }}</n-tag>
             </div>
-          </div>
+          </article>
         </div>
-      </div>
+      </SurfaceCard>
     </div>
   </div>
 </template>
@@ -70,6 +74,8 @@ import { getDocumentTags } from '@/api/knowledge'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import ScoreTag from '@/components/common/ScoreTag.vue'
+import PageHeader from '@/components/ui/PageHeader.vue'
+import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 
 const kbStore = useKnowledgeStore()
 const query = ref('')

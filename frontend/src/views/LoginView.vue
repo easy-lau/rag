@@ -203,6 +203,24 @@ async function handleLogin() {
 .login-security-note { display: flex; justify-content: center; align-items: center; gap: 7px; margin-top: 24px; color: #9ba8ba; font-size: 11px; }.login-security-note__lock { position: relative; width: 10px; height: 8px; border: 1.3px solid #a5b2c3; border-radius: 2px; }.login-security-note__lock::before { content: ''; position: absolute; left: 1px; bottom: 6px; width: 5px; height: 5px; border: 1.3px solid #a5b2c3; border-bottom: 0; border-radius: 5px 5px 0 0; }
 .login-panel__footer { position: absolute; right: 32px; bottom: 25px; left: 32px; color: #a8b2c0; font-size: 11px; text-align: center; }
 
+/* 登录页有独立的品牌视觉，仍需跟随全局深色模式，避免 Naive 控件变暗而页面面板保持纯白。 */
+.dark .login-page { background: #0f1727; }
+.dark .login-page__glow--top { background: rgba(63, 119, 230, .16); }
+.dark .login-page__glow--bottom { background: rgba(51, 168, 163, .09); }
+.dark .login-shell { border-color: rgba(67, 86, 117, .8); background: #172235; box-shadow: 0 28px 80px rgba(0, 0, 0, .32), 0 3px 12px rgba(0, 0, 0, .18); }
+.dark .login-panel { background: #172235; }
+.dark .login-form-heading h2 { color: #edf3fc; }
+.dark .login-form-heading span { color: #9daec4; }
+.dark .login-panel :deep(.n-form-item-label) { color: #c0cede; }
+.dark .login-panel :deep(.n-input) { --n-border: 1px solid #3b4d67 !important; --n-border-hover: 1px solid #6796e9 !important; --n-border-focus: 1px solid #76a7f4 !important; --n-box-shadow-focus: 0 0 0 3px rgba(104, 157, 239, .16) !important; --n-color: #202d42 !important; --n-text-color: #e6eef8 !important; --n-placeholder-color: #7789a3 !important; }
+.dark .login-panel :deep(.n-input__input-el) { color: #e6eef8; }
+.dark .login-panel :deep(.n-input__placeholder) { color: #7789a3; }
+.dark .login-panel :deep(.n-input__prefix) { color: #91a8c8; }
+.dark .login-security-note { color: #8293aa; }
+.dark .login-security-note__lock, .dark .login-security-note__lock::before { border-color: #8a9bb1; }
+.dark .login-panel__mobile-brand { color: #dce8f8; }
+.dark .login-panel__footer { color: #73849a; }
+
 @media (max-width: 800px) { .login-page { display: block; overflow: auto; background: linear-gradient(155deg, #eef5ff, #f8fbff 50%, #f5f8fc); }.login-shell { width: 100%; min-height: 100%; display: block; border: 0; border-radius: 0; box-shadow: none; }.login-hero { display: none; }.login-panel { min-height: 100vh; padding: 28px 24px 68px; }.login-panel__inner { padding: 28px 0; }.login-panel__mobile-brand { display: flex; align-items: center; gap: 9px; margin-bottom: 64px; color: #203458; font-size: 15px; font-weight: 680; }.login-panel__mobile-brand img, .login-panel__mobile-mark { width: 30px; height: 30px; border-radius: 9px; object-fit: cover; }.login-panel__mobile-mark { display: grid; place-items: center; color: white; background: linear-gradient(135deg, #558ce9, #2460c3); font-size: 15px; }.login-panel__footer { bottom: 22px; } }
 @media (max-width: 430px) { .login-panel { padding-right: 20px; padding-left: 20px; }.login-panel__mobile-brand { margin-bottom: 48px; }.login-form-heading h2 { font-size: 26px; }.login-panel__footer { right: 20px; left: 20px; }.login-security-note { font-size: 10px; white-space: nowrap; } }
 </style>

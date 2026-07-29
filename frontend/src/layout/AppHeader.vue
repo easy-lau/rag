@@ -1,34 +1,79 @@
 <template>
   <header class="h-12 flex items-center justify-between px-4 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 shrink-0">
     <div class="flex items-center gap-2 min-w-0">
-      <n-button v-if="ui.isMobile" text size="small" title="菜单" @click="ui.mobileNavOpen = true">
+      <n-button
+        v-if="ui.isCompact"
+        text
+        size="small"
+        title="打开会话菜单"
+        aria-label="打开会话菜单"
+        :aria-expanded="ui.mobileNavOpen"
+        @click="ui.mobileNavOpen = true"
+      >
         <template #icon><n-icon :size="20"><MenuOutline /></n-icon></template>
       </n-button>
-      <div class="text-sm font-medium text-gray-700 dark:text-gray-200 truncate">
+      <div
+        v-if="isChatRoute"
+        class="app-header__chat-context"
+        :title="conversationTitle"
+        :aria-label="`当前会话：${conversationTitle}`"
+      >
+        <span class="app-header__chat-context-dot" aria-hidden="true"></span>
+        <span class="truncate">{{ conversationTitle }}</span>
+      </div>
+      <div v-else class="text-sm font-medium text-gray-700 dark:text-gray-200 truncate">
         {{ currentPageTitle }}
       </div>
     </div>
-    <div class="flex items-center gap-3">
-      <n-button text size="small" @click="ui.toggleTheme()">
+    <div class="flex items-center gap-2 sm:gap-3">
+      <n-button
+        v-if="isChatRoute"
+        class="app-header__chat-search"
+        :class="{ 'is-active': ui.chatSearchOpen }"
+        size="small"
+        :aria-label="ui.chatSearchOpen ? '收起检索结果' : '展开检索结果'"
+        :aria-expanded="ui.chatSearchOpen"
+        :title="ui.chatSearchOpen ? '收起检索结果' : '展开检索结果'"
+        @click="ui.toggleChatSearch()"
+      >
+        <template #icon><n-icon><SearchOutline /></n-icon></template>
+        <span class="hidden sm:inline">{{ ui.chatSearchOpen ? '收起检索' : '检索结果' }}</span>
+      </n-button>
+
+      <n-button text size="small" title="切换深浅色主题" aria-label="切换深浅色主题" @click="ui.toggleTheme()">
         <template #icon>
           <n-icon><MoonOutline v-if="ui.mode !== 'dark'" /><SunnyOutline v-else /></n-icon>
         </template>
       </n-button>
 
       <!-- 用户菜单：点击展开「修改密码 / 退出登录」 -->
-      <n-dropdown trigger="click" :options="userOptions" @select="handleSelect">
-        <div class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg px-2 py-1 transition-colors">
+      <n-dropdown
+        trigger="click"
+        :options="userOptions"
+        @select="handleSelect"
+      >
+        <button
+          type="button"
+          class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg px-2 py-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60"
+          aria-label="打开用户菜单"
+        >
           <div class="w-7 h-7 rounded-full bg-blue-500 flex items-center justify-center text-white text-xs">
             {{ (authStore.user?.display_name || authStore.user?.username || '用')[0] }}
           </div>
-          <span>{{ authStore.user?.display_name || authStore.user?.username || '用户' }}</span>
+          <span class="max-w-32 truncate">{{ authStore.user?.display_name || authStore.user?.username || '用户' }}</span>
           <n-icon :size="14" class="text-gray-400"><ChevronDownOutline /></n-icon>
-        </div>
+        </button>
       </n-dropdown>
     </div>
 
     <!-- 修改密码弹窗 -->
-    <n-modal v-model:show="showPwd" preset="card" title="修改密码" style="width: 90vw; max-width: 400px">
+    <AppModal
+      v-model:show="showPwd"
+      title="修改密码"
+      width="min(90vw, 400px)"
+      :loading="saving"
+      @close="closePasswordModal"
+    >
       <n-form ref="pwdFormRef" :model="pwdForm" :rules="pwdRules" label-placement="top">
         <n-form-item label="当前密码" path="old_password">
           <n-input v-model:value="pwdForm.old_password" type="password" show-password-on="click" placeholder="请输入当前密码" />
@@ -41,26 +86,27 @@
         </n-form-item>
       </n-form>
       <template #footer>
-        <div class="flex justify-end gap-2">
-          <n-button @click="showPwd = false">取消</n-button>
-          <n-button type="primary" :loading="saving" @click="handleChangePassword">确定</n-button>
-        </div>
+        <n-button :disabled="saving" @click="closePasswordModal">取消</n-button>
+        <n-button type="primary" :loading="saving" @click="handleChangePassword">确定</n-button>
       </template>
-    </n-modal>
+    </AppModal>
   </header>
 </template>
 
 <script setup>
 import { computed, ref, h } from 'vue'
 import { useRoute } from 'vue-router'
-import { NButton, NIcon, NDropdown, NModal, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
-import { MoonOutline, SunnyOutline, ChevronDownOutline, KeyOutline, LogOutOutline, MenuOutline } from '@vicons/ionicons5'
+import { NButton, NIcon, NDropdown, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
+import { MoonOutline, SunnyOutline, ChevronDownOutline, KeyOutline, LogOutOutline, MenuOutline, SearchOutline } from '@vicons/ionicons5'
 import { useUiStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
+import { useChatStore } from '@/stores/chat'
 import { changePassword } from '@/api/auth'
+import AppModal from '@/components/ui/AppModal.vue'
 
 const ui = useUiStore()
 const authStore = useAuthStore()
+const chatStore = useChatStore()
 const route = useRoute()
 const msg = useMessage()
 
@@ -70,6 +116,11 @@ const titles = {
   users: '用户管理', roles: '角色管理', 'audit-logs': '审计日志'
 }
 const currentPageTitle = computed(() => titles[route.name] || 'RAG 检索系统')
+const isChatRoute = computed(() => route.name === 'chat')
+const conversationTitle = computed(() => {
+  const current = chatStore.conversations.find(item => item.id === chatStore.currentConvId)
+  return current?.title || (chatStore.currentConvId ? '当前对话' : '新对话')
+})
 
 const renderIcon = (icon) => () => h(NIcon, null, { default: () => h(icon) })
 const userOptions = [
@@ -77,7 +128,6 @@ const userOptions = [
   { type: 'divider', key: 'd1' },
   { label: '退出登录', key: 'logout', icon: renderIcon(LogOutOutline) },
 ]
-
 const showPwd = ref(false)
 const saving = ref(false)
 const pwdFormRef = ref(null)
@@ -100,6 +150,11 @@ function handleSelect(key) {
   }
 }
 
+function closePasswordModal() {
+  if (saving.value) return
+  showPwd.value = false
+}
+
 async function handleChangePassword() {
   try {
     await pwdFormRef.value?.validate()
@@ -118,3 +173,53 @@ async function handleChangePassword() {
   }
 }
 </script>
+
+<style scoped>
+.app-header__chat-context {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  color: var(--ui-text-secondary);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.app-header__chat-context-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--ui-primary);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ui-primary) 14%, transparent);
+}
+
+:deep(.app-header__chat-search.n-button) {
+  height: var(--ui-control-height-compact);
+  border-radius: var(--ui-radius-control);
+  font-size: 12px;
+  font-weight: 650;
+  --n-color: var(--ui-surface-muted) !important;
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-color-pressed: var(--ui-surface-pressed) !important;
+  --n-border: 1px solid var(--ui-border) !important;
+  --n-border-hover: 1px solid var(--ui-border-strong) !important;
+  --n-border-pressed: 1px solid var(--ui-border-focus) !important;
+  --n-text-color: var(--ui-text-secondary) !important;
+  --n-text-color-hover: var(--ui-primary) !important;
+  --n-text-color-pressed: var(--ui-primary-pressed) !important;
+}
+
+:deep(.app-header__chat-search.is-active.n-button) {
+  --n-color: var(--ui-primary-subtle) !important;
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-border: 1px solid var(--ui-border-focus) !important;
+  --n-text-color: var(--ui-primary) !important;
+}
+
+@media (max-width: 639px) {
+  .app-header__chat-context { max-width: 38vw; font-size: 12px; }
+  :deep(.app-header__chat-search.n-button) { min-width: var(--ui-control-height-compact); padding: 0 8px; }
+}
+</style>

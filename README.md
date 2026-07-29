@@ -8,6 +8,10 @@
 - **前端**：Vue 3 · Vite · Naive UI · Tailwind
 - **模型**：任意 OpenAI 兼容的 Chat / Embedding / Vision 接口
 
+## 前端 UI 开发约定
+
+新增或修改前端页面、组件、弹窗、下拉和响应式交互前，请先阅读 [UI 开发规范](docs/UI开发规范.md)。该规范是本项目 UI 的统一验收标准。
+
 ## 目录
 
 ```
