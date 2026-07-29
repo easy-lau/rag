@@ -80,6 +80,10 @@ class ConversationOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+
+
 # ── Search ───────────────────────────────────────────────────────
 class SearchRequest(BaseModel):
     query: str

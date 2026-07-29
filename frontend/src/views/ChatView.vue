@@ -54,7 +54,8 @@
           <n-spin size="large" />
         </div>
 
-        <template v-else>
+        <!-- 与底部输入区共用内容宽度，避免消息流在宽屏贴近页面两侧。 -->
+        <div v-else class="w-full max-w-4xl mx-auto">
           <ChatMessage
             v-for="msg in chatStore.messages"
             :key="msg.id"
@@ -62,7 +63,7 @@
             @retry="handleRetry"
             @preview="openSourcePreview"
           />
-        </template>
+        </div>
       </div>
 
       <!-- 已开始的会话固定使用底部输入框，避免与欢迎态的输入框重复。 -->

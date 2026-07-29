@@ -2,6 +2,7 @@ import http from '@/utils/request'
 
 export const getChatHistory = (params) => http.get('/chat/history', { params })
 export const getMessages = (convId) => http.get(`/chat/${convId}/messages`)
+export const renameConversation = (convId, title) => http.patch(`/chat/${convId}`, { title })
 export const deleteConversation = (convId) => http.delete(`/chat/${convId}`)
 
 export function createChatStream(payload) {

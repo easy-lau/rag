@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
 from models.db_models import Conversation, Message, User
-from models.schemas import ChatRequest, ConversationOut, MessageOut
+from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
 from core.rag_pipeline import run_rag_stream
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import CHAT_USE
@@ -163,6 +163,28 @@ async def get_messages(
         .order_by(Message.created_at)
     )).scalars().all()
     return rows
+
+
+@router.patch("/{conv_id}", response_model=ConversationOut)
+async def rename_conversation(
+    conv_id: uuid.UUID,
+    payload: ConversationRenameRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(CHAT_USE)),
+):
+    """更新会话标题；沿用读取/删除时的归属校验。"""
+    conv = await db.get(Conversation, conv_id)
+    if not conv or (not user.is_superadmin and conv.user_id != user.id):
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="会话标题不能为空")
+
+    conv.title = title
+    await db.commit()
+    await db.refresh(conv)
+    return conv
 
 
 @router.delete("/{conv_id}")

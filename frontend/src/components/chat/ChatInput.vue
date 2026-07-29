@@ -13,7 +13,13 @@
     />
     <div class="chat-composer__footer">
       <div class="chat-composer__config" aria-label="检索配置">
-        <n-popover trigger="click" placement="top-start" :show-arrow="false">
+        <n-popover
+          class="composer-settings-popover"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          :theme-overrides="composerPopoverThemeOverrides"
+        >
           <template #trigger>
             <button type="button" class="composer-setting composer-setting--kb" aria-label="配置知识库范围">
               <n-icon :size="16"><FolderOpenOutline /></n-icon>
@@ -35,11 +41,19 @@
               placeholder="选择知识库"
               class="composer-popover__select"
               :input-props="{ 'aria-label': '选择知识库' }"
+              :menu-props="composerSelectMenuProps"
+              :theme-overrides="composerSelectThemeOverrides"
               :max-tag-count="1"
             />
           </div>
         </n-popover>
-        <n-popover trigger="click" placement="top-start" :show-arrow="false">
+        <n-popover
+          class="composer-settings-popover"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          :theme-overrides="composerPopoverThemeOverrides"
+        >
           <template #trigger>
             <button type="button" class="composer-setting composer-setting--method" aria-label="配置检索方式">
               <n-icon :size="16"><SearchOutline /></n-icon>
@@ -59,10 +73,19 @@
               placeholder="选择检索方式"
               class="composer-popover__select"
               :input-props="{ 'aria-label': '选择检索方式' }"
+              :menu-props="composerSelectMenuProps"
+              :theme-overrides="composerSelectThemeOverrides"
             />
           </div>
         </n-popover>
-        <n-popover v-if="tagOptions.length" trigger="click" placement="top-start" :show-arrow="false">
+        <n-popover
+          v-if="tagOptions.length"
+          class="composer-settings-popover"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          :theme-overrides="composerPopoverThemeOverrides"
+        >
           <template #trigger>
             <button type="button" class="composer-setting composer-setting--tag" aria-label="按标签筛选">
               <n-icon :size="16"><PricetagOutline /></n-icon>
@@ -84,6 +107,8 @@
               placeholder="不限标签"
               class="composer-popover__select"
               :input-props="{ 'aria-label': '按标签筛选' }"
+              :menu-props="composerSelectMenuProps"
+              :theme-overrides="composerSelectThemeOverrides"
               :max-tag-count="1"
             />
           </div>
@@ -139,6 +164,17 @@ const chatStore = useChatStore()
 const kbStore = useKnowledgeStore()
 const text = ref('')
 const inputRef = ref(null)
+const composerPopoverThemeOverrides = {
+  borderRadius: '16px',
+  padding: '14px',
+  boxShadow: '0 16px 36px rgba(35, 61, 98, .14)',
+}
+const composerSelectThemeOverrides = {
+  peers: {
+    InternalSelectMenu: { borderRadius: '12px' },
+  },
+}
+const composerSelectMenuProps = { class: 'composer-select-menu' }
 
 const kbOptions = computed(() =>
   kbStore.list.map(kb => ({ label: kb.name, value: kb.id }))
@@ -430,6 +466,17 @@ defineExpose({ setText, focus })
   --n-arrow-color: #9aaec9 !important;
 }
 .dark .chat-composer__shortcut { color: #718096; }
+
+:global(.composer-settings-popover.n-popover) {
+  --n-border-radius: 16px !important;
+  border-radius: 16px !important;
+}
+
+:global(.composer-select-menu.n-base-select-menu) {
+  --n-border-radius: 12px !important;
+  border-radius: 12px !important;
+  overflow: hidden;
+}
 
 @media (max-width: 860px) {
   .chat-composer__footer { align-items: flex-end; }
