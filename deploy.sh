@@ -21,11 +21,6 @@ if ! "${RAG_DOCKER[@]}" compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! "${RAG_DOCKER[@]}" buildx version >/dev/null 2>&1; then
-  echo "错误：未找到 docker buildx，请先安装 docker-buildx-plugin。" >&2
-  exit 1
-fi
-
 if [[ ! -f .env ]]; then
   echo "错误：缺少 .env。请先执行 cp .env.example .env，并填写三个必填密钥。" >&2
   exit 1
@@ -43,8 +38,8 @@ echo ">>> 目标 Docker Context：$RAG_DOCKER_CONTEXT"
 echo ">>> 校验 Compose 配置"
 "${RAG_DOCKER[@]}" compose config --quiet
 
-echo ">>> 构建镜像"
-"${RAG_DOCKER[@]}" compose build --pull
+echo ">>> 拉取发布镜像"
+"${RAG_DOCKER[@]}" compose pull
 
 echo ">>> 启动数据库、执行迁移并启动应用"
 "${RAG_DOCKER[@]}" compose up -d --force-recreate --remove-orphans \

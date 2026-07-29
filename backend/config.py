@@ -16,12 +16,21 @@ class Settings(BaseSettings):
     chat_model: str = "gpt-4o"
     temperature: float = 0.7
     max_tokens: int = 2048
+    # 聊天流在首个文本分片前发生的瞬时上游故障可安全重试。
+    llm_request_timeout_seconds: float = 60.0
+    llm_max_attempts: int = 3
+    llm_retry_base_delay_seconds: float = 1.0
 
     # 向量模型
     embedding_api_key: str = ""
     embedding_base_url: str = "https://api.openai.com/v1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 2560
+    # 向量服务偶发超时的容错参数。max_attempts 包含首次请求。
+    embedding_request_timeout_seconds: float = 60.0
+    embedding_max_attempts: int = 3
+    embedding_retry_base_delay_seconds: float = 1.0
+    embedding_batch_size: int = 64
 
     # 多模态模型（图片/截图识别）
     vision_api_key: str = ""

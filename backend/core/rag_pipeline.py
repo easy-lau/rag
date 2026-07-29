@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core.retriever import hybrid_search
 from core.reranker import rerank
 from core.openai_client import get_client
+from core.llm_stream import stream_with_retry_before_first_delta
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -322,17 +323,28 @@ async def run_rag_stream(
         max_tokens=s.max_tokens,
         stream=True,
     )
-    try:
-        # 请求流式响应附带 token 用量统计
-        stream = await get_client().chat.completions.create(**create_kwargs, stream_options={"include_usage": True})
-    except Exception:
-        # 个别 OpenAI 兼容服务不支持 stream_options，降级为不带用量统计
-        stream = await get_client().chat.completions.create(**create_kwargs)
+    # 不依赖 stream_options：部分 OpenAI 兼容服务不支持它，且旧逻辑会把超时误判为
+    # 参数兼容问题而重复发起整轮请求。流式响应开始后不重试，避免重复输出给用户。
+    client = get_client().with_options(max_retries=0)
+
+    async def open_stream():
+        return await client.chat.completions.create(
+            **create_kwargs,
+            timeout=s.llm_request_timeout_seconds,
+        )
 
     usage = None
     t_gen = time.perf_counter()
     answer_chars = 0
-    async for chunk in stream:
+    prompt_chars = len(system_prompt) + len(question)
+    async for chunk in stream_with_retry_before_first_delta(
+        open_stream,
+        model=s.chat_model,
+        prompt_chars=prompt_chars,
+        timeout_seconds=s.llm_request_timeout_seconds,
+        max_attempts=s.llm_max_attempts,
+        retry_base_delay_seconds=s.llm_retry_base_delay_seconds,
+    ):
         # 末尾的用量统计块 choices 为空，需先取 usage、再判空取增量
         if getattr(chunk, "usage", None):
             usage = chunk.usage

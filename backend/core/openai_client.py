@@ -15,6 +15,8 @@ def get_embedding_client() -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=s.embedding_api_key or s.llm_api_key,
         base_url=s.embedding_base_url,
+        # Embedding 的重试由 core.embeddings 统一处理，便于记录批次和退避日志。
+        max_retries=0,
     )
 
 

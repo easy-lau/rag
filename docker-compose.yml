@@ -7,12 +7,9 @@ x-logging: &default-logging
     max-file: "3"
 
 x-app: &app-common
-  image: ${IMAGE_REPOSITORY:-rag}:${IMAGE_TAG:-latest}
-  build:
-    context: .
-    dockerfile: Dockerfile
-    args:
-      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+  # 前端 Nginx 与后端 FastAPI 的发布镜像，由 GitHub Actions 推送至阿里云 ACR。
+  # 生产环境建议在 .env 中固定 IMAGE_TAG（例如 1.0.0），避免 latest 自动变更。
+  image: crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com/easylau/rag:${IMAGE_TAG:-latest}
   env_file:
     - .env
   environment:

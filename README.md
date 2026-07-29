@@ -14,7 +14,7 @@
 
 ## Docker Compose 架构
 
-仓库只保留一个 `docker-compose.yml`，同时用于服务器部署和本地开发：
+仓库只保留一个 `docker-compose.yml`，直接拉取阿里云 ACR 中的前后端合一发布镜像：
 
 ```text
 浏览器 :8001 → app(Nginx + FastAPI) → postgres(pgvector)
@@ -22,7 +22,7 @@
             migrate(Alembic，一次性任务)
 ```
 
-- 全栈部署：`docker compose up -d --build`
+- 全栈部署：`docker compose pull && docker compose up -d`
 - 本地只启动数据库：`docker compose up -d postgres`
 - PostgreSQL 只绑定宿主机 `127.0.0.1:5433`
 - FastAPI `8000` 只在应用容器内部开放，Nginx 对外提供 `8001`
@@ -46,29 +46,32 @@ ACR_PASSWORD   阿里云容器镜像服务密码或访问凭证
 
 Release 标签 `v1.2.3` 会生成镜像版本 `1.2.3`。工作流同时构建 `linux/amd64` 和 `linux/arm64`。
 
-服务器使用已发布镜像时，将 `.env` 中的配置改为：
+Compose 已固定使用阿里云镜像仓库；服务器仅需在 `.env` 中选择要部署的版本：
 
 ```dotenv
-IMAGE_REPOSITORY=crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com/easylau/rag
 IMAGE_TAG=1.2.3
 ```
 
-然后登录阿里云仓库并更新：
+镜像仓库当前为公开仓库，服务器可直接拉取并更新：
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate migrate app
+```
+
+如后续将仓库改为私有仓库，再先执行：
 
 ```bash
 docker login crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com
-docker compose pull app
-docker compose up -d --force-recreate migrate app
 ```
 
 ## 新服务器首次部署
 
-前置条件：Linux 服务器已安装 Git、Docker Engine、Docker Compose v2.20+ 和 Docker Buildx。
+前置条件：Linux 服务器已安装 Git、Docker Engine 和 Docker Compose v2.20+。
 
 ```bash
 docker version
 docker compose version
-docker buildx version
 docker context show
 
 sudo mkdir -p /opt/rag
@@ -96,13 +99,16 @@ openssl rand -hex 16
 POSTGRES_PASSWORD=<第一个随机值>
 JWT_SECRET=<第二个随机值>
 ADMIN_INIT_PASSWORD=<第三个随机值或自定义强密码>
+# 可填 latest；生产环境建议固定为已发布版本，例如 1.2.3。
+IMAGE_TAG=latest
 ```
 
-不要在 Docker 部署的 `.env` 中设置 `DATABASE_URL`。配置检查通过后，一条命令完成构建、迁移和启动：
+不要在 Docker 部署的 `.env` 中设置 `DATABASE_URL`。配置检查通过后，拉取镜像、迁移并启动：
 
 ```bash
 docker compose config --quiet
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
 检查启动结果：
@@ -157,11 +163,13 @@ Caddy 会自动申请和续期证书。项目内层 Nginx 已配置 50 MB 上传
 
 ## 模型配置
 
-模型环境变量可以留空，部署后使用管理员账号在「系统设置」中填写。需要特别注意：
+生产部署时请在容器 `.env` 中填写 LLM、Embedding 和 Vision（如需）模型参数；修改后需重建 `app` 容器使其生效。需要特别注意：
 
 - Embedding 模型接口必须实际返回 `2560` 维向量。
 - 当前代码不会主动向兼容接口传递 `dimensions` 参数，仅填写维度环境变量不能改变模型输出。
 - 模型 API Key 会进入系统配置和数据库备份，备份文件应按敏感数据保护。
+- 聊天流默认单次超时 `60` 秒；仅在首个回答文本前发生超时、连接异常、限流或上游 5xx 时按 `1` 秒、`2` 秒退避重试，最多 `3` 次总尝试。回答开始输出后不会重试，避免重复内容。
+- 向量化默认单次超时 `60` 秒，发生超时、连接异常、限流或上游 5xx 时按 `1` 秒、`2` 秒退避重试，最多 `3` 次总尝试。可用 `.env` 的 `EMBEDDING_*` 重试参数覆盖。
 
 ## 本地开发
 
@@ -235,7 +243,7 @@ git rev-parse HEAD > "$RAG_BACKUP_DIR/git-commit.txt"
 
 ```bash
 git pull --ff-only origin main
-docker compose build --pull
+docker compose pull
 docker compose up -d --force-recreate --remove-orphans \
   migrate app
 
@@ -254,7 +262,7 @@ docker compose logs --tail=100 migrate app
 cd /opt/rag
 RAG_RESTORE_DIR="/opt/rag/backups/20260729-120000"
 
-docker compose build --pull
+docker compose pull
 docker compose stop app migrate
 docker compose up -d postgres
 
