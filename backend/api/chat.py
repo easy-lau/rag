@@ -9,6 +9,7 @@ from models.schemas import ChatRequest, ConversationOut, MessageOut
 from core.rag_pipeline import run_rag_stream
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import CHAT_USE
+from core.intent_router import classify_intent
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -24,7 +25,8 @@ async def send_message(
     if accessible is not None and not set(payload.knowledge_base_ids).issubset(set(accessible)):
         raise HTTPException(status_code=403, detail="无权访问部分知识库")
 
-    # 获取或创建会话
+    # 获取或创建会话。新会话先 flush 取得 id，但不提前提交；若后续路由/校验失败，
+    # 请求结束时整个未提交事务会回滚，避免留下空白会话。
     if payload.conversation_id:
         conv = await db.get(Conversation, payload.conversation_id)
         # 复用已有会话时校验归属：非超管不可操作他人会话
@@ -36,8 +38,19 @@ async def send_message(
     if not conv:
         conv = Conversation(title=payload.question[:50], user_id=user.id)
         db.add(conv)
-        await db.commit()
-        await db.refresh(conv)
+        await db.flush()
+
+    # 智能路由只输出受白名单约束的动作；知识库授权仍以上方接口校验为准。
+    decision = await classify_intent(
+        db,
+        payload.question,
+        user=user,
+        selected_kb_ids=payload.knowledge_base_ids,
+        conversation_id=conv.id,
+        record_log=True,
+    )
+    if decision.action == "retrieve" and not payload.knowledge_base_ids:
+        raise HTTPException(status_code=400, detail="该问题需要查询知识库，请至少选择一个知识库")
 
     # 保存用户消息
     user_msg = Message(
@@ -62,6 +75,7 @@ async def send_message(
                 search_config=search_config,
                 conversation_id=str(conv.id),
                 db=db,
+                intent=decision.to_dict(),
             ):
                 yield chunk
                 if '"type": "text_delta"' in chunk:

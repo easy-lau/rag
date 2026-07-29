@@ -44,6 +44,11 @@ def _usage_event(prompt: int, completion: int, total: int) -> str:
     return f"data: {json.dumps({'type': 'usage', 'prompt_tokens': prompt, 'completion_tokens': completion, 'total_tokens': total})}\n\n"
 
 
+def _intent_event(intent: dict) -> str:
+    """向前端公开已校验过的智能路由决策，不暴露分类提示词或原始问题。"""
+    return f"data: {json.dumps({'type': 'intent', 'decision': intent})}\n\n"
+
+
 # 命中文档若小于该字符数，则整篇注入上下文，保证跨段落/跨表格的信息完整
 WHOLE_DOC_MAX_CHARS = 6000
 WHOLE_DOC_TOTAL_BUDGET = 12000
@@ -169,6 +174,7 @@ async def run_rag_stream(
     search_config: dict,
     conversation_id: str,
     db: AsyncSession,
+    intent: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     s = get_settings()
     t_total = time.perf_counter()
@@ -177,11 +183,25 @@ async def run_rag_stream(
         conversation_id, len(kb_ids), question,
     )
 
-    # Step 1: 问题分析（顺带判断是否真的需要查知识库，闲聊/问候直接跳过检索）
+    # Step 1: 问题分析。正常聊天接口会先完成可配置的智能路由；保留旧判断作为
+    # 兼容兜底，以便其他调用方仍可直接使用本函数。
     yield _step_event("analyze", "active")
-    need_retrieval = bool(kb_ids) and await _needs_retrieval(question)
-    if not kb_ids:
-        logger.info("[意图判断] 未选择知识库，跳过检索")
+    route_action = (intent or {}).get("action", "retrieve")
+    if intent:
+        yield _intent_event(intent)
+        need_retrieval = route_action == "retrieve"
+        logger.info(
+            "[智能路由] conv=%s intent=%s action=%s source=%s confidence=%s",
+            conversation_id,
+            intent.get("intent_code"),
+            route_action,
+            intent.get("source"),
+            intent.get("confidence"),
+        )
+    else:
+        need_retrieval = bool(kb_ids) and await _needs_retrieval(question)
+        if not kb_ids:
+            logger.info("[意图判断] 未选择知识库，跳过检索")
     yield _step_event("analyze", "done")
 
     # Step 2: 查询扩展
@@ -277,8 +297,19 @@ async def run_rag_stream(
             "请明确告诉用户『知识库中未找到相关内容』，可简要建议其补充资料或换种问法，"
             "但禁止使用你自己的知识或经验编造答案。"
         )
+    elif route_action == "writing":
+        # 写作类请求明确不带知识库上下文，避免检索片段干扰改写、总结等输出。
+        system_prompt = (
+            "你是一位专业的中文写作助手。根据用户目标完成润色、改写、总结、起草等任务。"
+            "除非用户明确要求，否则不要编造事实；输出应直接可用、结构清晰。"
+        )
+    elif route_action == "system_help":
+        system_prompt = (
+            "你是该企业 RAG 检索系统的使用助手。请简洁说明如何选择知识库、提问、"
+            "查看检索结果、管理文档和在权限不足时该如何处理。不要虚构不存在的功能。"
+        )
     else:
-        # 闲聊/问候等无需查库的输入：按通用助手回答
+        # 闲聊/问候等无需查库的输入：按通用助手回答。
         system_prompt = "你是一个专业的助手，请尽力回答用户问题。"
 
     create_kwargs = dict(

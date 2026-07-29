@@ -4,7 +4,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from api import chat, knowledge, document, search, settings, auth, users, roles, login_logs, operation_logs
+from api import (
+    auth,
+    chat,
+    document,
+    intent_routing,
+    knowledge,
+    login_logs,
+    operation_logs,
+    roles,
+    search,
+    settings,
+    users,
+)
 from config import get_settings
 
 logging.basicConfig(
@@ -47,6 +59,7 @@ app.include_router(knowledge.router, prefix="/api")
 app.include_router(document.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
+app.include_router(intent_routing.router, prefix="/api")
 
 # 原始图片静态服务：上传的图片转写为文档后，原图仍可在编辑器对照、并供未来多模态问答回传
 _upload_dir = get_settings().upload_dir

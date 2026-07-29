@@ -17,6 +17,7 @@ const routes = [
       { path: 'users',       component: () => import('@/views/admin/UsersView.vue'),      name: 'users',       meta: { permission: 'menu:users' } },
       { path: 'roles',       component: () => import('@/views/admin/RolesView.vue'),      name: 'roles',       meta: { permission: 'menu:roles' } },
       { path: 'audit-logs',  component: () => import('@/views/admin/AuditLogsView.vue'),   name: 'audit-logs',  meta: { permission: 'menu:login_logs' } },
+      { path: 'intent-routing', component: () => import('@/views/admin/IntentRoutingView.vue'), name: 'intent-routing', meta: { permission: 'menu:intent_routing' } },
       { path: 'settings',    component: () => import('@/views/SettingsView.vue'),         name: 'settings',    meta: { permission: 'menu:settings' } },
     ]
   }

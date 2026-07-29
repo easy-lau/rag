@@ -9,6 +9,7 @@ MENU_CHAT = "menu:chat"
 MENU_KNOWLEDGE = "menu:knowledge"
 MENU_DOCUMENTS = "menu:documents"
 MENU_SEARCH_TEST = "menu:search_test"
+MENU_INTENT_ROUTING = "menu:intent_routing"
 MENU_SETTINGS = "menu:settings"
 MENU_USERS = "menu:users"
 MENU_ROLES = "menu:roles"
@@ -23,6 +24,8 @@ DOC_READ = "doc:read"
 DOC_WRITE = "doc:write"
 SETTINGS_READ = "settings:read"
 SETTINGS_WRITE = "settings:write"
+INTENT_READ = "intent:read"
+INTENT_MANAGE = "intent:manage"
 USER_MANAGE = "user:manage"
 ROLE_MANAGE = "role:manage"
 LOG_READ = "log:read"
@@ -35,6 +38,7 @@ ALL_PERMISSIONS: list[str] = [
     MENU_KNOWLEDGE,
     MENU_DOCUMENTS,
     MENU_SEARCH_TEST,
+    MENU_INTENT_ROUTING,
     MENU_SETTINGS,
     MENU_USERS,
     MENU_ROLES,
@@ -48,6 +52,8 @@ ALL_PERMISSIONS: list[str] = [
     DOC_WRITE,
     SETTINGS_READ,
     SETTINGS_WRITE,
+    INTENT_READ,
+    INTENT_MANAGE,
     USER_MANAGE,
     ROLE_MANAGE,
     LOG_READ,
@@ -61,6 +67,7 @@ MENUS: list[dict] = [
     {"key": MENU_KNOWLEDGE, "route": "knowledge", "title": "知识库", "permission": MENU_KNOWLEDGE},
     {"key": MENU_DOCUMENTS, "route": "documents", "title": "文档管理", "permission": MENU_DOCUMENTS},
     {"key": MENU_SEARCH_TEST, "route": "search-test", "title": "检索测试", "permission": MENU_SEARCH_TEST},
+    {"key": MENU_INTENT_ROUTING, "route": "intent-routing", "title": "智能路由", "permission": MENU_INTENT_ROUTING},
     {"key": MENU_SETTINGS, "route": "settings", "title": "系统设置", "permission": MENU_SETTINGS},
     {"key": MENU_USERS, "route": "users", "title": "用户管理", "permission": MENU_USERS},
     {"key": MENU_ROLES, "route": "roles", "title": "角色管理", "permission": MENU_ROLES},

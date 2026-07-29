@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Integer, ForeignKey, DateTime, Boolean, UniqueConstraint, Index
+from sqlalchemy import String, Text, Integer, ForeignKey, DateTime, Boolean, UniqueConstraint, Index, Float
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from pgvector.sqlalchemy import Vector
@@ -103,6 +103,83 @@ class SystemSetting(Base):
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[str | None] = mapped_column(Text)
+
+
+class IntentRouterConfig(Base):
+    """智能路由全局配置。
+
+    该表有且仅有 id=1 的一行。使用独立表而不是 settings KV，避免类别和路由日志
+    被序列化到字符串设置中，也便于后续增加版本和审计字段。
+    """
+
+    __tablename__ = "intent_router_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="rules_then_llm")
+    intent_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    confidence_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.65)
+    fallback_intent_code: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
+    allow_general_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc
+    )
+
+
+class IntentCategory(Base):
+    """可配置的意图分类及其固定后端动作。"""
+
+    __tablename__ = "intent_categories"
+    __table_args__ = (
+        UniqueConstraint("code", name="uq_intent_categories_code"),
+        Index("ix_intent_categories_enabled_priority", "enabled", "priority"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    examples: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc
+    )
+
+
+class IntentRouteLog(Base):
+    """一次实际智能路由的决策快照。
+
+    不存储问题正文，避免把用户聊天内容复制到另一张日志表；仅保留分类结论、
+    耗时和可选人工反馈，供路由效果调优。
+    """
+
+    __tablename__ = "intent_route_logs"
+    __table_args__ = (
+        Index("ix_intent_route_logs_created_at", "created_at"),
+        Index("ix_intent_route_logs_user_id_created_at", "user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
+    )
+    intent_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    intent_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    selected_kb_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    feedback: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
 class Role(Base):

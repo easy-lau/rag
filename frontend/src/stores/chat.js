@@ -40,7 +40,14 @@ export const useChatStore = defineStore('chat', () => {
 
     try {
       const res = await promise
-      if (!res.ok) throw new Error('请求失败')
+      if (!res.ok) {
+        let detail = '请求失败，请稍后重试'
+        try {
+          const body = await res.json()
+          detail = body?.detail || detail
+        } catch {}
+        throw new Error(detail)
+      }
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
@@ -59,7 +66,7 @@ export const useChatStore = defineStore('chat', () => {
         }
       }
     } catch (e) {
-      if (e.name !== 'AbortError') aiMsg.content += '\n\n[请求出错，请重试]'
+      if (e.name !== 'AbortError') aiMsg.content += `\n\n[${e.message || '请求出错，请重试'}]`
     } finally {
       isStreaming.value = false
       abortFn = null
@@ -75,7 +82,9 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function handleEvent(data, aiMsg, searchStore) {
-    if (data.type === 'search_step') {
+    if (data.type === 'intent') {
+      searchStore.setIntentDecision(data.decision || data)
+    } else if (data.type === 'search_step') {
       searchStore.updateStep(data.step, data.status)
     } else if (data.type === 'search_results') {
       searchStore.setResults(data)

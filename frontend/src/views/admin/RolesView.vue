@@ -100,10 +100,12 @@ const PERM_LABELS = {
   'menu:chat': '菜单·问答对话', 'menu:knowledge': '菜单·知识库', 'menu:documents': '菜单·文档',
   'menu:search_test': '菜单·检索测试', 'menu:settings': '菜单·系统设置',
   'menu:users': '菜单·用户管理', 'menu:roles': '菜单·角色管理',
+  'menu:intent_routing': '菜单·智能路由',
   'chat:use': '使用问答', 'search:use': '使用检索',
   'kb:read': '知识库·读', 'kb:write': '知识库·写', 'kb:access_all': '访问全部知识库',
   'doc:read': '文档·读', 'doc:write': '文档·写',
   'settings:read': '设置·读', 'settings:write': '设置·写',
+  'intent:read': '智能路由·读', 'intent:manage': '智能路由·管理',
   'user:manage': '用户管理', 'role:manage': '角色管理',
   'log:read': '查看审计日志（登录 / 操作）',
 }

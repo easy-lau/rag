@@ -13,6 +13,7 @@ export const useSearchStore = defineStore('search', () => {
   const results = ref([])
   const totalCount = ref(0)
   const searchMeta = ref({})
+  const intentDecision = ref(null)
   const steps = ref(STEPS.map(s => ({ ...s, status: 'pending' })))
 
   function resetSteps() {
@@ -20,6 +21,7 @@ export const useSearchStore = defineStore('search', () => {
     results.value = []
     totalCount.value = 0
     searchMeta.value = {}
+    intentDecision.value = null
   }
 
   function updateStep(key, status) {
@@ -37,5 +39,12 @@ export const useSearchStore = defineStore('search', () => {
     totalCount.value = data.total || 0
   }
 
-  return { results, totalCount, searchMeta, steps, resetSteps, updateStep, finishSteps, setResults }
+  function setIntentDecision(decision) {
+    intentDecision.value = decision || null
+  }
+
+  return {
+    results, totalCount, searchMeta, intentDecision, steps,
+    resetSteps, updateStep, finishSteps, setResults, setIntentDecision,
+  }
 })

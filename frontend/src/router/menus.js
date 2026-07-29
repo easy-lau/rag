@@ -1,6 +1,7 @@
 import {
   ChatbubbleEllipsesOutline, LibraryOutline, SearchOutline,
   SettingsOutline, PeopleOutline, ShieldOutline, TimeOutline,
+  GitNetworkOutline,
 } from '@vicons/ionicons5'
 
 // 侧边栏菜单单一来源：to(路由路径)、label、icon、permission(为空表示公开)、
@@ -12,6 +13,7 @@ export const MENU_ITEMS = [
   { to: '/users',       label: '用户管理',   icon: PeopleOutline, permission: 'menu:users' },
   { to: '/roles',       label: '角色管理',   icon: ShieldOutline, permission: 'menu:roles' },
   { to: '/audit-logs',  label: '审计日志',   icon: TimeOutline, permission: 'menu:login_logs' },
+  { to: '/intent-routing', label: '智能路由', icon: GitNetworkOutline, permission: 'menu:intent_routing' },
   { to: '/settings',    label: '系统设置',   icon: SettingsOutline, permission: 'menu:settings' },
 ]
 

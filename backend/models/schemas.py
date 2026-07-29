@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -224,3 +224,104 @@ class OperationLogPage(BaseModel):
     items: list[OperationLogOut]
     total: int
 
+
+# ── Intent Routing ──────────────────────────────────────────────
+IntentRouterMode = Literal["rules_then_llm", "llm_only", "off"]
+IntentAction = Literal["retrieve", "chat", "writing", "system_help"]
+IntentFeedback = Literal["correct", "incorrect"]
+
+
+class IntentRouterConfigOut(BaseModel):
+    enabled: bool
+    mode: IntentRouterMode
+    intent_model: str = ""
+    confidence_threshold: float = Field(..., ge=0, le=1)
+    fallback_intent_code: str = Field(..., min_length=1, max_length=64)
+    allow_general_chat: bool
+
+
+class IntentRouterConfigUpdate(BaseModel):
+    enabled: bool | None = None
+    mode: IntentRouterMode | None = None
+    intent_model: str | None = Field(None, max_length=255)
+    confidence_threshold: float | None = Field(None, ge=0, le=1)
+    fallback_intent_code: str | None = Field(None, min_length=1, max_length=64)
+    allow_general_chat: bool | None = None
+
+
+class IntentCategoryCreate(BaseModel):
+    code: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*$")
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field("", max_length=4000)
+    examples: list[str] = Field(default_factory=list, max_length=30)
+    action: IntentAction
+    enabled: bool = True
+    priority: int = Field(0, ge=-10000, le=10000)
+
+
+class IntentCategoryUpdate(BaseModel):
+    # code 是分类器和路由配置引用的稳定标识，创建后禁止修改。
+    name: str | None = Field(None, min_length=1, max_length=100)
+    description: str | None = Field(None, max_length=4000)
+    examples: list[str] | None = Field(None, max_length=30)
+    action: IntentAction | None = None
+    enabled: bool | None = None
+    priority: int | None = Field(None, ge=-10000, le=10000)
+
+
+class IntentCategoryOut(BaseModel):
+    id: uuid.UUID
+    code: str
+    name: str
+    description: str
+    examples: list[str] = Field(default_factory=list)
+    action: IntentAction
+    enabled: bool
+    priority: int
+
+    model_config = {"from_attributes": True}
+
+
+class IntentDecisionOut(BaseModel):
+    intent_code: str
+    intent_name: str
+    action: IntentAction
+    confidence: float = Field(..., ge=0, le=1)
+    source: str
+
+
+class IntentRouteTestRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=12000)
+    knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+
+
+class IntentRouteTestResponse(BaseModel):
+    decision: IntentDecisionOut
+    latency_ms: int = Field(..., ge=0)
+
+
+class IntentRouteLogOut(BaseModel):
+    id: uuid.UUID
+    user_id: uuid.UUID | None = None
+    conversation_id: uuid.UUID | None = None
+    intent_code: str
+    intent_name: str
+    action: IntentAction
+    confidence: float
+    source: str
+    latency_ms: int
+    selected_kb_count: int
+    feedback: IntentFeedback | None = None
+    feedback_at: datetime | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class IntentRouteLogPage(BaseModel):
+    items: list[IntentRouteLogOut]
+    total: int
+
+
+class IntentRouteFeedbackUpdate(BaseModel):
+    feedback: IntentFeedback

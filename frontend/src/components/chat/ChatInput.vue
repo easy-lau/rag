@@ -71,7 +71,7 @@
 
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
-import { NInput, NSelect, NSwitch, NButton, NIcon, NTooltip, useMessage } from 'naive-ui'
+import { NInput, NSelect, NSwitch, NButton, NIcon, NTooltip } from 'naive-ui'
 import { SendOutline, StopOutline, HelpCircleOutline } from '@vicons/ionicons5'
 import { useChatStore } from '@/stores/chat'
 import { useKnowledgeStore } from '@/stores/knowledge'
@@ -79,7 +79,6 @@ import { getDocumentTags } from '@/api/knowledge'
 
 const chatStore = useChatStore()
 const kbStore = useKnowledgeStore()
-const msg = useMessage()
 const text = ref('')
 
 const kbOptions = computed(() =>
@@ -124,11 +123,7 @@ const methodOptions = [
 
 function handleSend() {
   if (!text.value.trim() || chatStore.isStreaming) return
-  // 发送前校验：未选择知识库则提示并拦截，避免退化成无依据的自由作答
-  if (!chatStore.selectedKbIds.length) {
-    msg.warning('请先选择知识库')
-    return
-  }
+  // 是否需要知识库由后端智能路由决定：知识库问答仍会在后端强制校验权限与选择范围。
   chatStore.sendMessage(text.value.trim())
   text.value = ''
 }
