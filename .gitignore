@@ -11,6 +11,7 @@ venv/
 
 # 用户上传的文件（运行时数据，非代码）
 uploads/
+backups/
 
 # OMC 本地 agent 状态
 .omc/

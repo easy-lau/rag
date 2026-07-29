@@ -2,6 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 # 依赖全部走预编译 wheel：asyncpg / bcrypt / cryptography 均有 manylinux 包，
 # 且 asyncpg 运行时不依赖 libpq，故无需 gcc / libpq-dev，省掉缓慢的 apt 安装。
 # pip 默认走清华镜像（国内快）；海外部署可用
@@ -14,4 +17,10 @@ RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.txt
 
 COPY . .
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"]
+RUN chmod +x /app/docker-entrypoint.sh
+
+EXPOSE 8000
+
+# Alembic 由 Compose 中的一次性 migrate 服务执行，避免应用重启或多副本并发迁移。
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

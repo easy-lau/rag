@@ -1,9 +1,11 @@
 import os
 import logging
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 from api import (
     auth,
     chat,
@@ -19,6 +21,7 @@ from api import (
     users,
 )
 from config import get_settings
+from database import engine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,4 +82,14 @@ app.mount(
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        async with asyncio.timeout(2):
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("健康检查连接数据库失败: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="database unavailable",
+        ) from exc
+    return {"status": "ok", "database": "ok"}

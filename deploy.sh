@@ -1,29 +1,68 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-SERVER="root@10.168.120.42"
-SSH_KEY="$HOME/.ssh/id_ed25519"
-REMOTE_DIR="/data/engineering/rag"
+RAG_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$RAG_PROJECT_DIR"
+RAG_DOCKER_CONTEXT="${RAG_DOCKER_CONTEXT:-default}"
+RAG_DOCKER=(docker --context "$RAG_DOCKER_CONTEXT")
 
-echo ">>> 切换到远程 Docker Context..."
-docker context use remote
+if ! command -v docker >/dev/null 2>&1; then
+  echo "错误：未找到 docker，请先安装 Docker Engine 和 Docker Compose v2。" >&2
+  exit 1
+fi
 
-echo ">>> 同步代码到服务器..."
-rsync -avz \
-  --exclude 'node_modules' \
-  --exclude '__pycache__' \
-  --exclude '.env' \
-  --exclude '*.pyc' \
-  --exclude 'dist' \
-  --exclude '.git' \
-  -e "ssh -i $SSH_KEY -p 22" \
-  ./ $SERVER:$REMOTE_DIR/
+if ! docker context inspect "$RAG_DOCKER_CONTEXT" >/dev/null 2>&1; then
+  echo "错误：Docker Context '$RAG_DOCKER_CONTEXT' 不存在。" >&2
+  exit 1
+fi
 
-echo ">>> 同步 .env 文件..."
-scp -P 22 -i $SSH_KEY .env $SERVER:$REMOTE_DIR/.env
+if ! "${RAG_DOCKER[@]}" compose version >/dev/null 2>&1; then
+  echo "错误：未找到 docker compose v2。" >&2
+  exit 1
+fi
 
-echo ">>> 构建并启动..."
-docker compose up --build -d
+if ! "${RAG_DOCKER[@]}" buildx version >/dev/null 2>&1; then
+  echo "错误：未找到 docker buildx，请先安装 docker-buildx-plugin。" >&2
+  exit 1
+fi
 
-echo ">>> 完成！访问 http://10.168.120.42"
-echo ">>> 查看日志：docker compose logs -f"
+if [[ ! -f .env ]]; then
+  echo "错误：缺少 .env。请先执行 cp .env.example .env，并填写三个必填密钥。" >&2
+  exit 1
+fi
+
+for RAG_REQUIRED_KEY in POSTGRES_PASSWORD JWT_SECRET ADMIN_INIT_PASSWORD; do
+  if ! grep -Eq "^${RAG_REQUIRED_KEY}=.+$" .env; then
+    echo "错误：.env 中的 ${RAG_REQUIRED_KEY} 未填写。" >&2
+    exit 1
+  fi
+done
+
+echo ">>> 目标 Docker Context：$RAG_DOCKER_CONTEXT"
+
+echo ">>> 校验 Compose 配置"
+"${RAG_DOCKER[@]}" compose config --quiet
+
+echo ">>> 构建镜像"
+"${RAG_DOCKER[@]}" compose build --pull
+
+echo ">>> 启动数据库、执行迁移并启动应用"
+"${RAG_DOCKER[@]}" compose up -d --force-recreate --remove-orphans \
+  migrate backend frontend
+
+echo ">>> 等待端到端健康检查"
+for _ in $(seq 1 60); do
+  if "${RAG_DOCKER[@]}" compose exec -T frontend \
+    wget -q -O /dev/null http://127.0.0.1:8001/api/health \
+    >/dev/null 2>&1; then
+    "${RAG_DOCKER[@]}" compose ps -a
+    echo ">>> 部署完成。请按 .env 中的 APP_BIND_HOST/APP_PORT 或 HTTPS 域名访问。"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "错误：应用在 120 秒内未通过健康检查。" >&2
+"${RAG_DOCKER[@]}" compose ps -a
+"${RAG_DOCKER[@]}" compose logs --tail=100 postgres migrate backend frontend
+exit 1

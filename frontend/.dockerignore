@@ -1,0 +1,8 @@
+.env
+.env.*
+node_modules/
+dist/
+coverage/
+.vite/
+*.log
+.DS_Store

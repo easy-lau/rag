@@ -1,9 +1,14 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from pathlib import Path
+
+
+ROOT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://rag:password@localhost:5432/rag_db"
+    # Docker Compose 会显式覆盖；该默认值仅用于宿主机本地开发的端口约定。
+    database_url: str = "postgresql+asyncpg://rag:password@127.0.0.1:5433/rag_prod"
 
     # 大语言模型
     llm_api_key: str = ""
@@ -43,7 +48,8 @@ class Settings(BaseSettings):
     admin_init_password: str = "admin12345"
 
     class Config:
-        env_file = ".env"
+        # 宿主机开发始终读取项目根目录的统一 .env；Docker 通过环境变量覆盖。
+        env_file = ROOT_ENV_FILE
         extra = "ignore"
 
 
