@@ -3,14 +3,17 @@
     <!-- Main chat area -->
     <div class="flex flex-col flex-1 min-w-0">
       <div class="px-4 sm:px-6 py-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between gap-2">
+        <n-button text size="small" @click="chatStore.newConversation()">
+          <template #icon><n-icon><AddOutline /></n-icon></template>
+          新对话
+        </n-button>
         <n-button v-if="ui.isMobile" text size="small" @click="showResults = true">
           <template #icon><n-icon><SearchOutline /></n-icon></template>
           检索结果
         </n-button>
-        <span v-else></span>
-        <n-button text size="small" @click="chatStore.newConversation()">
-          <template #icon><n-icon><AddOutline /></n-icon></template>
-          新对话
+        <n-button v-else text size="small" @click="showResults = !showResults">
+          <template #icon><n-icon><SearchOutline /></n-icon></template>
+          {{ showResults ? '收起检索结果' : '展开检索结果' }}
         </n-button>
       </div>
 
@@ -36,8 +39,8 @@
       </div>
     </div>
 
-    <!-- 右侧检索结果：桌面内联，移动端抽屉（顶部按钮触发） -->
-    <div v-if="!ui.isMobile" class="w-80 shrink-0">
+    <!-- 检索结果默认收起：桌面端内联展开，移动端以抽屉显示 -->
+    <div v-if="!ui.isMobile && showResults" class="w-80 shrink-0">
       <SearchResultPanel />
     </div>
     <n-drawer v-else v-model:show="showResults" :width="320" placement="right" to="#app">
@@ -85,7 +88,7 @@ const ui = useUiStore()
 const msg = useMessage()
 const msgList = ref(null)
 
-// 移动端：检索结果抽屉开关
+// 检索结果默认收起：桌面端控制右栏，移动端控制抽屉
 const showResults = ref(false)
 
 // 来源文档只读预览
