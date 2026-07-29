@@ -1,0 +1,40 @@
+# 前端构建阶段
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# 前后端合一运行镜像
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx supervisor \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/nginx/conf.d/default.conf
+
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.txt
+
+COPY backend/ ./
+COPY --from=frontend-builder /frontend/dist/ /usr/share/nginx/html/
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+COPY deploy/supervisord.conf /etc/supervisor/conf.d/rag.conf
+
+RUN chmod +x /app/docker-entrypoint.sh \
+    && mkdir -p /app/uploads \
+    && nginx -t
+
+EXPOSE 8001
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/rag.conf"]

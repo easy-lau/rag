@@ -48,12 +48,12 @@ echo ">>> 构建镜像"
 
 echo ">>> 启动数据库、执行迁移并启动应用"
 "${RAG_DOCKER[@]}" compose up -d --force-recreate --remove-orphans \
-  migrate backend frontend
+  migrate app
 
 echo ">>> 等待端到端健康检查"
 for _ in $(seq 1 60); do
-  if "${RAG_DOCKER[@]}" compose exec -T frontend \
-    wget -q -O /dev/null http://127.0.0.1:8001/api/health \
+  if "${RAG_DOCKER[@]}" compose exec -T app \
+    python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=3)" \
     >/dev/null 2>&1; then
     "${RAG_DOCKER[@]}" compose ps -a
     echo ">>> 部署完成。请按 .env 中的 APP_BIND_HOST/APP_PORT 或 HTTPS 域名访问。"
@@ -64,5 +64,5 @@ done
 
 echo "错误：应用在 120 秒内未通过健康检查。" >&2
 "${RAG_DOCKER[@]}" compose ps -a
-"${RAG_DOCKER[@]}" compose logs --tail=100 postgres migrate backend frontend
+"${RAG_DOCKER[@]}" compose logs --tail=100 postgres migrate app
 exit 1

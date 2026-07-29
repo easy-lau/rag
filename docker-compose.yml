@@ -6,21 +6,21 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
-x-backend: &backend-common
-  image: ${COMPOSE_PROJECT_NAME:-rag}-backend:${IMAGE_TAG:-latest}
+x-app: &app-common
+  image: ${IMAGE_REPOSITORY:-rag}:${IMAGE_TAG:-latest}
   build:
-    context: ./backend
+    context: .
+    dockerfile: Dockerfile
     args:
       PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
   env_file:
     - .env
   environment:
     DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rag_prod}"
-    # 应用密钥由镜像入口在 backend/migrate 真正启动时校验，因此只启动
-    # postgres 的本地开发场景不需要解析应用配置。
     JWT_SECRET: "${JWT_SECRET:-}"
     ADMIN_INIT_PASSWORD: "${ADMIN_INIT_PASSWORD:-}"
   networks:
+    - application
     - database
   logging: *default-logging
 
@@ -49,59 +49,40 @@ services:
 
   # 数据库迁移是一次性任务；成功后正常显示 Exited (0)。
   migrate:
-    <<: *backend-common
+    <<: *app-common
     command: ["alembic", "upgrade", "head"]
     restart: "no"
+    networks:
+      - database
     depends_on:
       postgres:
         condition: service_healthy
 
-  backend:
-    <<: *backend-common
+  app:
+    <<: *app-common
     restart: unless-stopped
     init: true
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/rag.conf"]
     expose:
-      - "8000"
+      - "8001"
+    ports:
+      - "${APP_BIND_HOST:-0.0.0.0}:${APP_PORT:-8001}:8001"
     depends_on:
       migrate:
         condition: service_completed_successfully
     volumes:
       - upload_data:/app/uploads
-    networks:
-      - application
-      - database
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=3)"
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 25s
     stop_grace_period: 30s
-
-  frontend:
-    image: ${COMPOSE_PROJECT_NAME:-rag}-frontend:${IMAGE_TAG:-latest}
-    build:
-      context: ./frontend
-    restart: unless-stopped
-    ports:
-      - "${APP_BIND_HOST:-0.0.0.0}:${APP_PORT:-8001}:8001"
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - application
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8001/api/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    logging: *default-logging
 
 networks:
   application:

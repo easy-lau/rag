@@ -17,16 +17,49 @@
 仓库只保留一个 `docker-compose.yml`，同时用于服务器部署和本地开发：
 
 ```text
-浏览器 :8001 → frontend(Nginx) → backend(FastAPI) → postgres(pgvector)
-                                  ↑
-                          migrate(Alembic，一次性任务)
+浏览器 :8001 → app(Nginx + FastAPI) → postgres(pgvector)
+                    ↑
+            migrate(Alembic，一次性任务)
 ```
 
 - 全栈部署：`docker compose up -d --build`
 - 本地只启动数据库：`docker compose up -d postgres`
 - PostgreSQL 只绑定宿主机 `127.0.0.1:5433`
-- 后端 `8000` 只在 Compose 内网开放
+- FastAPI `8000` 只在应用容器内部开放，Nginx 对外提供 `8001`
 - 数据保存于 `rag_pg_data` 和 `rag_upload_data` 两个 Docker volume
+
+## GitHub Release 自动发布镜像
+
+工作流文件为 [.github/workflows/release-image.yml](/Users/liuxing/Engineering/Personal/rag/.github/workflows/release-image.yml:1)。发布 GitHub Release 后，会构建前后端合一镜像并推送到：
+
+```text
+crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com/easylau/rag:<版本号>
+crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com/easylau/rag:latest
+```
+
+在 GitHub 仓库的 `Settings → Secrets and variables → Actions` 中配置：
+
+```text
+ACR_USERNAME   阿里云容器镜像服务用户名
+ACR_PASSWORD   阿里云容器镜像服务密码或访问凭证
+```
+
+Release 标签 `v1.2.3` 会生成镜像版本 `1.2.3`。工作流同时构建 `linux/amd64` 和 `linux/arm64`。
+
+服务器使用已发布镜像时，将 `.env` 中的配置改为：
+
+```dotenv
+IMAGE_REPOSITORY=crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com/easylau/rag
+IMAGE_TAG=1.2.3
+```
+
+然后登录阿里云仓库并更新：
+
+```bash
+docker login crpi-ixo2xnp7izugsz4z.cn-hangzhou.personal.cr.aliyuncs.com
+docker compose pull app
+docker compose up -d --force-recreate migrate app
+```
 
 ## 新服务器首次部署
 
@@ -76,14 +109,14 @@ docker compose up -d --build
 
 ```bash
 docker compose ps -a
-docker compose exec -T backend alembic current
+docker compose exec -T app alembic current
 curl --fail --silent --show-error http://127.0.0.1:8001/api/health
-docker compose logs --tail=100 postgres migrate backend frontend
+docker compose logs --tail=100 postgres migrate app
 ```
 
 正常结果：
 
-- `postgres`、`backend`、`frontend` 为 `running/healthy`
+- `postgres`、`app` 为 `running/healthy`
 - `migrate` 为 `Exited (0)`，这是一次性迁移成功后的正常状态
 - Alembic 显示 `0020 (head)` 或仓库后续更新后的最新 head
 
@@ -165,14 +198,14 @@ npm run dev
 docker compose stop postgres
 ```
 
-只启动 PostgreSQL 时，Compose 不要求 JWT 和管理员密码；完整启动 `migrate/backend` 时，镜像入口会再次校验三个必填值并在缺失时拒绝启动。
+只启动 PostgreSQL 时，Compose 不要求 JWT 和管理员密码；完整启动 `migrate/app` 时，镜像入口会再次校验三个必填值并在缺失时拒绝启动。
 
 ## 日志与日常操作
 
 ```bash
 docker compose ps -a
-docker compose logs -f backend frontend
-docker compose restart backend frontend
+docker compose logs -f app
+docker compose restart app
 docker compose stop
 docker compose up -d
 ```
@@ -185,7 +218,7 @@ docker compose up -d
 
 ```bash
 cd /opt/rag
-docker compose stop frontend backend migrate
+docker compose stop app migrate
 
 RAG_BACKUP_DIR="backups/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RAG_BACKUP_DIR"
@@ -194,7 +227,7 @@ docker compose exec -T postgres \
   sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
   > "$RAG_BACKUP_DIR/database.dump"
 
-docker compose cp backend:/app/uploads "$RAG_BACKUP_DIR/uploads"
+docker compose cp app:/app/uploads "$RAG_BACKUP_DIR/uploads"
 git rev-parse HEAD > "$RAG_BACKUP_DIR/git-commit.txt"
 ```
 
@@ -204,11 +237,11 @@ git rev-parse HEAD > "$RAG_BACKUP_DIR/git-commit.txt"
 git pull --ff-only origin main
 docker compose build --pull
 docker compose up -d --force-recreate --remove-orphans \
-  migrate backend frontend
+  migrate app
 
-docker compose exec -T backend alembic current
+docker compose exec -T app alembic current
 curl --fail --silent --show-error http://127.0.0.1:8001/api/health
-docker compose logs --tail=100 migrate backend frontend
+docker compose logs --tail=100 migrate app
 ```
 
 权限迁移等不兼容版本禁止新旧后端同时运行；迁移失败时不要强行启动新后端，应先处理迁移错误或使用匹配的旧代码与升级前备份恢复。
@@ -222,7 +255,7 @@ cd /opt/rag
 RAG_RESTORE_DIR="/opt/rag/backups/20260729-120000"
 
 docker compose build --pull
-docker compose stop frontend backend migrate
+docker compose stop app migrate
 docker compose up -d postgres
 
 docker compose exec -T postgres \
@@ -233,11 +266,11 @@ docker compose exec -T postgres \
 docker compose run --rm --no-deps \
   --entrypoint sh \
   -v "$RAG_RESTORE_DIR/uploads:/restore:ro" \
-  backend -c 'find /app/uploads -mindepth 1 -depth -delete && cp -a /restore/. /app/uploads/'
+  app -c 'find /app/uploads -mindepth 1 -depth -delete && cp -a /restore/. /app/uploads/'
 
-docker compose up -d --force-recreate migrate backend frontend
+docker compose up -d --force-recreate migrate app
 
-docker compose exec -T backend alembic current
+docker compose exec -T app alembic current
 curl --fail --silent --show-error http://127.0.0.1:8001/api/health
 ```
 
