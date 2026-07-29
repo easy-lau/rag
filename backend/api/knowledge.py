@@ -9,8 +9,20 @@ from database import get_db
 from models.db_models import KnowledgeBase, Document, User
 from models.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
 from core.audit import AuditLogger, get_audit
-from core.deps import get_accessible_kb_ids, require_permission
-from core.permissions import KB_READ, KB_WRITE
+from core.deps import (
+    get_accessible_kb_ids,
+    require_all_kb_scope,
+    require_any_permission,
+    require_kb_access,
+)
+from core.permissions import (
+    CHAT_USE,
+    KB_CREATE,
+    KB_DELETE,
+    KB_READ,
+    KB_UPDATE,
+    ROLE_MANAGE,
+)
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 
@@ -29,7 +41,7 @@ async def _doc_count(db: AsyncSession, kb_id: uuid.UUID) -> int:
 @router.get("/list", response_model=list[KnowledgeBaseOut])
 async def list_knowledge_bases(
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(KB_READ)),
+    user: User = Depends(require_any_permission(CHAT_USE, KB_READ, ROLE_MANAGE)),
 ):
     # 非全权用户仅返回被授权的 KB；accessible 为 None 表示全部
     accessible = await get_accessible_kb_ids(user, db)
@@ -58,7 +70,7 @@ async def list_knowledge_bases(
 async def list_document_tags(
     kb_ids: list[uuid.UUID] | None = Query(None),
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_permission(KB_READ)),
+    user: User = Depends(require_any_permission(CHAT_USE, KB_READ)),
 ):
     """返回（指定/全部可访问）知识库下文档用过的去重标签，供问答页标签选择器使用。"""
     accessible = await get_accessible_kb_ids(user, db)
@@ -90,7 +102,7 @@ async def create_knowledge_base(
     payload: KnowledgeBaseCreate,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    user: User = Depends(require_permission(KB_WRITE)),
+    user: User = Depends(require_all_kb_scope(KB_CREATE)),
 ):
     kb = KnowledgeBase(
         name=payload.name,
@@ -115,7 +127,7 @@ async def update_knowledge_base(
     payload: KnowledgeBaseCreate,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    _: User = Depends(require_permission(KB_WRITE)),
+    _: User = Depends(require_kb_access(KB_UPDATE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb:
@@ -136,7 +148,7 @@ async def delete_knowledge_base(
     kb_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    _: User = Depends(require_permission(KB_WRITE)),
+    _: User = Depends(require_kb_access(KB_DELETE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb:

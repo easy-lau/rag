@@ -35,6 +35,13 @@ export const createTextDocument = (kbId, title, content, sourceUrl = null, tags 
 
 export const getDocument = (kbId, docId) => http.get(`/knowledge/${kbId}/documents/${docId}`)
 
+// 文档原图是受保护的知识库资源，必须通过带 Bearer token 的请求读取，
+// 再由页面使用临时 blob URL 展示；不能直接交给 <img src> 匿名访问。
+export const getDocumentImage = (url) => {
+  const apiPath = url.startsWith('/api/') ? url.slice(4) : url
+  return http.get(apiPath, { responseType: 'blob' })
+}
+
 export const updateTextDocument = (kbId, docId, title, content, sourceUrl = null, tags = []) =>
   http.put(`/knowledge/${kbId}/documents/${docId}`, { title, content, source_url: sourceUrl, tags })
 

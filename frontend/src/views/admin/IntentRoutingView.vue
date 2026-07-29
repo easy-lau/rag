@@ -238,7 +238,7 @@
 
     <DangerConfirm
       v-model:show="showCategoryDeleteConfirm"
-      title="永久删除意图分类？"
+      title="删除意图分类？"
       :subject="pendingCategoryDelete?.name || ''"
       description="删除后，分类说明、示例问题和路由动作配置都无法恢复。"
       :loading="deletingCategory"

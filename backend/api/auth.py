@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from core.audit import AuditLogger, get_audit
 from core.deps import _load_permissions, get_current_user
+from core.permissions import KB_SCOPE_ALL, KB_SCOPE_NONE
 from core.security import create_access_token, hash_password, verify_password
 from database import get_db
 from models.db_models import LoginLog, User
@@ -35,6 +36,11 @@ def _build_me(user: User, permissions: list[str]) -> MeOut:
         display_name=user.display_name,
         is_superadmin=user.is_superadmin,
         role_name=user.role.name if user.role else None,
+        kb_scope=(
+            KB_SCOPE_ALL
+            if user.is_superadmin
+            else getattr(user.role, "scope_mode", KB_SCOPE_NONE) if user.role else KB_SCOPE_NONE
+        ),
         permissions=permissions,
         menus=menus,
     )

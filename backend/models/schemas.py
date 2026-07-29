@@ -123,6 +123,7 @@ class MeOut(BaseModel):
     display_name: str | None = None
     is_superadmin: bool
     role_name: str | None = None
+    kb_scope: Literal["none", "selected", "all"] = "none"
     permissions: list[str] = []
     menus: list[str] = []
 
@@ -164,28 +165,40 @@ class UserUpdate(BaseModel):
 
 # ── Role ─────────────────────────────────────────────────────────
 class RoleCreate(BaseModel):
-    name: str
+    code: str | None = Field(None, max_length=64)
+    name: str = Field(..., min_length=1, max_length=50)
     description: str | None = None
-    permissions: list[str] = []
-    kb_ids: list[uuid.UUID] = []
+    is_assignable: bool = True
+    permissions: list[str] = Field(default_factory=list)
+    # None 仅用于兼容旧客户端：后端会根据 kb_ids 推断 selected / none。
+    scope_mode: Literal["none", "selected", "all"] | None = None
+    kb_ids: list[uuid.UUID] = Field(default_factory=list)
 
 
 class RoleOut(BaseModel):
     id: uuid.UUID
+    code: str | None = None
     name: str
     description: str | None = None
     is_system: bool
-    permissions: list[str] = []
-    kb_ids: list[uuid.UUID] = []
+    is_assignable: bool = True
+    permissions: list[str] = Field(default_factory=list)
+    scope_mode: Literal["none", "selected", "all"] = "none"
+    kb_ids: list[uuid.UUID] = Field(default_factory=list)
     created_at: datetime
 
     model_config = {"from_attributes": True}
 
 
 class RoleUpdate(BaseModel):
-    name: str | None = None
+    code: str | None = Field(None, max_length=64)
+    name: str | None = Field(None, min_length=1, max_length=50)
     description: str | None = None
+    # Omissible for PATCH-like PUT compatibility, but an explicit JSON null is
+    # invalid because assignment state has only two meanings.
+    is_assignable: bool = None
     permissions: list[str] | None = None
+    scope_mode: Literal["none", "selected", "all"] | None = None
     kb_ids: list[uuid.UUID] | None = None
 
 

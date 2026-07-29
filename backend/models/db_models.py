@@ -186,9 +186,14 @@ class Role(Base):
     __tablename__ = "roles"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # 稳定代码只用于内建角色识别；自定义角色保持为空，不能依赖可修改的中文名称做安全判断。
+    code: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     is_system: Mapped[bool] = mapped_column(Boolean, default=False)  # 内建角色禁止删除
+    is_assignable: Mapped[bool] = mapped_column(Boolean, default=True)
+    # none / selected / all；数据范围与功能 capability 分开保存。
+    scope_mode: Mapped[str] = mapped_column(String(16), default="none", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     users: Mapped[list["User"]] = relationship(back_populates="role")

@@ -131,7 +131,7 @@
     v-model:show="showDeleteModal"
     :loading="isDeleting"
     title="删除这段对话？"
-    :subject="`「${pendingDeleteTitle}」`"
+    :subject="pendingDeleteTitle"
     description="其中的全部问答内容也会被永久删除，且无法恢复。"
     confirm-text="永久删除"
     @confirm="submitDelete"

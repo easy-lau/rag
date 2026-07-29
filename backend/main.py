@@ -15,6 +15,7 @@ from api import (
     roles,
     search,
     settings,
+    uploads,
     users,
 )
 from config import get_settings
@@ -61,12 +62,19 @@ app.include_router(document.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(intent_routing.router, prefix="/api")
+app.include_router(uploads.router, prefix="/api")
 
-# 原始图片静态服务：上传的图片转写为文档后，原图仍可在编辑器对照、并供未来多模态问答回传
+# 品牌图需要在登录页公开显示；文档原图由 uploads 路由鉴权后返回，不能
+# 再把整个 upload_dir 作为无鉴权静态目录挂载。
 _upload_dir = get_settings().upload_dir
 os.makedirs(os.path.join(_upload_dir, "images"), exist_ok=True)
-os.makedirs(os.path.join(_upload_dir, "branding"), exist_ok=True)
-app.mount("/api/uploads", StaticFiles(directory=_upload_dir), name="uploads")
+_branding_dir = os.path.join(_upload_dir, "branding")
+os.makedirs(_branding_dir, exist_ok=True)
+app.mount(
+    "/api/uploads/branding",
+    StaticFiles(directory=_branding_dir),
+    name="branding_uploads",
+)
 
 
 @app.get("/api/health")

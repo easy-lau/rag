@@ -17,6 +17,8 @@ export const useAuthStore = defineStore('auth', () => {
   const isAuthenticated = computed(() => !!token.value)
   const permissions = computed(() => user.value?.permissions || [])
   const menus = computed(() => user.value?.menus || [])
+  const kbScope = computed(() => user.value?.kb_scope || 'none')
+  const hasAllKbScope = computed(() => user.value?.is_superadmin || kbScope.value === 'all')
 
   // 超管恒为 true，否则按 permissions 判断
   function hasPerm(key) {
@@ -54,7 +56,7 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   return {
-    token, user, isAuthenticated, permissions, menus,
+    token, user, isAuthenticated, permissions, menus, kbScope, hasAllKbScope,
     hasPerm, login, logout, fetchMe,
   }
 })

@@ -33,7 +33,18 @@
           <n-input v-model:value="form.display_name" placeholder="可选" />
         </n-form-item>
         <n-form-item label="角色">
-          <n-select v-model:value="form.role_id" :options="roleOptions" placeholder="选择角色" clearable />
+          <div class="w-full">
+            <n-select
+              v-model:value="form.role_id"
+              :options="roleOptions"
+              :disabled="editingIsSuperadmin"
+              placeholder="选择角色"
+              clearable
+            />
+            <p v-if="editingIsSuperadmin" class="mt-1.5 text-xs text-gray-500 dark:text-gray-400">
+              超级管理员的系统角色不可在此调整。
+            </p>
+          </div>
         </n-form-item>
         <n-form-item label="状态">
           <n-switch v-model:value="form.is_active">
@@ -52,7 +63,7 @@
 
     <DangerConfirm
       v-model:show="showDeleteConfirm"
-      title="永久删除用户？"
+      title="删除用户？"
       :subject="pendingDelete?.username || ''"
       description="删除后，该账号无法恢复，也无法继续登录系统。"
       :loading="deleting"
@@ -67,8 +78,9 @@ import { ref, reactive, computed, onMounted, watch, h } from 'vue'
 import { NButton, NIcon, NDataTable, NForm, NFormItem, NInput, NSelect, NSwitch, NTag, useMessage } from 'naive-ui'
 import { AddOutline } from '@vicons/ionicons5'
 import { getUsers, createUser, updateUser, deleteUser } from '@/api/users'
-import { getRoles } from '@/api/roles'
+import { getAssignableRoles } from '@/api/roles'
 import { useUiStore } from '@/stores/ui'
+import { useAuthStore } from '@/stores/auth'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import RowActions from '@/components/ui/RowActions.vue'
@@ -76,6 +88,7 @@ import DangerConfirm from '@/components/ui/DangerConfirm.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 
 const ui = useUiStore()
+const authStore = useAuthStore()
 const msg = useMessage()
 const users = ref([])
 const roles = ref([])
@@ -84,6 +97,7 @@ const saving = ref(false)
 
 const showModal = ref(false)
 const editingId = ref(null)
+const editingIsSuperadmin = ref(false)
 const form = ref({ username: '', password: '', display_name: '', role_id: null, is_active: true })
 const showDeleteConfirm = ref(false)
 const pendingDelete = ref(null)
@@ -104,7 +118,11 @@ watch(() => users.value.length, () => {
   if (pagination.page > max) pagination.page = max
 })
 
-const roleOptions = computed(() => roles.value.map(r => ({ label: r.name, value: r.id })))
+const roleOptions = computed(() => roles.value.map(r => ({
+  label: r.name,
+  value: r.id,
+  disabled: r.is_assignable === false,
+})))
 const roleName = (id) => roles.value.find(r => r.id === id)?.name || '—'
 
 const columns = [
@@ -119,7 +137,13 @@ const columns = [
     title: '操作', key: 'actions', width: 208, align: 'center', titleAlign: 'center',
     render: row => h(RowActions, { label: `用户 ${row.username} 操作` }, {
       default: () => [
-        h(NButton, { text: true, type: 'primary', size: 'small', onClick: () => openEdit(row) }, () => '编辑'),
+        h(NButton, {
+          text: true,
+          type: 'primary',
+          size: 'small',
+          disabled: row.is_superadmin && !authStore.user?.is_superadmin,
+          onClick: () => openEdit(row),
+        }, () => '编辑'),
         h(NButton, { text: true, size: 'small', disabled: row.is_superadmin, onClick: () => toggleActive(row) },
           () => row.is_active ? '禁用' : '启用'),
         h(NButton, { text: true, type: 'error', size: 'small', disabled: row.is_superadmin, onClick: () => openDelete(row) }, () => '删除'),
@@ -139,17 +163,28 @@ async function loadUsers() {
 }
 
 async function loadRoles() {
-  roles.value = await getRoles()
+  roles.value = await getAssignableRoles()
 }
 
 function openCreate() {
   editingId.value = null
+  editingIsSuperadmin.value = false
   form.value = { username: '', password: '', display_name: '', role_id: null, is_active: true }
   showModal.value = true
 }
 
 function openEdit(row) {
   editingId.value = row.id
+  editingIsSuperadmin.value = Boolean(row.is_superadmin)
+  // 不可分配的超级管理员角色不会出现在 /roles/assignable，编辑账号时补一个禁用展示项，
+  // 避免 Select 回退显示难以理解的 UUID。
+  if (row.is_superadmin && row.role_id && !roles.value.some(role => role.id === row.role_id)) {
+    roles.value = [...roles.value, {
+      id: row.role_id,
+      name: row.role_name || '超级管理员',
+      is_assignable: false,
+    }]
+  }
   form.value = {
     username: row.username,
     password: '',

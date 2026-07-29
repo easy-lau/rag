@@ -1,4 +1,4 @@
-"""鉴权依赖：当前用户解析、权限校验、可访问知识库范围。"""
+"""鉴权依赖：当前用户解析、能力校验、可访问知识库范围。"""
 
 import uuid
 
@@ -8,7 +8,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from core.permissions import ALL_PERMISSIONS, KB_ACCESS_ALL
+from core.permissions import (
+    ALL_PERMISSIONS,
+    KB_ACCESS_ALL,
+    KB_SCOPE_ALL,
+    KB_SCOPE_NONE,
+    effective_permissions,
+)
 from core.security import decode_access_token
 from database import get_db
 from models.db_models import RoleKnowledgeBase, RolePermission, User
@@ -17,15 +23,23 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 async def _load_permissions(user: User, db: AsyncSession) -> list[str]:
-    """计算用户权限列表：超管拥有全部权限，否则取其角色的 role_permissions。"""
+    """解析角色能力依赖，并派生兼容的菜单入口。
+
+    数据库中只保存 capability；菜单权限在这里派生，避免给菜单 key 就等于
+    获得接口权限的错误模型。超级管理员仍保留旧版 ``ALL_PERMISSIONS`` 行为。
+    """
     if user.is_superadmin:
-        return list(ALL_PERMISSIONS)
+        return effective_permissions((), is_superadmin=True)
     if user.role_id is None:
         return []
     result = await db.execute(
         select(RolePermission.permission_key).where(RolePermission.role_id == user.role_id)
     )
-    return [row[0] for row in result.all()]
+    scope_mode = getattr(user.role, "scope_mode", None) if user.role is not None else None
+    return effective_permissions(
+        (row[0] for row in result.all()),
+        scope_mode=scope_mode,
+    )
 
 
 async def get_current_user(
@@ -79,19 +93,48 @@ def require_permission(key: str):
     return checker
 
 
+def require_any_permission(*keys: str):
+    """依赖工厂：当前用户至少拥有一个给定 capability 即可访问。
+
+    用于知识库/标签选择这类公共入口：能问答的用户不必额外获得后台
+    ``kb:read`` 菜单能力，也可以读取其已授权知识库的必要元数据。
+    """
+    required = tuple(dict.fromkeys(key for key in keys if key))
+    if not required:
+        raise ValueError("至少需要一个权限 key")
+
+    async def checker(user: User = Depends(get_current_user)) -> User:
+        if user.is_superadmin or set(required) & set(getattr(user, "permissions", [])):
+            return user
+        raise HTTPException(status_code=403, detail="无权限")
+
+    return checker
+
+
 async def get_accessible_kb_ids(user: User, db: AsyncSession) -> list[uuid.UUID] | None:
     """返回用户可访问的知识库 id 列表。
 
-    超管或拥有 kb:access_all 权限时返回 None，代表"全部知识库"。
-    否则查 role_knowledge_bases 返回被授权的 kb_id 列表。
+    超管或角色范围为 ``all`` 时返回 None，代表"全部知识库"；范围为
+    ``none`` 时返回空列表；``selected`` 查询 role_knowledge_bases。
+
+    ``kb:access_all`` 仅作为 0019 迁移完成前滚动升级的兼容兜底，新的角色
+    配置不会再写入该 key。
     """
     permissions = getattr(user, "permissions", None)
     if permissions is None:
         permissions = await _load_permissions(user, db)
-    if user.is_superadmin or KB_ACCESS_ALL in permissions:
+    if user.is_superadmin:
         return None
     if user.role_id is None:
         return []
+
+    role = getattr(user, "role", None)
+    scope_mode = getattr(role, "scope_mode", None) if role is not None else None
+    if scope_mode == KB_SCOPE_ALL or KB_ACCESS_ALL in permissions:
+        return None
+    if scope_mode == KB_SCOPE_NONE:
+        return []
+
     result = await db.execute(
         select(RoleKnowledgeBase.kb_id).where(RoleKnowledgeBase.role_id == user.role_id)
     )
@@ -106,6 +149,25 @@ async def ensure_kb_access(user: User, kb_id: uuid.UUID, db: AsyncSession) -> No
     accessible = await get_accessible_kb_ids(user, db)
     if accessible is not None and kb_id not in accessible:
         raise HTTPException(status_code=403, detail="无权访问该知识库")
+
+
+def require_all_kb_scope(permission_key: str):
+    """要求操作 capability 且角色拥有全部知识库范围。
+
+    创建知识库没有可供范围校验的既有 ``kb_id``。若允许 selected scope
+    的编辑者创建，会产生其角色无法稳定覆盖的新资源，因此仅 all scope
+    或超级管理员可执行该动作。
+    """
+
+    async def checker(
+        user: User = Depends(require_permission(permission_key)),
+        db: AsyncSession = Depends(get_db),
+    ) -> User:
+        if await get_accessible_kb_ids(user, db) is not None:
+            raise HTTPException(status_code=403, detail="创建知识库需要全部知识库范围")
+        return user
+
+    return checker
 
 
 def require_kb_access(permission_key: str):

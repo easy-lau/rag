@@ -9,7 +9,7 @@
               <span class="hidden sm:inline">返回知识库</span>
             </n-button>
         <n-select v-model:value="selectedKbId" :options="kbOptions" placeholder="选择知识库" class="w-48" clearable />
-        <template v-if="authStore.hasPerm('doc:write')">
+        <template v-if="canCreateDocument">
           <n-button :disabled="!selectedKbId" @click="showUpload = true">
             <template #icon><n-icon><CloudUploadOutline /></n-icon></template>
             上传文档
@@ -36,7 +36,7 @@
     </SurfaceCard>
 
     <template v-else>
-      <div v-if="canWrite && checkedRowKeys.length" class="flex items-center gap-3 mb-3">
+      <div v-if="canDeleteDocument && checkedRowKeys.length" class="flex items-center gap-3 mb-3">
         <span class="text-sm text-gray-500 dark:text-gray-400">已选 {{ checkedRowKeys.length }} 项</span>
         <n-button size="small" type="error" @click="openBatchDelete">
           <template #icon><n-icon><TrashOutline /></n-icon></template>
@@ -48,7 +48,7 @@
         <n-data-table
           :columns="columns" :data="docs" :loading="loading"
           :row-key="rowKey" v-model:checked-row-keys="checkedRowKeys"
-          :pagination="pagination" :scroll-x="ui.isCompact ? 1040 : undefined"
+          :pagination="pagination" :scroll-x="1420"
           class="admin-data-table"
         />
       </SurfaceCard>
@@ -123,7 +123,9 @@
           </n-upload-dragger>
         </n-upload>
         <p class="text-xs text-gray-400 mt-3 leading-relaxed">
-          图片将通过「设置 → 多模态模型」配置的视觉模型转写成文本，上传后可在编辑器中对照原图校对，确认无误再保存入库。
+          {{ canUpdateDocument
+            ? '图片将通过「设置 → 多模态模型」配置的视觉模型转写成文本，上传后可在编辑器中对照原图校对。'
+            : '图片将通过「设置 → 多模态模型」配置的视觉模型转写成文本并直接入库。' }}
         </p>
         <div class="mt-3">
           <div class="text-xs text-gray-500 mb-1.5">标签（可选，用于检索软加权）</div>
@@ -155,7 +157,10 @@
       >
         <!-- Header -->
         <div class="flex items-center justify-between px-4 sm:px-6 py-3.5 border-b border-gray-200 dark:border-gray-700 shrink-0">
-          <span class="text-base font-semibold text-gray-800 dark:text-gray-100">{{ editingDocId ? '编辑文档' : '手动输入文档' }}</span>
+          <div class="flex min-w-0 items-center gap-2">
+            <span class="truncate text-base font-semibold text-gray-800 dark:text-gray-100">{{ documentEditorTitle }}</span>
+            <n-tag v-if="isViewingDocument" size="small" :bordered="false" round>仅查看</n-tag>
+          </div>
           <n-button text aria-label="关闭文档编辑器" :disabled="submittingText" @click="showTextEditor = false">
             <template #icon><n-icon :size="20"><CloseOutline /></n-icon></template>
           </n-button>
@@ -172,18 +177,25 @@
 
         <!-- Body -->
         <div class="flex-1 min-h-0 flex flex-col gap-3 px-4 sm:px-6 py-4">
-          <n-input v-model:value="textTitle" placeholder="文档标题" class="shrink-0" size="large" />
+          <n-input
+            v-model:value="textTitle"
+            placeholder="文档标题"
+            class="shrink-0"
+            size="large"
+            :readonly="isViewingDocument"
+          />
 
           <!-- 数据来源链接：开启后，问答检索的参考来源会把该文档标题渲染成可点击外链 -->
           <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3 shrink-0">
             <span class="sm:w-24 shrink-0 text-sm text-gray-600 dark:text-gray-300">数据来源链接</span>
-            <n-switch v-model:value="sourceUrlEnabled" size="small" />
+            <n-switch v-model:value="sourceUrlEnabled" size="small" :disabled="isViewingDocument" />
             <n-input
               v-if="sourceUrlEnabled"
               v-model:value="sourceUrl"
               placeholder="https:// 原文链接，问答来源将显示为可点击标题"
               size="small"
               class="w-full sm:flex-1"
+              :readonly="isViewingDocument"
             />
           </div>
 
@@ -194,6 +206,7 @@
               v-model:value="editTags" :options="tagSelectOptions"
               multiple filterable tag clearable size="small"
               placeholder="选择已有标签，或输入后回车新建" class="w-full sm:flex-1"
+              :disabled="isViewingDocument"
             />
           </div>
 
@@ -214,7 +227,7 @@
               :class="mobileEditorPane === 'editor' ? 'bg-blue-500 text-white shadow-sm' : 'text-gray-500 dark:text-gray-400'"
               :aria-pressed="mobileEditorPane === 'editor'"
               @click="mobileEditorPane = 'editor'"
-            >编辑</button>
+            >{{ isViewingDocument ? '内容' : '编辑' }}</button>
             <button
               type="button"
               class="flex-1 rounded-lg px-3 py-2 transition-colors"
@@ -228,11 +241,12 @@
             <!-- Editor -->
             <div :class="[mobileEditorPane === 'editor' ? 'flex' : 'hidden', 'lg:flex', 'flex-col min-h-0']">
               <div class="flex items-center gap-1.5 text-xs font-medium text-gray-500 mb-1.5 px-1 shrink-0">
-                <span class="w-1.5 h-1.5 rounded-full bg-blue-500"></span>Markdown 编辑
+                <span class="w-1.5 h-1.5 rounded-full bg-blue-500"></span>{{ isViewingDocument ? 'Markdown 内容' : 'Markdown 编辑' }}
               </div>
               <textarea
                 v-model="textContent"
                 spellcheck="false"
+                :readonly="isViewingDocument"
                 class="flex-1 min-h-0 w-full resize-none rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-gray-800 dark:text-gray-200 text-sm leading-relaxed font-mono p-4 outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 placeholder="# 标题&#10;&#10;在此输入 Markdown 内容，支持标题、列表、代码块、表格等..."
               />
@@ -288,10 +302,13 @@
 
         <!-- Footer -->
         <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between px-4 sm:px-6 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
-          <span class="text-xs text-gray-400">{{ textContent.length }} 字符 · 按标题自动分块入库</span>
+          <span class="text-xs text-gray-400">
+            {{ textContent.length }} 字符 · {{ isViewingDocument ? '当前仅查看' : '按标题自动分块入库' }}
+          </span>
           <div class="flex justify-end gap-2">
-            <n-button :disabled="submittingText" @click="showTextEditor = false">取消</n-button>
+            <n-button :disabled="submittingText" @click="showTextEditor = false">{{ isViewingDocument ? '关闭' : '取消' }}</n-button>
             <n-button
+              v-if="!isViewingDocument"
               type="primary"
               :loading="submittingText"
               :disabled="!textTitle.trim() || !textContent.trim()"
@@ -341,15 +358,14 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, watch, h } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch, h } from 'vue'
 import { useRoute } from 'vue-router'
 import { NButton, NIcon, NSelect, NDataTable, NModal, NUpload, NUploadDragger, NTag, NInput, NSpin, NSwitch, NImage, useMessage } from 'naive-ui'
-import { CloudUploadOutline, TrashOutline, CreateOutline, CloseOutline, PencilOutline, LibraryOutline, ArrowBackOutline, ImageOutline, PricetagsOutline } from '@vicons/ionicons5'
+import { CloudUploadOutline, TrashOutline, CreateOutline, CloseOutline, PencilOutline, LibraryOutline, ArrowBackOutline, ImageOutline, PricetagsOutline, EyeOutline } from '@vicons/ionicons5'
 import { renderDocMarkdown } from '@/utils/markdown'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useAuthStore } from '@/stores/auth'
-import { useUiStore } from '@/stores/ui'
-import { getAllDocuments, uploadDocument, uploadImageDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, updateTextDocument, updateDocumentTags } from '@/api/document'
+import { getAllDocuments, uploadDocument, uploadImageDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, getDocumentImage, updateTextDocument, updateDocumentTags } from '@/api/document'
 import { getDocumentTags } from '@/api/knowledge'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
@@ -360,9 +376,11 @@ import AppModal from '@/components/ui/AppModal.vue'
 const route = useRoute()
 const kbStore = useKnowledgeStore()
 const authStore = useAuthStore()
-const ui = useUiStore()
 const msg = useMessage()
-const canWrite = computed(() => authStore.hasPerm('doc:write'))
+const canReadDocument = computed(() => authStore.hasPerm('doc:read'))
+const canCreateDocument = computed(() => authStore.hasPerm('doc:create'))
+const canUpdateDocument = computed(() => authStore.hasPerm('doc:update'))
+const canDeleteDocument = computed(() => authStore.hasPerm('doc:delete'))
 const selectedKbId = ref(null)
 const docs = ref([])
 const loading = ref(false)
@@ -371,7 +389,7 @@ const rowKey = (row) => row.id
 const showDeleteConfirm = ref(false)
 const deleteTarget = ref(null)
 const deleting = ref(false)
-const deleteConfirmTitle = computed(() => deleteTarget.value?.kind === 'batch' ? '永久删除选中文档？' : '永久删除文档？')
+const deleteConfirmTitle = computed(() => deleteTarget.value?.kind === 'batch' ? '删除选中文档？' : '删除文档？')
 const deleteConfirmSubject = computed(() => {
   if (!deleteTarget.value) return ''
   if (deleteTarget.value.kind === 'batch') return `已选择 ${deleteTarget.value.ids.length} 个文档`
@@ -433,15 +451,34 @@ const textContent = ref('')
 const submittingText = ref(false)
 const processingStatus = ref('')
 const editingDocId = ref(null)
+const editorMode = ref('create')
 const editingImageUrl = ref(null)
 const sourceUrlEnabled = ref(false)
 const sourceUrl = ref('')
 const editTags = ref([])
 
 const renderedMarkdown = computed(() => renderDocMarkdown(textContent.value || ''))
+const isViewingDocument = computed(() => editorMode.value === 'view')
+const documentEditorTitle = computed(() => ({
+  create: '手动输入文档',
+  edit: '编辑文档',
+  view: '查看文档',
+})[editorMode.value] || '文档内容')
 
 const previewMode = ref('markdown')
 const mobileEditorPane = ref('editor')
+
+function clearEditingImageUrl() {
+  if (editingImageUrl.value?.startsWith('blob:')) {
+    URL.revokeObjectURL(editingImageUrl.value)
+  }
+  editingImageUrl.value = null
+}
+
+watch(showTextEditor, (shown) => {
+  if (!shown) clearEditingImageUrl()
+})
+onUnmounted(clearEditingImageUrl)
 
 function _splitText(text) {
   const CHUNK_SIZE = 500
@@ -509,7 +546,7 @@ const fmtTime = value => value ? new Intl.DateTimeFormat('zh-CN', {
 }).format(new Date(value)).replaceAll('/', '-') : '—'
 
 const columns = computed(() => [
-  ...(canWrite.value ? [{ type: 'selection', align: 'center', titleAlign: 'center' }] : []),
+  ...(canDeleteDocument.value ? [{ type: 'selection', align: 'center', titleAlign: 'center' }] : []),
   { title: '文件名', key: 'filename', minWidth: 190, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
   {
     title: '标签', key: 'tags', minWidth: 150, align: 'left', titleAlign: 'left',
@@ -521,36 +558,43 @@ const columns = computed(() => [
   { title: '类型', key: 'file_type', width: 82, align: 'center', titleAlign: 'center' },
   { title: '分块数', key: 'chunk_count', width: 82, align: 'center', titleAlign: 'center' },
   { title: '状态', key: 'status', width: 96, align: 'center', titleAlign: 'center', render: row => row.is_active ? statusTag(row.status) : h(NTag, { type: 'default', size: 'small' }, () => '停用') },
-  {
+  ...(canUpdateDocument.value ? [{
     title: '启用', key: 'is_active', width: 80, align: 'center', titleAlign: 'center',
     render: row => h(NSwitch, {
       value: row.is_active,
       size: 'small',
-      disabled: !canWrite.value,
       onUpdateValue: () => handleToggle(row),
     })
-  },
+  }] : []),
   { title: '上传时间', key: 'created_at', width: 168, align: 'center', titleAlign: 'center', render: r => fmtTime(r.created_at) },
   // 未实际修改过时，修改时间默认取创建时间
   { title: '最近修改', key: 'updated_at', width: 168, align: 'center', titleAlign: 'center', render: r => fmtTime(r.updated_at || r.created_at) },
   { title: '创建人', key: 'created_by_name', width: 100, align: 'left', titleAlign: 'left', render: r => r.created_by_name || '—' },
   // 未实际修改过时，修改人默认取创建人
   { title: '修改人', key: 'updated_by_name', width: 100, align: 'left', titleAlign: 'left', render: r => r.updated_by_name || r.created_by_name || '—' },
-  {
-    title: '操作', key: 'actions', width: 132, align: 'center', titleAlign: 'center',
-    render: row => canWrite.value
-      ? h(RowActions, { label: `文档 ${row.filename} 操作` }, {
-          default: () => [
-          h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑标签', title: '编辑标签', onClick: () => openTagEditor(row) },
-            { icon: () => h(NIcon, null, () => h(PricetagsOutline)) }),
-          h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑内容', title: '编辑内容', onClick: () => openEditEditor(row) },
-            { icon: () => h(NIcon, null, () => h(PencilOutline)) }),
-          h(NButton, { text: true, type: 'error', size: 'small', 'aria-label': '删除文档', title: '删除文档', onClick: () => openDelete(row) },
-            { icon: () => h(NIcon, null, () => h(TrashOutline)) }),
-          ],
-        })
-      : h('span', { class: 'text-xs text-gray-400' }, '—')
-  }
+  ...(canReadDocument.value || canUpdateDocument.value || canDeleteDocument.value ? [{
+    title: '操作', key: 'actions', width: 132, fixed: 'right', align: 'center', titleAlign: 'center',
+    render: row => h(RowActions, { label: `文档 ${row.filename} 操作` }, {
+      default: () => [
+        canReadDocument.value
+          ? h(NButton, { text: true, size: 'small', 'aria-label': '查看文档', title: '查看文档', onClick: () => openViewEditor(row) },
+              { icon: () => h(NIcon, null, () => h(EyeOutline)) })
+          : null,
+        canUpdateDocument.value
+          ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑标签', title: '编辑标签', onClick: () => openTagEditor(row) },
+              { icon: () => h(NIcon, null, () => h(PricetagsOutline)) })
+          : null,
+        canUpdateDocument.value
+          ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑内容', title: '编辑内容', onClick: () => openEditEditor(row) },
+              { icon: () => h(NIcon, null, () => h(PencilOutline)) })
+          : null,
+        canDeleteDocument.value
+          ? h(NButton, { text: true, type: 'error', size: 'small', 'aria-label': '删除文档', title: '删除文档', onClick: () => openDelete(row) },
+              { icon: () => h(NIcon, null, () => h(TrashOutline)) })
+          : null,
+      ].filter(Boolean),
+    })
+  }] : [])
 ])
 
 onMounted(async () => {
@@ -561,12 +605,22 @@ onMounted(async () => {
 watch(selectedKbId, async (id) => {
   checkedRowKeys.value = []
   if (!id) { docs.value = []; pagination.page = 1; kbTags.value = []; return }
+  if (!canReadDocument.value) {
+    docs.value = []
+    kbTags.value = []
+    msg.warning('当前角色没有查看文档的权限')
+    return
+  }
   loading.value = true
   try { docs.value = await getAllDocuments(id); pagination.page = 1; await loadKbTags() }
   finally { loading.value = false }
 })
 
 async function handleToggle(row) {
+  if (!canUpdateDocument.value) {
+    msg.warning('当前角色没有修改文档的权限')
+    return
+  }
   const updated = await toggleDocument(selectedKbId.value, row.id)
   const idx = docs.value.findIndex(d => d.id === row.id)
   if (idx !== -1) docs.value[idx] = { ...docs.value[idx], is_active: updated.is_active }
@@ -574,11 +628,19 @@ async function handleToggle(row) {
 }
 
 function openDelete(row) {
+  if (!canDeleteDocument.value) {
+    msg.warning('当前角色没有删除文档的权限')
+    return
+  }
   deleteTarget.value = { kind: 'single', row }
   showDeleteConfirm.value = true
 }
 
 function openBatchDelete() {
+  if (!canDeleteDocument.value) {
+    msg.warning('当前角色没有删除文档的权限')
+    return
+  }
   const ids = [...checkedRowKeys.value]
   if (!ids.length) return
   deleteTarget.value = { kind: 'batch', ids }
@@ -588,6 +650,10 @@ function openBatchDelete() {
 async function confirmDelete() {
   const target = deleteTarget.value
   if (!target || !selectedKbId.value) return
+  if (!canDeleteDocument.value) {
+    msg.warning('当前角色没有删除文档的权限')
+    return
+  }
   deleting.value = true
   try {
     if (target.kind === 'single') {
@@ -618,6 +684,10 @@ async function confirmDelete() {
 
 async function submitUpload() {
   if (!fileList.value.length || !selectedKbId.value) return
+  if (!canCreateDocument.value) {
+    msg.warning('当前角色没有新增文档的权限')
+    return
+  }
   uploading.value = true
   uploadStatus.value = '正在上传文件...'
   try {
@@ -637,11 +707,13 @@ async function submitUpload() {
     await loadKbTags()
     if (failed > 0) {
       msg.warning(`${uploaded.length - failed} 个成功，${failed} 个处理失败`)
-    } else if (uploaded.length === 1) {
+    } else if (uploaded.length === 1 && canUpdateDocument.value) {
       // 单文件：自动打开审阅编辑器
       await openEditEditor(uploaded[0])
     } else {
-      msg.success(`${uploaded.length} 个文档处理完成，可点击铅笔图标审阅识别内容`)
+      msg.success(canUpdateDocument.value
+        ? `${uploaded.length} 个文档处理完成，可点击编辑操作审阅内容`
+        : `${uploaded.length} 个文档创建成功`)
     }
   } catch {
     msg.error('上传失败，请重试')
@@ -654,9 +726,14 @@ async function submitUpload() {
 function handleUpload({ file, onFinish }) { onFinish() }
 
 function openTextEditor() {
+  if (!canCreateDocument.value) {
+    msg.warning('当前角色没有新增文档的权限')
+    return
+  }
   editingDocId.value = null
+  editorMode.value = 'create'
   mobileEditorPane.value = 'editor'
-  editingImageUrl.value = null
+  clearEditingImageUrl()
   textTitle.value = ''
   textContent.value = ''
   sourceUrlEnabled.value = false
@@ -665,12 +742,39 @@ function openTextEditor() {
   showTextEditor.value = true
 }
 
-async function openEditEditor(row) {
+function openViewEditor(row) {
+  return openDocumentEditor(row, 'view')
+}
+
+function openEditEditor(row) {
+  return openDocumentEditor(row, 'edit')
+}
+
+async function openDocumentEditor(row, mode) {
+  if (!canReadDocument.value) {
+    msg.warning('当前角色没有查看文档的权限')
+    return
+  }
+  if (mode === 'edit' && !canUpdateDocument.value) {
+    msg.warning('当前角色没有修改文档的权限')
+    return
+  }
   try {
     const doc = await getDocument(selectedKbId.value, row.id)
     editingDocId.value = row.id
+    editorMode.value = mode === 'edit' ? 'edit' : 'view'
     mobileEditorPane.value = 'editor'
-    editingImageUrl.value = doc.image_url || null
+    clearEditingImageUrl()
+    if (doc.image_url) {
+      try {
+        const imageBlob = await getDocumentImage(doc.image_url)
+        editingImageUrl.value = URL.createObjectURL(imageBlob)
+      } catch (error) {
+        msg.warning(error?.response?.data?.detail || (mode === 'view'
+          ? '原图加载失败，仍可继续查看识别文本'
+          : '原图加载失败，仍可继续编辑识别文本'))
+      }
+    }
     textTitle.value = doc.filename
     textContent.value = doc.raw_content || ''
     sourceUrl.value = doc.source_url || ''
@@ -683,6 +787,10 @@ async function openEditEditor(row) {
 }
 
 function openTagEditor(row) {
+  if (!canUpdateDocument.value) {
+    msg.warning('当前角色没有修改文档的权限')
+    return
+  }
   tagEditDoc.value = row
   tagEditValue.value = [...(row.tags || [])]
   showTagEditor.value = true
@@ -690,6 +798,10 @@ function openTagEditor(row) {
 
 async function saveTags() {
   if (!tagEditDoc.value) return
+  if (!canUpdateDocument.value) {
+    msg.warning('当前角色没有修改文档的权限')
+    return
+  }
   savingTags.value = true
   try {
     const updated = await updateDocumentTags(selectedKbId.value, tagEditDoc.value.id, tagEditValue.value)
@@ -707,6 +819,10 @@ async function saveTags() {
 
 async function submitImageUpload() {
   if (!imageFileList.value.length || !selectedKbId.value) return
+  if (!canCreateDocument.value) {
+    msg.warning('当前角色没有新增文档的权限')
+    return
+  }
   imageUploading.value = true
   imageUploadStatus.value = '正在上传图片...'
   try {
@@ -726,11 +842,13 @@ async function submitImageUpload() {
     await loadKbTags()
     if (failed > 0) {
       msg.warning(`${uploaded.length - failed} 张识别成功，${failed} 张失败（请检查「设置 → 多模态模型」配置）`)
-    } else if (uploaded.length === 1) {
+    } else if (uploaded.length === 1 && canUpdateDocument.value) {
       // 单张：自动打开审阅编辑器，对照原图校对识别结果
       await openEditEditor(uploaded[0])
     } else {
-      msg.success(`${uploaded.length} 张图片识别完成，可点击铅笔图标审阅识别内容`)
+      msg.success(canUpdateDocument.value
+        ? `${uploaded.length} 张图片识别完成，可点击编辑操作审阅识别内容`
+        : `${uploaded.length} 张图片文档创建成功`)
     }
   } catch {
     msg.error('图片上传失败，请重试')
@@ -755,19 +873,28 @@ function pollDocumentStatus(docId) {
 
 async function submitText() {
   if (!textTitle.value.trim() || !textContent.value.trim()) return
+  const isUpdate = editorMode.value === 'edit' && !!editingDocId.value
+  if (isViewingDocument.value) {
+    msg.warning('当前为只读查看模式')
+    return
+  }
+  if (isUpdate ? !canUpdateDocument.value : !canCreateDocument.value) {
+    msg.warning(isUpdate ? '当前角色没有修改文档的权限' : '当前角色没有新增文档的权限')
+    return
+  }
   submittingText.value = true
   processingStatus.value = '正在保存...'
   try {
     const url = (sourceUrlEnabled.value && sourceUrl.value.trim()) ? sourceUrl.value.trim() : null
     let doc
-    if (editingDocId.value) {
+    if (isUpdate) {
       doc = await updateTextDocument(selectedKbId.value, editingDocId.value, textTitle.value.trim(), textContent.value, url, editTags.value)
     } else {
       doc = await createTextDocument(selectedKbId.value, textTitle.value.trim(), textContent.value, url, editTags.value)
     }
     processingStatus.value = '正在分块处理...'
     await pollDocumentStatus(doc.id)
-    msg.success(editingDocId.value ? '文档已更新' : '文档已保存')
+    msg.success(isUpdate ? '文档已更新' : '文档已保存')
     showTextEditor.value = false
     docs.value = await getAllDocuments(selectedKbId.value)
     await loadKbTags()

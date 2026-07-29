@@ -14,7 +14,7 @@ from core.document_parser import parse_file, parse_markdown_content, excel_to_ma
 from core.embeddings import embed_batch
 from core.audit import AuditLogger, get_audit
 from core.deps import require_kb_access
-from core.permissions import DOC_READ, DOC_WRITE
+from core.permissions import DOC_CREATE, DOC_DELETE, DOC_READ, DOC_UPDATE
 from config import get_settings
 
 router = APIRouter(prefix="/knowledge", tags=["documents"])
@@ -84,7 +84,7 @@ async def upload_document(
     tags: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    user: User = Depends(require_kb_access(DOC_WRITE)),
+    user: User = Depends(require_kb_access(DOC_CREATE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb:
@@ -120,7 +120,7 @@ async def upload_image_document(
     tags: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    user: User = Depends(require_kb_access(DOC_WRITE)),
+    user: User = Depends(require_kb_access(DOC_CREATE)),
 ):
     """上传图片/截图：保存原图 → 多模态模型转写为 Markdown → 分块入库；
     原图保留以便在编辑器中对照校对。"""
@@ -175,7 +175,7 @@ async def create_text_document(
     body: TextDocumentIn,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    user: User = Depends(require_kb_access(DOC_WRITE)),
+    user: User = Depends(require_kb_access(DOC_CREATE)),
 ):
     kb = await db.get(KnowledgeBase, kb_id)
     if not kb:
@@ -222,7 +222,7 @@ async def update_text_document(
     body: TextDocumentIn,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    user: User = Depends(require_kb_access(DOC_WRITE)),
+    user: User = Depends(require_kb_access(DOC_UPDATE)),
 ):
     doc = await db.get(Document, doc_id)
     if not doc or doc.kb_id != kb_id:
@@ -257,7 +257,8 @@ async def update_document_tags(
     doc_id: uuid.UUID,
     body: TagsIn,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(require_kb_access(DOC_WRITE)),
+    audit: AuditLogger = Depends(get_audit),
+    user: User = Depends(require_kb_access(DOC_UPDATE)),
 ):
     """仅更新标签，不触发重新解析/嵌入——改标签不应让文档重新入库。"""
     doc = await db.get(Document, doc_id)
@@ -266,6 +267,14 @@ async def update_document_tags(
     doc.tags = _normalize_tags(body.tags)
     doc.updated_by = user.id
     doc.updated_at = now_utc()
+    audit.log(
+        db,
+        "doc.update_tags",
+        target_type="document",
+        target_id=doc.id,
+        target_name=doc.filename,
+        detail={"kb_id": str(kb_id), "tag_count": len(doc.tags)},
+    )
     await db.commit()
     await db.refresh(doc, attribute_names=["creator", "updater"])
     doc.created_by_name = _name(doc.creator)
@@ -278,12 +287,21 @@ async def toggle_document(
     kb_id: uuid.UUID,
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_kb_access(DOC_WRITE)),
+    audit: AuditLogger = Depends(get_audit),
+    _: User = Depends(require_kb_access(DOC_UPDATE)),
 ):
     doc = await db.get(Document, doc_id)
     if not doc or doc.kb_id != kb_id:
         raise HTTPException(status_code=404, detail="文档不存在")
     doc.is_active = not doc.is_active
+    audit.log(
+        db,
+        "doc.toggle",
+        target_type="document",
+        target_id=doc.id,
+        target_name=doc.filename,
+        detail={"kb_id": str(kb_id), "is_active": doc.is_active},
+    )
     await db.commit()
     await db.refresh(doc)
     return doc
@@ -295,7 +313,7 @@ async def delete_document(
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    _: User = Depends(require_kb_access(DOC_WRITE)),
+    _: User = Depends(require_kb_access(DOC_DELETE)),
 ):
     doc = await db.get(Document, doc_id)
     if not doc or doc.kb_id != kb_id:

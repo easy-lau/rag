@@ -3,7 +3,7 @@
     <div class="max-w-6xl mx-auto space-y-5">
       <PageHeader title="知识库管理" description="创建并维护可检索的知识库，文档会在对应知识库内统一管理。">
         <template #actions>
-          <n-button v-if="authStore.hasPerm('kb:write')" type="primary" @click="showCreate = true">
+          <n-button v-if="canCreateKb" type="primary" @click="showCreate = true">
             <template #icon><n-icon><AddOutline /></n-icon></template>
             创建知识库
           </n-button>
@@ -17,7 +17,9 @@
         >
           <n-icon :size="40" class="mb-2 text-slate-400"><LibraryOutline /></n-icon>
           <p class="text-sm text-slate-600 dark:text-slate-300">暂无知识库</p>
-          <p class="mt-1 text-xs text-slate-400">可从右上角创建第一个知识库</p>
+          <p class="mt-1 text-xs text-slate-400">
+            {{ canCreateKb ? '可从右上角创建第一个知识库' : '当前角色尚未被授权可访问的知识库' }}
+          </p>
         </SurfaceCard>
         <div v-else class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
           <SurfaceCard
@@ -30,11 +32,11 @@
               <div class="w-3 h-3 rounded-full shrink-0" :style="{ background: kb.icon_color }" />
               <h3 class="text-sm font-medium text-gray-800 dark:text-gray-200 truncate">{{ kb.name }}</h3>
             </div>
-            <div v-if="authStore.hasPerm('kb:write')" class="flex items-center gap-2 shrink-0 ml-2">
-              <n-button text size="tiny" aria-label="编辑知识库" @click="openEdit(kb)">
+            <div v-if="canUpdateKb || canDeleteKb" class="flex items-center gap-2 shrink-0 ml-2">
+              <n-button v-if="canUpdateKb" text size="tiny" aria-label="编辑知识库" @click="openEdit(kb)">
                 <template #icon><n-icon><PencilOutline /></n-icon></template>
               </n-button>
-              <n-button text size="tiny" type="error" aria-label="删除知识库" @click="openDelete(kb)">
+              <n-button v-if="canDeleteKb" text size="tiny" type="error" aria-label="删除知识库" @click="openDelete(kb)">
                 <template #icon><n-icon><TrashOutline /></n-icon></template>
               </n-button>
             </div>
@@ -42,8 +44,12 @@
           <p class="text-xs text-gray-500 dark:text-gray-400 mb-2 line-clamp-1">{{ kb.description || '暂无描述' }}</p>
           <div class="flex items-center justify-between mb-2">
             <span class="text-xs text-gray-400">{{ kb.doc_count }} 个文档</span>
-            <n-button size="tiny" @click="$router.push({ name: 'documents', query: { kb: kb.id } })">
-              管理文档
+            <n-button
+              v-if="canOpenDocuments"
+              size="tiny"
+              @click="$router.push({ name: 'documents', query: { kb: kb.id } })"
+            >
+              {{ canManageDocuments ? '管理文档' : '查看文档' }}
             </n-button>
           </div>
           <div class="flex items-center justify-between text-[11px] text-gray-400 dark:text-gray-500 pt-2 border-t border-gray-100 dark:border-gray-700">
@@ -124,7 +130,7 @@
 
     <DangerConfirm
       v-model:show="showDeleteConfirm"
-      title="永久删除知识库？"
+      title="删除知识库？"
       :subject="pendingDelete?.name || ''"
       description="删除前需先清空该知识库下的文档。删除成功后，知识库配置无法恢复。"
       :loading="deleting"
@@ -136,7 +142,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { NButton, NIcon, NSpin, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
 import { AddOutline, LibraryOutline, TrashOutline, PencilOutline } from '@vicons/ionicons5'
 import { useKnowledgeStore } from '@/stores/knowledge'
@@ -148,12 +154,29 @@ import AppModal from '@/components/ui/AppModal.vue'
 
 const kbStore = useKnowledgeStore()
 const authStore = useAuthStore()
+// 创建知识库没有现成对象可套用“指定知识库”范围，因此只允许全范围管理员创建。
+// 已授权知识库的修改和删除分别由独立能力 + 后端对象范围校验控制。
+const canCreateKb = computed(() => authStore.hasPerm('kb:create') && authStore.hasAllKbScope)
+const canUpdateKb = computed(() => authStore.hasPerm('kb:update'))
+const canDeleteKb = computed(() => authStore.hasPerm('kb:delete'))
+const canOpenDocuments = computed(() => (
+  authStore.hasPerm('menu:documents') && authStore.hasPerm('doc:read')
+))
+const canManageDocuments = computed(() => (
+  authStore.hasPerm('doc:create')
+  || authStore.hasPerm('doc:update')
+  || authStore.hasPerm('doc:delete')
+))
 const message = useMessage()
 const showDeleteConfirm = ref(false)
 const pendingDelete = ref(null)
 const deleting = ref(false)
 
 function openDelete(kb) {
+  if (!canDeleteKb.value) {
+    message.warning('当前角色没有删除知识库的权限')
+    return
+  }
   pendingDelete.value = kb
   showDeleteConfirm.value = true
 }
@@ -161,6 +184,10 @@ function openDelete(kb) {
 async function confirmDelete() {
   const kb = pendingDelete.value
   if (!kb) return
+  if (!canDeleteKb.value) {
+    message.warning('当前角色没有删除知识库的权限')
+    return
+  }
   deleting.value = true
   try {
     await kbStore.remove(kb.id)
@@ -188,6 +215,10 @@ onMounted(() => kbStore.fetchList())
 
 async function handleCreate() {
   if (!form.value.name.trim()) return
+  if (!canCreateKb.value) {
+    message.warning('创建知识库需要新增权限和全部知识库范围')
+    return
+  }
   creating.value = true
   try {
     await kbStore.create({ ...form.value })
@@ -199,6 +230,10 @@ async function handleCreate() {
 }
 
 function openEdit(kb) {
+  if (!canUpdateKb.value) {
+    message.warning('当前角色没有修改知识库的权限')
+    return
+  }
   editingId.value = kb.id
   editForm.value = { name: kb.name, description: kb.description || '', icon_color: kb.icon_color }
   showEdit.value = true
@@ -206,6 +241,10 @@ function openEdit(kb) {
 
 async function handleEdit() {
   if (!editForm.value.name.trim()) return
+  if (!canUpdateKb.value) {
+    message.warning('当前角色没有修改知识库的权限')
+    return
+  }
   saving.value = true
   try {
     await kbStore.update(editingId.value, { ...editForm.value })
