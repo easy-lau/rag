@@ -33,6 +33,7 @@
   --ui-primary-hover: #256fe5;
   --ui-primary-pressed: #1d5fca;
   --ui-primary-subtle: #eaf2ff;
+  --ui-text-on-primary: #ffffff;
 
   --ui-info: #3b82f6;
   --ui-info-hover: #256fe5;
@@ -100,6 +101,7 @@ body.dark,
   --ui-primary-hover: #78a9f5;
   --ui-primary-pressed: #3f7fdf;
   --ui-primary-subtle: #233d66;
+  --ui-text-on-primary: #ffffff;
 
   --ui-info: #68a1f5;
   --ui-info-hover: #84b4fa;

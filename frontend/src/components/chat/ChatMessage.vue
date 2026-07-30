@@ -7,7 +7,11 @@
 
     <div class="max-w-[85%] sm:max-w-[75%] min-w-0">
       <!-- User bubble -->
-      <div v-if="isUser" class="bg-blue-500 text-white px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed break-words">
+      <div
+        v-if="isUser"
+        class="chat-message__user-bubble px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed break-words"
+        @copy="handleUserCopy"
+      >
         {{ message.content }}
       </div>
 
@@ -146,6 +150,26 @@ function copy() {
   msg.success('已复制')
 }
 
+// 浏览器从块级气泡复制文本时可能把元素边界转换成首尾换行。
+// 只接管用户气泡内的原生复制，保留正文内部换行，同时清理并非消息内容的边界换行。
+function handleUserCopy(event) {
+  if (!event.clipboardData) return
+  const selection = window.getSelection()
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return
+
+  const range = selection.getRangeAt(0)
+  if (!event.currentTarget.contains(range.commonAncestorContainer)) return
+
+  const selectedText = selection.toString()
+  if (!selectedText) return
+
+  event.preventDefault()
+  event.clipboardData.setData(
+    'text/plain',
+    selectedText.replace(/^[\r\n]+|[\r\n]+$/g, '')
+  )
+}
+
 function handleMarkdownClick(e) {
   if (!(e.target instanceof Element)) return
   const btn = e.target.closest('.copy-btn')
@@ -166,3 +190,16 @@ function formatTime(t) {
   })
 }
 </script>
+
+<style scoped>
+.chat-message__user-bubble {
+  color: var(--ui-text-on-primary);
+  background: var(--ui-primary);
+}
+
+/* 用户气泡本身已经是蓝色，使用更深的品牌色标记选区，并保持白字。 */
+.chat-message__user-bubble::selection {
+  color: var(--ui-text-on-primary);
+  background: var(--ui-primary-pressed);
+}
+</style>
