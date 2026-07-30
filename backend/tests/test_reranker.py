@@ -3,6 +3,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from core.query_constraints import (
+    evaluate_candidate_constraints,
+    extract_query_constraints,
+)
 from core.reranker import rerank, rerank_with_status
 
 
@@ -15,39 +19,313 @@ def _client_with_payload(payload: dict):
     )
 
 
+def _assessment(
+    index: int,
+    *,
+    topic: float,
+    support: float,
+    constraint: str = "neutral",
+    role: str = "direct",
+    reason: str = "候选能够支撑查询",
+) -> dict:
+    return {
+        "index": index,
+        "topic_relevance": topic,
+        "answer_support": support,
+        "constraint_status": constraint,
+        "evidence_role": role,
+        "reason": reason,
+    }
+
+
+class QueryConstraintTests(unittest.TestCase):
+    def test_extracts_product_and_explicit_version_from_user_context(self) -> None:
+        constraints = extract_query_constraints(
+            "解决登录用户名枚举 要配置什么 我是云枢8.6"
+        )
+
+        self.assertEqual(constraints.product, "云枢")
+        self.assertEqual(constraints.version, "8.6")
+        self.assertTrue(constraints.explicit_version)
+        self.assertEqual(constraints.matched_text, "我是云枢8.6")
+        self.assertIn("显式版本", constraints.extraction_reason)
+
+    def test_obvious_old_versions_are_deterministic_mismatches(self) -> None:
+        constraints = extract_query_constraints("我是云枢8.6，用户名枚举怎么配置")
+
+        for version in ("6", "7"):
+            evaluation = evaluate_candidate_constraints(
+                constraints,
+                {
+                    "filename": f"云枢{version}配置参数说明",
+                    "content": f"产品版本：云枢{version}全系\nerror_reply_same: true",
+                },
+            )
+            self.assertEqual(evaluation.status, "mismatch")
+            self.assertIn("版本冲突", evaluation.reason)
+            self.assertEqual(evaluation.candidate_versions, (version,))
+
+    def test_explicit_compatibility_is_not_misclassified_as_exact(self) -> None:
+        constraints = extract_query_constraints("云枢8.6登录安全配置")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "跨版本安全说明",
+                "content": "本配置已验证兼容云枢8.6，可用于统一登录失败提示。",
+            },
+        )
+
+        self.assertEqual(evaluation.status, "compatible")
+        self.assertIn("兼容", evaluation.reason)
+
+    def test_negated_compatibility_and_version_prefix_are_not_positive_matches(self) -> None:
+        constraints = extract_query_constraints("我是云枢8.6")
+        for text in (
+            "本功能不兼容云枢8.6",
+            "该参数不支持云枢8.6",
+            "本配置并 不 支持 云枢 8.6",
+            "本配置不适用于云枢8.6",
+            "该能力不再兼容云枢8.6",
+            "当前无法适用于云枢8.6",
+            "该方案不能适用于云枢8.6",
+            "此插件未适配云枢8.6",
+            "这里只是对比，不代表支持云枢8.6",
+            "云枢8.6不再兼容该配置",
+        ):
+            with self.subTest(text=text):
+                evaluation = evaluate_candidate_constraints(
+                    constraints,
+                    {"filename": "说明", "content": text},
+                )
+                self.assertEqual(evaluation.status, "mismatch")
+
+        prefix = evaluate_candidate_constraints(
+            constraints,
+            {"filename": "说明", "content": "本功能支持云枢8.6.1"},
+        )
+        self.assertNotEqual(prefix.status, "compatible")
+
+    def test_declared_old_version_wins_over_incidental_target_version_mention(self) -> None:
+        constraints = extract_query_constraints("CloudPivot v8.6 登录安全")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "云枢6配置说明",
+                "metadata": {"product": "云枢", "version": "6"},
+                "content": "本文比较云枢8.6的差异，不代表兼容。",
+            },
+        )
+        self.assertEqual(evaluation.status, "mismatch")
+        self.assertIn("6", evaluation.candidate_versions)
+
+    def test_product_aliases_are_explicit_but_arbitrary_substrings_are_not(self) -> None:
+        constraints = extract_query_constraints("云枢8.6登录安全")
+        alias = evaluate_candidate_constraints(
+            constraints,
+            {"filename": "CloudPivot 8.6 安全配置", "content": "配置说明"},
+        )
+        conflicting = evaluate_candidate_constraints(
+            constraints,
+            {"metadata": {"product": "非云枢", "version": "8.6"}, "content": "配置说明"},
+        )
+        self.assertEqual(alias.status, "exact")
+        self.assertEqual(conflicting.status, "mismatch")
+
+    def test_node_count_is_not_extracted_as_version_and_product_only_is_kept(self) -> None:
+        constraints = extract_query_constraints("使用云枢 8 个节点")
+        self.assertEqual(constraints.product, "云枢")
+        self.assertIsNone(constraints.version)
+        self.assertFalse(constraints.has_hard_constraint)
+        self.assertTrue(constraints.has_product_constraint)
+
+    def test_component_version_cannot_override_declared_product_version(self) -> None:
+        constraints = extract_query_constraints("我是云枢8.6，用户名枚举怎么配置")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "云枢7配置.md",
+                "content": "Java版本：8.6\nerror_reply_same1: true",
+            },
+        )
+
+        self.assertEqual(evaluation.status, "mismatch")
+        self.assertEqual(evaluation.candidate_versions, ("7",))
+
+    def test_bare_component_compatibility_cannot_upgrade_old_product_document(self) -> None:
+        constraints = extract_query_constraints("云枢8.6登录安全")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "云枢7配置.md",
+                "content": "浏览器组件支持8.6，云枢产品版本仍为7。",
+            },
+        )
+
+        self.assertEqual(evaluation.status, "mismatch")
+
+    def test_version_metadata_without_product_identity_is_unknown(self) -> None:
+        constraints = extract_query_constraints("云枢8.6登录安全")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "其他系统配置.md",
+                "metadata": {"version": "8.6"},
+                "content": "登录安全说明",
+            },
+        )
+
+        self.assertEqual(evaluation.status, "unknown")
+
+    def test_conflicting_declared_versions_are_not_exact(self) -> None:
+        constraints = extract_query_constraints("云枢8.6登录安全")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "云枢7配置.md",
+                "content": "所属产品：云枢\n产品版本：云枢8.6",
+            },
+        )
+
+        self.assertEqual(evaluation.status, "mismatch")
+
+    def test_single_number_tag_is_not_treated_as_product_version(self) -> None:
+        constraints = extract_query_constraints("云枢8.6登录安全")
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "云枢配置.md",
+                "doc_tags": ["8"],
+                "content": "登录安全说明",
+            },
+        )
+
+        self.assertEqual(evaluation.status, "unknown")
+
+
 class RerankerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_complete_valid_scores_are_trusted_and_sorted(self) -> None:
+    async def test_complete_valid_assessments_are_trusted_and_sorted(self) -> None:
         results = [
             {"id": "a", "content": "A", "score": 0.02},
             {"id": "b", "content": "B", "score": 0.01},
         ]
-        client = _client_with_payload({
-            "scores": [
-                {"index": 1, "score": 0.2},
-                {"index": 2, "score": 0.9},
-            ]
-        })
+        client = _client_with_payload(
+            {
+                "results": [
+                    _assessment(1, topic=0.4, support=0.2),
+                    _assessment(2, topic=0.9, support=0.9),
+                ]
+            }
+        )
 
         with (
             patch("core.reranker.get_client", return_value=client),
             patch("core.reranker.get_settings", return_value=SimpleNamespace(chat_model="test")),
         ):
-            outcome = await rerank_with_status("query", results)
+            outcome = await rerank_with_status("普通查询", results)
 
         self.assertTrue(outcome.succeeded)
         self.assertEqual([item["id"] for item in outcome.results], ["b", "a"])
         self.assertEqual([item["score"] for item in outcome.results], [0.9, 0.2])
+        self.assertEqual([item["retrieval_score"] for item in outcome.results], [0.01, 0.02])
+        self.assertTrue(all(item["rerank_status"] == "verified" for item in outcome.results))
         # 不原地覆盖检索器返回值，失败回退时才能保留原始分数语义。
         self.assertEqual(results[0]["score"], 0.02)
+        self.assertNotIn("retrieval_score", results[0])
 
-    async def test_incomplete_scores_are_untrusted_and_preserve_original_order(self) -> None:
+    async def test_high_semantic_score_cannot_override_version_mismatch(self) -> None:
+        results = [
+            {
+                "id": "v6",
+                "filename": "云枢6配置参数说明",
+                "doc_tags": ["云枢", "配置"],
+                "metadata": {"heading": "登录安全"},
+                "content": "产品版本：云枢6全系\nerror_reply_same: true",
+                "score": 0.03,
+            },
+            {
+                "id": "v7",
+                "filename": "云枢7配置",
+                "content": "云枢7：error_reply_same1: true",
+                "score": 0.03,
+            },
+            {
+                "id": "v86",
+                "filename": "云枢8.6安全配置",
+                "content": "云枢8.6：security.login.error-reply-same: true",
+                "score": 0.01,
+            },
+        ]
+        # 故意模拟模型把旧版本全部误判为“精确直接证据”。代码规则必须覆盖它。
+        client = _client_with_payload(
+            {
+                "results": [
+                    _assessment(1, topic=0.99, support=0.99, constraint="exact"),
+                    _assessment(2, topic=0.99, support=0.99, constraint="exact"),
+                    _assessment(3, topic=0.80, support=0.80, constraint="exact"),
+                ]
+            }
+        )
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=SimpleNamespace(chat_model="test")),
+        ):
+            outcome = await rerank_with_status(
+                "解决登录用户名枚举 要配置什么 我是云枢8.6",
+                results,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual([item["id"] for item in outcome.results], ["v86", "v6", "v7"])
+        exact, version6, version7 = outcome.results
+        self.assertEqual(exact["constraint_status"], "exact")
+        for item in (version6, version7):
+            self.assertEqual(item["constraint_status"], "mismatch")
+            self.assertEqual(item["evidence_role"], "related")
+            self.assertEqual(item["score"], 0.0)
+            self.assertEqual(item["answer_support"], 0.99)
+            self.assertTrue(item["constraint_overridden"])
+            self.assertIn("版本冲突", item["constraint_reason"])
+
+    async def test_prompt_contains_filename_tags_metadata_and_more_than_300_chars(self) -> None:
+        long_content = "甲" * 360 + "CONTENT_END_MARKER"
+        results = [
+            {
+                "id": "a",
+                "filename": "云枢8.6配置.md",
+                "doc_tags": ["登录安全"],
+                "metadata": {"heading": "用户名枚举"},
+                "content": long_content,
+                "score": 0.02,
+            }
+        ]
+        client = _client_with_payload(
+            {"results": [_assessment(1, topic=0.9, support=0.9, constraint="exact")]}
+        )
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=SimpleNamespace(chat_model="test")),
+        ):
+            await rerank_with_status("云枢8.6如何配置", results)
+
+        messages = client.chat.completions.create.await_args.kwargs["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertNotIn("CONTENT_END_MARKER", messages[0]["content"])
+        prompt = messages[1]["content"]
+        self.assertIn("云枢8.6配置.md", prompt)
+        self.assertIn("登录安全", prompt)
+        self.assertIn("用户名枚举", prompt)
+        self.assertIn("CONTENT_END_MARKER", prompt)
+
+    async def test_incomplete_assessments_are_unverified_and_preserve_recall(self) -> None:
         results = [
             {"id": "a", "content": "A", "score": 0.02},
             {"id": "b", "content": "B", "score": 0.01},
         ]
-        client = _client_with_payload({
-            "scores": [{"index": 1, "score": 0.8}],
-        })
+        client = _client_with_payload(
+            {"results": [_assessment(1, topic=0.8, support=0.8)]}
+        )
 
         with (
             patch("core.reranker.get_client", return_value=client),
@@ -58,8 +336,42 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(outcome.succeeded)
         self.assertIn("未覆盖全部候选", outcome.error or "")
-        self.assertEqual(outcome.results, results)
-        self.assertEqual(compatible_results, results)
+        self.assertEqual([item["id"] for item in outcome.results], ["a", "b"])
+        self.assertEqual([item["score"] for item in outcome.results], [0.02, 0.01])
+        self.assertEqual(
+            [item["retrieval_score"] for item in outcome.results], [0.02, 0.01]
+        )
+        self.assertTrue(
+            all(item["rerank_status"] == "unverified" for item in outcome.results)
+        )
+        self.assertTrue(all(item["topic_relevance"] is None for item in outcome.results))
+        self.assertEqual([item["id"] for item in compatible_results], ["a", "b"])
+
+    async def test_invalid_multidimensional_field_falls_back_without_threshold_score(self) -> None:
+        results = [{"id": "a", "content": "A", "score": 0.015625}]
+        client = _client_with_payload(
+            {
+                "results": [
+                    _assessment(
+                        1,
+                        topic=0.9,
+                        support=0.9,
+                        constraint="made_up",
+                    )
+                ]
+            }
+        )
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=SimpleNamespace(chat_model="test")),
+        ):
+            outcome = await rerank_with_status("query", results)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("constraint_status", outcome.error or "")
+        self.assertEqual(outcome.results[0]["score"], 0.015625)
+        self.assertEqual(outcome.results[0]["rerank_status"], "unverified")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -26,6 +26,7 @@ MENU_SETTINGS = "menu:settings"
 MENU_USERS = "menu:users"
 MENU_ROLES = "menu:roles"
 MENU_LOGIN_LOGS = "menu:login_logs"
+MENU_RAG_TRACES = "menu:rag_traces"
 
 DERIVED_MENU_KEYS: tuple[str, ...] = (
     MENU_CHAT,
@@ -37,6 +38,7 @@ DERIVED_MENU_KEYS: tuple[str, ...] = (
     MENU_USERS,
     MENU_ROLES,
     MENU_LOGIN_LOGS,
+    MENU_RAG_TRACES,
 )
 
 
@@ -231,8 +233,8 @@ CAPABILITY_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "key": LOG_READ,
         "group": "system",
         "module": "audit_logs",
-        "label": "查看审计日志",
-        "description": "查看登录日志与操作审计记录。",
+        "label": "查看审计与调用链",
+        "description": "查看登录日志、操作审计和 RAG 调用链诊断信息。",
         "risk": "high",
         "requires": (),
     },
@@ -308,6 +310,7 @@ MENU_REQUIRE_ANY: dict[str, frozenset[str]] = {
     MENU_USERS: frozenset({USER_MANAGE}),
     MENU_ROLES: frozenset({ROLE_MANAGE}),
     MENU_LOGIN_LOGS: frozenset({LOG_READ}),
+    MENU_RAG_TRACES: frozenset({LOG_READ}),
 }
 
 MENUS: list[dict[str, Any]] = [
@@ -320,6 +323,7 @@ MENUS: list[dict[str, Any]] = [
     {"key": MENU_USERS, "route": "users", "title": "用户管理", "permission": MENU_USERS, "derived": True},
     {"key": MENU_ROLES, "route": "roles", "title": "角色管理", "permission": MENU_ROLES, "derived": True},
     {"key": MENU_LOGIN_LOGS, "route": "audit-logs", "title": "审计日志", "permission": MENU_LOGIN_LOGS, "derived": True},
+    {"key": MENU_RAG_TRACES, "route": "rag-traces", "title": "调用链路", "permission": MENU_RAG_TRACES, "derived": True},
 ]
 
 
@@ -335,7 +339,7 @@ MODULE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {"key": "settings", "group": "system", "label": "系统设置", "description": "模型、检索策略和站点配置。", "menu": MENU_SETTINGS},
     {"key": "users", "group": "system", "label": "用户管理", "description": "用户账号与角色分配。", "menu": MENU_USERS},
     {"key": "roles", "group": "system", "label": "角色管理", "description": "角色、能力和知识库范围。", "menu": MENU_ROLES},
-    {"key": "audit_logs", "group": "system", "label": "审计日志", "description": "登录与操作审计记录。", "menu": MENU_LOGIN_LOGS},
+    {"key": "audit_logs", "group": "system", "label": "审计与追踪", "description": "登录、操作审计记录与 RAG 调用链诊断。", "menu": MENU_LOGIN_LOGS},
 )
 
 
@@ -383,7 +387,7 @@ ROLE_TEMPLATES: tuple[dict[str, Any], ...] = (
     {
         "code": "auditor",
         "name": "审计员",
-        "description": "只读查看登录和操作审计日志。",
+        "description": "只读查看登录、操作审计日志和 RAG 调用链。",
         "scope_mode": KB_SCOPE_NONE,
         "capabilities": (LOG_READ,),
         "is_assignable": True,
@@ -391,7 +395,7 @@ ROLE_TEMPLATES: tuple[dict[str, Any], ...] = (
     {
         "code": "platform_operator",
         "name": "平台管理员",
-        "description": "管理模型、检索和站点设置，并查看审计日志。",
+        "description": "管理模型、检索和站点设置，并查看审计日志与调用链。",
         "scope_mode": KB_SCOPE_NONE,
         "capabilities": (SETTINGS_READ, SETTINGS_WRITE, LOG_READ),
         "is_assignable": False,
@@ -400,7 +404,7 @@ ROLE_TEMPLATES: tuple[dict[str, Any], ...] = (
 
 
 PERMISSION_CATALOG: dict[str, Any] = {
-    "version": 3,
+    "version": 4,
     "capabilities": [dict(item) for item in CAPABILITY_DEFINITIONS],
     "groups": (
         {"key": "workspace", "label": "问答工作台"},

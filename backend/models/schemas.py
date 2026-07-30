@@ -36,7 +36,7 @@ class DocumentOut(BaseModel):
     chunk_count: int
     status: str
     is_active: bool = True
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime | None = None
     created_by_name: str | None = None
@@ -47,17 +47,17 @@ class DocumentOut(BaseModel):
 
 # ── Chat ─────────────────────────────────────────────────────────
 class SearchConfig(BaseModel):
-    method: str = "hybrid"       # hybrid | vector | keyword
+    method: Literal["hybrid", "vector", "keyword"] = "hybrid"
     rerank: bool = True
-    top_k: int = 5
-    tags: list[str] = []         # 用户手动勾选的标签，对命中文档做检索软加权
+    top_k: int = Field(5, ge=1, le=20)
+    tags: list[str] = Field(default_factory=list, max_length=100)
 
 
 class ChatRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1, max_length=12000)
     conversation_id: uuid.UUID | None = None
-    knowledge_base_ids: list[uuid.UUID] = []
-    search_config: SearchConfig = SearchConfig()
+    knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+    search_config: SearchConfig = Field(default_factory=SearchConfig)
 
 
 class MessageOut(BaseModel):
@@ -86,12 +86,12 @@ class ConversationRenameRequest(BaseModel):
 
 # ── Search ───────────────────────────────────────────────────────
 class SearchRequest(BaseModel):
-    query: str
-    knowledge_base_ids: list[uuid.UUID] = []
-    method: str = "hybrid"
-    top_k: int = 5
+    query: str = Field(..., min_length=1, max_length=12000)
+    knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+    method: Literal["hybrid", "vector", "keyword"] = "hybrid"
+    top_k: int = Field(5, ge=1, le=20)
     rerank: bool = True
-    tags: list[str] = []         # 标签软加权（命中文档排序分上浮，不硬过滤）
+    tags: list[str] = Field(default_factory=list, max_length=100)  # 标签软加权
 
 
 class SearchResultItem(BaseModel):
@@ -102,7 +102,25 @@ class SearchResultItem(BaseModel):
     score: float
     chunk_index: int
     metadata: dict | None
-    tags: list[str] = []
+    tags: list[str] = Field(default_factory=list)
+    kb_id: uuid.UUID | None = None
+    doc_id: uuid.UUID | None = None
+    retrieval_score: float | None = None
+    vector_score: float | None = None
+    vector_rank: int | None = None
+    keyword_score: float | None = None
+    keyword_rank: int | None = None
+    trigram_score: float | None = None
+    trigram_rank: int | None = None
+    active_channels: list[str] = Field(default_factory=list)
+    rerank_status: str | None = None
+    topic_relevance: float | None = None
+    answer_support: float | None = None
+    constraint_status: str | None = None
+    evidence_role: str | None = None
+    rerank_reason: str | None = None
+    constraint_reason: str | None = None
+    ranking_factors: dict | None = None
 
 
 class SearchResponse(BaseModel):
@@ -244,12 +262,65 @@ class OperationLogPage(BaseModel):
     total: int
 
 
+# ── RAG Trace ───────────────────────────────────────────────────
+class RagTraceRunOut(BaseModel):
+    trace_id: str
+    request_kind: str
+    user_id: uuid.UUID | None = None
+    username: str | None = None
+    conversation_id: uuid.UUID | None = None
+    status: str
+    current_stage: str | None = None
+    event_count: int
+    observed_event_count: int
+    storage_omitted_event_count: int
+    storage_truncated: bool
+    content_included: bool
+    content_accessible: bool = True
+    input_preview: str | None = None
+    output_preview: str | None = None
+    evidence_status: str | None = None
+    selected_kb_count: int | None = None
+    hit_count: int | None = None
+    duration_ms: int | None = None
+    started_at: datetime
+    completed_at: datetime | None = None
+    updated_at: datetime
+
+
+class RagTraceRunPage(BaseModel):
+    items: list[RagTraceRunOut]
+    total: int
+
+
+class RagTraceEventOut(BaseModel):
+    id: uuid.UUID
+    sequence: int
+    event: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RagTraceDetailOut(RagTraceRunOut):
+    events: list[RagTraceEventOut] = Field(default_factory=list)
+
+
 # ── Intent Routing ──────────────────────────────────────────────
 IntentRouterMode = Literal["rules_then_llm", "llm_only", "off"]
 IntentAction = Literal["retrieve", "chat", "writing", "system_help"]
 IntentResponseMode = Literal["grounded_qa", "general_chat", "writing", "platform_help"]
 IntentRetrievalPolicy = Literal["required", "optional", "skip"]
-IntentEvidenceStatus = Literal["skipped", "hit", "no_hit", "unverified", "error"]
+IntentEvidenceStatus = Literal[
+    "skipped",
+    "hit",
+    "partial",
+    "version_mismatch",
+    "no_hit",
+    "unverified",
+    "error",
+]
 IntentFeedback = Literal["correct", "incorrect"]
 
 

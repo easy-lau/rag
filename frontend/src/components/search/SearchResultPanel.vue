@@ -29,6 +29,23 @@
         <span aria-hidden="true">·</span>
         <span>{{ retrievalPolicyLabel }}</span>
       </div>
+      <div v-if="showEvidenceBreakdown" class="mt-2 flex flex-wrap items-center gap-1.5" aria-label="检索证据分类">
+        <n-tag v-if="directHitCount" type="success" size="small" :bordered="false" round>
+          回答依据 {{ directHitCount }}
+        </n-tag>
+        <n-tag v-if="relatedReferenceCount" type="warning" size="small" :bordered="false" round>
+          相近资料 {{ relatedReferenceCount }}
+        </n-tag>
+        <n-tag v-if="unverifiedReferenceCount" size="small" :bordered="false" round>
+          待验证 {{ unverifiedReferenceCount }}
+        </n-tag>
+        <n-tag v-if="irrelevantReferenceCount" size="small" :bordered="false" round>
+          非回答依据 {{ irrelevantReferenceCount }}
+        </n-tag>
+      </div>
+      <p v-if="evidenceNotice" class="evidence-notice">
+        {{ evidenceNotice }}
+      </p>
       <p
         v-if="decisionReason"
         class="mt-1.5 truncate text-xs text-gray-400"
@@ -46,6 +63,7 @@
           :key="item.id"
           :item="item"
           :rank="i + 1"
+          :preview-enabled="canPreviewSources"
           @preview="$emit('preview', $event)"
         />
       </template>
@@ -67,17 +85,17 @@
           <span class="shrink-0 text-gray-500">执行状态</span>
           <span class="text-right text-gray-700 dark:text-gray-300">{{ retrievalExecutionLabel }}</span>
         </div>
-        <div class="flex justify-between text-xs">
-          <span class="text-gray-500">{{ searchStore.searchMeta.retrieval_executed === true ? '检索方式' : '配置方式' }}</span>
-          <span class="text-gray-700 dark:text-gray-300">{{ methodLabel }}</span>
+        <div class="flex justify-between gap-3 text-xs">
+          <span class="shrink-0 text-gray-500">{{ searchStore.searchMeta.retrieval_executed === true ? '检索方式' : '配置方式' }}</span>
+          <span class="min-w-0 break-words text-right text-gray-700 dark:text-gray-300">{{ methodLabel }}</span>
         </div>
         <div v-if="searchStore.searchMeta.top_k !== undefined" class="flex justify-between text-xs">
           <span class="text-gray-500">Top K</span>
           <span class="text-gray-700 dark:text-gray-300">{{ searchStore.searchMeta.top_k }}</span>
         </div>
-        <div v-if="['hit', 'unverified'].includes(searchStore.searchMeta.evidence_status) && hitCount" class="flex justify-between text-xs">
-          <span class="text-gray-500">{{ searchStore.searchMeta.evidence_status === 'hit' ? '有效命中' : '召回候选' }}</span>
-          <span class="text-gray-700 dark:text-gray-300">{{ hitCount }} 条</span>
+        <div v-if="hasDisplayedCandidates" class="flex justify-between gap-3 text-xs">
+          <span class="shrink-0 text-gray-500">展示候选</span>
+          <span class="text-gray-700 dark:text-gray-300">{{ displayedCandidateCount }} 条</span>
         </div>
       </div>
     </div>
@@ -89,16 +107,19 @@ import { computed } from 'vue'
 import { NButton, NIcon, NTag } from 'naive-ui'
 import { CloseOutline, SearchOutline } from '@vicons/ionicons5'
 import { useSearchStore } from '@/stores/search'
+import { useAuthStore } from '@/stores/auth'
 import DocumentResultItem from './DocumentResultItem.vue'
 import SearchProcess from './SearchProcess.vue'
 
 const searchStore = useSearchStore()
+const authStore = useAuthStore()
+const canPreviewSources = computed(() => authStore.hasPerm('doc:read'))
 defineProps({
   inDrawer: { type: Boolean, default: false },
 })
 defineEmits(['close', 'preview'])
 const methodLabel = computed(() => {
-  const m = { hybrid: '混合检索（向量+关键词）', vector: '向量检索', keyword: '关键词检索' }
+  const m = { hybrid: '混合检索（向量 + 全文 + 词面）', vector: '向量检索', keyword: '关键词检索（全文 + 词面）' }
   return m[searchStore.searchMeta.method] || (searchStore.searchMeta.retrieval_executed === true ? '未记录' : '—')
 })
 
@@ -119,14 +140,72 @@ const retrievalPolicyLabel = computed(() => ({
 })[searchStore.intentDecision?.retrieval_policy] || (searchStore.intentDecision?.need_retrieval ? '需要检索' : '无需检索'))
 
 const evidenceStatus = computed(() => searchStore.searchMeta.evidence_status || '')
-const hitCount = computed(() => Number(searchStore.searchMeta.hit_count ?? searchStore.totalCount ?? 0) || 0)
+const displayedCandidateCount = computed(() => (
+  Number(searchStore.searchMeta.displayed_candidate_count ?? searchStore.totalCount ?? 0) || 0
+))
+const hitCount = computed(() => Number(searchStore.searchMeta.hit_count ?? 0) || 0)
+const directEvidenceCount = computed(() => Number(searchStore.searchMeta.direct_evidence_count ?? 0) || 0)
+const directHitCount = computed(() => Math.max(directEvidenceCount.value, hitCount.value))
+const relatedReferenceCount = computed(() => Number(searchStore.searchMeta.related_reference_count ?? 0) || 0)
+const unverifiedReferenceCount = computed(() => Number(searchStore.searchMeta.unverified_reference_count ?? 0) || 0)
+const irrelevantReferenceCount = computed(() => Number(searchStore.searchMeta.irrelevant_reference_count ?? 0) || 0)
+const hasDisplayedCandidates = computed(() => displayedCandidateCount.value > 0)
+const showEvidenceBreakdown = computed(() => (
+  searchStore.hasResultEvent
+  && hasDisplayedCandidates.value
+  && (
+    directHitCount.value
+    || relatedReferenceCount.value
+    || unverifiedReferenceCount.value
+    || irrelevantReferenceCount.value
+  )
+))
 const retrievalState = computed(() => ({
   skipped: { label: '已跳过', type: 'default' },
-  hit: { label: `${hitCount.value} 条命中`, type: 'success' },
+  hit: {
+    label: directHitCount.value
+      ? `${directHitCount.value} 条回答依据`
+      : (searchStore.searchMeta.evidence_role_known && relatedReferenceCount.value
+          ? '仅相近资料'
+          : `${displayedCandidateCount.value} 条待验证`),
+    type: directHitCount.value
+      ? 'success'
+      : (searchStore.searchMeta.evidence_role_known && relatedReferenceCount.value ? 'warning' : 'default'),
+  },
+  partial: { label: '部分资料可用', type: 'warning' },
+  version_mismatch: { label: '仅相近版本', type: 'warning' },
   no_hit: { label: '未命中', type: 'warning' },
-  unverified: { label: hitCount.value ? `${hitCount.value} 条待验证` : '状态未验证', type: 'default' },
+  unverified: {
+    label: displayedCandidateCount.value ? `${displayedCandidateCount.value} 条待验证` : '状态未验证',
+    type: 'default',
+  },
   error: { label: '检索失败', type: 'error' },
 })[evidenceStatus.value] || { label: '等待执行', type: 'default' })
+
+const evidenceNotice = computed(() => {
+  if (evidenceStatus.value === 'version_mismatch') {
+    return '已找到主题相关资料，但没有符合目标版本的直接依据。相近版本内容仅供参考。'
+  }
+  if (evidenceStatus.value === 'partial') {
+    return directHitCount.value > 0
+      ? '部分资料可作为回答依据，其余结果仅作相近参考，请留意版本或其他关键约束。'
+      : '仅找到相近或适用性待确认的资料，暂无可直接支撑回答的依据。'
+  }
+  if (
+    searchStore.searchMeta.evidence_role_known
+    && directHitCount.value === 0
+    && relatedReferenceCount.value > 0
+  ) {
+    return '当前只有主题相关的相近资料，不能将相关度分数当作答案可信度。'
+  }
+  if (evidenceStatus.value === 'unverified' && displayedCandidateCount.value > 0) {
+    return '这些结果尚未完成证据角色判定；主题相关不代表版本适用或能够直接回答。'
+  }
+  if (!searchStore.searchMeta.evidence_role_known && displayedCandidateCount.value > 0) {
+    return '当前接口只返回了主题相关结果，尚未区分回答依据与相近资料。'
+  }
+  return ''
+})
 
 const decisionReason = computed(() => (
   searchStore.searchMeta.decision_reason || searchStore.intentDecision?.decision_reason || ''
@@ -166,6 +245,8 @@ const showExecutionMeta = computed(() => (
 const emptyResultText = computed(() => {
   return ({
     skipped: '本次已跳过知识库检索',
+    partial: '仅找到部分可用资料',
+    version_mismatch: '未找到符合目标版本的回答依据',
     no_hit: '已完成检索，但没有找到相关内容',
     unverified: '检索状态暂未确认',
     error: '知识库检索失败',
@@ -176,8 +257,24 @@ const emptyResultText = computed(() => {
 
 const emptyResultHint = computed(() => ({
   skipped: '这是后端策略的最终执行结果，并非“检索后无命中”。',
+  partial: '可以查看相近资料，但回答时只应采用已标记为“回答依据”的内容。',
+  version_mismatch: '相近版本资料不能直接证明目标版本可用，建议补充对应版本文档。',
   no_hit: '可以调整问法、检索标签，或确认知识库中已录入相关文档。',
   unverified: '服务端未返回完整证据状态，结果可能来自旧版本接口或请求已中断。',
   error: '请稍后重试；若持续失败，可联系管理员检查检索服务。',
 })[evidenceStatus.value] || '')
 </script>
+
+<style scoped>
+.evidence-notice {
+  margin-top: 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface-muted);
+  padding: 7px 9px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+</style>

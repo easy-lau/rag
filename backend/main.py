@@ -14,6 +14,7 @@ from api import (
     knowledge,
     login_logs,
     operation_logs,
+    rag_traces,
     roles,
     search,
     settings,
@@ -23,10 +24,13 @@ from api import (
 from config import get_settings
 from core.settings_crypto import SettingsEncryptionError
 from core.login_security import login_log_cleanup_loop
+from core.rag_trace_store import start_rag_trace_store, stop_rag_trace_store
 from database import engine
 
+_settings = get_settings()
+_log_level = getattr(logging, _settings.log_level.strip().upper(), logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
@@ -53,9 +57,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[startup] 重置卡死文档失败: {e}")
     login_log_cleanup_task = asyncio.create_task(login_log_cleanup_loop())
+    await start_rag_trace_store()
     try:
         yield
     finally:
+        await stop_rag_trace_store()
         login_log_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await login_log_cleanup_task
@@ -68,7 +74,13 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Conversation-ID", "Retry-After"],
+    expose_headers=[
+        "X-Conversation-ID",
+        "X-RAG-Trace-ID",
+        "X-RAG-Trace-Truncated",
+        "X-RAG-Trace-Omitted-Events",
+        "Retry-After",
+    ],
 )
 
 app.include_router(auth.router, prefix="/api")
@@ -76,6 +88,7 @@ app.include_router(users.router, prefix="/api")
 app.include_router(roles.router, prefix="/api")
 app.include_router(login_logs.router, prefix="/api")
 app.include_router(operation_logs.router, prefix="/api")
+app.include_router(rag_traces.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(knowledge.router, prefix="/api")
 app.include_router(document.router, prefix="/api")
@@ -86,7 +99,7 @@ app.include_router(uploads.router, prefix="/api")
 
 # 品牌图需要在登录页公开显示；文档原图由 uploads 路由鉴权后返回，不能
 # 再把整个 upload_dir 作为无鉴权静态目录挂载。
-_upload_dir = get_settings().upload_dir
+_upload_dir = _settings.upload_dir
 os.makedirs(os.path.join(_upload_dir, "images"), exist_ok=True)
 _branding_dir = os.path.join(_upload_dir, "branding")
 os.makedirs(_branding_dir, exist_ok=True)

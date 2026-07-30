@@ -791,7 +791,7 @@ function decisionReasonLabel(reason) {
 
 function evidenceStatusFor(result) {
   const status = result?.evidence_status
-  if (['skipped', 'hit', 'no_hit', 'unverified', 'error'].includes(status)) return status
+  if (['skipped', 'hit', 'partial', 'version_mismatch', 'no_hit', 'unverified', 'error'].includes(status)) return status
   if (result?.retrieval_executed === false) return 'skipped'
   if (result?.retrieval_executed === true && Number(result?.hit_count) > 0) return 'hit'
   if (result?.retrieval_executed === true && result?.hit_count !== undefined && result?.hit_count !== null) return 'no_hit'
@@ -804,6 +804,8 @@ function evidenceStatusLabel(status, simulation = false) {
   return {
     skipped: '已跳过检索',
     hit: '已命中证据',
+    partial: '部分证据可用',
+    version_mismatch: '仅命中其他版本',
     no_hit: '已检索但无命中',
     unverified: '状态未验证',
     error: '检索失败',
@@ -814,6 +816,8 @@ function evidenceStatusTagType(status) {
   return {
     skipped: 'default',
     hit: 'success',
+    partial: 'warning',
+    version_mismatch: 'warning',
     no_hit: 'warning',
     unverified: 'default',
     error: 'error',

@@ -13,7 +13,7 @@ http.interceptors.request.use(config => {
 })
 
 http.interceptors.response.use(
-  res => res.data,
+  res => res.config?.returnFullResponse ? res : res.data,
   err => {
     // token 失效/未授权：清除 token 并跳转登录页（用 window.location 避免循环依赖）
     if (err?.response?.status === 401) {

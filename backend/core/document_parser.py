@@ -9,6 +9,51 @@ CHUNK_OVERLAP = 50
 # 句末标点（中英文）：在其后切句，标点保留在前句末尾
 _SENT_END_RE = re.compile(r'(?<=[。！？；!?;])')
 
+# 仅匹配“整个正文都是占位符”的章节。这里刻意保持集合很小，避免把“没有权限”
+# 之类包含“无/没有”的有效短句误判为无内容。
+_PLACEHOLDER_SECTION_VALUES = frozenset({
+    "无",
+    "暂无",
+    "无内容",
+    "不涉及",
+    "n/a",
+    "-",
+})
+
+
+def _is_placeholder_only_section(text: str) -> bool:
+    """判断 Markdown 正文是否完全由低信息占位符组成。
+
+    支持模板里常见的 ``> 无`` 引用写法，但主动保护围栏代码、缩进代码和
+    Markdown 表格。函数只做精确整行匹配，不按包含关系或文本长度推断，避免
+    误删“测试”“同意”“OK”等短但有效的知识。
+    """
+    raw_lines = [line for line in text.splitlines() if line.strip()]
+    if not raw_lines:
+        return False
+
+    # 代码和表格即使内容看似占位符，也可能是需要原样说明的配置/示例。
+    if any(
+        re.match(r'^\s*(```|~~~)', line)
+        or line.startswith("    ")
+        or line.startswith("\t")
+        or re.match(r'^\s*\|.*\|\s*$', line)
+        for line in raw_lines
+    ):
+        return False
+
+    normalized: list[str] = []
+    for line in raw_lines:
+        # Markdown 模板常用 blockquote 包裹占位内容，例如 ``> 无``。
+        value = re.sub(r'^(?:\s*>\s*)+', '', line).strip().casefold()
+        if not value:
+            continue
+        normalized.append(value)
+
+    return bool(normalized) and all(
+        value in _PLACEHOLDER_SECTION_VALUES for value in normalized
+    )
+
 
 def _is_cjk(text: str) -> bool:
     """按中日韩字符占比判定（>20% 视为 CJK），比"字符数/词数"更准，避免英文被误判。"""
@@ -137,14 +182,20 @@ def parse_markdown_content(content: str, source: str) -> list[dict]:
     heading_path: list[tuple[int, str]] = []
     prose: list[str] = []
     table: list[str] = []
+    discarded_placeholder_section = False
 
     def flush_prose():
+        nonlocal discarded_placeholder_section
         if not prose:
             return
-        section = "\n".join(prose).strip()
+        raw_section = "\n".join(prose)
         prose.clear()
-        if not section:
+        if not raw_section.strip():
             return
+        if _is_placeholder_only_section(raw_section):
+            discarded_placeholder_section = True
+            return
+        section = raw_section.strip()
         ctx = _ctx_prefix(source, heading_path)
         for chunk in _split_text(section):
             chunks.append({"content": _with_ctx(ctx, chunk),
@@ -185,7 +236,9 @@ def parse_markdown_content(content: str, source: str) -> list[dict]:
     flush_table()
     flush_prose()
 
-    if not chunks and content.strip():
+    # 标题-only 文档仍使用原有兜底；但如果正文明确因“无/暂无”等占位符被
+    # 丢弃，不能再把整篇原文切分回来，否则过滤会失效。
+    if not chunks and content.strip() and not discarded_placeholder_section:
         for chunk in _split_text(content):
             chunks.append({"content": chunk, "metadata": {"source": source}})
     return chunks

@@ -13,6 +13,7 @@ x-app: &app-common
   env_file:
     - .env
   environment:
+    APP_ENV: "${APP_ENV:-production}"
     DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:?请先在 .env 中设置 POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rag_prod}"
     JWT_SECRET: "${JWT_SECRET:-}"
     CONFIG_ENCRYPTION_KEY: "${CONFIG_ENCRYPTION_KEY:-}"

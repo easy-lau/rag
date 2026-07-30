@@ -22,7 +22,10 @@ target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    url = config.get_main_option("sqlalchemy.url")
+    # alembic.ini intentionally不保存数据库凭据；离线生成 SQL 时同样从统一
+    # Settings 获取 URL，但不会建立连接。此前空 sqlalchemy.url 会让
+    # ``alembic upgrade ... --sql`` 在真正编译迁移前直接失败。
+    url = config.get_main_option("sqlalchemy.url") or get_settings().database_url
     context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()

@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, watch } from 'vue'
 import { createChatStream, getChatHistory, getMessages, renameConversation as renameConversationRequest, deleteConversation } from '@/api/chat'
 import { useSearchStore } from './search'
+import { answerSourcesFromSearchEvent } from '@/utils/chatEvidence'
 
 export const useChatStore = defineStore('chat', () => {
   const messages = ref([])
@@ -126,7 +127,17 @@ export const useChatStore = defineStore('chat', () => {
       // 搜索事件现在会返回实际执行与证据状态；搜索配置只作为旧版本接口
       // 未携带 method/top_k 时的展示兜底，不能代替服务端执行结论。
       searchStore.setResults(data, searchConfig.value)
-      aiMsg.sources = data.results?.slice(0, 5) || []
+      // 右侧面板展示完整 results；回答卡片只绑定真正进入生成上下文的
+      // answer_sources。旧协议由工具函数按证据状态和 context 数量保守兼容。
+      aiMsg.sources = answerSourcesFromSearchEvent(data, 20)
+      const eventMeta = data.search_meta || data.meta || {}
+      aiMsg.retrieval_executed = data.retrieval_executed ?? eventMeta.retrieval_executed
+      aiMsg.evidence_status = data.evidence_status ?? eventMeta.evidence_status
+      aiMsg.search_meta = {
+        ...eventMeta,
+        retrieval_executed: aiMsg.retrieval_executed,
+        evidence_status: aiMsg.evidence_status,
+      }
     } else if (data.type === 'text_delta') {
       aiMsg.content += data.content
     } else if (data.type === 'usage') {

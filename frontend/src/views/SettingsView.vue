@@ -54,7 +54,7 @@
                         <n-icon :size="15" class="text-gray-400 cursor-help"><HelpCircleOutline /></n-icon>
                       </template>
                       <div class="max-w-xs text-xs leading-relaxed">
-                        开启后，问答回答下方会展示本次命中的「知识库来源」与「参考来源」；关闭后则不显示来源（历史记录仍会保留，重新开启即可再次查看）。
+                        开启后，回答下方会区分展示「回答依据」「相近资料」和文档外部链接；关闭后不显示来源（历史记录仍会保留，重新开启即可再次查看）。
                       </div>
                     </n-tooltip>
                   </span>

@@ -8,6 +8,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimi
 
 from config import get_settings
 from core.openai_client import get_embedding_client
+from core.rag_trace import exception_log_text
 
 
 logger = logging.getLogger(__name__)
@@ -44,28 +45,26 @@ async def _create_embeddings_with_retry(
             can_retry = _is_retryable_embedding_error(exc) and attempt < attempt_limit
             if not can_retry:
                 logger.error(
-                    "[向量化] 请求失败 model=%s inputs=%d chars=%d attempt=%d/%d error=%s: %s",
+                    "[向量化] 请求失败 model=%s inputs=%d chars=%d attempt=%d/%d error=%s",
                     model,
                     len(texts),
                     char_count,
                     attempt,
                     attempt_limit,
-                    type(exc).__name__,
-                    exc,
+                    exception_log_text(exc),
                 )
                 raise
 
             delay = max(0.0, retry_base_delay_seconds) * (2 ** (attempt - 1))
             logger.warning(
-                "[向量化] 请求异常，%.1f 秒后重试 model=%s inputs=%d chars=%d attempt=%d/%d error=%s: %s",
+                "[向量化] 请求异常，%.1f 秒后重试 model=%s inputs=%d chars=%d attempt=%d/%d error=%s",
                 delay,
                 model,
                 len(texts),
                 char_count,
                 attempt,
                 attempt_limit,
-                type(exc).__name__,
-                exc,
+                exception_log_text(exc),
             )
             await asyncio.sleep(delay)
 

@@ -26,15 +26,23 @@ import { computed } from 'vue'
 import { NDrawer, NDrawerContent } from 'naive-ui'
 import { useUiStore } from '@/stores/ui'
 
-defineProps({
+const props = defineProps({
   show: { type: Boolean, default: false },
   title: { type: String, required: true },
   subtitle: { type: String, default: '' },
+  width: { type: [Number, String], default: 560 },
 })
 
 const emit = defineEmits(['update:show'])
 const ui = useUiStore()
-const drawerWidth = computed(() => (ui.isMobile ? '94vw' : ui.isCompact ? 'min(88vw, 560px)' : 560))
+const drawerWidth = computed(() => {
+  if (ui.isMobile) return '94vw'
+  if (ui.isCompact) {
+    const requested = typeof props.width === 'number' ? `${props.width}px` : props.width
+    return `min(88vw, ${requested})`
+  }
+  return props.width
+})
 const headerStyle = { borderBottom: '1px solid var(--ui-border)', padding: '18px 20px' }
 const bodyStyle = { background: 'var(--ui-surface-muted)', padding: '20px' }
 </script>

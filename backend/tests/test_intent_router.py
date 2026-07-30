@@ -1,15 +1,20 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from core.intent_router import (
     DEFAULT_INTENT_CATEGORIES,
+    INTENT_MAX_TOKENS,
     _apply_routing_policy,
     _classification_prompt,
+    classify_intent_result,
     _classify_with_llm,
     _default_config,
     _fallback_decision,
     _make_decision,
+    _parse_llm_decision_result,
+    _response_format_is_unsupported,
+    _requires_knowledge_retrieval,
     _rule_match,
 )
 from models.db_models import IntentCategory
@@ -21,6 +26,55 @@ def _categories() -> list[IntentCategory]:
 
 def _category(code: str) -> IntentCategory:
     return next(item for item in _categories() if item.code == code)
+
+
+def _model_settings(
+    *,
+    intent_model: str = "intent-model",
+    chat_model: str = "chat-model",
+    timeout: float = 17.5,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        intent_model=intent_model,
+        chat_model=chat_model,
+        llm_request_timeout_seconds=timeout,
+    )
+
+
+def _model_client(create: AsyncMock) -> SimpleNamespace:
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+    )
+    client.with_options = Mock(return_value=client)
+    return client
+
+
+def _model_response(
+    content: str | None,
+    *,
+    finish_reason: str = "stop",
+    reasoning_content: str | None = None,
+    response_id: str = "resp-test",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=response_id,
+        model="provider-model",
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                message=SimpleNamespace(
+                    content=content,
+                    reasoning_content=reasoning_content,
+                    refusal=None,
+                ),
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=120,
+            completion_tokens=32,
+            total_tokens=152,
+        ),
+    )
 
 
 class IntentRoutingPolicyTests(unittest.TestCase):
@@ -196,22 +250,22 @@ class IntentRoutingPolicyTests(unittest.TestCase):
         self.assertTrue(decision.need_retrieval)
         self.assertEqual(decision.decision_reason, "knowledge_dependent_writing")
 
-    def test_chat_with_selected_kb_uses_optional_retrieval(self) -> None:
+    def test_general_chat_skips_retrieval_even_when_kb_is_selected(self) -> None:
         classified = _make_decision(_category("general_chat"), 0.81, "llm")
 
         decision = _apply_routing_policy(
-            "这个产品支持哪些部署方式？",
+            "解释一下什么是向量数据库",
             classified,
             self.config,
             selected_kb_count=1,
         )
 
         self.assertEqual(decision.response_mode, "general_chat")
-        self.assertEqual(decision.retrieval_policy, "optional")
-        self.assertTrue(decision.need_retrieval)
-        self.assertEqual(decision.decision_reason, "selected_knowledge_context")
+        self.assertEqual(decision.retrieval_policy, "skip")
+        self.assertFalse(decision.need_retrieval)
+        self.assertEqual(decision.decision_reason, "classified_general_chat")
 
-    def test_chat_without_selected_kb_keeps_optional_policy_but_does_not_retrieve(self) -> None:
+    def test_general_chat_without_selected_kb_skips_retrieval(self) -> None:
         classified = _make_decision(_category("general_chat"), 0.81, "llm")
 
         decision = _apply_routing_policy(
@@ -221,9 +275,108 @@ class IntentRoutingPolicyTests(unittest.TestCase):
             selected_kb_count=0,
         )
 
-        self.assertEqual(decision.retrieval_policy, "optional")
+        self.assertEqual(decision.retrieval_policy, "skip")
         self.assertFalse(decision.need_retrieval)
-        self.assertEqual(decision.decision_reason, "no_selected_knowledge")
+        self.assertEqual(decision.decision_reason, "classified_general_chat")
+
+    def test_enterprise_or_external_operation_guard_corrects_chat_misclassification(self) -> None:
+        questions = (
+            "这个产品支持哪些部署方式？",
+            "云枢中如何配置登录用户名枚举？",
+            "CloudPivot 中如何配置登录用户名枚举？",
+            "钉钉中如何配置免登？",
+            "DingTalk 如何接入企业应用？",
+            "企业微信中如何配置通讯录同步？",
+            "企微如何配置回调接口？",
+            "WeCom 如何部署自建应用？",
+            "泛微OA中如何配置单点登录？",
+            "Weaver OA 如何配置接口认证？",
+            "公司的报销流程是什么？",
+            "请根据员工手册回答请假制度",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                classified = _make_decision(
+                    _category("general_chat"),
+                    0.91,
+                    "llm",
+                )
+                decision = _apply_routing_policy(
+                    question,
+                    classified,
+                    self.config,
+                    selected_kb_count=1,
+                )
+
+                self.assertTrue(_requires_knowledge_retrieval(question))
+                self.assertTrue(decision.need_retrieval)
+                self.assertEqual(decision.retrieval_policy, "required")
+                self.assertEqual(decision.response_mode, "grounded_qa")
+                self.assertEqual(decision.decision_reason, "knowledge_scope_guard")
+
+    def test_generic_operations_are_not_forced_into_enterprise_retrieval(self) -> None:
+        questions = (
+            "如何设置闹钟？",
+            "Python 怎么安装依赖？",
+            "Redis 应该如何设置？",
+            "PostgreSQL 如何配置高可用？",
+            "怎么修改个人邮箱密码？",
+            "什么是 HTML 文档？",
+            "Python 官方文档在哪里？",
+            "合同是什么？",
+            "介绍技术规范含义",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                classified = _make_decision(
+                    _category("general_chat"),
+                    0.91,
+                    "llm",
+                )
+                decision = _apply_routing_policy(
+                    question,
+                    classified,
+                    self.config,
+                    selected_kb_count=1,
+                )
+
+                self.assertFalse(_requires_knowledge_retrieval(question))
+                self.assertFalse(decision.need_retrieval)
+                self.assertEqual(decision.retrieval_policy, "skip")
+                self.assertEqual(decision.decision_reason, "classified_general_chat")
+
+    def test_explicit_enterprise_source_indicators_require_retrieval(self) -> None:
+        questions = (
+            "请根据员工手册说明请假规则",
+            "公司制度对报销有什么要求？",
+            "这份已上传文档讲了什么？",
+            "上述资料中的默认密码是什么？",
+            "知识库里是否有部署说明？",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertTrue(_requires_knowledge_retrieval(question))
+
+    def test_safe_fallback_only_skips_for_high_certainty_local_cases(self) -> None:
+        cases = (
+            ("你好", "general_chat", False, "exact_greeting"),
+            ("在哪里查看检索结果？", "platform_help", False, "explicit_platform_help"),
+            ("请润色以下内容：明天上午开会。", "writing", False, "inline_writing_content"),
+            ("云枢默认密码如何配置？", "grounded_qa", True, "safe_fallback"),
+            ("解释一下量子纠缠", "grounded_qa", True, "safe_fallback"),
+        )
+        for question, mode, need_retrieval, reason in cases:
+            with self.subTest(question=question):
+                fallback = _fallback_decision(self.config, _categories())
+                decision = _apply_routing_policy(
+                    question,
+                    fallback,
+                    self.config,
+                    selected_kb_count=1,
+                )
+                self.assertEqual(decision.response_mode, mode)
+                self.assertEqual(decision.need_retrieval, need_retrieval)
+                self.assertEqual(decision.decision_reason, reason)
 
     def test_disabling_general_chat_forces_retrieval_without_rewriting_source(self) -> None:
         config = _default_config()
@@ -286,6 +439,82 @@ class IntentRoutingPolicyTests(unittest.TestCase):
 
 
 class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):
+    class _ProviderError(RuntimeError):
+        def __init__(self, status_code: int, message: str):
+            super().__init__(message)
+            self.status_code = status_code
+
+    def test_parser_reports_precise_rejection_reasons(self) -> None:
+        categories = _categories()
+        disabled = _category("general_chat")
+        disabled.enabled = False
+        invalid_action = IntentCategory(
+            code="unsafe_action",
+            name="无效动作",
+            description="test",
+            examples=[],
+            action="execute_tool",
+            enabled=True,
+            priority=1,
+        )
+        cases = [
+            (None, categories, "empty_response"),
+            ("not-json", categories, "invalid_json"),
+            ('{"intent_code":"missing","confidence":0.9}', categories, "unknown_code"),
+            ('{"intent_code":"general_chat","confidence":0.9}', [disabled], "disabled_category"),
+            ('{"intent_code":"unsafe_action","confidence":0.9}', [invalid_action], "invalid_action"),
+            ('{"intent_code":"knowledge_qa","confidence":"bad"}', categories, "invalid_confidence"),
+            ('{"intent_code":"knowledge_qa","confidence":0.2}', categories, "below_threshold"),
+        ]
+
+        for content, available, expected_reason in cases:
+            with self.subTest(reason=expected_reason):
+                parsed = _parse_llm_decision_result(content, available, 0.65)
+                self.assertIsNone(parsed.decision)
+                self.assertEqual(parsed.rejection_reason, expected_reason)
+
+    async def test_classifier_traces_low_confidence_reason_and_model_metadata(self) -> None:
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"intent_code":"general_chat","confidence":0.2}'
+                        )
+                    )
+                ]
+            )
+        )
+        client = _model_client(create)
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=_model_settings(),
+            ),
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            decision = await _classify_with_llm(
+                "介绍一下向量数据库",
+                _default_config(),
+                _categories(),
+                trace_id="trace-123",
+            )
+
+        self.assertIsNone(decision)
+        event = trace.call_args
+        self.assertEqual(event.args[0], "intent.model_result")
+        self.assertEqual(event.kwargs["trace_id"], "trace-123")
+        self.assertEqual(event.kwargs["model"], "intent-model")
+        self.assertEqual(event.kwargs["rejection_reason"], "below_threshold")
+        self.assertEqual(event.kwargs["parsed_intent_code"], "general_chat")
+        self.assertEqual(event.kwargs["parsed_confidence"], 0.2)
+        self.assertTrue(event.kwargs["prompt_version"])
+        self.assertEqual(event.kwargs["attempt"], "primary")
+        self.assertGreaterEqual(event.kwargs["attempt_latency_ms"], 0)
+        self.assertEqual(create.await_count, 1)
+
     async def test_classifier_uses_model_management_intent_model(self) -> None:
         create = AsyncMock(
             return_value=SimpleNamespace(
@@ -298,18 +527,13 @@ class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         )
-        client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-        )
+        client = _model_client(create)
 
         with (
             patch("core.intent_router.get_client", return_value=client),
             patch(
                 "core.intent_router.get_settings",
-                return_value=SimpleNamespace(
-                    intent_model="intent-model",
-                    chat_model="chat-model",
-                ),
+                return_value=_model_settings(),
             ),
         ):
             decision = await _classify_with_llm(
@@ -319,7 +543,10 @@ class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(decision)
+        client.with_options.assert_called_once_with(max_retries=0)
         self.assertEqual(create.await_args.kwargs["model"], "intent-model")
+        self.assertEqual(create.await_args.kwargs["max_tokens"], INTENT_MAX_TOKENS)
+        self.assertEqual(create.await_args.kwargs["timeout"], 17.5)
 
     async def test_classifier_falls_back_to_chat_model_when_intent_model_is_empty(self) -> None:
         create = AsyncMock(
@@ -333,15 +560,13 @@ class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         )
-        client = SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
-        )
+        client = _model_client(create)
 
         with (
             patch("core.intent_router.get_client", return_value=client),
             patch(
                 "core.intent_router.get_settings",
-                return_value=SimpleNamespace(intent_model="", chat_model="chat-model"),
+                return_value=_model_settings(intent_model=""),
             ),
         ):
             await _classify_with_llm(
@@ -351,6 +576,327 @@ class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(create.await_args.kwargs["model"], "chat-model")
+        self.assertEqual(create.await_count, 1)
+
+    async def test_empty_primary_falls_back_to_chat_model_for_general_chat(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                _model_response("", response_id="primary-empty"),
+                _model_response(
+                    '{"intent_code":"general_chat","confidence":0.91}',
+                    response_id="fallback-general",
+                ),
+            ]
+        )
+        client = _model_client(create)
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=_model_settings(intent_model="reasoning-model"),
+            ),
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            decision = await _classify_with_llm(
+                "解释一下向量数据库",
+                _default_config(),
+                _categories(),
+                trace_id="trace-empty",
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.intent_code, "general_chat")
+        self.assertEqual(create.await_count, 2)
+        self.assertEqual(
+            [call.kwargs["model"] for call in create.await_args_list],
+            ["reasoning-model", "chat-model"],
+        )
+        self.assertTrue(all(call.kwargs["timeout"] == 17.5 for call in create.await_args_list))
+        self.assertEqual(trace.call_count, 2)
+        primary_event, fallback_event = trace.call_args_list
+        self.assertEqual(primary_event.kwargs["attempt"], "primary")
+        self.assertEqual(primary_event.kwargs["rejection_reason"], "empty_response")
+        self.assertFalse(primary_event.kwargs["accepted"])
+        self.assertEqual(fallback_event.kwargs["attempt"], "fallback_chat_model")
+        self.assertEqual(fallback_event.kwargs["primary_rejection_reason"], "empty_response")
+        self.assertTrue(fallback_event.kwargs["accepted"])
+        self.assertEqual(fallback_event.kwargs["parsed_intent_code"], "general_chat")
+        self.assertGreaterEqual(fallback_event.kwargs["attempt_latency_ms"], 0)
+
+    async def test_empty_primary_general_fallback_is_executed_as_direct_chat(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                _model_response(""),
+                _model_response('{"intent_code":"general_chat","confidence":0.91}'),
+            ]
+        )
+        client = _model_client(create)
+        config = _default_config()
+        with (
+            patch("core.intent_router.get_intent_router_config", new=AsyncMock(return_value=config)),
+            patch("core.intent_router.list_intent_categories", new=AsyncMock(return_value=_categories())),
+            patch("core.intent_router.get_client", return_value=client),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                "解释一下什么是向量数据库",
+                selected_kb_ids=["kb-1"],
+                record_log=False,
+            )
+
+        self.assertEqual(result.decision.intent_code, "general_chat")
+        self.assertEqual(result.decision.response_mode, "general_chat")
+        self.assertEqual(result.decision.retrieval_policy, "skip")
+        self.assertFalse(result.decision.need_retrieval)
+        self.assertEqual(result.decision.decision_reason, "classified_general_chat")
+
+    async def test_empty_primary_knowledge_fallback_is_executed_as_retrieval(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                _model_response(""),
+                _model_response('{"intent_code":"knowledge_qa","confidence":0.96}'),
+            ]
+        )
+        client = _model_client(create)
+        config = _default_config()
+        with (
+            patch("core.intent_router.get_intent_router_config", new=AsyncMock(return_value=config)),
+            patch("core.intent_router.list_intent_categories", new=AsyncMock(return_value=_categories())),
+            patch("core.intent_router.get_client", return_value=client),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                "公司的报销制度是什么？",
+                selected_kb_ids=["kb-1"],
+                record_log=False,
+            )
+
+        self.assertEqual(result.decision.intent_code, "knowledge_qa")
+        self.assertEqual(result.decision.response_mode, "grounded_qa")
+        self.assertEqual(result.decision.retrieval_policy, "required")
+        self.assertTrue(result.decision.need_retrieval)
+        self.assertEqual(result.decision.decision_reason, "classified_retrieval")
+
+    async def test_both_classification_models_fail_and_safe_fallback_stays_retrieval(self) -> None:
+        create = AsyncMock(side_effect=[_model_response(""), _model_response(None)])
+        client = _model_client(create)
+        config = _default_config()
+        with (
+            patch("core.intent_router.get_intent_router_config", new=AsyncMock(return_value=config)),
+            patch("core.intent_router.list_intent_categories", new=AsyncMock(return_value=_categories())),
+            patch("core.intent_router.get_client", return_value=client),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                "解释一下量子纠缠",
+                selected_kb_ids=["kb-1"],
+                record_log=False,
+            )
+
+        self.assertEqual(result.decision.intent_code, "other")
+        self.assertEqual(result.decision.response_mode, "grounded_qa")
+        self.assertEqual(result.decision.retrieval_policy, "required")
+        self.assertTrue(result.decision.need_retrieval)
+        self.assertEqual(result.decision.decision_reason, "safe_fallback")
+
+    async def test_empty_primary_falls_back_to_chat_model_for_knowledge_qa(self) -> None:
+        create = AsyncMock(
+            side_effect=[
+                _model_response(None),
+                _model_response(
+                    '{"intent_code":"knowledge_qa","confidence":0.96}'
+                ),
+            ]
+        )
+        client = _model_client(create)
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            decision = await _classify_with_llm(
+                "公司的报销制度是什么？",
+                _default_config(),
+                _categories(),
+                trace_id="trace-knowledge",
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.intent_code, "knowledge_qa")
+        self.assertEqual(create.await_count, 2)
+        fallback_event = trace.call_args_list[1]
+        self.assertEqual(fallback_event.kwargs["attempt"], "fallback_chat_model")
+        self.assertEqual(fallback_event.kwargs["parsed_intent_code"], "knowledge_qa")
+        self.assertEqual(fallback_event.kwargs["primary_rejection_reason"], "empty_response")
+
+    async def test_classifier_returns_none_when_primary_and_chat_fallback_are_empty(self) -> None:
+        create = AsyncMock(side_effect=[_model_response(""), _model_response(None)])
+        client = _model_client(create)
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            decision = await _classify_with_llm(
+                "公司的报销制度是什么？",
+                _default_config(),
+                _categories(),
+            )
+
+        self.assertIsNone(decision)
+        self.assertEqual(create.await_count, 2)
+        self.assertEqual(trace.call_count, 2)
+        fallback_event = trace.call_args_list[1]
+        self.assertEqual(fallback_event.kwargs["attempt"], "fallback_chat_model")
+        self.assertEqual(fallback_event.kwargs["rejection_reason"], "empty_response")
+        self.assertFalse(fallback_event.kwargs["accepted"])
+
+    async def test_finish_reason_length_rejects_primary_and_uses_chat_fallback(self) -> None:
+        reasoning = "internal reasoning that must not be logged"
+        create = AsyncMock(
+            side_effect=[
+                _model_response(
+                    '{"intent_code":"general_chat","confidence":0.99}',
+                    finish_reason="length",
+                    reasoning_content=reasoning,
+                    response_id="primary-truncated",
+                ),
+                _model_response(
+                    '{"intent_code":"knowledge_qa","confidence":0.94}',
+                    response_id="fallback-complete",
+                ),
+            ]
+        )
+        client = _model_client(create)
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            decision = await _classify_with_llm(
+                "公司制度是什么？",
+                _default_config(),
+                _categories(),
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.intent_code, "knowledge_qa")
+        primary_event, fallback_event = trace.call_args_list
+        self.assertEqual(primary_event.kwargs["rejection_reason"], "finish_reason_length")
+        self.assertEqual(primary_event.kwargs["finish_reason"], "length")
+        self.assertEqual(primary_event.kwargs["reasoning_content_chars"], len(reasoning))
+        self.assertNotIn("reasoning_content", primary_event.kwargs)
+        self.assertEqual(
+            fallback_event.kwargs["primary_rejection_reason"],
+            "finish_reason_length",
+        )
+
+    async def test_empty_response_does_not_retry_when_primary_is_chat_model(self) -> None:
+        create = AsyncMock(return_value=_model_response(""))
+        client = _model_client(create)
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=_model_settings(
+                    intent_model="same-model",
+                    chat_model="same-model",
+                ),
+            ),
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            decision = await _classify_with_llm(
+                "介绍一下向量数据库",
+                _default_config(),
+                _categories(),
+            )
+
+        self.assertIsNone(decision)
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(trace.call_count, 1)
+        self.assertEqual(trace.call_args.kwargs["attempt"], "primary")
+
+    async def test_classifier_does_not_retry_timeout_or_server_error_without_json_mode(self) -> None:
+        for error in (
+            TimeoutError("request timed out"),
+            self._ProviderError(500, "upstream unavailable"),
+            self._ProviderError(401, "invalid api key"),
+        ):
+            create = AsyncMock(side_effect=error)
+            client = _model_client(create)
+            with (
+                self.subTest(error=type(error).__name__, status=getattr(error, "status_code", None)),
+                patch("core.intent_router.get_client", return_value=client),
+                patch(
+                    "core.intent_router.get_settings",
+                    return_value=_model_settings(),
+                ),
+                patch("core.intent_router.trace_event") as trace,
+            ):
+                decision = await _classify_with_llm(
+                    "介绍一下向量数据库",
+                    _default_config(),
+                    _categories(),
+                )
+                self.assertIsNone(decision)
+                self.assertEqual(create.await_count, 1)
+                client.with_options.assert_called_once_with(max_retries=0)
+                self.assertEqual(create.await_args.kwargs["model"], "intent-model")
+                self.assertEqual(create.await_args.kwargs["timeout"], 17.5)
+                self.assertEqual(trace.call_count, 1)
+                self.assertEqual(trace.call_args.args[0], "intent.model_error")
+                self.assertEqual(trace.call_args.kwargs["attempt"], "primary")
+                self.assertEqual(trace.call_args.kwargs["rejection_reason"], "model_error")
+
+    async def test_classifier_retries_only_explicit_response_format_rejection(self) -> None:
+        rejection = self._ProviderError(
+            400,
+            "unknown parameter: response_format is not supported",
+        )
+        success = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"intent_code":"general_chat","confidence":0.9}'
+                    )
+                )
+            ]
+        )
+        create = AsyncMock(side_effect=[rejection, success])
+        client = _model_client(create)
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=_model_settings(),
+            ),
+        ):
+            decision = await _classify_with_llm(
+                "介绍一下向量数据库",
+                _default_config(),
+                _categories(),
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(create.await_count, 2)
+        client.with_options.assert_called_once_with(max_retries=0)
+        self.assertIn("response_format", create.await_args_list[0].kwargs)
+        self.assertNotIn("response_format", create.await_args_list[1].kwargs)
+        self.assertTrue(
+            all(call.kwargs["timeout"] == 17.5 for call in create.await_args_list)
+        )
+        self.assertTrue(_response_format_is_unsupported(rejection))
 
 
 if __name__ == "__main__":

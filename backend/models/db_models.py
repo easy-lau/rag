@@ -109,6 +109,80 @@ class Message(Base):
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
 
+class RagTraceRun(Base):
+    """一次问答或检索测试的调用链摘要。
+
+    列表只读取本表的短摘要；体积较大的逐阶段 JSON 存在 ``rag_trace_events``，
+    仅在管理员打开详情时加载。生产环境默认不保存问题、回答和候选正文。
+    """
+
+    __tablename__ = "rag_trace_runs"
+    __table_args__ = (
+        Index("ix_rag_trace_runs_started_at", "started_at"),
+        Index("ix_rag_trace_runs_status_started_at", "status", "started_at"),
+        Index("ix_rag_trace_runs_user_started_at", "user_id", "started_at"),
+        Index("ix_rag_trace_runs_conversation_started_at", "conversation_id", "started_at"),
+    )
+
+    trace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    # Trace 由独立异步队列写入，可能早于新会话事务提交，也需要在用户/会话
+    # 删除后保留 30 天用于排障。因此这里只保存不可反查业务正文的 UUID 快照，
+    # 不建立跨事务外键；详情事件仍通过 trace_id 外键随摘要级联清理。
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    current_stage: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # observed counts records accepted by the persistence worker; queue drops
+    # happen earlier and remain separately documented as an unknowable gap.
+    observed_event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    storage_omitted_event_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    storage_truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    content_included: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    input_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    selected_kb_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 审计命中数只统计 direct 回答证据；展示候选和 related 上下文不计入。
+    hit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc
+    )
+
+    events: Mapped[list["RagTraceEvent"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class RagTraceEvent(Base):
+    """调用链中的一个阶段事件；payload 已经过正文开关与异常脱敏处理。"""
+
+    __tablename__ = "rag_trace_events"
+    __table_args__ = (
+        UniqueConstraint("trace_id", "sequence", name="uq_rag_trace_event_sequence"),
+        Index("ix_rag_trace_events_event_created_at", "event", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trace_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("rag_trace_runs.trace_id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+    run: Mapped["RagTraceRun"] = relationship(back_populates="events")
+
+
 class SystemSetting(Base):
     __tablename__ = "settings"
 
@@ -193,7 +267,8 @@ class IntentRouteLog(Base):
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     selected_kb_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    # 实际检索结果在流式管线运行后回填；旧日志和被用户提前中止的请求允许为空。
+    # 实际检索结果在流式管线运行后回填；hit_count 仅统计 direct 回答证据，
+    # 旧日志和被用户提前中止的请求允许为空。
     retrieval_executed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     evidence_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     hit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

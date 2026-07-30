@@ -30,38 +30,79 @@
           <n-spin size="small" /><span>思考中...</span>
         </div>
 
-        <!-- 知识库来源：点击标题在当前页只读预览（所有命中文档都列出） -->
-        <div v-if="message.content && sources.length && showSources" class="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <span class="text-xs text-gray-400">知识库来源：</span>
+        <!-- 历史消息直接使用自身持久化的 sources，不依赖右侧“本次检索”状态。 -->
+        <div v-if="hasPersistedEvidence" class="message-evidence">
           <button
-            v-for="(src, i) in sources"
-            :key="i"
             type="button"
-            class="inline-flex max-w-[200px] items-center gap-1 text-left text-xs text-blue-500 hover:text-blue-600 hover:underline focus:outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-blue-400/60 dark:text-blue-300 dark:hover:text-blue-200"
-            :title="src.filename"
-            :aria-label="`预览知识库来源：${src.filename || '未命名文档'}`"
-            @click="openSource(src)"
+            class="message-evidence__toggle"
+            :class="`message-evidence__toggle--${evidenceSummary.tone}`"
+            :aria-expanded="evidenceExpanded"
+            :aria-controls="evidencePanelId"
+            :aria-label="`${evidenceSummary.ariaLabel}，${evidenceExpanded ? '收起检索资料' : evidenceSummary.actionLabel}`"
+            @click="evidenceExpanded = !evidenceExpanded"
           >
-            <n-icon :size="13"><DocumentTextOutline /></n-icon>
-            <span class="truncate">{{ src.filename }}</span>
+            <n-icon :size="15" aria-hidden="true"><DocumentTextOutline /></n-icon>
+            <span class="message-evidence__summary">
+              <span>{{ evidenceSummary.label }}</span>
+              <span v-if="evidenceSummary.level" aria-hidden="true">·</span>
+              <strong v-if="evidenceSummary.level">{{ evidenceSummary.level }}</strong>
+              <span v-if="evidenceSummary.percent !== null" class="message-evidence__score">
+                {{ evidenceSummary.percent }}%
+              </span>
+            </span>
+            <span class="message-evidence__action">{{ evidenceExpanded ? '收起' : evidenceSummary.actionLabel }}</span>
+            <n-icon
+              :size="14"
+              aria-hidden="true"
+              class="message-evidence__chevron"
+              :class="{ 'message-evidence__chevron--open': evidenceExpanded }"
+            >
+              <ChevronDownOutline />
+            </n-icon>
           </button>
-        </div>
 
-        <!-- 参考来源：仅列出带数据来源链接的文档，点击新标签页打开外部 URL；没有则整行不显示 -->
-        <div v-if="message.content && urlSources.length && showSources" class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <span class="text-xs text-gray-400">参考来源：</span>
-          <a
-            v-for="(src, i) in urlSources"
-            :key="i"
-            class="inline-flex items-center gap-1 max-w-[220px] text-xs text-blue-500 hover:text-blue-600 hover:underline focus:outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-blue-400/60 dark:text-blue-300 dark:hover:text-blue-200"
-            :href="src.source_url"
-            target="_blank"
-            rel="noopener noreferrer"
-            :title="src.source_url"
+          <section
+            v-show="evidenceExpanded"
+            :id="evidencePanelId"
+            class="message-evidence__panel"
+            role="region"
+            :aria-label="`本条回答的知识库检索结果，共 ${sources.length} 条`"
           >
-            <n-icon :size="13"><LinkOutline /></n-icon>
-            <span class="truncate">{{ src.filename }}</span>
-          </a>
+            <div class="message-evidence__panel-head">
+              <div>
+                <p class="message-evidence__panel-title">本条回答的知识库检索资料</p>
+                <p class="message-evidence__panel-hint">匹配分用于证据筛选，不代表答案正确率；相近资料不能作为直接依据。</p>
+              </div>
+              <span class="message-evidence__count">{{ sources.length }} 条</span>
+            </div>
+
+            <div class="message-evidence__results">
+              <DocumentResultItem
+                v-for="(source, index) in sources"
+                :key="source._evidenceKey"
+                :item="source"
+                :rank="index + 1"
+                :preview-enabled="canPreviewSources"
+                @preview="openSource"
+              />
+            </div>
+
+            <!-- 外部链接只表达资料原始地址，不等同于回答依据。 -->
+            <div v-if="urlSources.length" class="message-evidence__links">
+              <span>原始链接</span>
+              <a
+                v-for="source in urlSources"
+                :key="`${source._evidenceKey}-url`"
+                :href="source.source_url"
+                target="_blank"
+                rel="noopener noreferrer"
+                :title="source.source_url"
+              >
+                <n-icon :size="13" aria-hidden="true"><LinkOutline /></n-icon>
+                <span>{{ source.filename || '未命名文档' }}</span>
+              </a>
+            </div>
+          </section>
         </div>
 
         <!-- Actions -->
@@ -91,13 +132,16 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { NButton, NIcon, NSpin, useMessage } from 'naive-ui'
-import { CopyOutline, RefreshOutline, HardwareChipOutline, PersonOutline, DocumentTextOutline, StopCircleOutline, LinkOutline } from '@vicons/ionicons5'
+import { ChevronDownOutline, CopyOutline, RefreshOutline, HardwareChipOutline, PersonOutline, DocumentTextOutline, StopCircleOutline, LinkOutline } from '@vicons/ionicons5'
 import { useClipboard } from '@vueuse/core'
 import { renderMarkdown } from '@/utils/markdown'
 import { useSettingsStore } from '@/stores/settings'
 import { useChatStore } from '@/stores/chat'
+import { useAuthStore } from '@/stores/auth'
+import DocumentResultItem from '@/components/search/DocumentResultItem.vue'
+import { persistedAnswerSources } from '@/utils/chatEvidence'
 
 const props = defineProps({ message: Object })
 const emit = defineEmits(['retry', 'preview'])
@@ -106,10 +150,15 @@ const msg = useMessage()
 const { copy: copyText } = useClipboard()
 const settingsStore = useSettingsStore()
 const chatStore = useChatStore()
+const authStore = useAuthStore()
+const evidenceExpanded = ref(false)
 
 const isUser = computed(() => props.message.role === 'user')
 // 系统设置「显示参考来源」总开关：关闭则隐藏所有来源行（默认显示）
 const showSources = computed(() => settingsStore.data.show_sources !== false)
+// 普通问答角色可查看本轮命中片段，但不能因此获得整篇文档读取能力。
+// 只有后端同样允许的 doc:read 角色才显示可点击的全文预览行为。
+const canPreviewSources = computed(() => authStore.hasPerm('doc:read'))
 
 // 去掉正文里的内联引用标记（如 [1]、[2,3]），来源改到底部统一展示。
 // 单次扫描：命中代码块/行内代码则原样保留（避免误删代码里的 [0]），命中引用标记则删除。
@@ -123,18 +172,119 @@ function stripCitations(text) {
 
 const rendered = computed(() => renderMarkdown(stripCitations(props.message.content)))
 
-// 去重后的来源文档列表（按 doc_id / 文件名去重）
+function finiteScore(value) {
+  if (value === undefined || value === null || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Math.min(1, Math.max(0, parsed))
+}
+
+function normalizedEvidenceRole(source) {
+  const role = typeof source?.evidence_role === 'string'
+    ? source.evidence_role.trim().toLowerCase()
+    : ''
+  if (['direct', 'related', 'irrelevant'].includes(role)) return role
+
+  // 旧消息可能没有 evidence_role；只能把确定性约束冲突降级为相近资料，
+  // 不能仅凭一个高相似度分数推断它是回答依据。
+  const constraint = typeof source?.constraint_status === 'string'
+    ? source.constraint_status.trim().toLowerCase()
+    : ''
+  if (constraint.includes('mismatch') || constraint.includes('conflict')) return 'related'
+  return ''
+}
+
+function normalizedSource(source, index) {
+  const effectiveScore = finiteScore(source?.effective_score) ?? finiteScore(source?.score)
+  const answerSupport = finiteScore(source?.answer_support)
+  const chunkKey = source?.id || source?.chunk_id
+  return {
+    ...source,
+    id: chunkKey || source?.id,
+    score: effectiveScore,
+    effective_score: effectiveScore,
+    answer_support: answerSupport,
+    evidence_role: normalizedEvidenceRole(source),
+    _evidenceKey: chunkKey
+      || `${source?.doc_id || source?.filename || 'source'}-${source?.chunk_index ?? index}`,
+  }
+}
+
+// 历史接口直接返回消息持久化的 sources。先过滤旧版本误存的 no_hit 候选，
+// 再按具体片段去重；同一文档的不同回答依据仍需保留。
 const sources = computed(() => {
-  const list = props.message.sources || []
+  const list = persistedAnswerSources(props.message)
   const seen = new Set()
   const out = []
-  for (const s of list) {
-    const key = s.doc_id || s.filename
+  for (const [index, rawSource] of list.entries()) {
+    if (!rawSource || typeof rawSource !== 'object') continue
+    const source = normalizedSource(rawSource, index)
+    const key = source._evidenceKey
     if (!key || seen.has(key)) continue
     seen.add(key)
-    out.push(s)
+    out.push(source)
   }
   return out
+})
+
+const hasPersistedEvidence = computed(() => (
+  !isUser.value
+  && Boolean(props.message.content)
+  && showSources.value
+  && sources.value.length > 0
+  && sources.value.some(source => source.retrieval_executed !== false)
+  && props.message.retrieval_executed !== false
+  && props.message.search_meta?.retrieval_executed !== false
+))
+
+function sourceSupportScore(source) {
+  // answer_support 是“能否直接支撑答案”的专用指标；旧数据缺失时才回退到
+  // 经过约束惩罚的 effective_score。原始 retrieval_score 只代表召回排序，
+  // 不能在回答卡片上展示为答案匹配率。
+  return finiteScore(source.answer_support) ?? finiteScore(source.effective_score)
+}
+
+const evidenceSummary = computed(() => {
+  const directSources = sources.value.filter(source => source.evidence_role === 'direct')
+  const relatedSources = sources.value.filter(source => source.evidence_role === 'related')
+  if (directSources.length) {
+    const scores = directSources.map(sourceSupportScore).filter(score => score !== null)
+    const score = scores.length ? Math.max(...scores) : null
+    const percent = score === null ? null : Math.round(score * 100)
+    const level = score === null ? '已验证' : (score >= 0.8 ? '高匹配' : (score >= 0.6 ? '中匹配' : '低匹配'))
+    const scoreText = percent === null ? '' : `，证据支持分 ${percent}%`
+    return {
+      label: '知识库依据',
+      level,
+      percent,
+      tone: score !== null && score < 0.6 ? 'warning' : 'success',
+      actionLabel: '查看依据',
+      ariaLabel: `本条回答使用了 ${directSources.length} 条知识库依据${scoreText}。该分数不是答案正确率`,
+    }
+  }
+  if (relatedSources.length) {
+    return {
+      label: '相近资料',
+      level: `${relatedSources.length} 条`,
+      percent: null,
+      tone: 'warning',
+      actionLabel: '查看资料',
+      ariaLabel: `本条回答仅检索到 ${relatedSources.length} 条相近资料，不能作为直接回答依据`,
+    }
+  }
+  return {
+    label: '检索候选',
+    level: `${sources.value.length} 条`,
+    percent: null,
+    tone: 'neutral',
+    actionLabel: '查看结果',
+    ariaLabel: `本条回答保存了 ${sources.value.length} 条尚待验证的检索候选`,
+  }
+})
+
+const evidencePanelId = computed(() => {
+  const messageId = String(props.message.id || 'streaming').replace(/[^a-zA-Z0-9_-]/g, '-')
+  return `message-evidence-${messageId}`
 })
 
 // 参考来源：只取带数据来源链接的来源，点击跳转外部 URL
@@ -190,6 +340,205 @@ function formatTime(t) {
   })
 }
 </script>
+
+<style scoped>
+.message-evidence {
+  margin-top: 12px;
+}
+
+.message-evidence__toggle {
+  display: inline-flex;
+  min-height: var(--ui-control-height-compact);
+  max-width: 100%;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-pill);
+  background: var(--ui-surface-muted);
+  padding: 5px 9px;
+  color: var(--ui-text-secondary);
+  font-size: 12px;
+  line-height: 1.25;
+  text-align: left;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.message-evidence__toggle:hover {
+  border-color: var(--ui-border-strong);
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.message-evidence__toggle:focus-visible {
+  outline: 2px solid var(--ui-focus-outline);
+  outline-offset: 2px;
+  box-shadow: var(--ui-focus-ring);
+}
+
+.message-evidence__toggle--success {
+  border-color: color-mix(in srgb, var(--ui-success) 28%, var(--ui-border));
+  color: var(--ui-success);
+}
+
+.message-evidence__toggle--warning {
+  border-color: color-mix(in srgb, var(--ui-warning) 32%, var(--ui-border));
+  color: var(--ui-warning);
+}
+
+.message-evidence__summary {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.message-evidence__summary strong {
+  font-weight: 650;
+}
+
+.message-evidence__score {
+  border-left: 1px solid currentColor;
+  margin-left: 1px;
+  padding-left: 6px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.9;
+}
+
+.message-evidence__action {
+  color: var(--ui-primary);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.message-evidence__chevron {
+  flex: 0 0 auto;
+  color: var(--ui-icon);
+  transition: transform 150ms ease;
+}
+
+.message-evidence__chevron--open {
+  transform: rotate(180deg);
+}
+
+.message-evidence__panel {
+  margin-top: 8px;
+  overflow: hidden;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-popover);
+  background: var(--ui-bg-subtle);
+}
+
+.message-evidence__panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--ui-divider);
+  padding: 10px 12px;
+}
+
+.message-evidence__panel-title {
+  color: var(--ui-text);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.message-evidence__panel-hint {
+  margin-top: 2px;
+  color: var(--ui-text-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.message-evidence__count {
+  flex: 0 0 auto;
+  border-radius: var(--ui-radius-pill);
+  background: var(--ui-surface-muted);
+  padding: 3px 7px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.message-evidence__results {
+  max-height: min(42vh, 360px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+}
+
+.message-evidence__links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  border-top: 1px solid var(--ui-divider);
+  padding: 8px 12px;
+  color: var(--ui-text-tertiary);
+  font-size: 11px;
+}
+
+.message-evidence__links a {
+  display: inline-flex;
+  max-width: 220px;
+  align-items: center;
+  gap: 4px;
+  color: var(--ui-primary);
+}
+
+.message-evidence__links a span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-evidence__links a:hover {
+  color: var(--ui-primary-hover);
+  text-decoration: underline;
+}
+
+.message-evidence__links a:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--ui-focus-outline);
+  outline-offset: 2px;
+}
+
+@media (max-width: 639px) {
+  .message-evidence__toggle {
+    width: 100%;
+    min-height: 40px;
+    border-radius: var(--ui-radius-control);
+  }
+
+  .message-evidence__summary {
+    flex: 1 1 120px;
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .message-evidence__action {
+    margin-left: auto;
+  }
+
+  .message-evidence__panel-head {
+    align-items: center;
+  }
+
+  .message-evidence__results {
+    max-height: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message-evidence__toggle,
+  .message-evidence__chevron {
+    transition: none;
+  }
+}
+</style>
 
 <style scoped>
 .chat-message__user-bubble {

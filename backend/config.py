@@ -8,6 +8,29 @@ ROOT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
+    # 运行环境与日志。宿主机直接启动默认按开发环境处理；Docker Compose 会显式
+    # 设为 production，避免生产日志默认记录用户问题、模型回答等业务正文。
+    app_env: str = "development"
+    # 发布镜像在构建阶段注入；本地直接运行默认 dev。结构化追踪会携带这两个
+    # 字段，便于比较不同发版/提交上的检索算法指标。
+    app_version: str = "dev"
+    app_revision: str = ""
+    log_level: str = "INFO"
+    rag_trace_enabled: bool = True
+    rag_trace_content_enabled: bool | None = None
+    rag_trace_candidate_details_enabled: bool | None = None
+    rag_trace_content_max_chars: int = Field(50000, ge=1000, le=1000000)
+    # 调用链事件异步写入数据库，供后台按 trace_id / 会话 / 时间检索。
+    # 正文是否入库仍统一服从 rag_trace_include_content；生产环境默认只保存摘要、
+    # 指标与对象 ID。保留期到期后由后台清理任务级联删除事件明细。
+    rag_trace_persistence_enabled: bool = True
+    rag_trace_retention_days: int = Field(30, ge=1, le=365)
+    # 队列按事件数和单事件字节双重限界。500 条足以覆盖数轮完整候选链，
+    # PostgreSQL 长时间不可用时也不会让可观测数据无上限挤占应用内存。
+    rag_trace_queue_size: int = Field(500, ge=100, le=100000)
+    rag_trace_max_event_bytes: int = Field(131072, ge=16384, le=1048576)
+    rag_trace_max_events_per_run: int = Field(500, ge=20, le=5000)
+
     # Docker Compose 会显式覆盖；该默认值仅用于宿主机本地开发的端口约定。
     database_url: str = "postgresql+asyncpg://rag:password@127.0.0.1:5433/rag_prod"
 
@@ -117,6 +140,26 @@ class Settings(BaseSettings):
     login_log_retention_days: int = Field(90, ge=7, le=3650)
     # 仅用于加密 settings 表中的模型 API Key；必须保留在部署环境，绝不写入数据库。
     config_encryption_key: str = ""
+
+    @property
+    def rag_trace_include_content(self) -> bool:
+        """是否在算法追踪日志中记录完整问题、回答和候选片段。
+
+        开发环境默认开启，生产环境默认关闭；部署者仍可通过
+        ``RAG_TRACE_CONTENT_ENABLED`` 显式覆盖。
+        """
+
+        if self.rag_trace_content_enabled is not None:
+            return self.rag_trace_content_enabled
+        return self.app_env.strip().lower() not in {"prod", "production"}
+
+    @property
+    def rag_trace_include_candidate_details(self) -> bool:
+        """逐候选事件开发默认开启、生产默认关闭，避免日志量随候选数线性膨胀。"""
+
+        if self.rag_trace_candidate_details_enabled is not None:
+            return self.rag_trace_candidate_details_enabled
+        return self.app_env.strip().lower() not in {"prod", "production"}
 
     class Config:
         # 宿主机开发始终读取项目根目录的统一 .env；Docker 通过环境变量覆盖。

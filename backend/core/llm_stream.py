@@ -5,6 +5,8 @@ from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
 
+from core.rag_trace import exception_log_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -52,29 +54,27 @@ async def stream_with_retry_before_first_delta(
             )
             if not can_retry:
                 logger.error(
-                    "[聊天模型] 流请求失败 model=%s prompt_chars=%d timeout=%.1fs attempt=%d/%d emitted_text=%s error=%s: %s",
+                    "[聊天模型] 流请求失败 model=%s prompt_chars=%d timeout=%.1fs attempt=%d/%d emitted_text=%s error=%s",
                     model,
                     prompt_chars,
                     timeout_seconds,
                     attempt,
                     attempt_limit,
                     emitted_text,
-                    type(exc).__name__,
-                    exc,
+                    exception_log_text(exc),
                 )
                 raise
 
             delay = max(0.0, retry_base_delay_seconds) * (2 ** (attempt - 1))
             logger.warning(
-                "[聊天模型] 首个分片前请求异常，%.1f 秒后重试 model=%s prompt_chars=%d timeout=%.1fs attempt=%d/%d error=%s: %s",
+                "[聊天模型] 首个分片前请求异常，%.1f 秒后重试 model=%s prompt_chars=%d timeout=%.1fs attempt=%d/%d error=%s",
                 delay,
                 model,
                 prompt_chars,
                 timeout_seconds,
                 attempt,
                 attempt_limit,
-                type(exc).__name__,
-                exc,
+                exception_log_text(exc),
             )
             await asyncio.sleep(delay)
 
