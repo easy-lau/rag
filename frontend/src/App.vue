@@ -19,7 +19,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   NConfigProvider,
   NDialogProvider,
@@ -42,16 +42,20 @@ const isDark = computed(() => ui.mode === 'dark')
 const theme = computed(() => isDark.value ? darkTheme : null)
 const themeOverrides = ref(createNaiveThemeOverrides())
 
-function syncThemeOverrides() {
+function syncThemeOverrides(dark = isDark.value) {
+  // useColorMode、Tailwind dark class 与 Naive UI 必须在同一帧使用同一主题。
+  // 主动同步根节点后再读取 token，避免 Theme Overrides 晚一帧造成控件闪白。
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.toggle('dark', dark)
+  }
   themeOverrides.value = createNaiveThemeOverrides()
 }
 
 // 任何页面/登录页加载时都拉取公开品牌信息，应用品牌与浏览器标题。
-// 等待 VueUse 写入 html.dark 后再读取 CSS token，避免深色模式取到上一帧的值。
 onMounted(() => {
   siteStore.fetchSite()
-  nextTick(syncThemeOverrides)
+  syncThemeOverrides()
 })
 
-watch(isDark, () => nextTick(syncThemeOverrides), { flush: 'post' })
+watch(isDark, dark => syncThemeOverrides(dark), { flush: 'sync' })
 </script>

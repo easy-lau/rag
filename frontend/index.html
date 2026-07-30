@@ -3,6 +3,24 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      // 在 Vue、Tailwind 和业务样式加载前恢复主题，避免深色用户刷新页面时先白屏。
+      (() => {
+        try {
+          const savedMode = localStorage.getItem('rag-theme')
+          const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+          const shouldUseDark = savedMode === 'dark'
+            || ((!savedMode || savedMode === 'auto') && prefersDark)
+          document.documentElement.classList.toggle('dark', shouldUseDark)
+        } catch (_) {
+          // 禁用存储时继续使用浅色初始页，应用启动后仍可正常切换。
+        }
+      })()
+    </script>
+    <style>
+      html, body, #app { min-height: 100%; margin: 0; background: #f5f8fc; }
+      html.dark, html.dark body, html.dark #app { background: #111a28; }
+    </style>
     <title>RAG 检索系统</title>
   </head>
   <body>

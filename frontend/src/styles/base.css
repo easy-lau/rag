@@ -28,7 +28,18 @@ body {
 
 #app {
   min-height: 100%;
+  background: var(--ui-bg);
   color: var(--ui-text);
+}
+
+/* 主题切换必须是一次原子换肤，而不是让不同组件各自播放颜色过渡。
+ * class 只在切换按钮触发后的两帧内存在，不影响日常 hover / focus 动效。 */
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  transition: none !important;
 }
 
 ::selection {
