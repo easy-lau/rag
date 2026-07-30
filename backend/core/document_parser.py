@@ -89,8 +89,32 @@ def _split_text(text: str) -> list[str]:
             g = carry + g
         out.append(sep.join(g))
 
+    # 短内容同样可能是有效知识（例如“测试”“同意”“OK”），不能因为低于
+    # 最小块长度就把整篇文档过滤为空。对于长文末尾产生的短碎片，优先并入
+    # 相邻 chunk；如果整篇只有一个短片段，则原样保留为一个 chunk。
+    nonempty = [chunk.strip() for chunk in out if chunk.strip()]
+    if not nonempty:
+        return []
+
     min_len = 5 if cjk else 20
-    return [c for c in out if len(c.strip()) >= min_len]
+    chunks: list[str] = []
+    leading_short = ""
+    for chunk in nonempty:
+        if len(chunk) < min_len:
+            if chunks:
+                chunks[-1] = f"{chunks[-1]}{sep}{chunk}".strip()
+            else:
+                leading_short = f"{leading_short}{sep}{chunk}".strip()
+            continue
+
+        if leading_short:
+            chunk = f"{leading_short}{sep}{chunk}".strip()
+            leading_short = ""
+        chunks.append(chunk)
+
+    if leading_short:
+        chunks.append(leading_short)
+    return chunks
 
 
 def _ctx_prefix(title: str, heading_path: list) -> str:
