@@ -259,12 +259,23 @@ defineExpose({ setText, focus })
   box-shadow: var(--ui-focus-ring), var(--ui-shadow-card);
 }
 
-.chat-composer__input :deep(.n-input__textarea-el) {
-  min-height: 58px !important;
+.chat-composer__input {
+  /* 背景由外层 composer 统一承载，避免 Naive UI 主题在下一帧重算时内层闪白。 */
+  --n-color: transparent !important;
+  --n-color-focus: transparent !important;
+  background-color: transparent;
+}
+
+.chat-composer__input :deep(.n-input__textarea-el),
+.chat-composer__input :deep(.n-input__textarea-mirror),
+.chat-composer__input :deep(.n-input__placeholder) {
   padding: 1px 2px 6px;
-  color: var(--ui-text);
   font-size: 14px;
   line-height: 1.75;
+}
+
+.chat-composer__input :deep(.n-input__textarea-el) {
+  color: var(--ui-text);
 }
 
 .chat-composer__input :deep(.n-input__placeholder) {
