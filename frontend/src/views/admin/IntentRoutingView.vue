@@ -1,7 +1,7 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="max-w-6xl mx-auto space-y-6">
-      <PageHeader title="智能路由" description="先识别问题意图，再以受控策略选择检索、通用回答或写作等固定处理流程。">
+      <PageHeader title="智能路由" description="分别记录用户意图、回答模式和检索策略，由后端策略层决定最终是否查询知识库。">
         <template #meta>
           <n-tag :type="routingActive ? 'success' : 'default'" :bordered="false" round>
             {{ canRead ? (routingActive ? '路由已启用' : '路由未启用') : '无访问权限' }}
@@ -29,7 +29,7 @@
                 <span class="w-2 h-2 rounded-full bg-blue-500 inline-block"></span>
                 路由策略
               </h3>
-              <p class="mt-1 text-xs text-gray-400">模型只能返回已启用的意图编码；最终动作仍由服务端白名单和权限校验决定。</p>
+              <p class="mt-1 text-xs text-gray-400">模型只负责识别意图；回答模式和是否检索由服务端策略层独立决策，并继续受权限校验约束。</p>
             </div>
             <div class="flex items-center gap-3">
               <span v-if="!canManage" class="text-xs text-gray-400">当前仅可查看</span>
@@ -111,7 +111,7 @@
                   <span class="w-2 h-2 rounded-full bg-orange-500 inline-block"></span>
                   在线测试
                 </h3>
-                <p class="mt-1 text-xs text-gray-400">只模拟路由决策，不会创建对话或调用知识库回答。</p>
+                <p class="mt-1 text-xs text-gray-400">只模拟无知识库场景下的最终路由决策，不会创建对话或执行真实检索。</p>
               </div>
               <n-button type="primary" :loading="testing" :disabled="!testQuery.trim()" @click="runTest">测试路由</n-button>
             </div>
@@ -129,8 +129,11 @@
                 <span class="text-sm font-medium text-gray-700 dark:text-gray-200">路由结果</span>
                 <n-tag type="info" size="small" :bordered="false">{{ testResult.intent_code || testResult.intent || 'unknown' }}</n-tag>
                 <n-tag size="small" :type="actionTagType(testAction)" :bordered="false">{{ actionLabel(testAction) }}</n-tag>
+                <n-tag size="small" :type="retrievalPolicyTagType(retrievalPolicyFor(testResult))" :bordered="false">
+                  {{ retrievalPolicyLabel(retrievalPolicyFor(testResult)) }}
+                </n-tag>
               </div>
-              <div class="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+              <div class="grid grid-cols-1 gap-x-4 gap-y-3 text-xs sm:grid-cols-2">
                 <div>
                   <div class="text-gray-400">判定来源</div>
                   <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ sourceLabel(testResult.decision_source || testResult.source) }}</div>
@@ -140,17 +143,34 @@
                   <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ formatConfidence(testResult.confidence) }}</div>
                 </div>
                 <div>
-                  <div class="text-gray-400">是否检索</div>
+                  <div class="text-gray-400">最终是否检索</div>
                   <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ needsRetrieval(testResult) ? '是' : '否' }}</div>
+                </div>
+                <div>
+                  <div class="text-gray-400">回答模式</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ responseModeLabel(responseModeFor(testResult)) }}</div>
+                </div>
+                <div>
+                  <div class="text-gray-400">检索策略</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ retrievalPolicyLabel(retrievalPolicyFor(testResult)) }}</div>
+                </div>
+                <div>
+                  <div class="text-gray-400">执行状态</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ retrievalExecutionLabel(testResult, true) }}</div>
+                </div>
+                <div>
+                  <div class="text-gray-400">证据状态</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ evidenceStatusLabel(testResult.evidence_status, true) }}</div>
                 </div>
                 <div v-if="testResult.latency_ms !== undefined && testResult.latency_ms !== null">
                   <div class="text-gray-400">耗时</div>
                   <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ testResult.latency_ms }} ms</div>
                 </div>
               </div>
-              <p v-if="testReason" class="mt-3 pt-3 border-t border-gray-200 dark:border-gray-600 text-xs leading-relaxed text-gray-500 dark:text-gray-400">
-                {{ testReason }}
-              </p>
+              <div v-if="testReason" class="mt-3 border-t border-gray-200 pt-3 text-xs leading-relaxed text-gray-500 dark:border-gray-600 dark:text-gray-400">
+                <span class="text-gray-400">策略原因：</span>
+                <span :title="testReason">{{ decisionReasonLabel(testReason) }}</span>
+              </div>
             </div>
           </SurfaceCard>
 
@@ -158,9 +178,9 @@
           <section class="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-gray-800 dark:to-gray-800 rounded-xl border border-blue-100 dark:border-gray-700 p-5 sm:p-6">
             <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200">安全的路由边界</h3>
             <div class="mt-4 space-y-3 text-sm text-gray-600 dark:text-gray-300">
-              <div class="flex gap-3"><span class="text-blue-500 font-semibold">1</span><span>规则命中后可直接选择固定动作，复杂问题再交给低成本模型分类。</span></div>
-              <div class="flex gap-3"><span class="text-blue-500 font-semibold">2</span><span>模型输出会校验为已启用的意图编码，不能指定任意接口、知识库或权限。</span></div>
-              <div class="flex gap-3"><span class="text-blue-500 font-semibold">3</span><span>低置信度和异常结果统一按兜底意图处理；知识库权限仍在实际检索前校验。</span></div>
+              <div class="flex gap-3"><span class="text-blue-500 font-semibold">1</span><span>规则和模型只产生意图分类，不能直接控制接口、知识库或越过权限边界。</span></div>
+              <div class="flex gap-3"><span class="text-blue-500 font-semibold">2</span><span>后端策略层结合意图与知识库选择状态，独立确定回答模式和检索策略。</span></div>
+              <div class="flex gap-3"><span class="text-blue-500 font-semibold">3</span><span>日志同时记录原始分类、最终策略和证据状态，便于区分“跳过检索”与“检索无命中”。</span></div>
             </div>
           </section>
           </div>
@@ -180,7 +200,7 @@
 
           <n-data-table
             remote :columns="logColumns" :data="logs" :loading="logsLoading"
-            :pagination="logPagination" :scroll-x="ui.isCompact ? 1040 : undefined"
+            :pagination="logPagination" :scroll-x="1580"
             class="intent-routing-table"
           />
           </SurfaceCard>
@@ -376,28 +396,77 @@ const categoryColumns = [
 ]
 
 const logColumns = [
-  { title: '时间', key: 'created_at', width: 165, render: row => formatTime(row.created_at) },
   {
-    title: '意图', key: 'intent_code', minWidth: 170,
-    render: row => h('div', { class: 'flex flex-col gap-0.5 min-w-0' }, [
+    title: '时间', key: 'created_at', width: 160, align: 'center', titleAlign: 'center',
+    render: row => h('span', { class: 'whitespace-nowrap' }, formatTime(row.created_at)),
+  },
+  {
+    title: '识别意图', key: 'intent_code', width: 190, align: 'left', titleAlign: 'left',
+    render: row => h('div', { class: 'flex min-w-0 flex-col gap-0.5 py-1' }, [
       h('span', { class: 'text-sm truncate' }, row.intent_name || '—'),
-      h('code', { class: 'text-xs text-blue-600 dark:text-blue-400 truncate' }, row.intent_code || row.intent || '—'),
+      h('code', {
+        class: 'truncate text-xs text-blue-600 dark:text-blue-400',
+        title: row.intent_code || row.intent || '',
+      }, row.intent_code || row.intent || '—'),
     ]),
   },
-  { title: '置信度', key: 'confidence', width: 90, render: row => formatConfidence(row.confidence) },
-  { title: '来源', key: 'decision_source', width: 90, render: row => sourceLabel(row.decision_source || row.source) },
   {
-    title: '动作', key: 'action', width: 110,
+    title: '分类动作', key: 'action', width: 115, align: 'center', titleAlign: 'center',
     render: row => h(NTag, { size: 'small', type: actionTagType(row.action), bordered: false }, () => actionLabel(row.action)),
   },
-  { title: '知识库数', key: 'selected_kb_count', width: 100, render: row => row.selected_kb_count ?? 0 },
-  { title: '耗时', key: 'latency_ms', width: 95, render: row => row.latency_ms === undefined ? '—' : `${row.latency_ms} ms` },
   {
-    title: '反馈', key: 'feedback', width: 100,
+    title: '判定', key: 'decision_source', width: 115, align: 'center', titleAlign: 'center',
+    render: row => h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
+      h('span', { class: 'text-sm' }, sourceLabel(row.decision_source || row.source)),
+      h('span', { class: 'text-xs text-gray-400' }, formatConfidence(row.confidence)),
+    ]),
+  },
+  {
+    title: '最终策略', key: 'retrieval_policy', width: 230, align: 'left', titleAlign: 'left',
+    render: row => h('div', { class: 'flex min-w-0 flex-col gap-1.5 py-1' }, [
+      h('div', { class: 'flex items-center gap-1.5 whitespace-nowrap' }, [
+        h(NTag, { size: 'small', type: responseModeTagType(responseModeFor(row)), bordered: false }, () => responseModeLabel(responseModeFor(row))),
+        h(NTag, { size: 'small', type: retrievalPolicyTagType(retrievalPolicyFor(row)), bordered: false }, () => retrievalPolicyLabel(retrievalPolicyFor(row))),
+      ]),
+      h('span', { class: 'text-xs text-gray-500 dark:text-gray-400' }, `最终检索：${needsRetrieval(row) ? '是' : '否'}`),
+    ]),
+  },
+  {
+    title: '策略原因', key: 'decision_reason', width: 220, align: 'left', titleAlign: 'left',
+    render: row => {
+      const reason = decisionReasonFor(row)
+      return h('div', { class: 'flex min-w-0 flex-col gap-0.5 py-1' }, [
+        h('span', { class: 'truncate text-sm', title: decisionReasonLabel(reason) }, decisionReasonLabel(reason)),
+        h('code', { class: 'truncate text-xs text-gray-400', title: reason }, reason || '—'),
+      ])
+    },
+  },
+  {
+    title: '执行 / 证据', key: 'evidence_status', width: 180, align: 'left', titleAlign: 'left',
+    render: row => {
+      const status = evidenceStatusFor(row)
+      return h('div', { class: 'flex min-w-0 flex-col items-start gap-1 py-1' }, [
+        h(NTag, { size: 'small', type: evidenceStatusTagType(status), bordered: false }, () => evidenceStatusLabel(status)),
+        h('span', { class: 'truncate text-xs text-gray-500 dark:text-gray-400' }, retrievalExecutionLabel(row)),
+        status === 'hit'
+          ? h('span', { class: 'text-xs text-gray-400' }, `有效命中：${Number(row.hit_count ?? 0)} 条`)
+          : null,
+      ])
+    },
+  },
+  {
+    title: '上下文', key: 'selected_kb_count', width: 125, align: 'center', titleAlign: 'center',
+    render: row => h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
+      h('span', { class: 'text-sm' }, `${row.selected_kb_count ?? 0} 个知识库`),
+      h('span', { class: 'text-xs text-gray-400' }, row.latency_ms === undefined || row.latency_ms === null ? '耗时 —' : `${row.latency_ms} ms`),
+    ]),
+  },
+  {
+    title: '反馈', key: 'feedback', width: 100, align: 'center', titleAlign: 'center',
     render: row => h(NTag, { size: 'small', type: feedbackTagType(row.feedback), bordered: false }, () => feedbackLabel(row.feedback)),
   },
   {
-    title: '操作', key: 'actions', width: 150,
+    title: '操作', key: 'actions', width: 145, align: 'center', titleAlign: 'center',
     render: row => h('div', { style: 'display:flex;justify-content:center;gap:6px;align-items:center' }, [
       h(NButton, {
         text: true, type: 'success', size: 'small', disabled: !canManage.value || !!row.feedback,
@@ -410,10 +479,9 @@ const logColumns = [
     ]),
   },
 ]
-logColumns.forEach(column => { column.titleAlign = 'center'; column.align = 'center' })
 
 const testAction = computed(() => testResult.value?.action || testResult.value?.route_action || '')
-const testReason = computed(() => testResult.value?.reason || testResult.value?.message || '')
+const testReason = computed(() => decisionReasonFor(testResult.value))
 
 onMounted(loadPage)
 
@@ -605,7 +673,15 @@ async function runTest() {
   testResult.value = null
   try {
     const data = await testIntentRouting({ question: query })
-    testResult.value = data?.decision ? { ...data.decision, latency_ms: data.latency_ms } : data
+    testResult.value = data?.decision
+      ? {
+          ...data.decision,
+          latency_ms: data.latency_ms,
+          retrieval_executed: data.retrieval_executed ?? data.decision.retrieval_executed,
+          evidence_status: data.evidence_status ?? data.decision.evidence_status,
+          hit_count: data.hit_count ?? data.decision.hit_count,
+        }
+      : data
   } catch (error) {
     showError(error, '测试路由失败')
   } finally {
@@ -643,6 +719,123 @@ function actionTagType(action) {
   }[action] || 'default'
 }
 
+function responseModeFor(result) {
+  if (!result) return ''
+  if (result.response_mode) return result.response_mode
+  return ({
+    retrieve: 'grounded_qa',
+    chat: 'general_chat',
+    writing: 'writing',
+    system_help: 'platform_help',
+  })[result.action || result.route_action] || ''
+}
+
+function responseModeLabel(mode) {
+  return {
+    grounded_qa: '知识库问答',
+    general_chat: '通用回答',
+    writing: '写作模式',
+    platform_help: '平台帮助',
+  }[mode] || mode || '未记录'
+}
+
+function responseModeTagType(mode) {
+  return {
+    grounded_qa: 'success',
+    general_chat: 'info',
+    writing: 'warning',
+    platform_help: 'default',
+  }[mode] || 'default'
+}
+
+function retrievalPolicyFor(result) {
+  if (!result) return ''
+  if (result.retrieval_policy) return result.retrieval_policy
+  return needsRetrieval(result) ? 'required' : 'skip'
+}
+
+function retrievalPolicyLabel(policy) {
+  return {
+    required: '必须检索',
+    optional: '按证据检索',
+    skip: '跳过检索',
+  }[policy] || policy || '未记录'
+}
+
+function retrievalPolicyTagType(policy) {
+  return {
+    required: 'success',
+    optional: 'warning',
+    skip: 'default',
+  }[policy] || 'default'
+}
+
+function decisionReasonFor(result) {
+  return result?.decision_reason || result?.reason || result?.message || ''
+}
+
+function decisionReasonLabel(reason) {
+  return {
+    safe_fallback: '分类异常或置信度不足，采用安全检索兜底',
+    classification_pending_policy: '分类已完成，等待策略层决策',
+    general_chat_disabled: '系统已关闭非检索回答',
+    classified_retrieval: '意图分类明确要求知识库检索',
+    exact_greeting: '明确的问候或礼貌用语',
+    explicit_platform_help: '明确询问当前 RAG 平台功能',
+    platform_help_scope_guard: '并非当前平台帮助，策略保护已强制检索',
+    inline_writing_content: '用户已提供待处理文本，无需查询知识库',
+    knowledge_dependent_writing: '写作任务依赖知识库资料，必须先检索',
+    selected_knowledge_context: '已选择知识库，允许使用知识证据',
+    no_selected_knowledge: '未选择知识库，按非检索模式回答',
+    invalid_action_fallback: '分类动作无效，采用安全检索兜底',
+    legacy_action_mapping: '历史日志按原分类动作补全执行策略',
+    legacy_probe: '旧接口通过轻量判断生成检索计划',
+    explicit_need_retrieval: '调用方明确指定是否检索',
+    retrieval_required: '检索策略要求执行知识库检索',
+    retrieval_skipped: '检索策略明确跳过知识库检索',
+    optional_auto_detection: '可选检索由轻量判断决定',
+  }[reason] || reason || '未记录'
+}
+
+function evidenceStatusFor(result) {
+  const status = result?.evidence_status
+  if (['skipped', 'hit', 'no_hit', 'unverified', 'error'].includes(status)) return status
+  if (result?.retrieval_executed === false) return 'skipped'
+  if (result?.retrieval_executed === true && Number(result?.hit_count) > 0) return 'hit'
+  if (result?.retrieval_executed === true && result?.hit_count !== undefined && result?.hit_count !== null) return 'no_hit'
+  if (Number(result?.hit_count) > 0) return 'hit'
+  return 'unverified'
+}
+
+function evidenceStatusLabel(status, simulation = false) {
+  if (!status && simulation) return '未执行（仅测试路由策略）'
+  return {
+    skipped: '已跳过检索',
+    hit: '已命中证据',
+    no_hit: '已检索但无命中',
+    unverified: '状态未验证',
+    error: '检索失败',
+  }[status] || status || '未记录'
+}
+
+function evidenceStatusTagType(status) {
+  return {
+    skipped: 'default',
+    hit: 'success',
+    no_hit: 'warning',
+    unverified: 'default',
+    error: 'error',
+  }[status] || 'default'
+}
+
+function retrievalExecutionLabel(result, simulation = false) {
+  if (result?.retrieval_executed === true) return '已执行知识库检索'
+  if (result?.retrieval_executed === false) return '已按策略跳过检索'
+  if (simulation) return '未执行（仅测试路由策略）'
+  if (result?.evidence_status === 'error') return '检索执行失败'
+  return '未记录或请求提前中止'
+}
+
 function sourceLabel(source) {
   return { rule: '规则', llm: '模型', fallback: '兜底', policy_fallback: '策略兜底' }[source] || source || '—'
 }
@@ -661,9 +854,10 @@ function formatConfidence(value) {
 }
 
 function needsRetrieval(result) {
+  if (!result) return false
   if (result.need_retrieval !== undefined) return !!result.need_retrieval
   if (result.needs_retrieval !== undefined) return !!result.needs_retrieval
-  return result.action === 'retrieve'
+  return (result.action || result.route_action) === 'retrieve'
 }
 
 function formatTime(value) {

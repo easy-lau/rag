@@ -172,11 +172,21 @@ class IntentRouteLog(Base):
     )
     intent_code: Mapped[str] = mapped_column(String(64), nullable=False)
     intent_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # ``action`` 保留分类所绑定的原始动作，便于判断模型究竟选中了什么；以下字段
+    # 记录后端策略层给出的最终执行计划，不能再从 action 反向推导。
     action: Mapped[str] = mapped_column(String(32), nullable=False)
+    response_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    retrieval_policy: Mapped[str] = mapped_column(String(16), nullable=False)
+    need_retrieval: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    decision_reason: Mapped[str] = mapped_column(String(64), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     selected_kb_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # 实际检索结果在流式管线运行后回填；旧日志和被用户提前中止的请求允许为空。
+    retrieval_executed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    evidence_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    hit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     feedback: Mapped[str | None] = mapped_column(String(16), nullable=True)
     feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

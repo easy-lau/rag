@@ -245,6 +245,9 @@ class OperationLogPage(BaseModel):
 # ── Intent Routing ──────────────────────────────────────────────
 IntentRouterMode = Literal["rules_then_llm", "llm_only", "off"]
 IntentAction = Literal["retrieve", "chat", "writing", "system_help"]
+IntentResponseMode = Literal["grounded_qa", "general_chat", "writing", "platform_help"]
+IntentRetrievalPolicy = Literal["required", "optional", "skip"]
+IntentEvidenceStatus = Literal["skipped", "hit", "no_hit", "unverified", "error"]
 IntentFeedback = Literal["correct", "incorrect"]
 
 
@@ -303,6 +306,10 @@ class IntentDecisionOut(BaseModel):
     intent_code: str
     intent_name: str
     action: IntentAction
+    response_mode: IntentResponseMode
+    retrieval_policy: IntentRetrievalPolicy
+    need_retrieval: bool
+    decision_reason: str = Field(..., min_length=1, max_length=64)
     confidence: float = Field(..., ge=0, le=1)
     source: str
 
@@ -324,10 +331,17 @@ class IntentRouteLogOut(BaseModel):
     intent_code: str
     intent_name: str
     action: IntentAction
+    response_mode: IntentResponseMode
+    retrieval_policy: IntentRetrievalPolicy
+    need_retrieval: bool
+    decision_reason: str
     confidence: float
     source: str
     latency_ms: int
     selected_kb_count: int
+    retrieval_executed: bool | None = None
+    evidence_status: IntentEvidenceStatus | None = None
+    hit_count: int | None = None
     feedback: IntentFeedback | None = None
     feedback_at: datetime | None = None
     created_at: datetime

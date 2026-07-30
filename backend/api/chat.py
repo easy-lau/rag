@@ -4,12 +4,12 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
-from models.db_models import Conversation, Message, User
+from models.db_models import Conversation, IntentRouteLog, Message, User
 from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
 from core.rag_pipeline import run_rag_stream
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import CHAT_USE
-from core.intent_router import classify_intent
+from core.intent_router import classify_intent_result
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -41,7 +41,7 @@ async def send_message(
         await db.flush()
 
     # 智能路由只输出受白名单约束的动作；知识库授权仍以上方接口校验为准。
-    decision = await classify_intent(
+    routing_result = await classify_intent_result(
         db,
         payload.question,
         user=user,
@@ -49,7 +49,8 @@ async def send_message(
         conversation_id=conv.id,
         record_log=True,
     )
-    if decision.action == "retrieve" and not payload.knowledge_base_ids:
+    decision = routing_result.decision
+    if decision.need_retrieval and not payload.knowledge_base_ids:
         raise HTTPException(status_code=400, detail="该问题需要查询知识库，请至少选择一个知识库")
 
     # 保存用户消息
@@ -68,6 +69,9 @@ async def send_message(
         full_response = []
         sources = []
         tokens = None
+        retrieval_executed = None
+        evidence_status = None
+        hit_count = None
         # 会话和用户消息已提交。先告知前端会话 ID，用户在首条回答完成前停止时也能继续该会话。
         yield f"data: {_json.dumps({'type': 'conversation_started', 'conversation_id': str(conv.id)})}\n\n"
         try:
@@ -90,6 +94,9 @@ async def send_message(
                     try:
                         data = _json.loads(chunk.removeprefix("data: ").strip())
                         sources = data.get("results", [])[:5]
+                        retrieval_executed = data.get("retrieval_executed")
+                        evidence_status = data.get("evidence_status")
+                        hit_count = data.get("total", len(data.get("results", [])))
                     except Exception:
                         pass
                 if '"type": "usage"' in chunk:
@@ -100,6 +107,21 @@ async def send_message(
                         pass
         except Exception as e:
             print(f"[chat/stream error] {type(e).__name__}: {e}")
+            if retrieval_executed is None:
+                retrieval_executed = bool(decision.need_retrieval)
+            if evidence_status is None:
+                evidence_status = "error" if decision.need_retrieval else "skipped"
+            if hit_count is None:
+                hit_count = 0
+            from database import AsyncSessionLocal
+            async with AsyncSessionLocal() as save_db:
+                if routing_result.route_log_id is not None:
+                    route_log = await save_db.get(IntentRouteLog, routing_result.route_log_id)
+                    if route_log is not None:
+                        route_log.retrieval_executed = retrieval_executed
+                        route_log.evidence_status = evidence_status
+                        route_log.hit_count = hit_count
+                        await save_db.commit()
             yield f"data: {_json.dumps({'type': 'error', 'message': str(e)})}\n\n"
             yield f"data: {_json.dumps({'type': 'done', 'conversation_id': str(conv.id)})}\n\n"
             return
@@ -115,6 +137,18 @@ async def send_message(
                 tokens=tokens,
             )
             save_db.add(ai_msg)
+            if routing_result.route_log_id is not None:
+                route_log = await save_db.get(IntentRouteLog, routing_result.route_log_id)
+                if route_log is not None:
+                    route_log.retrieval_executed = (
+                        bool(retrieval_executed)
+                        if retrieval_executed is not None
+                        else bool(decision.need_retrieval)
+                    )
+                    route_log.evidence_status = evidence_status or (
+                        "no_hit" if decision.need_retrieval else "skipped"
+                    )
+                    route_log.hit_count = int(hit_count or 0)
             await save_db.commit()
 
     return StreamingResponse(

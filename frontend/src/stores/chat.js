@@ -123,7 +123,9 @@ export const useChatStore = defineStore('chat', () => {
     } else if (data.type === 'search_step') {
       searchStore.updateStep(data.step, data.status)
     } else if (data.type === 'search_results') {
-      searchStore.setResults(data)
+      // 搜索事件现在会返回实际执行与证据状态；搜索配置只作为旧版本接口
+      // 未携带 method/top_k 时的展示兜底，不能代替服务端执行结论。
+      searchStore.setResults(data, searchConfig.value)
       aiMsg.sources = data.results?.slice(0, 5) || []
     } else if (data.type === 'text_delta') {
       aiMsg.content += data.content
@@ -133,6 +135,17 @@ export const useChatStore = defineStore('chat', () => {
       if (data.conversation_id) currentConvId.value = data.conversation_id
       searchStore.finishSteps()
     } else if (data.type === 'error') {
+      // 正常管线会先发送 search_results；若异常发生得更早，则显式标记为
+      // “检索状态失败”，避免结果面板一直误显示为等待中。
+      if (!searchStore.hasResultEvent) {
+        searchStore.setResults({
+          results: [],
+          total: 0,
+          retrieval_executed: null,
+          evidence_status: 'error',
+          decision_reason: searchStore.intentDecision?.decision_reason || '',
+        }, searchConfig.value)
+      }
       aiMsg.content += `\n\n[错误：${data.message}]`
     }
   }
