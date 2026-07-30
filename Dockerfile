@@ -14,14 +14,14 @@ ENV VITE_APP_VERSION=${APP_VERSION} \
 RUN npm run build
 
 # 前后端合一运行镜像
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://pypi.org/simple
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends nginx supervisor \
@@ -29,7 +29,11 @@ RUN apt-get update \
     && rm -f /etc/nginx/conf.d/default.conf
 
 COPY backend/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} -r requirements.txt
+RUN pip install --no-cache-dir \
+        --retries 5 \
+        --timeout 60 \
+        --index-url "${PIP_INDEX_URL}" \
+        -r requirements.txt
 
 COPY backend/ ./
 COPY --from=frontend-builder /frontend/dist/ /usr/share/nginx/html/
