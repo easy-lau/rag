@@ -77,9 +77,17 @@
                 <template #prefix><n-icon><LockClosedOutline /></n-icon></template>
               </n-input>
             </n-form-item>
-            <n-button type="primary" block size="large" class="login-submit" :loading="loading" @click="handleLogin">
-              <span>{{ loading ? '正在验证身份' : '安全登录' }}</span>
-              <span v-if="!loading" class="login-submit__arrow">→</span>
+            <n-button
+              type="primary"
+              block
+              size="large"
+              class="login-submit"
+              :loading="loading"
+              :disabled="cooldownSeconds > 0"
+              @click="handleLogin"
+            >
+              <span>{{ loginButtonText }}</span>
+              <span v-if="!loading && !cooldownSeconds" class="login-submit__arrow">→</span>
             </n-button>
           </n-form>
 
@@ -98,7 +106,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NForm, NFormItem, NInput, NButton, NIcon, useMessage } from 'naive-ui'
 import { PersonOutline, LockClosedOutline } from '@vicons/ionicons5'
@@ -114,13 +122,39 @@ const siteStore = useSiteStore()
 
 const formRef = ref(null)
 const loading = ref(false)
+const cooldownSeconds = ref(0)
+let cooldownTimer = null
 const form = ref({ username: '', password: '' })
 const rules = {
   username: { required: true, message: '请输入用户名', trigger: 'blur' },
   password: { required: true, message: '请输入密码', trigger: 'blur' },
 }
 
+const loginButtonText = computed(() => {
+  if (loading.value) return '正在验证身份'
+  if (cooldownSeconds.value > 0) return `${cooldownSeconds.value} 秒后重试`
+  return '安全登录'
+})
+
+function startCooldown(seconds) {
+  const safeSeconds = Math.min(86400, Math.max(1, Number.parseInt(seconds, 10) || 60))
+  cooldownSeconds.value = safeSeconds
+  if (cooldownTimer) window.clearInterval(cooldownTimer)
+  cooldownTimer = window.setInterval(() => {
+    cooldownSeconds.value = Math.max(0, cooldownSeconds.value - 1)
+    if (!cooldownSeconds.value && cooldownTimer) {
+      window.clearInterval(cooldownTimer)
+      cooldownTimer = null
+    }
+  }, 1000)
+}
+
+onBeforeUnmount(() => {
+  if (cooldownTimer) window.clearInterval(cooldownTimer)
+})
+
 async function handleLogin() {
+  if (loading.value || cooldownSeconds.value > 0) return
   try {
     await formRef.value?.validate()
   } catch {
@@ -139,7 +173,13 @@ async function handleLogin() {
     router.push(target)
   } catch (e) {
     const detail = e?.response?.data?.detail
-    message.error(detail || '登录失败，请检查用户名或密码')
+    if (e?.response?.status === 429) {
+      const retryAfter = e.response.headers?.['retry-after']
+      startCooldown(retryAfter)
+      message.warning(detail || '登录请求过于频繁，请稍后再试')
+    } else {
+      message.error(detail || '登录失败，请检查用户名或密码')
+    }
   } finally {
     loading.value = false
   }

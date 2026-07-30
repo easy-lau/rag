@@ -1,6 +1,17 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Text, Integer, ForeignKey, DateTime, Boolean, UniqueConstraint, Index, Float
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from pgvector.sqlalchemy import Vector
@@ -257,7 +268,21 @@ class RoleKnowledgeBase(Base):
 
 class LoginLog(Base):
     __tablename__ = "login_logs"
-    __table_args__ = (Index("ix_login_logs_created_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_login_logs_created_at", "created_at"),
+        Index("ix_login_logs_success_created_at", "success", "created_at"),
+        Index("ix_login_logs_username_created_at", "username", "created_at"),
+        Index("ix_login_logs_ip_created_at", "ip", "created_at"),
+        Index("ix_login_logs_last_attempt_at", "last_attempt_at"),
+        Index(
+            "ix_login_logs_failure_aggregation",
+            "success",
+            "username",
+            "ip",
+            "fail_reason",
+            "last_attempt_at",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -269,7 +294,48 @@ class LoginLog(Base):
     fail_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
     ip: Mapped[str | None] = mapped_column(String(64))
     user_agent: Mapped[str | None] = mapped_column(Text)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    last_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class LoginThrottle(Base):
+    """登录失败来源限流状态。
+
+    ``pair`` 仅限制某个来源对某个用户名的尝试，``ip`` 限制来源扫描多个账号，
+    ``account`` 只用于发现集中攻击并告警，绝不据此锁定用户账号。
+    bucket_key 使用 SHA-256 摘要，避免在状态表中重复保存用户名和 IP 明文；
+    可读信息仍由 login_logs 审计表保存。
+    """
+
+    __tablename__ = "login_throttles"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('pair', 'ip', 'account')",
+            name="ck_login_throttles_scope",
+        ),
+        Index("ix_login_throttles_last_failed_at", "last_failed_at"),
+        Index("ix_login_throttles_blocked_until", "blocked_until"),
+    )
+
+    scope: Mapped[str] = mapped_column(String(16), primary_key=True)
+    bucket_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    blocked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_failed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc, onupdate=now_utc
+    )
 
 
 class OperationLog(Base):

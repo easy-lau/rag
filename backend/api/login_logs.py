@@ -27,7 +27,7 @@ async def list_login_logs(
     )).scalar_one()
     rows = (await db.execute(
         select(LoginLog)
-        .order_by(LoginLog.created_at.desc())
+        .order_by(LoginLog.last_attempt_at.desc())
         .offset(offset)
         .limit(page_size)
     )).scalars().all()

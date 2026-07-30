@@ -7,6 +7,8 @@ log() 只是把一条 OperationLog 加入会话，随业务 commit 一起落库�
 红线：detail 绝不写入密码 / API Key / Token 等敏感值，密钥类只记"哪些键被改"。
 """
 
+from ipaddress import ip_address
+
 from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,11 +17,22 @@ from models.db_models import OperationLog, User
 
 
 def client_ip(request: Request) -> str | None:
-    """解析客户端 IP：优先取 X-Forwarded-For 首段，否则回退 request.client.host。"""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None
+    """只信任同容器 Nginx 从环回地址写入的 X-Real-IP，拒绝客户端伪造 XFF。"""
+
+    def normalize(value: str | None) -> str | None:
+        if not value:
+            return None
+        try:
+            return str(ip_address(value.strip()))
+        except ValueError:
+            return None
+
+    peer = normalize(request.client.host if request.client else None)
+    if peer and ip_address(peer).is_loopback:
+        real_ip = normalize(request.headers.get("x-real-ip"))
+        if real_ip:
+            return real_ip
+    return peer
 
 
 class AuditLogger:

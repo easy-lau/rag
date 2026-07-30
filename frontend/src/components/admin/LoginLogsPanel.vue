@@ -21,7 +21,9 @@
           </div>
           <p v-if="!current.success" class="login-detail__failure">{{ current.fail_reason || '未提供失败原因' }}</p>
           <dl class="login-detail__grid mt-5">
-            <div><dt>登录时间</dt><dd class="tabular-nums">{{ fmtTime(current.created_at) }}</dd></div>
+            <div><dt>首次尝试</dt><dd class="tabular-nums">{{ fmtTime(current.created_at) }}</dd></div>
+            <div><dt>最近尝试</dt><dd class="tabular-nums">{{ fmtTime(current.last_attempt_at || current.created_at) }}</dd></div>
+            <div><dt>尝试次数</dt><dd class="tabular-nums">{{ current.attempt_count || 1 }}</dd></div>
             <div><dt>IP 地址</dt><dd>{{ current.ip || '—' }}</dd></div>
             <div><dt>浏览器</dt><dd>{{ parseUA(current.user_agent).browser }}</dd></div>
             <div><dt>操作系统</dt><dd>{{ parseUA(current.user_agent).os }}</dd></div>
@@ -92,8 +94,12 @@ const timeParts = value => {
 const columns = [
   { title: '用户名', key: 'username', width: 150, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
   {
-    title: '结果', key: 'success', width: 90, align: 'center', titleAlign: 'center',
-    render: r => h(NTag, { type: r.success ? 'success' : 'error', size: 'small' }, () => r.success ? '成功' : '失败')
+    title: '结果', key: 'success', width: 105, align: 'center', titleAlign: 'center',
+    render: r => h(
+      NTag,
+      { type: r.success ? 'success' : 'error', size: 'small' },
+      () => r.success ? '成功' : (r.attempt_count || 1) > 1 ? `失败 ×${r.attempt_count}` : '失败'
+    )
   },
   {
     title: '失败原因', key: 'fail_reason', minWidth: 160, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true },
@@ -110,9 +116,9 @@ const columns = [
     }
   },
   {
-    title: '时间', key: 'created_at', width: 158, align: 'center', titleAlign: 'center',
+    title: '最近时间', key: 'last_attempt_at', width: 158, align: 'center', titleAlign: 'center',
     render: row => {
-      const time = timeParts(row.created_at)
+      const time = timeParts(row.last_attempt_at || row.created_at)
       return h('div', { class: 'login-time' }, [
         h('span', { class: 'login-time__date' }, time.date),
         h('span', { class: 'login-time__value' }, time.time),

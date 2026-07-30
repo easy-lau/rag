@@ -113,8 +113,8 @@ class SearchResponse(BaseModel):
 
 # ── Auth ─────────────────────────────────────────────────────────
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
 
 
 class MeOut(BaseModel):
@@ -211,6 +211,8 @@ class LoginLogOut(BaseModel):
     fail_reason: str | None = None
     ip: str | None = None
     user_agent: str | None = None
+    attempt_count: int = 1
+    last_attempt_at: datetime | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

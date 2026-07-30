@@ -97,6 +97,20 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 720
     admin_init_password: str = "admin12345"
+    # 登录防护属于部署安全策略，只允许由服务端环境变量配置，不能下放到后台页面。
+    # pair 只限制某一来源对某一用户名的尝试；ip 用于限制同一来源扫描多个账号；
+    # account 只触发安全告警，不能据此锁定账号。
+    login_pair_failure_threshold: int = Field(5, ge=3, le=20)
+    login_pair_window_minutes: int = Field(15, ge=1, le=1440)
+    login_pair_block_minutes: int = Field(15, ge=1, le=1440)
+    login_ip_failure_threshold: int = Field(20, ge=5, le=1000)
+    login_ip_window_minutes: int = Field(15, ge=1, le=1440)
+    login_ip_block_minutes: int = Field(60, ge=1, le=10080)
+    login_account_alert_threshold: int = Field(20, ge=5, le=1000)
+    login_account_alert_window_minutes: int = Field(15, ge=1, le=1440)
+    login_throttle_retention_hours: int = Field(48, ge=24, le=720)
+    login_log_aggregate_seconds: int = Field(60, ge=10, le=3600)
+    login_log_retention_days: int = Field(90, ge=7, le=3650)
     # 仅用于加密 settings 表中的模型 API Key；必须保留在部署环境，绝不写入数据库。
     config_encryption_key: str = ""
 

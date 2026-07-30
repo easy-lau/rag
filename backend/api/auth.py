@@ -1,30 +1,85 @@
 """认证路由：登录、查询当前用户、修改密码。"""
 
 from datetime import datetime, timezone
+import math
+from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from starlette.concurrency import run_in_threadpool
 
-from core.audit import AuditLogger, get_audit
+from core.audit import AuditLogger, client_ip, get_audit
 from core.deps import _load_permissions, get_current_user
+from core.login_security import (
+    LockedLoginSource,
+    clear_login_pair_failures,
+    lock_login_source,
+    record_login_attempt,
+    register_login_failure,
+)
 from core.permissions import KB_SCOPE_ALL, KB_SCOPE_NONE
 from core.security import create_access_token, hash_password, verify_password
 from database import get_db
-from models.db_models import LoginLog, User
+from models.db_models import User
 from models.schemas import LoginRequest, MeOut, TokenOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# 固定 dummy hash 让“不存在的用户”也执行一次同成本 bcrypt，降低用户名枚举风险。
+_DUMMY_PASSWORD_HASH = "$2b$12$lrBrXsiG6Anzu7hVqV7kJ.XAOq6/cKbW6qMvgwvpIcBvMa72qxqmO"
+_GENERIC_LOGIN_ERROR = "用户名或密码错误"
 
-def _client_ip(request: Request) -> str | None:
-    """解析客户端 IP：优先取 X-Forwarded-For 首段，否则回退 request.client.host。"""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else None
+
+def _raise_rate_limited(retry_after: int) -> None:
+    seconds = max(1, math.ceil(retry_after))
+    raise HTTPException(
+        status_code=429,
+        detail="登录尝试过于频繁，请稍后再试",
+        headers={"Retry-After": str(seconds), "Cache-Control": "no-store"},
+    )
+
+
+async def _record_failure_and_raise(
+    db: AsyncSession,
+    *,
+    user: User | None,
+    username: str,
+    fail_reason: str,
+    ip: str | None,
+    user_agent: str | None,
+    now: datetime,
+    source: LockedLoginSource,
+) -> NoReturn:
+    """原子登记来源失败与审计，然后返回通用 401 或来源级 429。"""
+    throttle = await register_login_failure(
+        db,
+        source=source,
+        username=username,
+        ip=ip,
+        now=now,
+    )
+    audit_reason = (
+        f"{fail_reason}，来源临时受限"
+        if throttle.retry_after_seconds
+        else fail_reason
+    )
+    await record_login_attempt(
+        db,
+        user=user,
+        username=username,
+        success=False,
+        fail_reason=audit_reason,
+        ip=ip,
+        user_agent=user_agent,
+        now=now,
+    )
+    await db.commit()
+    if throttle.retry_after_seconds:
+        _raise_rate_limited(throttle.retry_after_seconds)
+    raise HTTPException(status_code=401, detail=_GENERIC_LOGIN_ERROR)
 
 
 def _build_me(user: User, permissions: list[str]) -> MeOut:
@@ -48,36 +103,101 @@ def _build_me(user: User, permissions: list[str]) -> MeOut:
 
 @router.post("/login", response_model=TokenOut)
 async def login(payload: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    """用户名/密码登录，校验通过后签发 JWT 并返回当前用户信息；各分支均记录登录日志。"""
-    ip = _client_ip(request)
+    """用户名/密码登录；限制攻击来源，但不因外部失败全局锁定账号。"""
+    now = datetime.now(timezone.utc)
+    username = payload.username.strip()
+    ip = client_ip(request)
     user_agent = request.headers.get("user-agent")
-    result = await db.execute(
-        select(User).options(selectinload(User.role)).where(User.username == payload.username)
+
+    source = await lock_login_source(
+        db,
+        username=username,
+        ip=ip,
+        now=now,
     )
+    if source.throttle.retry_after_seconds:
+        # 受限请求不再执行 bcrypt 或查询用户，但仍以 60 秒窗口聚合留痕。
+        await record_login_attempt(
+            db,
+            user=None,
+            username=username,
+            success=False,
+            fail_reason="来源已限流",
+            ip=ip,
+            user_agent=user_agent,
+            now=now,
+        )
+        await db.commit()
+        _raise_rate_limited(source.throttle.retry_after_seconds)
+
+    # 首次查询不预加载角色，避免用户存在与否产生额外查询时序差异；只有密码校验
+    # 成功后才加载登录响应所需的角色数据。
+    result = await db.execute(select(User).where(User.username == username))
     user = result.scalar_one_or_none()
 
-    # 用户不存在：写失败日志（user_id 空），再抛 401
+    # 用户不存在仍执行固定 bcrypt；对外响应与密码错误完全一致。
     if user is None:
-        db.add(LoginLog(user_id=None, username=payload.username, success=False,
-                        fail_reason="用户不存在", ip=ip, user_agent=user_agent))
-        await db.commit()
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    # 密码错误：写失败日志，再抛 401
-    if not verify_password(payload.password, user.password_hash):
-        db.add(LoginLog(user_id=user.id, username=user.username, success=False,
-                        fail_reason="密码错误", ip=ip, user_agent=user_agent))
-        await db.commit()
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    # 用户被禁用：写失败日志，再抛 403
-    if not user.is_active:
-        db.add(LoginLog(user_id=user.id, username=user.username, success=False,
-                        fail_reason="账号已禁用", ip=ip, user_agent=user_agent))
-        await db.commit()
-        raise HTTPException(status_code=403, detail="用户已禁用")
+        await run_in_threadpool(verify_password, payload.password, _DUMMY_PASSWORD_HASH)
+        await _record_failure_and_raise(
+            db,
+            user=None,
+            username=username,
+            fail_reason="用户不存在",
+            ip=ip,
+            user_agent=user_agent,
+            now=now,
+            source=source,
+        )
 
-    # 登录成功：更新最后登录时间并写成功日志（一起 commit）
-    user.last_login_at = datetime.now(timezone.utc)
-    db.add(LoginLog(user_id=user.id, username=user.username, success=True, ip=ip, user_agent=user_agent))
+    # 已禁用账号也执行真实密码校验，但无论密码是否正确都返回同一通用错误。
+    if not user.is_active:
+        await run_in_threadpool(verify_password, payload.password, user.password_hash)
+        await _record_failure_and_raise(
+            db,
+            user=user,
+            username=user.username,
+            fail_reason="账号已禁用",
+            ip=ip,
+            user_agent=user_agent,
+            now=now,
+            source=source,
+        )
+
+    password_matches = await run_in_threadpool(
+        verify_password,
+        payload.password,
+        user.password_hash,
+    )
+    if not password_matches:
+        await _record_failure_and_raise(
+            db,
+            user=user,
+            username=user.username,
+            fail_reason="密码错误",
+            ip=ip,
+            user_agent=user_agent,
+            now=now,
+            source=source,
+        )
+
+    role_result = await db.execute(
+        select(User).options(selectinload(User.role)).where(User.id == user.id)
+    )
+    user = role_result.scalar_one()
+
+    # 登录成功只清理当前来源 + 用户名组合；IP 扫描和账号异常统计不能被掩盖。
+    await clear_login_pair_failures(db, username=user.username, ip=ip)
+    user.last_login_at = now
+    await record_login_attempt(
+        db,
+        user=user,
+        username=user.username,
+        success=True,
+        fail_reason=None,
+        ip=ip,
+        user_agent=user_agent,
+        now=now,
+    )
     await db.commit()
 
     permissions = await _load_permissions(user, db)

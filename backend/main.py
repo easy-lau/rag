@@ -1,7 +1,7 @@
 import os
 import logging
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -22,6 +22,7 @@ from api import (
 )
 from config import get_settings
 from core.settings_crypto import SettingsEncryptionError
+from core.login_security import login_log_cleanup_loop
 from database import engine
 
 logging.basicConfig(
@@ -51,7 +52,13 @@ async def lifespan(app: FastAPI):
         await document.reset_stuck_processing()
     except Exception as e:
         print(f"[startup] 重置卡死文档失败: {e}")
-    yield
+    login_log_cleanup_task = asyncio.create_task(login_log_cleanup_loop())
+    try:
+        yield
+    finally:
+        login_log_cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await login_log_cleanup_task
 
 
 app = FastAPI(title="RAG 检索系统", version="1.0.0", lifespan=lifespan)
@@ -61,7 +68,7 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Conversation-ID"],
+    expose_headers=["X-Conversation-ID", "Retry-After"],
 )
 
 app.include_router(auth.router, prefix="/api")
