@@ -22,11 +22,11 @@ if ! "${RAG_DOCKER[@]}" compose version >/dev/null 2>&1; then
 fi
 
 if [[ ! -f .env ]]; then
-  echo "错误：缺少 .env。请先执行 cp .env.example .env，并填写三个必填密钥。" >&2
+  echo "错误：缺少 .env。请先执行 cp .env.example .env，并填写四个必填安全项。" >&2
   exit 1
 fi
 
-for RAG_REQUIRED_KEY in POSTGRES_PASSWORD JWT_SECRET ADMIN_INIT_PASSWORD; do
+for RAG_REQUIRED_KEY in POSTGRES_PASSWORD JWT_SECRET CONFIG_ENCRYPTION_KEY ADMIN_INIT_PASSWORD; do
   if ! grep -Eq "^${RAG_REQUIRED_KEY}=.+$" .env; then
     echo "错误：.env 中的 ${RAG_REQUIRED_KEY} 未填写。" >&2
     exit 1

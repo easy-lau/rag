@@ -4,7 +4,7 @@
       <div class="max-w-6xl mx-auto space-y-5">
         <PageHeader
           title="系统设置"
-          description="统一管理模型服务、检索策略与站点品牌信息。敏感配置仅对有权限的管理员开放。"
+          description="管理检索策略与站点品牌信息。模型服务配置请前往“模型管理”。"
         >
           <template #meta>
             <n-tag :type="canWrite ? 'success' : 'warning'" :bordered="false" round>
@@ -16,79 +16,8 @@
           <n-icon :size="17"><LockClosedOutline /></n-icon>
           当前账号仅可查看系统设置，不能修改或上传站点资源。
         </div>
-        <!-- 模型配置：左右两列 -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <!-- 大语言模型 -->
-          <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6">
-            <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
-              <span class="w-2 h-2 rounded-full bg-blue-500 inline-block"></span>
-              大语言模型
-            </h3>
-            <n-form :model="form" :disabled="!canWrite" label-placement="top" class="space-y-1">
-              <n-form-item label="API Key">
-                <n-input v-model:value="llmKey" type="password" show-password-on="click" :placeholder="llmKeyPlaceholder" />
-              </n-form-item>
-              <n-form-item label="Base URL">
-                <n-input v-model:value="form.llm_base_url" placeholder="https://api.openai.com/v1" />
-              </n-form-item>
-              <n-form-item label="对话模型">
-                <n-input v-model:value="form.chat_model" placeholder="gpt-4o" />
-              </n-form-item>
-              <div class="grid grid-cols-2 gap-4">
-                <n-form-item label="Temperature">
-                  <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" class="w-full" />
-                </n-form-item>
-                <n-form-item label="Max Tokens">
-                  <n-input-number v-model:value="form.max_tokens" :min="256" :max="8192" :step="256" class="w-full" />
-                </n-form-item>
-              </div>
-            </n-form>
-          </div>
-
-          <!-- 向量模型 -->
-          <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6">
-            <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
-              <span class="w-2 h-2 rounded-full bg-purple-500 inline-block"></span>
-              向量模型
-            </h3>
-            <n-form :model="form" :disabled="!canWrite" label-placement="top" class="space-y-1">
-              <n-form-item label="API Key">
-                <n-input v-model:value="embKey" type="password" show-password-on="click" :placeholder="embKeyPlaceholder" />
-              </n-form-item>
-              <n-form-item label="Base URL">
-                <n-input v-model:value="form.embedding_base_url" placeholder="https://api.openai.com/v1" />
-              </n-form-item>
-              <n-form-item label="Embedding 模型">
-                <n-input v-model:value="form.embedding_model" placeholder="text-embedding-3-small" />
-              </n-form-item>
-            </n-form>
-          </div>
-        </div>
-
-        <!-- 多模态模型（图片识别） -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mt-6">
-          <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1 flex items-center gap-2">
-            <span class="w-2 h-2 rounded-full bg-orange-500 inline-block"></span>
-            多模态模型（图片识别）
-          </h3>
-          <p class="text-xs text-gray-400 mb-4">用于把上传的图片 / 截图通过视觉模型转写为可编辑文本（如 gpt-4o、qwen-vl-max）</p>
-          <n-form :model="form" :disabled="!canWrite" label-placement="top">
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <n-form-item label="API Key">
-                <n-input v-model:value="visionKey" type="password" show-password-on="click" :placeholder="visionKeyPlaceholder" />
-              </n-form-item>
-              <n-form-item label="Base URL">
-                <n-input v-model:value="form.vision_base_url" placeholder="https://api.openai.com/v1" />
-              </n-form-item>
-              <n-form-item label="视觉模型">
-                <n-input v-model:value="form.vision_model" placeholder="gpt-4o" />
-              </n-form-item>
-            </div>
-          </n-form>
-        </div>
-
         <!-- 检索参数 -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mt-6">
+        <SurfaceCard padding="lg" class="mt-6">
           <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
             检索参数
@@ -134,10 +63,10 @@
               </n-form-item>
             </div>
           </n-form>
-        </div>
+        </SurfaceCard>
 
         <!-- 站点设置 -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm p-6 mt-6">
+        <SurfaceCard padding="lg" class="mt-6">
           <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-pink-500 inline-block"></span>
             站点设置
@@ -178,7 +107,7 @@
               </n-form-item>
             </div>
           </n-form>
-        </div>
+        </SurfaceCard>
 
         <div v-if="canWrite" class="flex justify-end mt-6">
           <n-button type="primary" size="large" class="px-10" :loading="saving" @click="handleSave">保存设置</n-button>
@@ -197,6 +126,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
 import { uploadLogo } from '@/api/settings'
 import PageHeader from '@/components/ui/PageHeader.vue'
+import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 
 const settingsStore = useSettingsStore()
 const authStore = useAuthStore()
@@ -206,24 +136,9 @@ const saving = ref(false)
 const form = ref({ ...settingsStore.data })
 const canWrite = computed(() => authStore.hasPerm('settings:write'))
 
-// API Key 单独管理：输入框始终为空，只有填写了才会提交，避免把掩码回写覆盖真实 Key
-const llmKey = ref('')
-const embKey = ref('')
-const visionKey = ref('')
-
-const llmKeyPlaceholder = computed(() =>
-  settingsStore.data.llm_api_key ? `已配置 ${settingsStore.data.llm_api_key}，留空则不修改` : 'sk-...')
-const embKeyPlaceholder = computed(() =>
-  settingsStore.data.embedding_api_key ? `已配置 ${settingsStore.data.embedding_api_key}，留空则不修改` : 'sk-...')
-const visionKeyPlaceholder = computed(() =>
-  settingsStore.data.vision_api_key ? `已配置 ${settingsStore.data.vision_api_key}，留空则不修改` : 'sk-...')
-
 onMounted(async () => {
   await settingsStore.fetch()
   form.value = { ...settingsStore.data }
-  llmKey.value = ''
-  embKey.value = ''
-  visionKey.value = ''
 })
 
 async function handleLogoUpload({ file, onFinish, onError }) {
@@ -246,24 +161,21 @@ async function handleSave() {
   if (!canWrite.value) return
   saving.value = true
   try {
-    // 不提交掩码后的 Key 字段；仅在用户输入新 Key 时才包含
-    const payload = { ...form.value }
-    delete payload.llm_api_key
-    delete payload.embedding_api_key
-    delete payload.vision_api_key
-    if (llmKey.value.trim()) payload.llm_api_key = llmKey.value.trim()
-    if (embKey.value.trim()) payload.embedding_api_key = embKey.value.trim()
-    if (visionKey.value.trim()) payload.vision_api_key = visionKey.value.trim()
-
+    const payload = {
+      top_k: form.value.top_k,
+      rerank_enabled: form.value.rerank_enabled,
+      show_sources: form.value.show_sources,
+      site_title: form.value.site_title,
+      site_description: form.value.site_description,
+      site_logo: form.value.site_logo,
+      browser_title: form.value.browser_title,
+      site_copyright: form.value.site_copyright,
+    }
     await settingsStore.save(payload)
     msg.success('设置已保存')
     // 刷新公开品牌信息，让侧边栏 / 浏览器标题即时更新
     await siteStore.fetchSite()
-    // 保存后刷新掩码提示并清空输入框
     form.value = { ...settingsStore.data }
-    llmKey.value = ''
-    embKey.value = ''
-    visionKey.value = ''
   } catch {
     msg.error('保存失败，请检查配置')
   } finally {

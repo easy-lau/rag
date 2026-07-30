@@ -37,6 +37,7 @@ const routes = [
       { path: 'users', component: () => import('@/views/admin/UsersView.vue'), name: 'users', meta: { permission: 'menu:users' } },
       { path: 'roles', component: () => import('@/views/admin/RolesView.vue'), name: 'roles', meta: { permission: 'menu:roles' } },
       { path: 'audit-logs', component: () => import('@/views/admin/AuditLogsView.vue'), name: 'audit-logs', meta: { permission: 'menu:login_logs' } },
+      { path: 'model-management', component: () => import('@/views/admin/ModelManagementView.vue'), name: 'model-management', meta: { permission: 'menu:settings' } },
       { path: 'settings', component: () => import('@/views/SettingsView.vue'), name: 'settings', meta: { permission: 'menu:settings' } },
     ],
   },
@@ -48,6 +49,7 @@ const routes = [
   { path: '/users', redirect: legacyRedirect('users') },
   { path: '/roles', redirect: legacyRedirect('roles') },
   { path: '/audit-logs', redirect: legacyRedirect('audit-logs') },
+  { path: '/model-management', redirect: legacyRedirect('model-management') },
   { path: '/settings', redirect: legacyRedirect('settings') },
 ]
 

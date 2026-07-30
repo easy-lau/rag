@@ -11,6 +11,11 @@ if [ -z "${JWT_SECRET:-}" ]; then
   exit 1
 fi
 
+if [ -z "${CONFIG_ENCRYPTION_KEY:-}" ]; then
+  echo "错误：CONFIG_ENCRYPTION_KEY 未设置，请先填写根目录 .env。" >&2
+  exit 1
+fi
+
 if [ -z "${ADMIN_INIT_PASSWORD:-}" ]; then
   echo "错误：ADMIN_INIT_PASSWORD 未设置，请先填写根目录 .env。" >&2
   exit 1

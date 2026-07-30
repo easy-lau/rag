@@ -85,10 +85,11 @@ chmod 600 .env
 
 这些命令应登录目标服务器后执行，`docker context show` 通常应为 `default`；不要在来源不明的远程 Context 上直接部署。
 
-生成三个不同的随机值：
+生成四个不同的随机值：
 
 ```bash
 openssl rand -hex 24
+openssl rand -hex 32
 openssl rand -hex 32
 openssl rand -hex 16
 ```
@@ -98,7 +99,8 @@ openssl rand -hex 16
 ```dotenv
 POSTGRES_PASSWORD=<第一个随机值>
 JWT_SECRET=<第二个随机值>
-ADMIN_INIT_PASSWORD=<第三个随机值或自定义强密码>
+CONFIG_ENCRYPTION_KEY=<第三个随机值>
+ADMIN_INIT_PASSWORD=<第四个随机值或自定义强密码>
 # 可填 latest；生产环境建议固定为已发布版本，例如 1.2.3。
 IMAGE_TAG=latest
 ```
@@ -126,7 +128,7 @@ docker compose logs --tail=100 postgres migrate app
 - `migrate` 为 `Exited (0)`，这是一次性迁移成功后的正常状态
 - Alembic 显示 `0020 (head)` 或仓库后续更新后的最新 head
 
-默认访问地址为 `http://服务器IP:8001`。初始用户名为 `admin`，密码是首次迁移前填写的 `ADMIN_INIT_PASSWORD`；数据库初始化后再修改该环境变量不会修改现有管理员密码。
+默认访问地址为 `http://服务器IP:8001`。初始用户名为 `admin`，密码是首次迁移前填写的 `ADMIN_INIT_PASSWORD`；数据库初始化后再修改该环境变量不会修改现有管理员密码。首次登录后，请进入“管理后台 → 模型管理”配置 Chat、Embedding 和 Vision（可选）模型；检索策略与站点品牌信息仍在“系统设置”中维护。
 
 也可以执行仓库内的安全包装脚本完成同样的首次构建与启动：
 
@@ -163,13 +165,16 @@ Caddy 会自动申请和续期证书。项目内层 Nginx 已配置 50 MB 上传
 
 ## 模型配置
 
-生产部署时请在容器 `.env` 中填写 LLM、Embedding 和 Vision（如需）模型参数；修改后需重建 `app` 容器使其生效。需要特别注意：
+模型配置不放在服务器 `.env`。以拥有 `settings:write` 权限的管理员身份进入“管理后台 → 模型管理”，填写 Chat、Embedding 和 Vision（可选）的 API Key、Base URL；三类模型都可直接输入模型 ID，也可按需点击各自的“获取模型”读取列表后选择。然后先使用每张卡片上的“测试当前填写”，确认成功后再保存。旧版 `.env` 中残留的 `LLM_*`、`EMBEDDING_*`、`VISION_*`，以及 `TEMPERATURE`、`TOP_K`、`SITE_*` 等后台可管理变量都会被新版本忽略，请迁移到后台设置后删除。
 
-- Embedding 模型接口必须实际返回 `2560` 维向量。
-- 当前代码不会主动向兼容接口传递 `dimensions` 参数，仅填写维度环境变量不能改变模型输出。
-- 模型 API Key 会进入系统配置和数据库备份，备份文件应按敏感数据保护。
-- 聊天流默认单次超时 `60` 秒；仅在首个回答文本前发生超时、连接异常、限流或上游 5xx 时按 `1` 秒、`2` 秒退避重试，最多 `3` 次总尝试。回答开始输出后不会重试，避免重复内容。
-- 向量化默认单次超时 `60` 秒，发生超时、连接异常、限流或上游 5xx 时按 `1` 秒、`2` 秒退避重试，最多 `3` 次总尝试。可用 `.env` 的 `EMBEDDING_*` 重试参数覆盖。
+- API Key 仅在提交时从浏览器发往后端，使用 `.env` 中独立的 `CONFIG_ENCRYPTION_KEY` 加密后保存到 PostgreSQL；读取设置接口、审计日志和页面都不会回显其明文。
+- 获取模型列表同样由后端携带当前填写或已保存的 Key 调用兼容接口的 `/models`；列表不会保存候选 Key，也不会把 Key 返回给浏览器。
+- 保存成功后当前应用立即使用新配置；应用重启后会从数据库恢复，不需要重建容器。
+- Embedding 模型接口必须实际返回 `2560` 维向量；测试会直接显示返回维度，保存发生变化的向量配置时后端也会再次校验并拒绝不匹配的值。
+- 若 Chat / Embedding / Vision 使用不同服务商或不同 Base URL，应分别填写对应 API Key；变更任一服务的 Base URL 时也必须重新填写该服务 API Key，系统不会把旧密钥发送给新地址。
+- `CONFIG_ENCRYPTION_KEY` 不是 JWT 密钥，必须与数据库备份分开保存在密码管理器或密钥管理系统。遗失该密钥后，数据库中已加密的模型 API Key 无法恢复；不要只修改该值来“轮换”，需先规划完整的密钥重加密迁移。
+
+从旧版本升级时，先备份数据库和 `.env`，再补充 `CONFIG_ENCRYPTION_KEY` 并启动新版本。首次成功启动会把 `settings` 表中历史明文模型 API Key 自动迁移为密文；迁移后不要与旧版本应用混跑，因为旧版本不能读取加密值。
 
 ## 本地开发
 
@@ -206,7 +211,7 @@ npm run dev
 docker compose stop postgres
 ```
 
-只启动 PostgreSQL 时，Compose 不要求 JWT 和管理员密码；完整启动 `migrate/app` 时，镜像入口会再次校验三个必填值并在缺失时拒绝启动。
+只启动 PostgreSQL 时，Compose 不要求 JWT、配置加密主密钥和管理员密码；完整启动 `migrate/app` 时，镜像入口会再次校验四个必填安全项并在缺失时拒绝启动。
 
 ## 日志与日常操作
 

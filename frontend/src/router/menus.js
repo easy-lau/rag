@@ -1,6 +1,7 @@
 import {
   ChatbubbleEllipsesOutline, LibraryOutline, DocumentTextOutline, SearchOutline,
   SettingsOutline, PeopleOutline, ShieldOutline, TimeOutline, GitNetworkOutline,
+  HardwareChipOutline,
 } from '@vicons/ionicons5'
 
 // 问答工作台与管理后台使用两套独立菜单。权限仍以既有 menu:* 为准；
@@ -22,6 +23,7 @@ export const ADMIN_MENU_ITEMS = [
   { to: '/admin/users', label: '用户管理', icon: PeopleOutline, permission: 'menu:users', group: 'system' },
   { to: '/admin/roles', label: '角色管理', icon: ShieldOutline, permission: 'menu:roles', group: 'system' },
   { to: '/admin/audit-logs', label: '审计日志', icon: TimeOutline, permission: 'menu:login_logs', group: 'system' },
+  { to: '/admin/model-management', label: '模型管理', icon: HardwareChipOutline, permission: 'menu:settings', group: 'system' },
   { to: '/admin/settings', label: '系统设置', icon: SettingsOutline, permission: 'menu:settings', group: 'system' },
 ]
 

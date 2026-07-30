@@ -1,19 +1,57 @@
+import logging
 import os
+import time
 import uuid
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from database import get_db
-from models.db_models import SystemSetting, User
-from config import get_settings
+from typing import Literal
+from urllib.parse import urlsplit
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from openai import AsyncOpenAI
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from config import get_settings
 from core.audit import AuditLogger, get_audit
 from core.deps import require_permission
+from core.openai_client import get_service_credentials
 from core.permissions import SETTINGS_READ, SETTINGS_WRITE
+from core.settings_crypto import (
+    SECRET_SETTING_KEYS,
+    SettingsEncryptionError,
+    decrypt_setting_secret,
+    encrypt_setting_secret,
+    is_encrypted_setting_value,
+)
+from database import get_db
+from models.db_models import SystemSetting, User
 
+
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 LOGO_EXTS = {"png", "jpg", "jpeg", "webp", "gif", "svg", "ico"}
+SECRET_CONFIGURED_LABEL = "已配置（加密保存）"
+ENV_SECRET_CONFIGURED_LABEL = "已配置（环境变量）"
+PUBLIC_SITE_SETTING_KEYS = frozenset({
+    "site_title",
+    "site_description",
+    "site_logo",
+    "browser_title",
+    "site_copyright",
+})
+MODEL_SERVICE_FIELDS = {
+    "llm": ("llm_api_key", "llm_base_url", "chat_model"),
+    "embedding": ("embedding_api_key", "embedding_base_url", "embedding_model"),
+    "vision": ("vision_api_key", "vision_base_url", "vision_model"),
+}
+
+# 透明 1×1 PNG。视觉模型测试使用真实图片输入，避免只验证到文本聊天接口。
+_CONNECTION_TEST_IMAGE = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/"
+    "qY8nLwAAAABJRU5ErkJggg=="
+)
 
 
 class SettingsOut(BaseModel):
@@ -60,66 +98,52 @@ class SettingsUpdate(BaseModel):
     site_copyright: str | None = None
 
 
-def _mask(key: str) -> str:
-    if not key or len(key) < 8:
-        return key or ""
-    return key[:5] + "***" + key[-3:]
+EDITABLE_SETTING_KEYS = frozenset(SettingsUpdate.model_fields)
 
 
-async def apply_stored_settings() -> None:
-    """启动时把数据库 settings 表里保存的配置加载进运行时 Settings，
-    使设置页保存的 Key / Base URL / 模型在重启后依然生效。"""
-    from database import AsyncSessionLocal
-    s = get_settings()
-    async with AsyncSessionLocal() as db:
-        rows = (await db.execute(select(SystemSetting))).scalars().all()
-    for row in rows:
-        if row.value is None or not hasattr(s, row.key):
-            continue
-        current = getattr(s, row.key)
-        try:
-            if isinstance(current, bool):
-                coerced = str(row.value).strip().lower() in ("true", "1", "yes")
-            elif isinstance(current, int):
-                coerced = int(row.value)
-            elif isinstance(current, float):
-                coerced = float(row.value)
-            else:
-                coerced = row.value
-            setattr(s, row.key, coerced)
-        except (ValueError, TypeError):
-            continue
+class ModelConnectionTest(BaseModel):
+    service: Literal["llm", "embedding", "vision"]
+    api_key: str | None = None
+    base_url: str | None = None
+    model: str | None = None
 
 
-async def _load(db: AsyncSession) -> dict:
-    rows = (await db.execute(select(SystemSetting))).scalars().all()
-    db_map = {r.key: r.value for r in rows}
-    s = get_settings()
+class ModelConnectionTestOut(BaseModel):
+    ok: bool
+    message: str
+    embedding_dimensions: int | None = None
+    latency_ms: int
+    error_code: str | None = None
 
-    def v(key, default):
-        return db_map.get(key, str(default))
 
-    return {
-        "llm_api_key":      _mask(db_map.get("llm_api_key") or s.llm_api_key),
-        "llm_base_url":     v("llm_base_url", s.llm_base_url),
-        "chat_model":       v("chat_model", s.chat_model),
-        "temperature":      float(v("temperature", s.temperature)),
-        "max_tokens":       int(v("max_tokens", s.max_tokens)),
-        "embedding_api_key": _mask(db_map.get("embedding_api_key") or s.embedding_api_key),
-        "embedding_base_url": v("embedding_base_url", s.embedding_base_url),
-        "embedding_model":  v("embedding_model", s.embedding_model),
-        "vision_api_key":   _mask(db_map.get("vision_api_key") or s.vision_api_key),
-        "vision_base_url":  v("vision_base_url", s.vision_base_url),
-        "vision_model":     v("vision_model", s.vision_model),
-        "top_k":            int(v("top_k", s.top_k)),
-        "rerank_enabled":   v("rerank_enabled", s.rerank_enabled).lower() == "true",
-        "show_sources":     v("show_sources", s.show_sources).lower() == "true",
-        "site_title":       v("site_title", s.site_title),
-        "site_description": v("site_description", s.site_description),
-        "site_logo":        v("site_logo", s.site_logo),
-        "browser_title":    v("browser_title", s.browser_title),
-        "site_copyright":   v("site_copyright", s.site_copyright),
-    }
+class ModelListRequest(BaseModel):
+    """读取 OpenAI 兼容服务的模型目录。
+
+    ``api_key`` 只用于本次请求：允许管理员在尚未保存配置前先验证并选择模型，
+    但绝不写入数据库、响应或审计日志。
+    """
+
+    service: Literal["llm", "embedding", "vision"]
+    api_key: str | None = None
+    base_url: str | None = None
+
+
+class ModelListOut(BaseModel):
+    models: list[str]
+    latency_ms: int
+
+
+class _ModelListFetchError(Exception):
+    """上游 /models 请求失败时的安全错误载体。
+
+    只保留异常类型和耗时，避免上游响应中可能携带的密钥、请求头或服务商细节
+    经由日志、审计或 HTTP 响应泄漏。
+    """
+
+    def __init__(self, error_code: str, latency_ms: int):
+        super().__init__(error_code)
+        self.error_code = error_code
+        self.latency_ms = latency_ms
 
 
 class SiteSettingsOut(BaseModel):
@@ -130,18 +154,379 @@ class SiteSettingsOut(BaseModel):
     site_copyright: str
 
 
-async def _load_site(db: AsyncSession) -> dict:
-    """读取公开品牌字段：从数据库 settings 表取这 4 个 key，缺失则回退 config 默认。"""
+def _coerce_setting_value(key: str, value: str, settings) -> object:
+    current = getattr(settings, key)
+    if isinstance(current, bool):
+        return value.strip().lower() in ("true", "1", "yes")
+    if isinstance(current, int):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    return value
+
+
+def _is_secret_placeholder(value: str) -> bool:
+    return not value.strip() or "***" in value or value.startswith("已配置")
+
+
+def _base_url_identity(value: str) -> tuple[str, str, int | None, str]:
+    """校验模型 Base URL，并返回用于比较凭据边界的规范化标识。"""
+    try:
+        parsed = urlsplit(value.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Base URL 格式或端口不正确") from exc
+
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Base URL 必须是无账号、查询参数和片段的 http:// 或 https:// 地址",
+        )
+
+    default_port = 443 if parsed.scheme == "https" else 80
+    normalized_port = None if port in (None, default_port) else port
+    path = parsed.path.rstrip("/")
+    return parsed.scheme.lower(), parsed.hostname.lower(), normalized_port, path
+
+
+def _validate_model_base_url_updates(updates: dict[str, object], settings) -> None:
+    """Base URL 变化时不允许静默复用旧服务密钥到新地址。"""
+    for service, (api_key_field, base_url_field, model_field) in MODEL_SERVICE_FIELDS.items():
+        if model_field in updates:
+            model = str(updates[model_field]).strip()
+            if not model:
+                raise HTTPException(status_code=400, detail="模型名称不能为空")
+            updates[model_field] = model
+
+        if base_url_field not in updates:
+            continue
+
+        new_base_url = str(updates[base_url_field]).strip()
+        updates[base_url_field] = new_base_url
+        new_identity = _base_url_identity(new_base_url)
+        saved_api_key, saved_base_url = get_service_credentials(service, settings)
+        if (
+            saved_api_key
+            and new_identity != _base_url_identity(saved_base_url)
+            and not updates.get(api_key_field)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="更改 Base URL 时必须重新填写该服务的 API Key",
+            )
+
+
+async def _validate_embedding_update(updates: dict[str, object], settings) -> None:
+    """Embedding 连接发生变化时，在保存前验证可用性及 2560 维约束。"""
+    api_key_field, base_url_field, model_field = MODEL_SERVICE_FIELDS["embedding"]
+    fields = (api_key_field, base_url_field, model_field)
+    if not any(
+        field in updates and updates[field] != getattr(settings, field)
+        for field in fields
+    ):
+        return
+
+    saved_api_key, saved_base_url = get_service_credentials("embedding", settings)
+    api_key = str(updates.get(api_key_field) or saved_api_key)
+    base_url = str(updates.get(base_url_field) or saved_base_url)
+    model = str(
+        updates[model_field] if model_field in updates else getattr(settings, model_field)
+    )
+    result = await _run_model_connection_test(
+        ModelConnectionTest(service="embedding"),
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.message)
+
+
+def _secret_status(db_value: str | None, env_value: str) -> str:
+    if db_value is not None:
+        # 无论历史明文还是新版密文，接口都绝不返回密钥内容。
+        return SECRET_CONFIGURED_LABEL if db_value else ""
+    return ENV_SECRET_CONFIGURED_LABEL if env_value else ""
+
+
+def _value_from_database(db_map: dict[str, str | None], key: str, settings):
+    value = db_map.get(key)
+    if value is None:
+        return getattr(settings, key)
+    try:
+        return _coerce_setting_value(key, value, settings)
+    except (TypeError, ValueError):
+        logger.warning("[系统设置] 忽略无法解析的字段 key=%s", key)
+        return getattr(settings, key)
+
+
+def _decrypt_secret_for_runtime(value: str, settings) -> str:
+    return decrypt_setting_secret(value, settings.config_encryption_key)
+
+
+async def apply_stored_settings() -> None:
+    """数据库优先加载运行时设置，并在有主密钥时自动迁移历史明文 API Key。"""
+    from database import AsyncSessionLocal
+
+    settings = get_settings()
+    migrated_keys: list[str] = []
+    async with AsyncSessionLocal() as db:
+        rows = (await db.execute(select(SystemSetting))).scalars().all()
+        for row in rows:
+            if row.value is None or row.key not in EDITABLE_SETTING_KEYS:
+                continue
+
+            value = row.value
+            if row.key in SECRET_SETTING_KEYS:
+                try:
+                    value = _decrypt_secret_for_runtime(value, settings)
+                except SettingsEncryptionError as exc:
+                    # 密文若无法解密，继续使用环境变量会掩盖密钥丢失、也会破坏
+                    # “数据库优先”的语义。由 lifespan 中止应用启动，避免带着错误配置提供服务。
+                    logger.error("[系统设置] 无法加载加密密钥 key=%s: %s", row.key, exc)
+                    raise
+
+                if value and not is_encrypted_setting_value(row.value):
+                    if settings.config_encryption_key:
+                        row.value = encrypt_setting_secret(value, settings.config_encryption_key)
+                        migrated_keys.append(row.key)
+                    else:
+                        raise SettingsEncryptionError(
+                            "检测到历史明文模型密钥；请设置 CONFIG_ENCRYPTION_KEY 后重新启动以完成加密迁移"
+                        )
+
+            try:
+                setattr(settings, row.key, _coerce_setting_value(row.key, value, settings))
+            except (TypeError, ValueError):
+                logger.warning("[系统设置] 忽略无法解析的字段 key=%s", row.key)
+
+        if migrated_keys:
+            await db.commit()
+
+    if migrated_keys:
+        logger.info("[系统设置] 已将历史明文模型密钥迁移为加密存储：%s", ", ".join(migrated_keys))
+
+
+async def _load(db: AsyncSession) -> dict:
     rows = (await db.execute(select(SystemSetting))).scalars().all()
-    db_map = {r.key: r.value for r in rows}
-    s = get_settings()
+    db_map = {row.key: row.value for row in rows}
+    settings = get_settings()
+
     return {
-        "site_title":       db_map.get("site_title") or s.site_title,
-        "site_description": db_map.get("site_description") or s.site_description,
-        "site_logo":        db_map.get("site_logo") or s.site_logo,
-        "browser_title":    db_map.get("browser_title") or s.browser_title,
-        "site_copyright":   db_map.get("site_copyright") or s.site_copyright,
+        "llm_api_key": _secret_status(db_map.get("llm_api_key"), settings.llm_api_key),
+        "llm_base_url": _value_from_database(db_map, "llm_base_url", settings),
+        "chat_model": _value_from_database(db_map, "chat_model", settings),
+        "temperature": _value_from_database(db_map, "temperature", settings),
+        "max_tokens": _value_from_database(db_map, "max_tokens", settings),
+        "embedding_api_key": _secret_status(db_map.get("embedding_api_key"), settings.embedding_api_key),
+        "embedding_base_url": _value_from_database(db_map, "embedding_base_url", settings),
+        "embedding_model": _value_from_database(db_map, "embedding_model", settings),
+        "vision_api_key": _secret_status(db_map.get("vision_api_key"), settings.vision_api_key),
+        "vision_base_url": _value_from_database(db_map, "vision_base_url", settings),
+        "vision_model": _value_from_database(db_map, "vision_model", settings),
+        "top_k": _value_from_database(db_map, "top_k", settings),
+        "rerank_enabled": _value_from_database(db_map, "rerank_enabled", settings),
+        "show_sources": _value_from_database(db_map, "show_sources", settings),
+        "site_title": _value_from_database(db_map, "site_title", settings),
+        "site_description": _value_from_database(db_map, "site_description", settings),
+        "site_logo": _value_from_database(db_map, "site_logo", settings),
+        "browser_title": _value_from_database(db_map, "browser_title", settings),
+        "site_copyright": _value_from_database(db_map, "site_copyright", settings),
     }
+
+
+async def _load_site(db: AsyncSession) -> dict:
+    """公开端点只读取品牌字段，绝不返回模型或密钥配置。"""
+    rows = await db.execute(
+        select(SystemSetting.key, SystemSetting.value).where(
+            SystemSetting.key.in_(PUBLIC_SITE_SETTING_KEYS)
+        )
+    )
+    db_map = dict(rows.all())
+    settings = get_settings()
+    return {
+        "site_title": _value_from_database(db_map, "site_title", settings),
+        "site_description": _value_from_database(db_map, "site_description", settings),
+        "site_logo": _value_from_database(db_map, "site_logo", settings),
+        "browser_title": _value_from_database(db_map, "browser_title", settings),
+        "site_copyright": _value_from_database(db_map, "site_copyright", settings),
+    }
+
+
+def _resolve_model_service_credentials(
+    service: Literal["llm", "embedding", "vision"],
+    *,
+    submitted_api_key: str | None,
+    submitted_base_url: str | None,
+) -> tuple[str, str, str]:
+    """解析一次模型服务调用所需凭据，并守住已保存 Key 的地址边界。"""
+    settings = get_settings()
+    saved_api_key, saved_base_url = get_service_credentials(service, settings)
+    submitted_key = (submitted_api_key or "").strip()
+    submitted_key = "" if _is_secret_placeholder(submitted_key) else submitted_key
+    base_url = (submitted_base_url or "").strip() or saved_base_url
+
+    base_url_identity = _base_url_identity(base_url)
+    if submitted_key:
+        api_key = submitted_key
+    else:
+        if not saved_api_key:
+            raise HTTPException(status_code=400, detail="请先填写 API Key")
+        if base_url_identity != _base_url_identity(saved_base_url):
+            raise HTTPException(
+                status_code=400,
+                detail="更改 Base URL 时必须重新填写 API Key，系统不会把已保存密钥发送到新地址",
+            )
+        api_key = saved_api_key
+
+    return api_key, base_url, base_url_identity[1]
+
+
+def _test_config(payload: ModelConnectionTest) -> tuple[str, str, str, str]:
+    settings = get_settings()
+    _, _, model_field = MODEL_SERVICE_FIELDS[payload.service]
+    api_key, base_url, host = _resolve_model_service_credentials(
+        payload.service,
+        submitted_api_key=payload.api_key,
+        submitted_base_url=payload.base_url,
+    )
+    model = (payload.model or "").strip() or getattr(settings, model_field)
+
+    if not model:
+        raise HTTPException(status_code=400, detail="请先填写模型名称或推理接入点 ID")
+    return api_key, base_url, model, host
+
+
+def _model_list_config(payload: ModelListRequest) -> tuple[str, str, str]:
+    """模型列表不需要预先填写 model，只复用凭据和 Base URL 校验规则。"""
+    return _resolve_model_service_credentials(
+        payload.service,
+        submitted_api_key=payload.api_key,
+        submitted_base_url=payload.base_url,
+    )
+
+
+def _safe_model_ids(response) -> list[str]:
+    """从 OpenAI SDK 响应中提取可安全交给 UI 展示的模型 ID。"""
+    model_ids: set[str] = set()
+    for item in getattr(response, "data", ()) or ():
+        model_id = getattr(item, "id", None)
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        # 保留主流 OpenAI 兼容服务的模型 ID 字符集，同时过滤控制字符和异常长值。
+        if (
+            not model_id
+            or len(model_id) > 256
+            or any(ord(char) < 32 or ord(char) == 127 for char in model_id)
+        ):
+            continue
+        model_ids.add(model_id)
+    return sorted(model_ids, key=str.casefold)
+
+
+async def _fetch_model_ids(
+    *,
+    service: Literal["llm", "embedding", "vision"],
+    api_key: str,
+    base_url: str,
+) -> tuple[list[str], int]:
+    """调用 OpenAI 兼容的 ``/models``，只返回模型 ID 和耗时。"""
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+    started = time.monotonic()
+    try:
+        response = await client.models.list(timeout=15)
+        return _safe_model_ids(response), round((time.monotonic() - started) * 1000)
+    except Exception as exc:
+        error_code = type(exc).__name__
+        latency_ms = round((time.monotonic() - started) * 1000)
+        logger.warning(
+            "[系统设置] 模型列表获取失败 service=%s error=%s",
+            service,
+            error_code,
+        )
+        raise _ModelListFetchError(error_code, latency_ms) from None
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            # 客户端关闭失败不应覆盖已经得到的列表，也不记录可能包含敏感信息的异常文本。
+            logger.warning("[系统设置] 模型列表客户端关闭失败 service=%s", service)
+
+
+async def _run_model_connection_test(
+    payload: ModelConnectionTest,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> ModelConnectionTestOut:
+    """发起最小真实模型请求；调用方仅得到安全的、可展示的结果。"""
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+    started = time.monotonic()
+    try:
+        if payload.service == "embedding":
+            response = await client.embeddings.create(
+                model=model,
+                input="系统配置连接测试",
+                timeout=15,
+            )
+            dimensions = len(response.data[0].embedding) if response.data else 0
+            expected = get_settings().embedding_dimensions
+            if dimensions != expected:
+                return ModelConnectionTestOut(
+                    ok=False,
+                    message=f"向量模型返回 {dimensions} 维，当前知识库需要 {expected} 维",
+                    embedding_dimensions=dimensions,
+                    latency_ms=round((time.monotonic() - started) * 1000),
+                    error_code="embedding_dimension_mismatch",
+                )
+            return ModelConnectionTestOut(
+                ok=True,
+                message="向量模型连接成功",
+                embedding_dimensions=dimensions,
+                latency_ms=round((time.monotonic() - started) * 1000),
+            )
+
+        content = "请只回复 OK"
+        if payload.service == "vision":
+            content = [
+                {"type": "text", "text": "请只回复 OK"},
+                {"type": "image_url", "image_url": {"url": _CONNECTION_TEST_IMAGE}},
+            ]
+        await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=8,
+            timeout=15,
+        )
+        return ModelConnectionTestOut(
+            ok=True,
+            message="模型连接成功",
+            latency_ms=round((time.monotonic() - started) * 1000),
+        )
+    except Exception as exc:
+        error_code = type(exc).__name__
+        logger.warning(
+            "[系统设置] 模型连接测试失败 service=%s error=%s",
+            payload.service,
+            error_code,
+        )
+        return ModelConnectionTestOut(
+            ok=False,
+            message="模型连接失败，请检查 API Key、Base URL、模型名称和网络连通性",
+            latency_ms=round((time.monotonic() - started) * 1000),
+            error_code=error_code,
+        )
+    finally:
+        await client.close()
 
 
 @router.get("", response_model=SettingsOut)
@@ -154,9 +539,98 @@ async def get_settings_api(
 
 @router.get("/site", response_model=SiteSettingsOut)
 async def get_site_settings(db: AsyncSession = Depends(get_db)):
-    """公开端点（无鉴权）：供登录页、普通用户、浏览器标题读取站点品牌信息。
-    仅返回 4 个非敏感品牌字段，绝不暴露 API Key 等完整设置。"""
     return await _load_site(db)
+
+
+@router.post("/test-connection", response_model=ModelConnectionTestOut)
+async def test_model_connection(
+    payload: ModelConnectionTest,
+    db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
+    _: User = Depends(require_permission(SETTINGS_WRITE)),
+):
+    """测试尚未保存的表单配置，密钥不写入日志、审计明细或数据库。"""
+    api_key, base_url, model, host = _test_config(payload)
+    result = await _run_model_connection_test(
+        payload,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+    )
+    # 成功与失败都留下一条不含密钥的审计记录，便于排查服务器网络或模型配置问题。
+    audit.log(
+        db,
+        "settings.connection_test",
+        target_type="settings",
+        detail={
+            "service": payload.service,
+            "model": model,
+            "host": host,
+            "ok": result.ok,
+            "latency_ms": result.latency_ms,
+            "error_code": result.error_code,
+        },
+    )
+    await db.commit()
+    return result
+
+
+@router.post("/models", response_model=ModelListOut)
+async def list_models(
+    payload: ModelListRequest,
+    db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
+    _: User = Depends(require_permission(SETTINGS_WRITE)),
+):
+    """获取 OpenAI 兼容服务的模型 ID 列表，供设置页选择模型。
+
+    调用可使用本次表单临时填写的 API Key；若未填写，则仅在 Base URL 未改变时
+    使用已保存的 Key。这样既支持“先获取、再保存”，也不会将旧 Key 发送至新地址。
+    """
+    api_key, base_url, host = _model_list_config(payload)
+    try:
+        models, latency_ms = await _fetch_model_ids(
+            service=payload.service,
+            api_key=api_key,
+            base_url=base_url,
+        )
+    except _ModelListFetchError as exc:
+        audit.log(
+            db,
+            "settings.model_list",
+            target_type="settings",
+            detail={
+                "service": payload.service,
+                "host": host,
+                "ok": False,
+                "latency_ms": exc.latency_ms,
+                "error_code": exc.error_code,
+            },
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "无法获取模型列表，请检查 API Key、Base URL、网络连通性，"
+                "或确认服务商支持 OpenAI 兼容的 /models 接口"
+            ),
+        ) from None
+
+    # 仅记录调用结果摘要；候选 Key、已保存 Key 与完整模型列表均不进入审计。
+    audit.log(
+        db,
+        "settings.model_list",
+        target_type="settings",
+        detail={
+            "service": payload.service,
+            "host": host,
+            "ok": True,
+            "latency_ms": latency_ms,
+            "model_count": len(models),
+        },
+    )
+    await db.commit()
+    return ModelListOut(models=models, latency_ms=latency_ms)
 
 
 @router.post("/logo")
@@ -169,8 +643,8 @@ async def upload_logo(
     if ext not in LOGO_EXTS:
         raise HTTPException(status_code=400, detail="仅支持 PNG / JPG / JPEG / WEBP / GIF / SVG / ICO 图片")
 
-    s = get_settings()
-    branding_dir = os.path.join(s.upload_dir, "branding")
+    settings = get_settings()
+    branding_dir = os.path.join(settings.upload_dir, "branding")
     os.makedirs(branding_dir, exist_ok=True)
     saved_name = f"{uuid.uuid4()}.{ext}"
     saved_path = os.path.join(branding_dir, saved_name)
@@ -191,29 +665,46 @@ async def update_settings(
 ):
     updates = payload.model_dump(exclude_none=True)
 
-    # 绝不用空值或掩码占位符覆盖已存储的 API Key
-    for key_field in ("llm_api_key", "embedding_api_key", "vision_api_key"):
-        val = updates.get(key_field)
-        if val is not None and (not val.strip() or "***" in val):
+    # 前端只在填写新密钥时提交；掩码、空值均不能覆盖已有密钥。
+    for key_field in SECRET_SETTING_KEYS:
+        value = updates.get(key_field)
+        if value is not None and _is_secret_placeholder(value):
             updates.pop(key_field, None)
 
+    settings = get_settings()
+    _validate_model_base_url_updates(updates, settings)
+    if any(key in SECRET_SETTING_KEYS for key in updates) and not settings.config_encryption_key:
+        raise HTTPException(
+            status_code=503,
+            detail="服务未配置 CONFIG_ENCRYPTION_KEY，无法安全保存 API Key",
+        )
+    await _validate_embedding_update(updates, settings)
+
     for key, value in updates.items():
+        stored_value = str(value)
+        if key in SECRET_SETTING_KEYS:
+            try:
+                stored_value = encrypt_setting_secret(stored_value, settings.config_encryption_key)
+            except SettingsEncryptionError as exc:
+                raise HTTPException(status_code=503, detail="无法加密保存 API Key") from exc
+
         row = await db.get(SystemSetting, key)
         if row:
-            row.value = str(value)
+            row.value = stored_value
         else:
-            db.add(SystemSetting(key=key, value=str(value)))
+            db.add(SystemSetting(key=key, value=stored_value))
 
-    # 审计：只记被修改的键名（密钥类仅出现 key 名，绝不记其值）
     if updates:
-        audit.log(db, "settings.update", target_type="settings",
-                  detail={"changed": sorted(updates.keys())})
+        audit.log(
+            db,
+            "settings.update",
+            target_type="settings",
+            detail={"changed": sorted(updates.keys())},
+        )
     await db.commit()
 
-    # 刷新内存配置
-    s = get_settings()
+    # 单进程运行时即时生效；重启后 apply_stored_settings 会再次从数据库恢复。
     for key, value in updates.items():
-        if hasattr(s, key):
-            setattr(s, key, value)
+        setattr(settings, key, value)
 
     return await _load(db)

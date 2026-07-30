@@ -18,3 +18,5 @@ openpyxl>=3.1
 passlib[bcrypt]>=1.7
 bcrypt>=4.0,<4.1  # passlib 1.7.4 不兼容 bcrypt>=4.1（缺 __about__）
 python-jose[cryptography]>=3.3
+# 直接用于加密数据库中的模型 API Key；不要只依赖 python-jose 的可选传递依赖。
+cryptography>=42

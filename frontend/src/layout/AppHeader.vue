@@ -112,7 +112,7 @@ const msg = useMessage()
 
 const titles = {
   chat: '问答对话', knowledge: '知识库管理', documents: '文档管理',
-  'search-test': '检索测试', settings: '系统设置',
+  'search-test': '检索测试', settings: '系统设置', 'model-management': '模型管理',
   users: '用户管理', roles: '角色管理', 'audit-logs': '审计日志'
 }
 const currentPageTitle = computed(() => titles[route.name] || 'RAG 检索系统')

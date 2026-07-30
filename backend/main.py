@@ -21,6 +21,7 @@ from api import (
     users,
 )
 from config import get_settings
+from core.settings_crypto import SettingsEncryptionError
 from database import engine
 
 logging.basicConfig(
@@ -34,8 +35,17 @@ async def lifespan(app: FastAPI):
     # 启动时加载数据库中保存的设置（API Key、Base URL、模型等）
     try:
         await settings.apply_stored_settings()
-    except Exception as e:
-        print(f"[startup] 加载已存设置失败: {e}")
+    except SettingsEncryptionError:
+        # 密钥丢失或密文损坏时不能静默回退到环境变量，否则会以错误配置继续处理用户请求。
+        logging.getLogger(__name__).critical("[startup] 无法解密数据库中的模型密钥，拒绝启动应用")
+        raise
+    except Exception as exc:
+        # 数据库设置是运行时模型配置的唯一来源，加载失败时不能以默认配置继续对外提供服务。
+        logging.getLogger(__name__).error(
+            "[startup] 加载数据库系统设置失败，拒绝启动应用 error=%s",
+            type(exc).__name__,
+        )
+        raise
     # 重置上次进程退出时卡在『处理中』的文档（其后台任务已随进程丢失）
     try:
         await document.reset_stuck_processing()

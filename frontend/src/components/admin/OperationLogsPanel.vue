@@ -104,6 +104,8 @@ const ACTION_LABELS = {
   'doc.upload': '上传文档', 'doc.upload_image': '上传图片', 'doc.create_text': '新建文本文档',
   'doc.update': '编辑文档', 'doc.delete': '删除文档',
   'settings.update': '修改系统设置',
+  'settings.connection_test': '测试模型连接',
+  'settings.model_list': '获取模型列表',
   'auth.change_password': '修改密码',
   'intent_router.config.update': '更新路由策略',
   'intent_router.category.create': '新增意图分类',
@@ -125,6 +127,8 @@ const FIELD_LABELS = {
   confidence_threshold: '置信度阈值', fallback_intent_code: '兜底意图',
   allow_general_chat: '通用问答开关', examples: '示例问题', action: '路由动作',
   priority: '优先级', code: '意图编码', feedback: '反馈结果', file_type: '文件类型',
+  service: '模型类型', model: '模型名称', host: '服务地址', ok: '测试结果',
+  latency_ms: '耗时（毫秒）', error_code: '错误标识', model_count: '模型数量',
 }
 const INTENT_ACTION_LABELS = {
   retrieve: '知识库检索', chat: '通用回答', writing: '写作 / 润色', system_help: '系统使用帮助',
@@ -170,6 +174,7 @@ function fmtFieldVal(field, v) {
   if (field === 'enabled') return v ? '开启' : '关闭'
   if (field === 'action') return INTENT_ACTION_LABELS[v] || String(v)
   if (field === 'feedback') return FEEDBACK_LABELS[v] || String(v)
+  if (field === 'ok') return v ? '成功' : '失败'
   if (v === null || v === '' || v === undefined) return '空'
   if (v === true) return '是'
   if (v === false) return '否'
