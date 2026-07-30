@@ -31,10 +31,17 @@ jobs:
         id: version
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
           MANUAL_VERSION: ${{ inputs.version }}
         run: |
-          version="${RELEASE_TAG:-$MANUAL_VERSION}"
+          case "$EVENT_NAME" in
+            workflow_dispatch) version="$MANUAL_VERSION" ;;
+            release) version="$RELEASE_TAG" ;;
+            push) version="$REF_NAME" ;;
+            *) version="" ;;
+          esac
           version="${version#v}"
           if [[ ! "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
             echo "镜像版本号不符合 Docker tag 规则：$version" >&2
@@ -59,6 +66,9 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+            APP_REVISION=${{ github.sha }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest

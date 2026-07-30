@@ -5,6 +5,12 @@ WORKDIR /frontend
 COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
+
+ARG APP_VERSION=dev
+ARG APP_REVISION=
+ENV VITE_APP_VERSION=${APP_VERSION} \
+    VITE_APP_REVISION=${APP_REVISION}
+
 RUN npm run build
 
 # 前后端合一运行镜像

@@ -84,9 +84,10 @@
       </div>
     </section>
 
-    <!-- 唯一的后台入口：桌面端保留当前问答上下文，移动端直接切页。 -->
-    <div v-if="canEnterAdmin" class="px-3 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
+    <!-- 侧栏底部：唯一的后台入口与构建时注入的版本信息。 -->
+    <div class="px-3 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
       <button
+        v-if="canEnterAdmin"
         type="button"
         class="group flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors hover:bg-blue-50 dark:hover:bg-blue-900/20"
         :title="ui.isCompact ? '进入管理后台' : '在新标签打开管理后台'"
@@ -101,6 +102,7 @@
         </span>
         <n-icon :size="15" class="text-gray-300 dark:text-gray-600 group-hover:text-blue-400 transition-colors"><ChevronForwardOutline /></n-icon>
       </button>
+      <AppVersion :class="{ 'mt-2': canEnterAdmin }" />
     </div>
   </aside>
 
@@ -149,6 +151,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useChatStore } from '@/stores/chat'
 import { useSiteStore } from '@/stores/site'
 import { useUiStore } from '@/stores/ui'
+import AppVersion from '@/components/ui/AppVersion.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 
