@@ -42,6 +42,7 @@ class SettingsCryptoTests(unittest.TestCase):
                 "LLM_API_KEY": "must-not-be-used",
                 "LLM_BASE_URL": "https://legacy.example.test/v1",
                 "CHAT_MODEL": "legacy-model",
+                "INTENT_MODEL": "legacy-intent-model",
                 "EMBEDDING_DIMENSIONS": "1536",
                 "TEMPERATURE": "1.9",
                 "TOP_K": "20",
@@ -53,6 +54,7 @@ class SettingsCryptoTests(unittest.TestCase):
         self.assertEqual(settings.llm_api_key, "")
         self.assertEqual(settings.llm_base_url, "https://api.openai.com/v1")
         self.assertEqual(settings.chat_model, "gpt-4o")
+        self.assertEqual(settings.intent_model, "")
         self.assertEqual(settings.embedding_dimensions, 2560)
         self.assertEqual(settings.temperature, 0.7)
         self.assertEqual(settings.top_k, 5)
@@ -131,6 +133,7 @@ def _runtime_settings(**overrides):
         "llm_api_key": "",
         "llm_base_url": "https://llm.example.test/v1",
         "chat_model": "chat-model",
+        "intent_model": "",
         "temperature": 0.7,
         "max_tokens": 2048,
         "embedding_api_key": "",
@@ -237,6 +240,34 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 503)
         self.assertEqual(session.commits, 0)
+
+    async def test_update_normalizes_and_applies_intent_model(self) -> None:
+        session = _Session()
+        audit = Mock()
+        settings = _runtime_settings()
+
+        with (
+            patch("api.settings.get_settings", return_value=settings),
+            patch(
+                "api.settings._load",
+                new=AsyncMock(return_value={"intent_model": "intent-model"}),
+            ),
+        ):
+            result = await update_settings(
+                SettingsUpdate(intent_model="  intent-model  "),
+                db=session,
+                audit=audit,
+                _=None,
+            )
+
+        self.assertEqual(result["intent_model"], "intent-model")
+        self.assertEqual(settings.intent_model, "intent-model")
+        self.assertEqual(session.added[0].key, "intent_model")
+        self.assertEqual(session.added[0].value, "intent-model")
+        self.assertEqual(
+            audit.log.call_args.kwargs["detail"],
+            {"changed": ["intent_model"]},
+        )
 
     async def test_update_rejects_base_url_change_without_a_new_key(self) -> None:
         session = _Session()
@@ -397,6 +428,78 @@ class ModelConnectionTestTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error_code, "RuntimeError")
         self.assertNotIn("raw upstream detail", result.message)
+        client.close.assert_awaited_once()
+
+    async def test_vision_test_reports_base_connection_failure_separately(self) -> None:
+        create = AsyncMock(side_effect=RuntimeError("raw upstream detail"))
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            close=AsyncMock(),
+        )
+
+        with patch("api.settings.AsyncOpenAI", return_value=client):
+            result = await _run_model_connection_test(
+                ModelConnectionTest(service="vision"),
+                api_key="sk-never-log-this",
+                base_url="https://vision.example.test/v1",
+                model="vision-model",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "vision_text_RuntimeError")
+        self.assertIn("基础文本接口连接失败", result.message)
+        self.assertEqual(create.await_count, 1)
+        client.close.assert_awaited_once()
+
+    async def test_vision_test_reports_image_protocol_failure_after_text_success(self) -> None:
+        create = AsyncMock(
+            side_effect=[SimpleNamespace(), RuntimeError("raw upstream detail")]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            close=AsyncMock(),
+        )
+
+        with patch("api.settings.AsyncOpenAI", return_value=client):
+            result = await _run_model_connection_test(
+                ModelConnectionTest(service="vision"),
+                api_key="sk-never-log-this",
+                base_url="https://vision.example.test/v1",
+                model="vision-model",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "vision_image_RuntimeError")
+        self.assertIn("文本接口连接成功，但图片输入失败", result.message)
+        self.assertEqual(create.await_count, 2)
+        image_content = create.await_args_list[1].kwargs["messages"][0]["content"]
+        self.assertEqual(image_content[1]["type"], "image_url")
+        self.assertTrue(
+            image_content[1]["image_url"]["url"].startswith(
+                "data:image/png;base64,iVBOR"
+            )
+        )
+        self.assertGreater(len(image_content[1]["image_url"]["url"]), 400)
+        client.close.assert_awaited_once()
+
+    async def test_vision_test_succeeds_only_after_text_and_image_requests(self) -> None:
+        create = AsyncMock(return_value=SimpleNamespace())
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            close=AsyncMock(),
+        )
+
+        with patch("api.settings.AsyncOpenAI", return_value=client):
+            result = await _run_model_connection_test(
+                ModelConnectionTest(service="vision"),
+                api_key="sk-never-log-this",
+                base_url="https://vision.example.test/v1",
+                model="vision-model",
+            )
+
+        self.assertTrue(result.ok)
+        self.assertIn("图片输入测试成功", result.message)
+        self.assertEqual(create.await_count, 2)
         client.close.assert_awaited_once()
 
     async def test_connection_endpoint_audits_without_api_key(self) -> None:

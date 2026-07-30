@@ -38,7 +38,6 @@ def _config_out(config: IntentRouterConfig) -> IntentRouterConfigOut:
     return IntentRouterConfigOut(
         enabled=config.enabled,
         mode=config.mode,
-        intent_model=config.intent_model or "",
         confidence_threshold=config.confidence_threshold,
         fallback_intent_code=config.fallback_intent_code,
         allow_general_chat=config.allow_general_chat,
@@ -108,9 +107,6 @@ async def update_config(
 
     changed: list[str] = []
     for key, value in updates.items():
-        # 空字符串表示恢复使用聊天模型，数据库统一保存为 NULL。
-        if key == "intent_model":
-            value = value.strip() or None
         if getattr(config, key) != value:
             setattr(config, key, value)
             changed.append(key)

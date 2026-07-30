@@ -229,7 +229,6 @@ def _default_config() -> IntentRouterConfig:
         id=ROUTER_CONFIG_ID,
         enabled=True,
         mode="rules_then_llm",
-        intent_model=None,
         confidence_threshold=DEFAULT_CONFIDENCE_THRESHOLD,
         fallback_intent_code="other",
         allow_general_chat=True,
@@ -462,7 +461,8 @@ async def _classify_with_llm(
     *,
     selected_kb_count: int = 0,
 ) -> IntentDecision | None:
-    model = (config.intent_model or "").strip() or get_settings().chat_model
+    settings = get_settings()
+    model = settings.intent_model.strip() or settings.chat_model
     try:
         request = dict(
             model=model,

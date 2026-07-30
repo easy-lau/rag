@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,11 +46,11 @@ MODEL_SERVICE_FIELDS = {
     "vision": ("vision_api_key", "vision_base_url", "vision_model"),
 }
 
-# 透明 1×1 PNG。视觉模型测试使用真实图片输入，避免只验证到文本聊天接口。
+# 64×64、非透明且包含清晰边框/交叉线的 PNG。部分兼容网关会拒绝透明 1×1
+# 占位图，因此测试图片必须更接近正式上传的普通截图，避免误判多模态能力。
 _CONNECTION_TEST_IMAGE = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/"
-    "qY8nLwAAAABJRU5ErkJggg=="
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAABP0lEQVR42u3aSw7CMAxFUXbAkBUwYVssn0UUJCSEaJs4znPrW4I6QuC8I/WTJj5d7w/0cRqAARACzpfb+5hSfj7x6oCEhu9sJkAqw0+wVcD8pwnTv74pAbIZFsNUAHkMazHqgAyGQgATYF9DeWgrYC9DddAGwPYGy3BtgC0NxoGaAdsY7EN4ANGGpuJOQJyhtawfEGFwFOwCaA2+Ur0AlcFdRADoN/T8XQPoCdGJlwF8UfpPPyWgNZDk4hED7LFUty89wBJOePMNAZQjah9/UYC1oPKHdyBgHjdi+hQLKBhU9cMBiwZh8QE49inEvojZt1H2g4w9lWBP5tjTafYLDfuVkv1Sz15WYS9ssZcW2Yu77OV19gYHe4uJvcnH3mZlb3SzWw3YzR7sdht2wxO+5ew4TX9Tyk8dMDp3B+APAU9fQ3JlaZ+uUgAAAABJRU5ErkJggg=="
 )
 
 
@@ -58,6 +58,7 @@ class SettingsOut(BaseModel):
     llm_api_key: str
     llm_base_url: str
     chat_model: str
+    intent_model: str
     temperature: float
     max_tokens: int
     embedding_api_key: str
@@ -80,6 +81,7 @@ class SettingsUpdate(BaseModel):
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     chat_model: str | None = None
+    intent_model: str | None = Field(None, max_length=255)
     temperature: float | None = None
     max_tokens: int | None = None
     embedding_api_key: str | None = None
@@ -323,6 +325,7 @@ async def _load(db: AsyncSession) -> dict:
         "llm_api_key": _secret_status(db_map.get("llm_api_key"), settings.llm_api_key),
         "llm_base_url": _value_from_database(db_map, "llm_base_url", settings),
         "chat_model": _value_from_database(db_map, "chat_model", settings),
+        "intent_model": _value_from_database(db_map, "intent_model", settings),
         "temperature": _value_from_database(db_map, "temperature", settings),
         "max_tokens": _value_from_database(db_map, "max_tokens", settings),
         "embedding_api_key": _secret_status(db_map.get("embedding_api_key"), settings.embedding_api_key),
@@ -468,9 +471,29 @@ async def _run_model_connection_test(
     base_url: str,
     model: str,
 ) -> ModelConnectionTestOut:
-    """发起最小真实模型请求；调用方仅得到安全的、可展示的结果。"""
+    """发起最小真实模型请求；多模态按“文本连接→图片输入”两阶段验证。"""
     client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     started = time.monotonic()
+
+    def elapsed_ms() -> int:
+        return round((time.monotonic() - started) * 1000)
+
+    def log_failure(exc: Exception, *, stage: str) -> None:
+        status_code = getattr(exc, "status_code", None)
+        request_id = getattr(exc, "request_id", None)
+        if not isinstance(request_id, str) or len(request_id) > 128 or any(
+            ord(char) < 32 or ord(char) == 127 for char in request_id
+        ):
+            request_id = None
+        logger.warning(
+            "[系统设置] 模型连接测试失败 service=%s stage=%s error=%s status=%s request_id=%s",
+            payload.service,
+            stage,
+            type(exc).__name__,
+            status_code or "-",
+            request_id or "-",
+        )
+
     try:
         if payload.service == "embedding":
             response = await client.embeddings.create(
@@ -485,44 +508,85 @@ async def _run_model_connection_test(
                     ok=False,
                     message=f"向量模型返回 {dimensions} 维，当前知识库需要 {expected} 维",
                     embedding_dimensions=dimensions,
-                    latency_ms=round((time.monotonic() - started) * 1000),
+                    latency_ms=elapsed_ms(),
                     error_code="embedding_dimension_mismatch",
                 )
             return ModelConnectionTestOut(
                 ok=True,
                 message="向量模型连接成功",
                 embedding_dimensions=dimensions,
-                latency_ms=round((time.monotonic() - started) * 1000),
+                latency_ms=elapsed_ms(),
             )
 
-        content = "请只回复 OK"
         if payload.service == "vision":
-            content = [
-                {"type": "text", "text": "请只回复 OK"},
-                {"type": "image_url", "image_url": {"url": _CONNECTION_TEST_IMAGE}},
-            ]
+            # 第一步只验证地址、密钥、模型名称和 Chat Completions 文本接口。
+            try:
+                await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "请只回复 OK"}],
+                    max_tokens=8,
+                    timeout=15,
+                )
+            except Exception as exc:
+                log_failure(exc, stage="text")
+                return ModelConnectionTestOut(
+                    ok=False,
+                    message="多模态模型的基础文本接口连接失败，请检查 API Key、Base URL、模型名称和网络连通性",
+                    latency_ms=elapsed_ms(),
+                    error_code=f"vision_text_{type(exc).__name__}",
+                )
+
+            # 第二步使用与正式图片识别相同的 Chat Completions image_url Data URL 协议。
+            try:
+                await client.chat.completions.create(
+                    model=model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "请简短描述图片中的形状和颜色"},
+                            {"type": "image_url", "image_url": {"url": _CONNECTION_TEST_IMAGE}},
+                        ],
+                    }],
+                    temperature=0,
+                    max_tokens=32,
+                    timeout=15,
+                )
+            except Exception as exc:
+                log_failure(exc, stage="image")
+                return ModelConnectionTestOut(
+                    ok=False,
+                    message=(
+                        "模型文本接口连接成功，但图片输入失败；当前服务可能不兼容 "
+                        "Chat Completions 的 image_url Base64 格式，或上游服务暂时异常"
+                    ),
+                    latency_ms=elapsed_ms(),
+                    error_code=f"vision_image_{type(exc).__name__}",
+                )
+
+            return ModelConnectionTestOut(
+                ok=True,
+                message="多模态模型连接及图片输入测试成功",
+                latency_ms=elapsed_ms(),
+            )
+
         await client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": content}],
+            messages=[{"role": "user", "content": "请只回复 OK"}],
             max_tokens=8,
             timeout=15,
         )
         return ModelConnectionTestOut(
             ok=True,
             message="模型连接成功",
-            latency_ms=round((time.monotonic() - started) * 1000),
+            latency_ms=elapsed_ms(),
         )
     except Exception as exc:
         error_code = type(exc).__name__
-        logger.warning(
-            "[系统设置] 模型连接测试失败 service=%s error=%s",
-            payload.service,
-            error_code,
-        )
+        log_failure(exc, stage="connection")
         return ModelConnectionTestOut(
             ok=False,
             message="模型连接失败，请检查 API Key、Base URL、模型名称和网络连通性",
-            latency_ms=round((time.monotonic() - started) * 1000),
+            latency_ms=elapsed_ms(),
             error_code=error_code,
         )
     finally:
@@ -672,6 +736,9 @@ async def update_settings(
             updates.pop(key_field, None)
 
     settings = get_settings()
+    if "intent_model" in updates:
+        # 空值表示复用对话模型；统一去除首尾空白，避免模型 ID 隐性失效。
+        updates["intent_model"] = str(updates["intent_model"]).strip()
     _validate_model_base_url_updates(updates, settings)
     if any(key in SECRET_SETTING_KEYS for key in updates) and not settings.config_encryption_key:
         raise HTTPException(

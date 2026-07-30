@@ -119,8 +119,8 @@ class SystemSetting(Base):
 class IntentRouterConfig(Base):
     """智能路由全局配置。
 
-    该表有且仅有 id=1 的一行。使用独立表而不是 settings KV，避免类别和路由日志
-    被序列化到字符串设置中，也便于后续增加版本和审计字段。
+    该表有且仅有 id=1 的一行，仅保存路由策略；意图模型由模型管理中的 settings
+    统一维护，类别与路由日志仍使用各自的结构化表。
     """
 
     __tablename__ = "intent_router_configs"
@@ -128,7 +128,6 @@ class IntentRouterConfig(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     mode: Mapped[str] = mapped_column(String(32), nullable=False, default="rules_then_llm")
-    intent_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     confidence_threshold: Mapped[float] = mapped_column(Float, nullable=False, default=0.65)
     fallback_intent_code: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
     allow_general_chat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

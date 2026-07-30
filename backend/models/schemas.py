@@ -256,7 +256,6 @@ IntentFeedback = Literal["correct", "incorrect"]
 class IntentRouterConfigOut(BaseModel):
     enabled: bool
     mode: IntentRouterMode
-    intent_model: str = ""
     confidence_threshold: float = Field(..., ge=0, le=1)
     fallback_intent_code: str = Field(..., min_length=1, max_length=64)
     allow_general_chat: bool
@@ -265,7 +264,6 @@ class IntentRouterConfigOut(BaseModel):
 class IntentRouterConfigUpdate(BaseModel):
     enabled: bool | None = None
     mode: IntentRouterMode | None = None
-    intent_model: str | None = Field(None, max_length=255)
     confidence_threshold: float | None = Field(None, ge=0, le=1)
     fallback_intent_code: str | None = Field(None, min_length=1, max_length=64)
     allow_general_chat: bool | None = None

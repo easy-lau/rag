@@ -1,9 +1,12 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from core.intent_router import (
     DEFAULT_INTENT_CATEGORIES,
     _apply_routing_policy,
     _classification_prompt,
+    _classify_with_llm,
     _default_config,
     _fallback_decision,
     _make_decision,
@@ -280,6 +283,74 @@ class IntentRoutingPolicyTests(unittest.TestCase):
                 "decision_reason",
             },
         )
+
+
+class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_classifier_uses_model_management_intent_model(self) -> None:
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"intent_code":"general_chat","confidence":0.9}'
+                        )
+                    )
+                ]
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=SimpleNamespace(
+                    intent_model="intent-model",
+                    chat_model="chat-model",
+                ),
+            ),
+        ):
+            decision = await _classify_with_llm(
+                "介绍一下向量数据库",
+                _default_config(),
+                _categories(),
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(create.await_args.kwargs["model"], "intent-model")
+
+    async def test_classifier_falls_back_to_chat_model_when_intent_model_is_empty(self) -> None:
+        create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"intent_code":"general_chat","confidence":0.9}'
+                        )
+                    )
+                ]
+            )
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+        with (
+            patch("core.intent_router.get_client", return_value=client),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=SimpleNamespace(intent_model="", chat_model="chat-model"),
+            ),
+        ):
+            await _classify_with_llm(
+                "介绍一下向量数据库",
+                _default_config(),
+                _categories(),
+            )
+
+        self.assertEqual(create.await_args.kwargs["model"], "chat-model")
 
 
 if __name__ == "__main__":

@@ -51,12 +51,6 @@
                   :disabled="!canManage || savingConfig"
                 />
               </n-form-item>
-              <n-form-item label="意图模型">
-                <n-input
-                  v-model:value="config.intent_model" placeholder="留空则复用对话模型"
-                  :disabled="!canManage || savingConfig"
-                />
-              </n-form-item>
               <n-form-item label="低置信度阈值">
                 <n-input-number
                   v-model:value="config.confidence_threshold" :min="0" :max="1" :step="0.05"
@@ -295,7 +289,6 @@ const ui = useUiStore()
 const DEFAULT_CONFIG = {
   enabled: true,
   mode: 'rules_then_llm',
-  intent_model: '',
   confidence_threshold: 0.65,
   fallback_intent_code: 'other',
   allow_general_chat: true,
@@ -568,7 +561,6 @@ async function saveConfig() {
     const payload = {
       enabled: !!config.value.enabled,
       mode: config.value.mode,
-      intent_model: config.value.intent_model?.trim() || '',
       confidence_threshold: Number(config.value.confidence_threshold),
       fallback_intent_code: config.value.fallback_intent_code,
       allow_general_chat: !!config.value.allow_general_chat,

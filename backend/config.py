@@ -20,6 +20,10 @@ class Settings(BaseSettings):
         validation_alias="__DATABASE_SETTINGS_ONLY_LLM_BASE_URL",
     )
     chat_model: str = Field("gpt-4o", validation_alias="__DATABASE_SETTINGS_ONLY_CHAT_MODEL")
+    # 意图识别与对话共用 LLM 服务凭据；留空时运行时自动复用 chat_model。
+    intent_model: str = Field(
+        "", validation_alias="__DATABASE_SETTINGS_ONLY_INTENT_MODEL"
+    )
     temperature: float = Field(
         0.7, validation_alias="__DATABASE_SETTINGS_ONLY_TEMPERATURE"
     )
