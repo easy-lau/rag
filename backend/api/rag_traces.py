@@ -65,17 +65,30 @@ _TRACE_TERMINAL_EVENTS = {
 }
 _TRACE_CORE_EVENTS = {
     "chat.request",
+    "conversation.context_candidates",
     "conversation.context_resolved",
     "conversation.reference_unresolved",
     "intent.model_result",
     "intent.model_error",
+    "intent.contract_compiled",
     "intent.routing_decision",
+    "intent.clarification_created",
+    "intent.clarification_resolved",
+    "intent.clarification_expired",
+    "evidence.ambiguity_assessed",
+    "evidence.clarification_required",
+    "evidence.clarification_created",
+    "evidence.clarification_repeated",
+    "evidence.clarification_resolved",
+    "evidence.scope_filter_applied",
+    "evidence.scope_filter_rejected_candidates",
     "retrieval.plan",
     "retrieval.completed",
     "retrieval.error",
     "rerank.completed",
     "evidence.selection",
     "generation.context",
+    "generation.skipped",
     "generation.completed",
     *_TRACE_EXPANSION_EVENTS,
     *_TRACE_JOINT_EVENTS,
@@ -209,9 +222,11 @@ def _trace_event_payloads(
 # ``error`` field is copied into these summaries.
 _DIAGNOSTIC_ENUM_FIELDS = {
     "coverage_status",
+    "decision_reason",
     "fallback_reason_code",
     "pass",
     "pass_name",
+    "relation",
     "scan_guard_reason",
     "status",
     "trigger",
@@ -247,6 +262,7 @@ _DIAGNOSTIC_MAP_FIELDS = {
     },
     "counts_by_origin": {
         "global_retrieval",
+        "small_document_full",
         "adjacent",
         "same_section",
         "table_sibling",
@@ -417,6 +433,11 @@ def _diagnostic_field_value(key: str, value: Any) -> Any:
             output[str(map_key)] = map_value
         return output or None
 
+    if key == "route_state_revision":
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
     # Counts, budgets, durations, and scores are all scalar metrics.  Keep the
     # key allow-list at the call site; this suffix check only validates type.
     if (
@@ -469,6 +490,44 @@ def _pick_diagnostic_history(
     ]
 
 
+def _clarification_lifecycle_snapshot(
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize clarification transitions without copying task or user text."""
+
+    transition_names = {
+        "intent.clarification_created": "created",
+        "intent.clarification_resolved": "resolved",
+        "intent.clarification_expired": "expired",
+        "evidence.clarification_created": "created",
+        "evidence.clarification_repeated": "repeated",
+        "evidence.clarification_resolved": "resolved",
+    }
+    counts = {f"{transition}_count": 0 for transition in transition_names.values()}
+    history: list[dict[str, Any]] = []
+    for event in events:
+        event_name = str(event.get("event") or "")
+        transition = transition_names.get(event_name)
+        if transition is None:
+            continue
+        counts[f"{transition}_count"] += 1
+        payload = event.get("payload")
+        metrics = _pick_diagnostic_fields(
+            payload if isinstance(payload, dict) else None,
+            "route_state_revision",
+            "selected_kb_count",
+            "unresolved_count",
+            "choice_count",
+            "decision_reason",
+            "relation",
+        )
+        history.append({
+            "event": event_name,
+            **(metrics or {}),
+        })
+    return {**counts, "events": history}
+
+
 def _pick_trace_fields(
     payload: dict[str, Any] | None,
     *keys: str,
@@ -503,6 +562,15 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "attempt_latency_ms",
                 "timeout_seconds",
                 "json_mode_retry_used",
+                "strict_schema_used",
+                "json_object_fallback_used",
+                "route_schema_version",
+                "relation",
+                "readiness",
+                "evidence_scope",
+                "query_mode",
+                "context_turn_count",
+                "requirement_count",
             )
             if key in payload
         })
@@ -552,6 +620,10 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
             "unresolved_reference",
             "history_message_count",
             "carryover_source_count",
+            "relation",
+            "readiness",
+            "query_mode",
+            "context_turn_count",
             "standalone_query_chars",
             "standalone_query_sha256",
         ),
@@ -561,7 +633,41 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
             "intent",
             "selected_kb_count",
             "decision_reason",
+            "route_schema_version",
+            "contract_schema_version",
+            "relation",
+            "readiness",
+            "evidence_scope",
+            "query_mode",
+            "context_turn_count",
+            "requirement_count",
+            "dispatch_authorized",
         ),
+        "task_contract": _pick_trace_fields(
+            _trace_event_payload(events, "intent.contract_compiled"),
+            "schema_version",
+            "route_schema_version",
+            "readiness",
+            "intent_code",
+            "action",
+            "confidence",
+            "source",
+            "relation",
+            "evidence_scope",
+            "query_mode",
+            "context_turn_count",
+            "response_mode",
+            "retrieval_policy",
+            "need_retrieval",
+            "dispatch_authorized",
+            "decision_reason",
+            "selected_kb_count",
+            "requirement_count",
+            "required_requirement_count",
+            "bridge_requirement_count",
+            "clarification_unresolved_count",
+        ),
+        "clarification_lifecycle": _clarification_lifecycle_snapshot(events),
         "retrieval_plan": _pick_trace_fields(
             _trace_event_payload(events, "retrieval.plan"),
             "need_retrieval",

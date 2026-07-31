@@ -7,7 +7,8 @@ from unittest.mock import patch
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import Column
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -28,15 +29,34 @@ class _MigrationRecorder:
     def __init__(self) -> None:
         self.tables: dict[str, tuple] = {}
         self.executed: list[str] = []
+        self.added_columns: list[tuple[str, Column]] = []
+        self.created_indexes: list[tuple[str, str, tuple[str, ...], bool]] = []
+        self.altered_columns: list[tuple[str, str, dict]] = []
 
     def create_table(self, name, *items, **_kwargs) -> None:
         self.tables[name] = items
 
-    def create_index(self, *_args, **_kwargs) -> None:
-        return None
+    def add_column(self, table_name: str, column: Column) -> None:
+        self.added_columns.append((table_name, column))
+
+    def create_index(
+        self,
+        name: str,
+        table_name: str,
+        columns,
+        *,
+        unique: bool = False,
+        **_kwargs,
+    ) -> None:
+        self.created_indexes.append(
+            (name, table_name, tuple(columns), unique)
+        )
 
     def execute(self, statement) -> None:
         self.executed.append(str(statement))
+
+    def alter_column(self, table_name: str, column_name: str, **kwargs) -> None:
+        self.altered_columns.append((table_name, column_name, kwargs))
 
 
 class MigrationLineageTests(unittest.TestCase):
@@ -100,7 +120,75 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertIn("metadata->>'table_id'", sql)
         self.assertIn("~ '^[0-9]{1,9}$'", sql)
 
-    def test_alembic_has_single_0027_head(self) -> None:
+    def test_intent_route_state_migration_is_additive_and_unbound(self) -> None:
+        migration_28 = _load_migration("0028_add_intent_route_state.py")
+        recorder = _MigrationRecorder()
+
+        with patch.object(migration_28, "op", recorder):
+            migration_28.upgrade()
+
+        columns = {
+            (table_name, column.name): column
+            for table_name, column in recorder.added_columns
+        }
+        pending_state = columns[("conversations", "pending_route_state")]
+        self.assertIsInstance(pending_state.type, JSONB)
+        self.assertTrue(pending_state.nullable)
+
+        revision = columns[("conversations", "route_state_revision")]
+        self.assertIsInstance(revision.type, Integer)
+        self.assertFalse(revision.nullable)
+        self.assertEqual(str(revision.server_default.arg), "0")
+
+        trace_id = columns[("intent_route_logs", "trace_id")]
+        self.assertIsInstance(trace_id.type, String)
+        self.assertEqual(trace_id.type.length, 64)
+        self.assertTrue(trace_id.nullable)
+        self.assertFalse(trace_id.foreign_keys)
+
+        route_summary = columns[("intent_route_logs", "route_summary")]
+        self.assertIsInstance(route_summary.type, JSONB)
+        self.assertTrue(route_summary.nullable)
+        self.assertIn(
+            (
+                "ix_intent_route_logs_trace_id",
+                "intent_route_logs",
+                ("trace_id",),
+                False,
+            ),
+            recorder.created_indexes,
+        )
+
+    def test_intent_evidence_status_expands_for_clarification_outcome(self) -> None:
+        migration_29 = _load_migration(
+            "0029_expand_intent_evidence_status.py"
+        )
+        upgrade_recorder = _MigrationRecorder()
+        with patch.object(migration_29, "op", upgrade_recorder):
+            migration_29.upgrade()
+
+        self.assertEqual(len(upgrade_recorder.altered_columns), 1)
+        table_name, column_name, kwargs = upgrade_recorder.altered_columns[0]
+        self.assertEqual(
+            (table_name, column_name),
+            ("intent_route_logs", "evidence_status"),
+        )
+        self.assertEqual(kwargs["existing_type"].length, 16)
+        self.assertEqual(kwargs["type_"].length, 32)
+        self.assertTrue(kwargs["existing_nullable"])
+
+        downgrade_recorder = _MigrationRecorder()
+        with patch.object(migration_29, "op", downgrade_recorder):
+            migration_29.downgrade()
+        self.assertIn(
+            "char_length(evidence_status) > 16",
+            downgrade_recorder.executed[0],
+        )
+        _, _, downgrade_kwargs = downgrade_recorder.altered_columns[0]
+        self.assertEqual(downgrade_kwargs["existing_type"].length, 32)
+        self.assertEqual(downgrade_kwargs["type_"].length, 16)
+
+    def test_alembic_has_single_0029_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -108,8 +196,8 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0027"])
-        self.assertEqual(scripts.get_revision("0027").down_revision, "0026")
+        self.assertEqual(scripts.get_heads(), ["0029"])
+        self.assertEqual(scripts.get_revision("0029").down_revision, "0028")
 
 
 if __name__ == "__main__":  # pragma: no cover

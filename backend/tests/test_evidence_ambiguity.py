@@ -1,0 +1,1110 @@
+import unittest
+
+from core.evidence_ambiguity import (
+    _version_key,
+    detect_evidence_scope_ambiguity,
+    query_requests_all_scopes,
+    resolve_explicit_scope_comparison,
+)
+from core.query_constraints import extract_query_constraints
+
+
+def _candidate(
+    *,
+    chunk_id: str,
+    doc_id: str,
+    filename: str,
+    content: str,
+    topic: float,
+    support: float,
+    role: str = "related",
+    metadata: dict | None = None,
+) -> dict:
+    return {
+        "id": chunk_id,
+        "kb_id": "kb-1",
+        "doc_id": doc_id,
+        "filename": filename,
+        "content": content,
+        "metadata": metadata or {},
+        "topic_relevance": topic,
+        "answer_support": support,
+        "evidence_role": role,
+        "rerank_status": "verified",
+    }
+
+
+class EvidenceAmbiguityTests(unittest.TestCase):
+    def test_log9_two_relevant_versions_require_clarification(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="v6-basic",
+                doc_id="doc-v6",
+                filename="钉钉",
+                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                topic=0.7,
+                support=0.1,
+            ),
+            _candidate(
+                chunk_id="v8-basic",
+                doc_id="doc-v8",
+                filename="二开发送钉钉工作通知",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.9,
+                support=0.1,
+            ),
+            _candidate(
+                chunk_id="v8-solution",
+                doc_id="doc-v8",
+                filename="二开发送钉钉工作通知",
+                content="调用 DingTalkMessageServiceImpl 发送钉钉工作通知",
+                topic=1.0,
+                support=0.98,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="v7-config",
+                doc_id="doc-v7-config",
+                filename="云枢7配置",
+                content="所属产品：云枢>> 产品版本：云枢7全系>>",
+                topic=0.2,
+                support=0.0,
+                role="irrelevant",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢中想二开钉钉消息可以吗",
+            constraints=extract_query_constraints(
+                "云枢中想二开钉钉消息可以吗"
+            ),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(len(decision.choices), 2)
+        self.assertEqual(
+            {choice.versions for choice in decision.choices},
+            {("6.0.1",), ("8.2.75",)},
+        )
+        self.assertIn("中青建安", decision.question)
+        self.assertIn("都对比", decision.question)
+        self.assertNotIn("云枢7配置", decision.question)
+
+    def test_same_version_complementary_documents_do_not_clarify(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="a",
+                doc_id="doc-a",
+                filename="配置说明",
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.9,
+                support=0.5,
+            ),
+            _candidate(
+                chunk_id="b",
+                doc_id="doc-b",
+                filename="接口补充",
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.85,
+                support=0.8,
+                role="direct",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_same_version_explicit_different_projects_require_clarification(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="project-a",
+                doc_id="doc-a",
+                filename="甲项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="project-b",
+                doc_id="doc-b",
+                filename="乙项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：华东示范项目>"
+                ),
+                topic=0.88,
+                support=0.75,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "project")
+        self.assertEqual(
+            {choice.projects for choice in decision.choices},
+            {("中青建安",), ("华东示范项目",)},
+        )
+
+    def test_same_version_same_project_documents_remain_complementary(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="project-a-one",
+                doc_id="doc-a-one",
+                filename="接口配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="project-a-two",
+                doc_id="doc-a-two",
+                filename="接口参数补充",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.85,
+                support=0.75,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+
+    def test_project_template_placeholder_does_not_create_false_scope(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="template",
+                doc_id="doc-template",
+                filename="通用问题模板",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：<出现问题的项目，非必填>>"
+                ),
+                topic=0.9,
+                support=0.6,
+            ),
+            _candidate(
+                chunk_id="real-project",
+                doc_id="doc-real-project",
+                filename="项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.92,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_explicit_version_filters_other_versions_without_clarifying(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="v6",
+                doc_id="doc-v6",
+                filename="旧版",
+                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="v8",
+                doc_id="doc-v8",
+                filename="新版",
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢8.2.75消息接口怎么配置",
+            constraints=extract_query_constraints("云枢8.2.75消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_explicit_version_still_clarifies_different_projects(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="project-a-v8",
+                doc_id="doc-a-v8",
+                filename="甲项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="project-b-v8",
+                doc_id="doc-b-v8",
+                filename="乙项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：华东示范项目>"
+                ),
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢8.2.75消息接口怎么配置",
+            constraints=extract_query_constraints("云枢8.2.75消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "project")
+
+    def test_explicit_project_filters_other_projects_without_clarifying(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="project-a-explicit",
+                doc_id="doc-a-explicit",
+                filename="甲项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：中青建安>"
+                ),
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="project-b-explicit",
+                doc_id="doc-b-explicit",
+                filename="乙项目配置",
+                content=(
+                    "所属产品：云枢8>> 产品版本：8.2.75>> "
+                    "所属项目：华东示范项目>"
+                ),
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        query = "中青建安的云枢8.2.75消息接口怎么配置"
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.relevant_document_count, 1)
+
+    def test_explicit_all_versions_request_does_not_clarify(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="v6",
+                doc_id="doc-v6",
+                filename="旧版",
+                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="v8",
+                doc_id="doc-v8",
+                filename="新版",
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="请分别对比云枢所有版本的消息接口",
+            constraints=extract_query_constraints(
+                "请分别对比云枢所有版本的消息接口"
+            ),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "query_requests_all_scopes")
+
+    def test_colloquial_all_scope_requests_do_not_clarify(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="v6",
+                doc_id="doc-v6",
+                filename="旧版",
+                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="v8",
+                doc_id="doc-v8",
+                filename="新版",
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        for query in ("两个都要", "都查一下", "都看看", "都对比"):
+            with self.subTest(query=query):
+                decision = detect_evidence_scope_ambiguity(
+                    query=query,
+                    constraints=extract_query_constraints(query),
+                    candidates=candidates,
+                )
+                self.assertFalse(decision.needs_clarification)
+                self.assertEqual(decision.reason, "query_requests_all_scopes")
+
+    def test_feature_list_with_douyao_does_not_disable_scope_clarification(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="feature-v1",
+                doc_id="doc-feature-v1",
+                filename="旧版安全配置",
+                content="所属产品：产品A；产品版本：1.0",
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="feature-v2",
+                doc_id="doc-feature-v2",
+                filename="新版安全配置",
+                content="所属产品：产品A；产品版本：2.0",
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        for query in (
+            "账号锁定和密码策略都要怎么配置",
+            "版本控制和账号策略都要配置",
+            "项目管理和登录安全都要配置",
+            "产品编码和权限策略都要配置",
+        ):
+            with self.subTest(query=query):
+                self.assertFalse(query_requests_all_scopes(query))
+                decision = detect_evidence_scope_ambiguity(
+                    query=query,
+                    constraints=extract_query_constraints(query),
+                    candidates=candidates,
+                )
+                self.assertTrue(decision.needs_clarification)
+
+    def test_verified_scope_uses_same_topic_gate_as_pipeline(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="threshold-v1",
+                doc_id="doc-threshold-v1",
+                filename="版本一",
+                content="所属产品：产品A；产品版本：1.0",
+                topic=0.55,
+                support=0.9,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="threshold-v2",
+                doc_id="doc-threshold-v2",
+                filename="版本二",
+                content="所属产品：产品A；产品版本：2.0",
+                topic=0.55,
+                support=0.9,
+                role="direct",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="产品A的安全配置",
+            constraints=extract_query_constraints("产品A的安全配置"),
+            candidates=candidates,
+        )
+        self.assertTrue(decision.needs_clarification)
+
+    def test_productless_versioned_policies_still_clarify(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="policy-2024",
+                doc_id="doc-policy-2024",
+                filename="差旅制度2024版",
+                content="普通员工住宿标准",
+                metadata={"version": "2024"},
+                topic=0.95,
+                support=0.9,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="policy-2025",
+                doc_id="doc-policy-2025",
+                filename="差旅制度2025版",
+                content="普通员工住宿标准",
+                metadata={"version": "2025"},
+                topic=0.95,
+                support=0.9,
+                role="direct",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="普通员工的出差标准是什么",
+            constraints=extract_query_constraints("普通员工的出差标准是什么"),
+            candidates=candidates,
+        )
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+
+        explicit = detect_evidence_scope_ambiguity(
+            query="普通员工的2025版出差标准是什么",
+            constraints=extract_query_constraints("普通员工的2025版出差标准是什么"),
+            candidates=candidates,
+        )
+        self.assertFalse(explicit.needs_clarification)
+        self.assertEqual(explicit.relevant_document_count, 1)
+
+        arbitrary_number = detect_evidence_scope_ambiguity(
+            query="出差需要2天怎么报销",
+            constraints=extract_query_constraints("出差需要2天怎么报销"),
+            candidates=candidates,
+        )
+        self.assertTrue(arbitrary_number.needs_clarification)
+
+    def test_overlapping_multi_product_document_bridges_product_groups(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="product-a",
+                doc_id="doc-product-a",
+                filename="产品A配置",
+                content="配置说明",
+                metadata={"product": "产品A"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="product-b",
+                doc_id="doc-product-b",
+                filename="产品B配置",
+                content="配置说明",
+                metadata={"product": "产品B"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="product-ab",
+                doc_id="doc-product-ab",
+                filename="产品兼容说明",
+                content="兼容说明",
+                metadata={"product": ["产品A", "产品B"]},
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="账号安全如何配置",
+            constraints=extract_query_constraints("账号安全如何配置"),
+            candidates=candidates,
+        )
+        self.assertFalse(decision.needs_clarification)
+
+    def test_unversioned_companion_is_shared_by_every_version_choice(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="shared",
+                doc_id="doc-shared",
+                filename="通用前置条件",
+                content="所属产品：产品A；通用前置条件",
+                topic=0.9,
+                support=0.7,
+            ),
+            _candidate(
+                chunk_id="shared-v1",
+                doc_id="doc-shared-v1",
+                filename="版本一",
+                content="所属产品：产品A；产品版本：1.0",
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="shared-v2",
+                doc_id="doc-shared-v2",
+                filename="版本二",
+                content="所属产品：产品A；产品版本：2.0",
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="产品A如何配置",
+            constraints=extract_query_constraints("产品A如何配置"),
+            candidates=candidates,
+        )
+        self.assertTrue(decision.needs_clarification)
+        self.assertTrue(all("doc-shared" in choice.doc_ids for choice in decision.choices))
+        self.assertTrue(
+            all("doc-shared" in choice.companion_doc_ids for choice in decision.choices)
+        )
+        self.assertTrue(all(choice.anchor_doc_ids for choice in decision.choices))
+
+    def test_numeric_and_text_versions_have_stable_mixed_sorting(self) -> None:
+        self.assertEqual(
+            sorted(["legacy", "8.2.75", "6.0.1"], key=_version_key),
+            ["6.0.1", "8.2.75", "legacy"],
+        )
+
+    def test_choice_display_text_is_bounded_for_pending_protocol(self) -> None:
+        long_filename = "内部配置" * 120
+        candidates = [
+            _candidate(
+                chunk_id="bounded-v6",
+                doc_id="bounded-doc-v6",
+                filename=long_filename,
+                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="bounded-v8",
+                doc_id="bounded-doc-v8",
+                filename=long_filename,
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        for choice in decision.choices:
+            self.assertLessEqual(len(choice.label), 500)
+            self.assertTrue(all(len(item) <= 500 for item in choice.filenames))
+
+    def test_irrelevant_other_version_does_not_create_false_choice(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="answer",
+                doc_id="doc-answer",
+                filename="消息接口",
+                content="所属产品：云枢8>> 产品版本：8.2.75>>",
+                topic=0.95,
+                support=0.9,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="noise",
+                doc_id="doc-noise",
+                filename="云枢6数据库配置",
+                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                topic=0.2,
+                support=0.0,
+                role="irrelevant",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+
+    def test_product_ambiguity_is_driven_by_document_identity(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="cloudpivot",
+                doc_id="doc-cloudpivot",
+                filename="账号安全配置",
+                content="账号安全配置",
+                metadata={"product": "云枢", "version": "8.2.75"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="weaver",
+                doc_id="doc-weaver",
+                filename="账号安全配置",
+                content="账号安全配置",
+                metadata={"product": "泛微OA", "version": "10.0"},
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="解决登录用户名枚举要配置什么",
+            constraints=extract_query_constraints(
+                "解决登录用户名枚举要配置什么"
+            ),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "product_version")
+        self.assertEqual(len(decision.choices), 2)
+
+    def test_overlapping_multi_version_documents_are_one_scope_group(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="multi",
+                doc_id="doc-multi",
+                filename="兼容说明",
+                content="兼容说明",
+                metadata={"product": "云枢", "version": ["7", "8"]},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="v8",
+                doc_id="doc-v8",
+                filename="云枢8补充说明",
+                content="补充说明",
+                metadata={"product": "云枢", "version": "8"},
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="云枢消息接口怎么配置",
+            constraints=extract_query_constraints("云枢消息接口怎么配置"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+
+    def test_enumerated_product_generations_exclude_unmentioned_version(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="shared",
+                doc_id="doc-shared",
+                filename="通用前置条件",
+                content="通用说明",
+                metadata={"product": "云枢"},
+                topic=0.9,
+                support=0.7,
+            ),
+            *[
+                _candidate(
+                    chunk_id=f"version-{version}",
+                    doc_id=f"doc-{generation}",
+                    filename=f"云枢{generation}说明",
+                    content="产品说明",
+                    metadata={"product": "云枢", "version": version},
+                    topic=0.9,
+                    support=0.8,
+                )
+                for generation, version in (
+                    ("6", "6.0.1"),
+                    ("7", "7.1.0"),
+                    ("8", "8.2.75"),
+                )
+            ],
+        ]
+
+        query = "对比云枢6和云枢8的配置差异"
+        plan = resolve_explicit_scope_comparison(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertTrue(plan.matched)
+        self.assertEqual(plan.reason, "explicit_enumerated_scopes")
+        self.assertEqual(plan.dimension, "version")
+        self.assertEqual(
+            {choice.versions for choice in plan.choices},
+            {("6.0.1",), ("8.2.75",)},
+        )
+        self.assertEqual(
+            set(plan.allowed_doc_ids),
+            {"doc-6", "doc-8", "doc-shared"},
+        )
+        self.assertNotIn("doc-7", plan.allowed_doc_ids)
+        self.assertTrue(
+            all(
+                choice.companion_doc_ids == ("doc-shared",)
+                for choice in plan.choices
+            )
+        )
+        self.assertEqual(
+            {choice.anchor_doc_ids for choice in plan.choices},
+            {("doc-6",), ("doc-8",)},
+        )
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "explicit_enumerated_scopes")
+        self.assertEqual(len(decision.choices), 2)
+
+    def test_source_versions_generate_only_unique_prefix_aliases(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="v6",
+                doc_id="doc-v6",
+                filename="版本六",
+                content="配置说明",
+                metadata={"product": "云枢", "version": "6.0.1"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="v8",
+                doc_id="doc-v8",
+                filename="版本八",
+                content="配置说明",
+                metadata={"product": "云枢", "version": "8.2.75"},
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        for query in (
+            "对比云枢6和云枢8",
+            "比较云枢6.0和云枢8.2",
+            "版本6.0.1与8.2.75版有什么区别",
+            "v6 vs v8",
+            "云枢6和云枢8都要配置登录安全",
+            "云枢6与云枢8都需要配置登录安全",
+        ):
+            with self.subTest(query=query):
+                plan = resolve_explicit_scope_comparison(
+                    query=query,
+                    constraints=extract_query_constraints(query),
+                    candidates=candidates,
+                )
+                self.assertTrue(plan.matched)
+                self.assertEqual(
+                    {choice.versions for choice in plan.choices},
+                    {("6.0.1",), ("8.2.75",)},
+                )
+
+    def test_ambiguous_version_prefix_is_not_guessed(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"v-{version}",
+                doc_id=f"doc-{version}",
+                filename=f"版本{version}",
+                content="配置说明",
+                metadata={"product": "云枢", "version": version},
+                topic=0.9,
+                support=0.8,
+            )
+            for version in ("8.2.1", "8.2.9", "8.6.1")
+        ]
+
+        plan = resolve_explicit_scope_comparison(
+            query="对比v8.2和v8.6",
+            constraints=extract_query_constraints("对比v8.2和v8.6"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(plan.matched)
+        self.assertEqual(plan.reason, "enumerated_scope_aliases_not_unique")
+
+    def test_enumerated_projects_exclude_unmentioned_project(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="project-shared",
+                doc_id="doc-project-shared",
+                filename="通用配置",
+                content="通用配置",
+                metadata={"product": "平台A", "version": "2.0"},
+                topic=0.9,
+                support=0.7,
+            ),
+            *[
+                _candidate(
+                    chunk_id=f"project-{project}",
+                    doc_id=f"doc-{project}",
+                    filename=f"{project}配置",
+                    content="项目配置",
+                    metadata={
+                        "product": "平台A",
+                        "version": "2.0",
+                        "project": project,
+                    },
+                    topic=0.9,
+                    support=0.8,
+                )
+                for project in ("甲项目", "乙项目", "丙项目")
+            ],
+        ]
+
+        query = "对比甲项目和乙项目的配置差异"
+        plan = resolve_explicit_scope_comparison(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertTrue(plan.matched)
+        self.assertEqual(plan.dimension, "project")
+        self.assertEqual(
+            {choice.projects for choice in plan.choices},
+            {("甲项目",), ("乙项目",)},
+        )
+        self.assertNotIn("doc-丙项目", plan.allowed_doc_ids)
+        self.assertIn("doc-project-shared", plan.allowed_doc_ids)
+        self.assertTrue(
+            all(
+                "doc-project-shared" in choice.companion_doc_ids
+                for choice in plan.choices
+            )
+        )
+
+    def test_all_versions_are_scoped_by_named_source_product(self) -> None:
+        candidates = [
+            *[
+                _candidate(
+                    chunk_id=f"cloud-{version}",
+                    doc_id=f"doc-cloud-{version}",
+                    filename=f"云枢{version}",
+                    content="配置说明",
+                    metadata={"product": "云枢", "version": version},
+                    topic=0.9,
+                    support=0.8,
+                )
+                for version in ("6.0.1", "7.1.0", "8.2.75")
+            ],
+            _candidate(
+                chunk_id="other-product",
+                doc_id="doc-other-product",
+                filename="其他产品",
+                content="配置说明",
+                metadata={"product": "其他平台", "version": "10.0"},
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        query = "请对比云枢所有版本的配置"
+        plan = resolve_explicit_scope_comparison(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertTrue(plan.matched)
+        self.assertEqual(plan.reason, "explicit_all_scopes")
+        self.assertEqual(plan.dimension, "version")
+        self.assertEqual(len(plan.choices), 3)
+        self.assertNotIn("doc-other-product", plan.allowed_doc_ids)
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "query_requests_all_scopes")
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(len(decision.choices), 3)
+
+    def test_all_projects_keep_every_project_in_named_product_version(self) -> None:
+        candidates = [
+            *[
+                _candidate(
+                    chunk_id=f"project-all-{project}",
+                    doc_id=f"doc-project-all-{project}",
+                    filename=f"{project}配置",
+                    content="项目配置",
+                    metadata={
+                        "product": "云枢",
+                        "version": version,
+                        "project": project,
+                    },
+                    topic=0.9,
+                    support=0.8,
+                )
+                for project, version in (
+                    ("甲项目", "8.2.75"),
+                    ("乙项目", "8.2.75"),
+                    ("丙项目", "8.2.75"),
+                    ("丁项目", "9.0"),
+                )
+            ],
+        ]
+
+        query = "云枢8.2的所有项目都对比"
+        plan = resolve_explicit_scope_comparison(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertTrue(plan.matched)
+        self.assertEqual(plan.reason, "explicit_all_scopes")
+        self.assertEqual(plan.dimension, "project")
+        self.assertEqual(
+            {choice.projects for choice in plan.choices},
+            {('甲项目',), ('乙项目',), ('丙项目',)},
+        )
+        self.assertNotIn("doc-project-all-丁项目", plan.allowed_doc_ids)
+
+    def test_more_than_six_explicit_scopes_never_returns_partial_plan(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"many-{version}",
+                doc_id=f"doc-many-{version}",
+                filename=f"版本{version}",
+                content="配置说明",
+                metadata={"product": "平台A", "version": version},
+                topic=0.9,
+                support=0.8,
+            )
+            for version in ("1", "2", "3", "4", "5", "6", "7")
+        ]
+
+        plan = resolve_explicit_scope_comparison(
+            query="平台A所有版本都对比",
+            constraints=extract_query_constraints("平台A所有版本都对比"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(plan.matched)
+        self.assertEqual(
+            plan.reason,
+            "too_many_explicit_scopes_for_complete_plan",
+        )
+        self.assertEqual(plan.choices, ())
+        self.assertEqual(plan.allowed_doc_ids, ())
+        all_decision = detect_evidence_scope_ambiguity(
+            query="平台A所有版本都对比",
+            constraints=extract_query_constraints("平台A所有版本都对比"),
+            candidates=candidates,
+        )
+        self.assertTrue(all_decision.needs_clarification)
+        self.assertEqual(all_decision.dimension, "version")
+        self.assertEqual(
+            all_decision.reason,
+            "too_many_mutually_exclusive_scopes",
+        )
+        self.assertEqual(all_decision.choices, ())
+
+        enumerated_query = "对比" + "、".join(
+            f"v{version}" for version in ("1", "2", "3", "4", "5", "6", "7")
+        )
+        enumerated_plan = resolve_explicit_scope_comparison(
+            query=enumerated_query,
+            constraints=extract_query_constraints(enumerated_query),
+            candidates=candidates,
+        )
+        self.assertFalse(enumerated_plan.matched)
+        self.assertEqual(
+            enumerated_plan.reason,
+            "too_many_explicit_scopes_for_complete_plan",
+        )
+        self.assertEqual(enumerated_plan.choices, ())
+        enumerated_decision = detect_evidence_scope_ambiguity(
+            query=enumerated_query,
+            constraints=extract_query_constraints(enumerated_query),
+            candidates=candidates,
+        )
+        self.assertTrue(enumerated_decision.needs_clarification)
+        self.assertEqual(enumerated_decision.choices, ())
+
+    def test_duration_numbers_do_not_select_real_version_one_or_two(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"policy-{version}",
+                doc_id=f"doc-policy-{version}",
+                filename=f"差旅制度{version}版",
+                content="出差报销规定",
+                metadata={"version": version},
+                topic=0.95,
+                support=0.9,
+                role="direct",
+            )
+            for version in ("1", "2")
+        ]
+
+        for query in ("出差需要2天怎么报销", "对比出差2天和3天的差异"):
+            with self.subTest(query=query):
+                plan = resolve_explicit_scope_comparison(
+                    query=query,
+                    constraints=extract_query_constraints(query),
+                    candidates=candidates,
+                )
+                self.assertFalse(plan.matched)
+                decision = detect_evidence_scope_ambiguity(
+                    query=query,
+                    constraints=extract_query_constraints(query),
+                    candidates=candidates,
+                )
+                self.assertTrue(decision.needs_clarification)
+                self.assertEqual(len(decision.choices), 2)
+
+    def test_explicit_year_version_still_keeps_only_that_source_scope(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"year-{version}",
+                doc_id=f"doc-year-{version}",
+                filename=f"差旅制度{version}版",
+                content="出差标准",
+                metadata={"version": version},
+                topic=0.95,
+                support=0.9,
+                role="direct",
+            )
+            for version in ("2024", "2025")
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="2025版出差标准",
+            constraints=extract_query_constraints("2025版出差标准"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.relevant_document_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

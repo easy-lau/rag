@@ -14,6 +14,7 @@ const EVIDENCE_STATUSES = new Set([
   'hit',
   'partial',
   'version_mismatch',
+  'needs_clarification',
   'no_hit',
   'unverified',
   'error',
@@ -23,7 +24,14 @@ const EXECUTED_EVIDENCE_STATUSES = new Set([
   'hit',
   'partial',
   'version_mismatch',
+  'needs_clarification',
   'no_hit',
+])
+const NON_ANSWER_EVIDENCE_STATUSES = new Set([
+  'skipped',
+  'needs_clarification',
+  'no_hit',
+  'error',
 ])
 
 function firstDefined(...values) {
@@ -64,27 +72,66 @@ function normalizeResult(result) {
 function normalizeIntentDecision(decision) {
   if (!decision) return null
 
-  // 新接口把“意图、回答模式、是否检索”拆开保存；旧接口只返回 action，
-  // 这里仅作为版本兼容层补齐字段，业务组件不再自行根据 action 猜测检索状态。
-  const legacyNeedRetrieval = decision.action === 'retrieve'
-  const needRetrieval = Boolean(firstDefined(
-    decision.need_retrieval,
-    decision.needs_retrieval,
-    legacyNeedRetrieval,
-  ))
-  const responseMode = decision.response_mode || ({
-    retrieve: 'grounded_qa',
-    chat: 'general_chat',
-    writing: 'writing',
-    system_help: 'platform_help',
-  }[decision.action]) || ''
+  const schemaVersion = String(decision.schema_version || '')
+  const routeDecision = decision.route_decision || decision.semantic_decision
+    || (schemaVersion.includes('route_decision') ? decision : null)
+  const taskContract = decision.task_contract || decision.contract || decision.execution_contract || decision.route_summary
+    || (schemaVersion.includes('task_contract') ? decision : null)
+  const isContractPayload = Boolean(
+    routeDecision
+    || taskContract
+    || schemaVersion.includes('route_decision')
+    || schemaVersion.includes('task_contract')
+  )
+
+  // 新协议必须以服务端编译合同为准，不能再从 operation/action 反推执行策略。
+  // action 映射只服务于没有协议版本和合同对象的旧 SSE 事件。
+  let needRetrieval = firstDefined(
+    taskContract?.need_retrieval,
+    taskContract?.needs_retrieval,
+    taskContract?.retrieval?.required,
+    taskContract?.execution?.need_retrieval,
+    !isContractPayload ? decision.need_retrieval : undefined,
+    !isContractPayload ? decision.needs_retrieval : undefined,
+  )
+  if (typeof needRetrieval !== 'boolean') {
+    needRetrieval = isContractPayload ? null : decision.action === 'retrieve'
+  }
+  const responseMode = firstDefined(
+    taskContract?.response_mode,
+    taskContract?.execution?.response_mode,
+    !isContractPayload ? decision.response_mode : undefined,
+    !isContractPayload ? ({
+      retrieve: 'grounded_qa',
+      chat: 'general_chat',
+      writing: 'writing',
+      system_help: 'platform_help',
+    }[decision.action]) : '',
+  ) || ''
+  const retrievalPolicy = firstDefined(
+    taskContract?.retrieval_policy,
+    taskContract?.retrieval?.policy,
+    taskContract?.execution?.retrieval_policy,
+    !isContractPayload ? decision.retrieval_policy : undefined,
+    !isContractPayload && typeof needRetrieval === 'boolean'
+      ? (needRetrieval ? 'required' : 'skip')
+      : '',
+  ) || ''
+  const operation = routeDecision?.operation || routeDecision?.intent_code || decision.operation || ''
 
   return {
     ...decision,
+    route_decision: routeDecision,
+    task_contract: taskContract,
+    operation,
+    relation: routeDecision?.relation || decision.relation || '',
+    readiness: routeDecision?.readiness || decision.readiness || '',
+    intent_code: decision.intent_code || operation,
+    intent_name: decision.intent_name || operation,
     response_mode: responseMode,
-    retrieval_policy: decision.retrieval_policy || (needRetrieval ? 'required' : 'skip'),
+    retrieval_policy: retrievalPolicy,
     need_retrieval: needRetrieval,
-    decision_reason: decision.decision_reason || decision.reason || '',
+    decision_reason: taskContract?.decision_reason || taskContract?.reason || decision.decision_reason || decision.reason || '',
   }
 }
 
@@ -147,10 +194,11 @@ export const useSearchStore = defineStore('search', () => {
       else evidenceStatus = 'unverified'
     }
 
-    const hasNoAnswerEvidence = ['no_hit', 'skipped', 'error'].includes(evidenceStatus)
-    if (evidenceStatus === 'no_hit') {
-      // no_hit 可以保留宽召回候选供右侧解释，但任何 direct 角色都与最终状态
-      // 冲突，必须降级为相近资料，卡片不得继续显示绿色“回答依据”。
+    const hasNoAnswerEvidence = NON_ANSWER_EVIDENCE_STATUSES.has(evidenceStatus)
+    if (evidenceStatus === 'no_hit' || evidenceStatus === 'needs_clarification') {
+      // no_hit 和 needs_clarification 都可以保留宽召回候选供右侧解释，但任何
+      // direct 角色都与最终状态冲突，必须降级为相近资料。用户确认适用范围前，
+      // 卡片不得继续显示绿色“回答依据”。
       normalizedResults = normalizedResults.map(item => (
         item?.evidence_role === 'direct'
           ? { ...item, evidence_role: 'related' }
@@ -179,7 +227,7 @@ export const useSearchStore = defineStore('search', () => {
     const directEvidenceCount = hasNoAnswerEvidence
       ? 0
       : (explicitDirectCount ?? derivedDirectCount)
-    const relatedReferenceCount = evidenceStatus === 'no_hit'
+    const relatedReferenceCount = evidenceStatus === 'no_hit' || evidenceStatus === 'needs_clarification'
       ? Math.max(explicitRelatedCount ?? 0, derivedRelatedCount)
       : (evidenceStatus === 'skipped' || evidenceStatus === 'error'
           ? 0
@@ -245,6 +293,12 @@ export const useSearchStore = defineStore('search', () => {
         eventMeta.query_constraints,
         searchMeta.value.query_constraints,
         {},
+      ),
+      clarification: firstDefined(
+        data.clarification,
+        eventMeta.clarification,
+        searchMeta.value.clarification,
+        null,
       ),
       retrieval_executed: retrievalExecuted,
       evidence_status: evidenceStatus,

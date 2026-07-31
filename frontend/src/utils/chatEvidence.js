@@ -1,4 +1,4 @@
-const NON_ANSWER_STATUSES = new Set(['skipped', 'no_hit', 'error'])
+const NON_ANSWER_STATUSES = new Set(['skipped', 'needs_clarification', 'no_hit', 'error'])
 const EVIDENCE_ROLES = new Set(['direct', 'related', 'irrelevant'])
 
 function normalizedStatus(value) {
@@ -45,7 +45,7 @@ export function answerSourcesFromSearchEvent(data, limit = 20) {
   if (!safeLimit || !data || typeof data !== 'object') return []
 
   const evidenceStatus = eventEvidenceStatus(data)
-  // no_hit 即使错误地携带了候选，也没有任何知识库正文进入回答上下文。
+  // 非回答状态即使错误地携带了候选，也没有任何知识库正文进入回答上下文。
   if (NON_ANSWER_STATUSES.has(evidenceStatus)) return []
 
   if (Object.prototype.hasOwnProperty.call(data, 'answer_sources')) {
@@ -81,7 +81,7 @@ export function answerSourcesFromSearchEvent(data, limit = 20) {
 }
 
 /**
- * 过滤历史消息中旧版本曾误存入 sources 的 no_hit/skipped/error 检索候选。
+ * 过滤历史消息中旧版本曾误存入 sources 的非回答状态检索候选。
  */
 export function persistedAnswerSources(message) {
   if (!message || typeof message !== 'object') return []

@@ -39,8 +39,12 @@
 | `retrieval.channel_error` / `retrieval.error` | 单通道或整体召回失败，以及是否由其它通道或上一轮合法证据恢复 |
 | `rerank.candidate` | 主题相关度、可回答性、产品/版本约束、证据角色和模型理由 |
 | `rerank.completed` | 重排是否尝试、成功、降级原因、候选数和耗时 |
+| `evidence.ambiguity_assessed` / `evidence.clarification_required` | 根据重排后的真实相关文档判断是否存在互斥产品、版本或项目范围；要求澄清时禁止生成 |
+| `evidence.clarification_created` / `evidence.clarification_repeated` / `evidence.clarification_resolved` | 证据范围选项的保存、无效短回复重复和最终选择；pending state 只保存候选，不授予执行权限 |
+| `evidence.scope_filter_applied` | 用户选择后应用的知识库、文档和选项数量；`global_fallback_allowed=false` 表示禁止退回全库检索 |
 | `evidence.selection` | 直接证据、相近资料、淘汰数量及最终证据状态 |
 | `generation.context` | 实际注入模型的文档、角色和上下文字符数 |
+| `generation.skipped` | 因证据范围待澄清而跳过回答模型 |
 | `generation.completed` | 模型生成完成、回答长度、token 与耗时 |
 | `chat.response` | 最终回答、来源摘要、token 和证据状态 |
 | `chat.cancelled` | 用户停止、浏览器断连或服务关闭导致流取消，调用链立即标记为已中断 |

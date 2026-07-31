@@ -48,8 +48,8 @@ test('no_hit 即使携带 results 或异常 answer_sources 也不展示为回答
   }), [])
 })
 
-test('skipped 和 error 即使携带异常 answer_sources 也不展示为回答依据', () => {
-  for (const evidenceStatus of ['skipped', 'error']) {
+test('skipped、needs_clarification 和 error 即使携带异常 answer_sources 也不展示为回答依据', () => {
+  for (const evidenceStatus of ['skipped', 'needs_clarification', 'error']) {
     assert.deepEqual(answerSourcesFromSearchEvent({
       evidence_status: evidenceStatus,
       results: [direct],
@@ -96,4 +96,18 @@ test('消息级 no_hit 会隐藏所有旧来源', () => {
     evidence_status: 'no_hit',
     sources: [related],
   }), [])
+})
+
+test('待选择范围的历史消息和来源都不能恢复为回答依据', () => {
+  assert.deepEqual(persistedAnswerSources({
+    evidence_status: 'needs_clarification',
+    sources: [direct],
+  }), [])
+
+  assert.deepEqual(persistedAnswerSources({
+    sources: [
+      { ...direct, evidence_status: 'needs_clarification' },
+      { ...direct, id: 'used', evidence_status: 'hit' },
+    ],
+  }), [{ ...direct, id: 'used', evidence_status: 'hit' }])
 })

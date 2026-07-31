@@ -29,6 +29,10 @@ PER_DOCUMENT_RERANK_CHUNKS = 3
 # 文档内二次检索只服务于首轮已经定位到的少量文档。这里的上限与全局召回分开，
 # 避免通过扩大全局 Top K 来弥补跨片段问题，也避免异常计划扫描大量文档。
 MAX_SCOPED_DOCUMENTS = 3
+# 检索后澄清选择可能包含多个互斥范围。默认的证据扩展仍只允许 3 篇文档，
+# 只有显式的范围选择重检索才可以提高该上限；总候选数、单文档候选数以及
+# 大文档精确扫描 guard 仍沿用下方现有硬预算，不能随文档数线性膨胀。
+MAX_EVIDENCE_SCOPE_DOCUMENTS = 30
 MAX_SCOPED_QUERIES = 2
 MAX_SCOPED_RESULTS = 12
 MAX_SCOPED_RESULTS_PER_DOCUMENT = 4
@@ -143,8 +147,8 @@ def _build_trigram_terms(query: str) -> list[str]:
         match.group(0) for match in _TRIGRAM_TOKEN_RE.finditer(normalized)
     )
 
-    # 同时加入去掉问句外壳后的版本；例如“我是云枢8.6”会得到“云枢8.6”，
-    # “解决登录用户名枚举”会得到“登录用户名枚举”。
+    # 同时加入去掉问句外壳后的版本；例如“我是产品8.6”会得到“产品8.6”，
+    # “解决缓存失效问题”会得到“缓存失效问题”。
     stripped_candidates = [_strip_query_fillers(term) for term in base_candidates]
     # 完整问句用于召回整句近似；去外壳实体优先于其余原句片段，确保特别长的问句
     # 达到词项上限时，产品、版本和主题仍不会被尾部的口语成分挤掉。
@@ -1264,6 +1268,7 @@ async def search_within_documents(
     method: str = "hybrid",
     per_document_limit: int = MAX_SCOPED_RESULTS_PER_DOCUMENT,
     total_limit: int = 8,
+    max_document_count: int = MAX_SCOPED_DOCUMENTS,
     trace_id: str | None = None,
     surface: str = "chat",
 ) -> list[dict]:
@@ -1277,7 +1282,11 @@ async def search_within_documents(
     started_at = time.perf_counter()
     scoped_queries = _bounded_scoped_queries(queries)
     scoped_kb_ids = _bounded_unique(kb_ids, 100)
-    scoped_doc_ids = _bounded_unique(doc_ids, MAX_SCOPED_DOCUMENTS)
+    bounded_document_count = max(
+        1,
+        min(int(max_document_count), MAX_EVIDENCE_SCOPE_DOCUMENTS),
+    )
+    scoped_doc_ids = _bounded_unique(doc_ids, bounded_document_count)
     if not scoped_queries or not scoped_kb_ids or not scoped_doc_ids:
         return []
 

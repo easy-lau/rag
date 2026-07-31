@@ -8,6 +8,7 @@ from core.reranker import (
     RerankOutcome,
     joint_rerank_with_coverage,
     rerank_with_status,
+    select_small_document_evidence_with_coverage,
 )
 
 
@@ -244,6 +245,48 @@ class FirstPassPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.succeeded)
         self.assertEqual(outcome.requirements[0].importance, "helpful")
 
+    async def test_route_locked_requirement_cannot_be_downgraded_by_reranker(self) -> None:
+        locked = (
+            AnswerRequirement(
+                id="r1",
+                description="取得完整出差标准",
+                importance="required",
+                source="explicit",
+            ),
+        )
+        payload = {
+            "requirements": [
+                _requirement(
+                    "r1",
+                    "取得完整出差标准",
+                    importance="helpful",
+                    source="explicit",
+                )
+            ],
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["r1"],
+                )
+            ],
+        }
+
+        with (
+            patch("core.reranker.get_client", return_value=_client_with_payload(payload)),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await rerank_with_status(
+                "普通员工的出差标准是什么",
+                [{"id": "answer", "content": "D级出差标准", "score": 0.1}],
+                locked,
+            )
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("不得修改路由器锁定的 requirements", outcome.error or "")
+        self.assertEqual(outcome.results[0]["rerank_status"], "unverified")
+
     async def test_complete_standalone_answer_disables_model_expansion(self) -> None:
         results = [
             {"id": "answer", "content": "报销应在5个工作日内提交。", "score": 0.1},
@@ -320,6 +363,337 @@ class FirstPassPlanningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("冲突", outcome.error or "")
 
 
+class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def _run(self, payload, *, eligible=(1, 2, 3), anchors=(1,)):
+        results = [
+            {"id": "grade", "doc_id": "travel", "content": "普通员工属于D级。"},
+            {"id": "train", "doc_id": "travel", "content": "D级乘高铁二等座。"},
+            {"id": "hotel", "doc_id": "travel", "content": "D级住宿450元/天。"},
+            {"id": "other", "doc_id": "other", "content": "员工请假需审批。"},
+        ]
+        requirements = [
+            _requirement("r1", "回答普通员工出差标准"),
+            _requirement(
+                "r2",
+                "确认普通员工对应职级",
+                importance="helpful",
+                source="inferred",
+            ),
+        ]
+        client = _client_with_payload(payload)
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await select_small_document_evidence_with_coverage(
+                "普通员工的出差标准是什么",
+                results,
+                requirements,
+                bridge_requirement_ids=("r2",),
+                eligible_candidate_indexes=eligible,
+                anchor_candidate_indexes=anchors,
+            )
+        return outcome, client
+
+    async def test_compact_selector_builds_complete_target_document_set(self) -> None:
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [
+                        {"subject": "普通员工", "relation": "属于", "object": "D级"}
+                    ],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+                {
+                    "index": 3,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, client = await self._run(payload)
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(outcome.selected_candidate_indexes, (1, 2, 3))
+        selected = [item for item in outcome.results if item.get("jointly_selected")]
+        self.assertEqual({item["id"] for item in selected}, {"grade", "train", "hotel"})
+        self.assertTrue(all(item["evidence_role"] == "direct" for item in selected))
+        self.assertTrue(all(
+            item["assessment_mode"] == "small_document_binary_selection"
+            for item in outcome.results
+        ))
+        competitor = next(item for item in outcome.results if item["id"] == "other")
+        self.assertFalse(competitor["jointly_selected"])
+
+        call = client.chat.completions.create.await_args
+        response_format = call.kwargs["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        index_schema = response_format["json_schema"]["schema"]["properties"][
+            "selected"
+        ]["items"]["properties"]["index"]
+        self.assertEqual(index_schema["enum"], [1, 2, 3])
+        self.assertNotIn(
+            "evidence_sets",
+            response_format["json_schema"]["schema"]["properties"],
+        )
+        user_payload = json.loads(call.kwargs["messages"][1]["content"])
+        self.assertEqual(user_payload["output_contract"], "json")
+        self.assertEqual(user_payload["bridge_requirement_ids"], ["r2"])
+        self.assertEqual(user_payload["eligible_candidate_indexes"], [1, 2, 3])
+        self.assertEqual(user_payload["anchor_candidate_indexes"], [1])
+        self.assertLessEqual(call.kwargs["timeout"], 15)
+        self.assertLessEqual(call.kwargs["max_tokens"], 700)
+        grade = next(item for item in selected if item["id"] == "grade")
+        train = next(item for item in selected if item["id"] == "train")
+        self.assertEqual(grade["contribution_role"], "bridge")
+        self.assertEqual(grade["bridge_facts"][0]["object"], "D级")
+        self.assertEqual(train["contribution_role"], "complement")
+
+    async def test_complete_claim_without_required_bridge_fails_closed(self) -> None:
+        payload = {
+            "selected": [{
+                "index": 2,
+                "role": "answer",
+                "supports_requirement_ids": ["r1"],
+                "bridge_facts": [],
+            }],
+            "coverage_complete": True,
+        }
+
+        outcome, _client = await self._run(payload)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("bridge", outcome.error or "")
+        self.assertFalse(any(
+            item.get("jointly_selected") for item in outcome.results
+        ))
+
+    async def test_competitor_cannot_be_selected_outside_target_allowlist(self) -> None:
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [
+                        {"subject": "普通员工", "relation": "属于", "object": "D级"}
+                    ],
+                },
+                {
+                    "index": 4,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, _client = await self._run(payload)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("index", outcome.error or "")
+        self.assertFalse(any(
+            item.get("jointly_selected") for item in outcome.results
+        ))
+
+    async def test_valid_incomplete_selection_remains_no_evidence(self) -> None:
+        payload = {
+            "selected": [{
+                "index": 1,
+                "role": "bridge",
+                "supports_requirement_ids": ["r2"],
+                "bridge_facts": [
+                    {"subject": "普通员工", "relation": "属于", "object": "D级"}
+                ],
+            }],
+            "coverage_complete": False,
+        }
+
+        outcome, _client = await self._run(payload)
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "insufficient")
+        self.assertEqual(outcome.selected_candidate_indexes, ())
+        self.assertEqual(outcome.missing_requirement_ids, ("r1",))
+
+    async def test_complete_claim_without_selected_anchor_fails_closed(self) -> None:
+        payload = {
+            "selected": [
+                {
+                    "index": 2,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [
+                        {"subject": "D级", "relation": "乘坐", "object": "高铁二等座"}
+                    ],
+                },
+                {
+                    "index": 3,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, _client = await self._run(payload, anchors=(1,))
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("锚点", outcome.error or "")
+
+    async def test_fabricated_bridge_fact_fails_closed(self) -> None:
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [
+                        {"subject": "普通员工", "relation": "属于", "object": "A级"}
+                    ],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, _client = await self._run(payload)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("object", outcome.error or "")
+
+    async def test_single_required_question_keeps_anchored_bridge(self) -> None:
+        results = [
+            {"id": "grade", "doc_id": "travel", "content": "普通员工属于D级。"},
+            {
+                "id": "standard",
+                "doc_id": "travel",
+                "content": "D级乘经济舱，住宿450元/天。" + "细则" * 1600,
+            },
+        ]
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [
+                        {"subject": "普通员工", "relation": "属于", "object": "D级"}
+                    ],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+        client = _client_with_payload(payload)
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await select_small_document_evidence_with_coverage(
+                "普通员工的出差标准是什么",
+                results,
+                [_requirement("r1", "回答普通员工出差标准")],
+                eligible_candidate_indexes=(1, 2),
+                anchor_candidate_indexes=(1,),
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(outcome.selected_candidate_indexes, (1, 2))
+        selected = {
+            item["id"]: item
+            for item in outcome.results
+            if item.get("jointly_selected")
+        }
+        self.assertEqual(selected["grade"]["contribution_role"], "bridge")
+        self.assertEqual(selected["standard"]["contribution_role"], "complement")
+        self.assertEqual(selected["grade"]["bridge_facts"][0]["object"], "D级")
+        request_payload = json.loads(
+            client.chat.completions.create.await_args.kwargs["messages"][1]["content"]
+        )
+        self.assertFalse(request_payload["candidates"][1]["content_truncated"])
+        self.assertGreater(len(request_payload["candidates"][1]["content"]), 3000)
+
+    async def test_answer_with_bridge_facts_fails_closed(self) -> None:
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [
+                        {"subject": "普通员工", "relation": "属于", "object": "D级"}
+                    ],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [
+                        {"subject": "D级", "relation": "乘坐", "object": "高铁二等座"}
+                    ],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, _client = await self._run(payload)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("必须为空", outcome.error or "")
+
+    async def test_json_fallback_cannot_exceed_bridge_fact_schema_limit(self) -> None:
+        fact = {"subject": "普通员工", "relation": "属于", "object": "D级"}
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [fact, fact, fact],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, _client = await self._run(payload)
+
+        self.assertFalse(outcome.succeeded)
+        self.assertIn("契约上限", outcome.error or "")
+
+
 class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
     async def _run(self, query, results, requirements, payload):
         client = _client_with_payload(payload)
@@ -332,6 +706,132 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
                 results,
                 requirements,
             )
+
+    async def test_joint_request_prefers_strict_schema_enum_contract(self) -> None:
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{"id": "hotel", "content": "D级住宿450元/天。", "score": 0.02}]
+        payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["r1"],
+                    bridge_facts=[],
+                )
+            ],
+            "evidence_sets": [
+                {
+                    "id": "set_1",
+                    "candidate_indexes": [1],
+                    "joint_answer_support": 0.9,
+                    "coverage": [
+                        {"requirement_id": "r1", "candidate_indexes": [1]}
+                    ],
+                    "coverage_status": "complete",
+                    "missing_requirement_ids": [],
+                    "reason": "住宿标准完整",
+                }
+            ],
+            "selected_set_id": "set_1",
+        }
+        client = _client_with_payload(payload)
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "普通员工住宿标准是什么",
+                results,
+                requirements,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        response_format = client.chat.completions.create.await_args.kwargs[
+            "response_format"
+        ]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertTrue(response_format["json_schema"]["strict"])
+        schema = response_format["json_schema"]["schema"]
+        self.assertFalse(schema["additionalProperties"])
+        results_schema = schema["properties"]["results"]
+        self.assertEqual(results_schema["minItems"], 0)
+        self.assertEqual(results_schema["maxItems"], 1)
+        result_properties = results_schema["items"]["properties"]
+        self.assertEqual(
+            set(result_properties["evidence_role"]["enum"]),
+            {"direct", "related", "irrelevant"},
+        )
+        self.assertEqual(
+            result_properties["supports_requirement_ids"]["items"]["enum"],
+            ["r1"],
+        )
+        self.assertLessEqual(
+            client.chat.completions.create.await_args.kwargs["max_tokens"],
+            2800,
+        )
+
+    async def test_compact_joint_response_safely_omits_irrelevant_candidates(self) -> None:
+        requirements = [_requirement("r1", "完整回答普通员工出差标准")]
+        results = [
+            {"id": f"chunk-{index}", "content": f"无关章节 {index}", "score": 0.02}
+            for index in range(1, 16)
+        ]
+        results[2]["content"] = "普通员工属于D级"
+        results[3]["content"] = "D级乘坐经济舱和高铁二等座"
+        results[6]["content"] = "D级住宿一线450元、二线350元、其他250元"
+        results[7]["content"] = "D级餐饮补贴100元/天"
+        results[8]["content"] = "通讯50元/天，出差补贴100元/天"
+        selected_indexes = (3, 4, 7, 8, 9)
+        payload = {
+            "results": [
+                _assessment(
+                    index,
+                    role="direct",
+                    contribution=("bridge" if index == 3 else "complement"),
+                    supports=["r1"],
+                    bridge_facts=(
+                        [{"subject": "普通员工", "relation": "属于", "object": "D级"}]
+                        if index == 3
+                        else []
+                    ),
+                )
+                for index in selected_indexes
+            ],
+            "evidence_sets": [{
+                "id": "set_1",
+                "candidate_indexes": list(selected_indexes),
+                "joint_answer_support": 0.94,
+                "coverage": [{
+                    "requirement_id": "r1",
+                    "candidate_indexes": list(selected_indexes),
+                }],
+                "coverage_status": "complete",
+                "missing_requirement_ids": [],
+                "reason": "职级映射与D级各项标准共同覆盖问题",
+            }],
+            "selected_set_id": "set_1",
+        }
+
+        outcome = await self._run(
+            "普通员工的出差标准是什么",
+            results,
+            requirements,
+            payload,
+        )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(outcome.selected_candidate_indexes, selected_indexes)
+        self.assertEqual(len(outcome.results), 15)
+        selected = [item for item in outcome.results if item["jointly_selected"]]
+        omitted = [item for item in outcome.results if not item["jointly_selected"]]
+        self.assertEqual(len(selected), 5)
+        self.assertEqual(len(omitted), 10)
+        self.assertTrue(all(item["rerank_status"] == "unverified" for item in omitted))
+        self.assertTrue(all(item["joint_rerank_status"] == "omitted" for item in omitted))
+        self.assertTrue(all(item["evidence_role"] == "irrelevant" for item in omitted))
+        self.assertTrue(all(item["supports_requirement_ids"] == [] for item in omitted))
 
     async def test_bridge_and_complement_form_complete_joint_evidence(self) -> None:
         requirements = [
@@ -581,6 +1081,102 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "coverage_status 无效",
             repair_call.kwargs["messages"][1]["content"],
+        )
+
+    async def test_schema_fallback_repair_uses_lowercase_json_contract(self) -> None:
+        class ProviderContractError(Exception):
+            def __init__(self, status_code: int, message: str) -> None:
+                super().__init__(message)
+                self.status_code = status_code
+
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{"id": "hotel", "content": "D级住宿450元/天。", "score": 0.02}]
+        valid_payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["r1"],
+                    bridge_facts=[],
+                )
+            ],
+            "evidence_sets": [
+                {
+                    "id": "set_1",
+                    "candidate_indexes": [1],
+                    "joint_answer_support": 0.9,
+                    "coverage": [
+                        {"requirement_id": "r1", "candidate_indexes": [1]}
+                    ],
+                    "coverage_status": "complete",
+                    "missing_requirement_ids": [],
+                    "reason": "住宿标准完整",
+                }
+            ],
+            "selected_set_id": "set_1",
+        }
+        invalid_payload = json.loads(json.dumps(valid_payload))
+        invalid_payload["results"][0]["evidence_role"] = "DIRECT_EVIDENCE"
+        json_object_attempt = 0
+
+        async def create(**kwargs):
+            nonlocal json_object_attempt
+            response_format = kwargs["response_format"]
+            if response_format["type"] == "json_schema":
+                raise ProviderContractError(
+                    400,
+                    "Invalid value: json_schema. Supported values are: "
+                    "text, json_object",
+                )
+            json_object_attempt += 1
+            messages_text = "\n".join(
+                str(message.get("content") or "") for message in kwargs["messages"]
+            )
+            if json_object_attempt == 1:
+                return _payload_response(invalid_payload)
+            if "json" not in messages_text:
+                raise ProviderContractError(
+                    400,
+                    "messages must contain the word 'json' to use json_object",
+                )
+            return _payload_response(valid_payload)
+
+        create_mock = AsyncMock(side_effect=create)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock))
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "普通员工住宿标准是什么",
+                results,
+                requirements,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(create_mock.await_count, 3)
+        self.assertEqual(
+            create_mock.await_args_list[0].kwargs["response_format"]["type"],
+            "json_schema",
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["response_format"] == {"type": "json_object"}
+                for call in create_mock.await_args_list[1:]
+            )
+        )
+        repair_messages = create_mock.await_args_list[2].kwargs["messages"]
+        self.assertIn(
+            "json",
+            "\n".join(str(message.get("content") or "") for message in repair_messages),
+        )
+        self.assertIn(
+            "evidence_role 必须为",
+            repair_messages[1]["content"],
         )
 
     async def test_failed_structure_repair_falls_back_without_promotion(self) -> None:

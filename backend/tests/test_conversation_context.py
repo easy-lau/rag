@@ -7,8 +7,11 @@ from core.conversation_context import (
     build_standalone_query,
     detect_followup,
     prepare_conversation_context,
+    resolve_routed_conversation_context,
+    route_context_payloads,
 )
 from core.query_constraints import extract_query_constraints
+from core.query_route_contract import parse_rag_route_decision
 from models.db_models import Document, DocumentChunk, Message
 
 
@@ -45,6 +48,146 @@ class _FakeDB:
 
 
 class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_semantic_followup_can_use_current_query_and_reuse_evidence(self) -> None:
+        conversation_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        document_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        user_message = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="user",
+            content="普通员工的出差标准是什么",
+            created_at=now - timedelta(seconds=2),
+        )
+        assistant_message = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="assistant",
+            content="普通员工属于 D 级，以下是出差标准。",
+            sources=[{"id": str(chunk_id), "evidence_role": "direct"}],
+            created_at=now - timedelta(seconds=1),
+        )
+        document = Document(
+            id=document_id,
+            kb_id=kb_id,
+            filename="出差管理制度.md",
+            status="ready",
+            is_active=True,
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=document_id,
+            kb_id=kb_id,
+            content="D 级员工住宿标准按城市类别执行。",
+            chunk_index=2,
+        )
+        db = _FakeDB(
+            [assistant_message, user_message],
+            [(chunk, document)],
+        )
+
+        prepared = await prepare_conversation_context(
+            db,
+            conversation_id=conversation_id,
+            question="普通员工出差的住宿标准",
+            kb_ids=[kb_id],
+        )
+        self.assertFalse(prepared.is_followup)  # legacy syntax heuristic
+        self.assertEqual(route_context_payloads(prepared)[0]["candidate_key"], "t1")
+
+        resolved = await resolve_routed_conversation_context(
+            db,
+            context=prepared,
+            question="普通员工出差的住宿标准",
+            kb_ids=[kb_id],
+            route_decision={
+                "readiness": "ready",
+                "relation": "followup",
+                "query_resolution": {
+                    "mode": "current",
+                    "context_turn_keys": ["t1"],
+                },
+            },
+        )
+
+        self.assertTrue(resolved.is_followup)
+        self.assertEqual(resolved.relation, "followup")
+        self.assertEqual(resolved.query_resolution_mode, "current")
+        self.assertEqual(resolved.standalone_query, "普通员工出差的住宿标准")
+        self.assertEqual(resolved.context_turn_keys, ("t1",))
+        self.assertEqual(len(resolved.carryover_sources), 1)
+        self.assertEqual(resolved.carryover_sources[0]["id"], chunk_id)
+        self.assertEqual(
+            [item["role"] for item in resolved.history_messages],
+            ["user", "assistant"],
+        )
+
+    async def test_semantic_elliptical_followup_contextualizes_query(self) -> None:
+        conversation_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        user_message = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="user",
+            content="普通员工的出差标准是什么",
+            created_at=now - timedelta(seconds=2),
+        )
+        assistant_message = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="assistant",
+            content="普通员工属于 D 级。",
+            sources=[],
+            created_at=now - timedelta(seconds=1),
+        )
+        db = _FakeDB([assistant_message, user_message], [])
+        prepared = await prepare_conversation_context(
+            db,
+            conversation_id=conversation_id,
+            question="住宿呢",
+            kb_ids=[],
+        )
+        route_decision = parse_rag_route_decision(
+            {
+                "schema_version": "rag_route_decision.v1",
+                "readiness": "ready",
+                "intent_code": "knowledge_qa",
+                "relation": "followup",
+                "evidence_scope": "enterprise_kb",
+                "query_resolution": {
+                    "mode": "contextualize",
+                    "context_turn_keys": ["t1"],
+                },
+                "requirements": [
+                    {
+                        "role": "answer",
+                        "origin": "user_text",
+                        "description": "取得住宿标准",
+                    }
+                ],
+                "clarification": {"question": "", "unresolved": []},
+                "confidence": 0.95,
+                "rationale": "省略宾语的语义追问",
+            },
+            allowed_intent_codes=["knowledge_qa"],
+            available_turn_keys=["t1"],
+        )
+        resolved = await resolve_routed_conversation_context(
+            db,
+            context=prepared,
+            question="住宿呢",
+            kb_ids=[],
+            route_decision=route_decision,
+        )
+
+        self.assertTrue(resolved.is_followup)
+        self.assertEqual(resolved.query_resolution_mode, "contextualize")
+        self.assertEqual(resolved.context_turn_keys, ("t1",))
+        self.assertIn("住宿呢", resolved.standalone_query)
+        self.assertIn("普通员工", resolved.standalone_query)
+
     def test_explicit_reference_is_followup_but_new_topic_is_not(self) -> None:
         self.assertTrue(
             detect_followup(
@@ -68,7 +211,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     (False, "standalone_question"),
                 )
-        for question in ("那云枢7呢", "那8.6呢", "那这个版本呢"):
+        for question in ("那云枢7呢", "那8.6呢", "那这个版本呢", "云枢8.6呢"):
             with self.subTest(question=question):
                 self.assertTrue(
                     detect_followup(question, has_previous_turn=True)[0]
@@ -109,6 +252,10 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         unresolved = detect_followup("如果是8.6呢", has_previous_turn=False)
         self.assertFalse(unresolved[0])
         self.assertTrue(unresolved[1].startswith("unresolved_reference:"))
+
+        scoped_unresolved = detect_followup("云枢8.6呢", has_previous_turn=False)
+        self.assertFalse(scoped_unresolved[0])
+        self.assertTrue(scoped_unresolved[1].startswith("unresolved_reference:"))
 
     def test_missing_action_object_inherits_only_when_history_exists(self) -> None:
         followups = (

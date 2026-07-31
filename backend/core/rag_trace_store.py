@@ -395,6 +395,17 @@ async def _persist_batch(records: list[dict[str, Any]]) -> None:
             if timestamp < run.started_at:
                 run.started_at = timestamp
 
+            # Pipeline ``total_ms`` starts after synchronous intent routing, so
+            # copying it from ``generation.completed`` under-reports what the
+            # caller actually waited for.  A terminal event closes the run and
+            # therefore has enough information to replace any stage-only value
+            # with the wall-clock duration from the first observed event.
+            if event_name in _TERMINAL_EVENTS:
+                run.duration_ms = max(
+                    0,
+                    round((timestamp - run.started_at).total_seconds() * 1000),
+                )
+
             max_events = settings.rag_trace_max_events_per_run
             is_terminal = event_name in _TERMINAL_EVENTS
             # Reserve the final slot for success/error/cancel. Candidate bursts

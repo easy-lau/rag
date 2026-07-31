@@ -1,7 +1,7 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="max-w-6xl mx-auto space-y-6">
-      <PageHeader title="智能路由" description="分别记录用户意图、回答模式和检索策略，由后端策略层决定最终是否查询知识库。">
+      <PageHeader title="智能路由" description="分别展示模型语义决定与后端编译合同；只有通过策略和权限门禁后，任务才会进入检索或回答流程。">
         <template #meta>
           <n-tag :type="routingActive ? 'success' : 'default'" :bordered="false" round>
             {{ canRead ? (routingActive ? '路由已启用' : '路由未启用') : '无访问权限' }}
@@ -29,7 +29,7 @@
                 <span class="w-2 h-2 rounded-full bg-blue-500 inline-block"></span>
                 路由策略
               </h3>
-              <p class="mt-1 text-xs text-gray-400">模型只负责识别意图；回答模式和是否检索由服务端策略层独立决策，并继续受权限校验约束。</p>
+              <p class="mt-1 text-xs text-gray-400">模型只表达操作、会话关系和证据需求；回答模式、检索策略和执行授权由服务端确定性编译，并继续受权限校验约束。</p>
             </div>
             <div class="flex items-center gap-3">
               <span v-if="!canManage" class="text-xs text-gray-400">当前仅可查看</span>
@@ -71,6 +71,20 @@
               </n-form-item>
             </div>
           </n-form>
+          <div class="grid grid-cols-1 gap-3 border-t border-gray-100 pt-4 text-xs dark:border-gray-700 sm:grid-cols-3">
+            <div>
+              <div class="text-gray-400">语义协议</div>
+              <div class="mt-1 break-all font-mono text-gray-700 dark:text-gray-200">{{ config.route_schema_version || '未记录' }}</div>
+            </div>
+            <div>
+              <div class="text-gray-400">任务合同</div>
+              <div class="mt-1 break-all font-mono text-gray-700 dark:text-gray-200">{{ config.contract_schema_version || '未记录' }}</div>
+            </div>
+            <div>
+              <div class="text-gray-400">Prompt 版本</div>
+              <div class="mt-1 break-all font-mono text-gray-700 dark:text-gray-200">{{ config.prompt_version || '未记录' }}</div>
+            </div>
+          </div>
           </SurfaceCard>
 
           <!-- 意图分类 -->
@@ -96,7 +110,7 @@
           />
           </SurfaceCard>
 
-          <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+          <div class="grid grid-cols-1 gap-6">
           <!-- 在线测试 -->
           <SurfaceCard>
             <div class="flex items-start justify-between gap-3 mb-4">
@@ -105,63 +119,206 @@
                   <span class="w-2 h-2 rounded-full bg-orange-500 inline-block"></span>
                   在线测试
                 </h3>
-                <p class="mt-1 text-xs text-gray-400">只模拟无知识库场景下的最终路由决策，不会创建对话或执行真实检索。</p>
+                <p class="mt-1 text-xs text-gray-400">模拟当前输入、最近会话和知识库选择状态；只执行路由，不会创建对话、读取知识库或执行真实检索。</p>
               </div>
               <n-button type="primary" :loading="testing" :disabled="!testQuery.trim()" @click="runTest">测试路由</n-button>
             </div>
 
-            <n-input
-              v-model:value="testQuery" type="textarea" :rows="4"
-              placeholder="例如：请说明公司的报销审批流程"
-              @keyup.ctrl.enter="runTest"
-              @keyup.meta.enter="runTest"
-            />
-            <p class="mt-1.5 text-xs text-gray-400">按 Ctrl / Cmd + Enter 可快速测试。</p>
+            <n-form label-placement="top">
+              <n-form-item label="当前问题">
+                <n-input
+                  v-model:value="testQuery" type="textarea" :rows="4"
+                  :maxlength="12000" show-count
+                  placeholder="例如：住宿标准呢？"
+                  @keyup.ctrl.enter="runTest"
+                  @keyup.meta.enter="runTest"
+                />
+                <template #feedback>按 Ctrl / Cmd + Enter 可快速测试。</template>
+              </n-form-item>
 
-            <div v-if="testResult" class="mt-4 rounded-lg bg-gray-50 dark:bg-gray-700/40 border border-gray-100 dark:border-gray-700 p-4">
+              <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div class="text-sm font-medium text-gray-700 dark:text-gray-200">最近会话</div>
+                  <div class="mt-0.5 text-xs text-gray-400">按真实顺序提供必要上下文，最多 6 条；留空消息不会发送。</div>
+                </div>
+                <n-button
+                  secondary
+                  size="small"
+                  :disabled="testContextMessages.length >= MAX_TEST_CONTEXT_MESSAGES || testing"
+                  @click="addTestContextMessage"
+                >
+                  添加消息
+                </n-button>
+              </div>
+              <div
+                v-if="!testContextMessages.length"
+                class="mb-4 rounded-lg border border-dashed border-gray-200 px-4 py-3 text-xs text-gray-400 dark:border-gray-700"
+              >
+                当前按独立问题测试；如需验证“住宿呢”“补贴呢”等追问，请添加最近会话。
+              </div>
+              <div v-else class="mb-4 space-y-3">
+                <div
+                  v-for="(item, index) in testContextMessages"
+                  :key="item.id"
+                  class="grid grid-cols-1 items-start gap-2 rounded-lg border border-gray-100 p-3 dark:border-gray-700 sm:grid-cols-[120px_minmax(0,1fr)_auto]"
+                >
+                  <n-select
+                    v-model:value="item.role"
+                    :options="contextRoleOptions"
+                    :disabled="testing"
+                    :aria-label="`第 ${index + 1} 条消息角色`"
+                  />
+                  <n-input
+                    v-model:value="item.content"
+                    type="textarea"
+                    :rows="2"
+                    :maxlength="4000"
+                    show-count
+                    :disabled="testing"
+                    :placeholder="item.role === 'assistant' ? '上一轮助手回答' : '上一轮用户问题'"
+                    :aria-label="`第 ${index + 1} 条消息内容`"
+                  />
+                  <n-button
+                    text
+                    type="error"
+                    :disabled="testing"
+                    :aria-label="`删除第 ${index + 1} 条会话消息`"
+                    @click="removeTestContextMessage(item.id)"
+                  >
+                    删除
+                  </n-button>
+                </div>
+              </div>
+
+              <n-form-item label="模拟已选择知识库数量">
+                <n-input-number
+                  v-model:value="testSelectedKbCount"
+                  :min="0"
+                  :max="100"
+                  :step="1"
+                  :precision="0"
+                  :disabled="testing"
+                  class="w-full sm:max-w-xs"
+                />
+                <template #feedback>仅提供数量作为路由上下文，不读取真实知识库名称、文档或权限范围。</template>
+              </n-form-item>
+            </n-form>
+
+            <div v-if="testResult" class="mt-2 rounded-lg bg-gray-50 dark:bg-gray-700/40 border border-gray-100 dark:border-gray-700 p-4">
               <div class="flex flex-wrap items-center gap-2 mb-3">
                 <span class="text-sm font-medium text-gray-700 dark:text-gray-200">路由结果</span>
-                <n-tag type="info" size="small" :bordered="false">{{ testResult.intent_code || testResult.intent || 'unknown' }}</n-tag>
-                <n-tag size="small" :type="actionTagType(testAction)" :bordered="false">{{ actionLabel(testAction) }}</n-tag>
+                <n-tag type="info" size="small" :bordered="false">{{ operationLabel(semanticOperationFor(testResult)) }}</n-tag>
+                <n-tag size="small" :type="readinessTagType(readinessFor(testResult))" :bordered="false">
+                  {{ readinessLabel(readinessFor(testResult)) }}
+                </n-tag>
                 <n-tag size="small" :type="retrievalPolicyTagType(retrievalPolicyFor(testResult))" :bordered="false">
                   {{ retrievalPolicyLabel(retrievalPolicyFor(testResult)) }}
                 </n-tag>
               </div>
-              <div class="grid grid-cols-1 gap-x-4 gap-y-3 text-xs sm:grid-cols-2">
+
+              <section v-if="testRouteDecision" class="border-t border-gray-200 pt-3 dark:border-gray-600">
+                <h4 class="text-xs font-semibold text-gray-600 dark:text-gray-300">模型语义决定</h4>
+                <div class="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                  <div><div class="text-gray-400">语义意图</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ operationLabel(semanticOperationFor(testResult)) }}</div></div>
+                  <div><div class="text-gray-400">会话关系</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ relationLabel(testRouteDecision.relation) }}</div></div>
+                  <div><div class="text-gray-400">准备状态</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ readinessLabel(testRouteDecision.readiness) }}</div></div>
+                  <div><div class="text-gray-400">证据范围</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ evidenceScopeLabel(testRouteDecision.evidence_scope) }}</div></div>
+                  <div><div class="text-gray-400">查询处理</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ queryResolutionLabel(testRouteDecision.query_resolution?.mode || testRouteDecision.query_resolution_mode) }}</div></div>
+                  <div><div class="text-gray-400">绑定上下文</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ testRouteDecision.query_resolution?.context_turn_keys?.length || 0 }} 条</div></div>
+                  <div><div class="text-gray-400">置信度</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ formatConfidence(testRouteDecision.confidence) }}</div></div>
+                  <div><div class="text-gray-400">协议版本</div><div class="mt-0.5 break-all font-mono text-gray-700 dark:text-gray-200">{{ testRouteDecision.schema_version || '未记录' }}</div></div>
+                </div>
+                <div v-if="testRequirements.length" class="mt-3">
+                  <div class="text-xs text-gray-400">回答需求</div>
+                  <div class="mt-2 space-y-2">
+                    <div v-for="requirement in testRequirements" :key="requirement.id || requirement.description" class="rounded-lg border border-gray-200 px-3 py-2 text-xs dark:border-gray-600">
+                      <div class="flex flex-wrap items-center gap-2">
+                        <n-tag size="small" :bordered="false">{{ requirementRoleLabel(requirement.role) }}</n-tag>
+                        <span class="text-gray-500 dark:text-gray-400">{{ requirement.origin || '来源未记录' }}</span>
+                      </div>
+                      <p class="mt-1.5 break-words text-gray-700 dark:text-gray-200">{{ requirement.description || '未提供需求说明' }}</p>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="testClarificationQuestion" class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+                  澄清问题：{{ testClarificationQuestion }}
+                  <div v-if="testRouteDecision.clarification?.unresolved?.length" class="mt-1.5 text-amber-700 dark:text-amber-300">
+                    未解决项：{{ testRouteDecision.clarification.unresolved.map(item => `${item.role || '未命名'}（${item.reason || '未说明'}）`).join('、') }}
+                  </div>
+                </div>
+              </section>
+
+              <section v-if="testTaskContract" class="mt-4 border-t border-gray-200 pt-3 dark:border-gray-600">
+                <h4 class="text-xs font-semibold text-gray-600 dark:text-gray-300">后端编译合同</h4>
+                <div class="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                  <div><div class="text-gray-400">回答模式</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ responseModeLabel(responseModeFor(testResult)) }}</div></div>
+                  <div><div class="text-gray-400">检索策略</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ retrievalPolicyLabel(retrievalPolicyFor(testResult)) }}</div></div>
+                  <div><div class="text-gray-400">最终是否检索</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ booleanDecisionLabel(needsRetrievalValue(testResult)) }}</div></div>
+                  <div><div class="text-gray-400">允许执行</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ booleanDecisionLabel(dispatchAuthorizedFor(testResult)) }}</div></div>
+                  <div><div class="text-gray-400">合同状态</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ readinessLabel(testTaskContract.readiness) }}</div></div>
+                  <div><div class="text-gray-400">会话关系</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ relationLabel(testTaskContract.relation) }}</div></div>
+                  <div><div class="text-gray-400">查询处理</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ queryResolutionLabel(testTaskContract.query_mode || testTaskContract.query_resolution?.mode) }}</div></div>
+                  <div><div class="text-gray-400">知识库上下文</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ testTaskContract.selected_kb_count ?? 0 }} 个</div></div>
+                  <div><div class="text-gray-400">编译需求</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ Array.isArray(testTaskContract.requirements) ? testTaskContract.requirements.length : 0 }} 项</div></div>
+                  <div><div class="text-gray-400">合同版本</div><div class="mt-0.5 break-all font-mono text-gray-700 dark:text-gray-200">{{ testTaskContract.schema_version || '未记录' }}</div></div>
+                  <div class="sm:col-span-2 lg:col-span-3"><div class="text-gray-400">编译原因</div><div class="mt-0.5 break-words text-gray-700 dark:text-gray-200">{{ decisionReasonLabel(decisionReasonFor(testResult)) }}</div></div>
+                </div>
+                <div v-if="testTaskContract.clarification?.question" class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+                  合同澄清：{{ testTaskContract.clarification.question }}
+                </div>
+              </section>
+
+              <section v-if="!testRouteDecision && !testTaskContract" class="border-t border-gray-200 pt-3 dark:border-gray-600">
+                <div class="grid grid-cols-1 gap-x-4 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+                  <div><div class="text-gray-400">旧版意图</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ testResult.intent_name || testResult.intent_code || testResult.intent || '未记录' }}</div></div>
+                  <div><div class="text-gray-400">分类动作</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ actionLabel(testAction) }}</div></div>
+                  <div><div class="text-gray-400">回答模式</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ responseModeLabel(responseModeFor(testResult)) }}</div></div>
+                  <div><div class="text-gray-400">最终是否检索</div><div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ booleanDecisionLabel(needsRetrievalValue(testResult)) }}</div></div>
+                </div>
+              </section>
+
+              <section class="mt-4 border-t border-gray-200 pt-3 dark:border-gray-600">
+                <h4 class="text-xs font-semibold text-gray-600 dark:text-gray-300">诊断摘要</h4>
+                <div class="mt-3 grid grid-cols-1 gap-x-4 gap-y-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
                 <div>
                   <div class="text-gray-400">判定来源</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ sourceLabel(testResult.decision_source || testResult.source) }}</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ sourceLabel(testDiagnostics.source || testResult.decision_source || testResult.source) }}</div>
                 </div>
                 <div>
-                  <div class="text-gray-400">置信度</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ formatConfidence(testResult.confidence) }}</div>
+                  <div class="text-gray-400">Schema 校验</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ diagnosticBooleanLabel(testDiagnostics.schema_valid) }}</div>
                 </div>
                 <div>
-                  <div class="text-gray-400">最终是否检索</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ needsRetrieval(testResult) ? '是' : '否' }}</div>
+                  <div class="text-gray-400">输出约束</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ structuredOutputLabel(testDiagnostics) }}</div>
                 </div>
                 <div>
-                  <div class="text-gray-400">回答模式</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ responseModeLabel(responseModeFor(testResult)) }}</div>
+                  <div class="text-gray-400">格式修复</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ diagnosticBooleanLabel(testDiagnostics.repair_used, '已使用', '未使用') }}</div>
                 </div>
                 <div>
-                  <div class="text-gray-400">检索策略</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ retrievalPolicyLabel(retrievalPolicyFor(testResult)) }}</div>
+                  <div class="text-gray-400">备用 / 兜底</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ diagnosticBooleanLabel(testDiagnostics.fallback_used, '已使用', '未使用') }}</div>
+                </div>
+                <div>
+                  <div class="text-gray-400">Prompt 版本</div>
+                  <div class="mt-0.5 break-all font-mono text-gray-700 dark:text-gray-200">{{ testDiagnostics.prompt_version || '未记录' }}</div>
+                </div>
+                <div>
+                  <div class="text-gray-400">模型</div>
+                  <div class="mt-0.5 break-all text-gray-700 dark:text-gray-200">{{ testDiagnostics.model || testDiagnostics.route_model || '未记录' }}</div>
                 </div>
                 <div>
                   <div class="text-gray-400">执行状态</div>
                   <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ retrievalExecutionLabel(testResult, true) }}</div>
                 </div>
-                <div>
-                  <div class="text-gray-400">证据状态</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ evidenceStatusLabel(testResult.evidence_status, true) }}</div>
-                </div>
-                <div v-if="testResult.latency_ms !== undefined && testResult.latency_ms !== null">
+                <div v-if="testDiagnostics.latency_ms !== undefined && testDiagnostics.latency_ms !== null">
                   <div class="text-gray-400">耗时</div>
-                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ testResult.latency_ms }} ms</div>
+                  <div class="mt-0.5 text-gray-700 dark:text-gray-200">{{ testDiagnostics.latency_ms }} ms</div>
                 </div>
               </div>
-              <div v-if="testReason" class="mt-3 border-t border-gray-200 pt-3 text-xs leading-relaxed text-gray-500 dark:border-gray-600 dark:text-gray-400">
+              </section>
+              <div v-if="testReason && !testTaskContract" class="mt-3 border-t border-gray-200 pt-3 text-xs leading-relaxed text-gray-500 dark:border-gray-600 dark:text-gray-400">
                 <span class="text-gray-400">策略原因：</span>
                 <span :title="testReason">{{ decisionReasonLabel(testReason) }}</span>
               </div>
@@ -172,9 +329,9 @@
           <section class="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-gray-800 dark:to-gray-800 rounded-xl border border-blue-100 dark:border-gray-700 p-5 sm:p-6">
             <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200">安全的路由边界</h3>
             <div class="mt-4 space-y-3 text-sm text-gray-600 dark:text-gray-300">
-              <div class="flex gap-3"><span class="text-blue-500 font-semibold">1</span><span>规则和模型只产生意图分类，不能直接控制接口、知识库或越过权限边界。</span></div>
-              <div class="flex gap-3"><span class="text-blue-500 font-semibold">2</span><span>后端策略层结合意图与知识库选择状态，独立确定回答模式和检索策略。</span></div>
-              <div class="flex gap-3"><span class="text-blue-500 font-semibold">3</span><span>日志同时记录原始分类、最终策略和证据状态，便于区分“跳过检索”与“检索无命中”。</span></div>
+              <div class="flex gap-3"><span class="text-blue-500 font-semibold">1</span><span>规则和模型只产生语义决定，不能直接控制接口、知识库或越过权限边界。</span></div>
+              <div class="flex gap-3"><span class="text-blue-500 font-semibold">2</span><span>后端编译器结合语义决定与知识库选择状态，独立确定回答模式、检索策略和执行授权。</span></div>
+              <div class="flex gap-3"><span class="text-blue-500 font-semibold">3</span><span>日志同时记录语义决定、编译合同和证据状态，便于区分“等待澄清”“跳过检索”与“检索无命中”。</span></div>
             </div>
           </section>
           </div>
@@ -305,6 +462,11 @@ const savingCategory = ref(false)
 const testing = ref(false)
 const testQuery = ref('')
 const testResult = ref(null)
+const testContextMessages = ref([])
+const testSelectedKbCount = ref(0)
+
+const MAX_TEST_CONTEXT_MESSAGES = 6
+let testContextMessageSequence = 0
 
 const categoryModalVisible = ref(false)
 const editingCategoryId = ref(null)
@@ -327,6 +489,10 @@ const actionOptions = [
   { label: '通用回答', value: 'chat' },
   { label: '写作 / 润色', value: 'writing' },
   { label: '系统使用帮助', value: 'system_help' },
+]
+const contextRoleOptions = [
+  { label: '用户', value: 'user' },
+  { label: '助手', value: 'assistant' },
 ]
 const fallbackOptions = computed(() => {
   const items = categories.value
@@ -394,35 +560,66 @@ const logColumns = [
     render: row => h('span', { class: 'whitespace-nowrap' }, formatTime(row.created_at)),
   },
   {
-    title: '识别意图', key: 'intent_code', width: 190, align: 'left', titleAlign: 'left',
-    render: row => h('div', { class: 'flex min-w-0 flex-col gap-0.5 py-1' }, [
-      h('span', { class: 'text-sm truncate' }, row.intent_name || '—'),
-      h('code', {
-        class: 'truncate text-xs text-blue-600 dark:text-blue-400',
-        title: row.intent_code || row.intent || '',
-      }, row.intent_code || row.intent || '—'),
-    ]),
+    title: '语义决定', key: 'intent_code', width: 210, align: 'left', titleAlign: 'left',
+    render: row => {
+      const operation = semanticOperationFor(row)
+      const readiness = semanticReadinessFor(row)
+      const semanticName = taskContractFor(row)?.intent_name || row.intent_name || operationLabel(operation)
+      return h('div', { class: 'flex min-w-0 flex-col items-start gap-1 py-1' }, [
+        h('span', { class: 'text-sm truncate' }, semanticName),
+        h('code', {
+          class: 'truncate text-xs text-blue-600 dark:text-blue-400',
+          title: operation,
+        }, operation || '—'),
+        readiness
+          ? h(NTag, { size: 'small', type: readinessTagType(readiness), bordered: false }, () => readinessLabel(readiness))
+          : null,
+      ])
+    },
   },
   {
-    title: '分类动作', key: 'action', width: 115, align: 'center', titleAlign: 'center',
-    render: row => h(NTag, { size: 'small', type: actionTagType(row.action), bordered: false }, () => actionLabel(row.action)),
+    title: '会话 / 证据', key: 'relation', width: 145, align: 'left', titleAlign: 'left',
+    render: row => {
+      const relation = relationFor(row)
+      const scope = evidenceScopeFor(row)
+      if (!relation && !scope) {
+        return h(NTag, { size: 'small', type: actionTagType(row.action), bordered: false }, () => actionLabel(row.action))
+      }
+      return h('div', { class: 'flex min-w-0 flex-col items-start gap-1 py-1' }, [
+        h('span', { class: 'text-sm' }, relationLabel(relation)),
+        h('span', { class: 'truncate text-xs text-gray-400', title: scope }, evidenceScopeLabel(scope)),
+      ])
+    },
   },
   {
     title: '判定', key: 'decision_source', width: 115, align: 'center', titleAlign: 'center',
-    render: row => h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
-      h('span', { class: 'text-sm' }, sourceLabel(row.decision_source || row.source)),
-      h('span', { class: 'text-xs text-gray-400' }, formatConfidence(row.confidence)),
-    ]),
+    render: row => {
+      const diagnostics = diagnosticsFor(row)
+      const decision = explicitRouteDecisionFor(row)
+      return h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
+        h('span', { class: 'text-sm' }, sourceLabel(diagnostics.source || row.decision_source || row.source)),
+        h('span', { class: 'text-xs text-gray-400' }, formatConfidence(decision?.confidence ?? row.confidence)),
+        diagnostics.repair_used
+          ? h('span', { class: 'text-xs text-amber-600 dark:text-amber-400' }, '已修复格式')
+          : null,
+      ])
+    },
   },
   {
     title: '最终策略', key: 'retrieval_policy', width: 230, align: 'left', titleAlign: 'left',
-    render: row => h('div', { class: 'flex min-w-0 flex-col gap-1.5 py-1' }, [
-      h('div', { class: 'flex items-center gap-1.5 whitespace-nowrap' }, [
-        h(NTag, { size: 'small', type: responseModeTagType(responseModeFor(row)), bordered: false }, () => responseModeLabel(responseModeFor(row))),
-        h(NTag, { size: 'small', type: retrievalPolicyTagType(retrievalPolicyFor(row)), bordered: false }, () => retrievalPolicyLabel(retrievalPolicyFor(row))),
-      ]),
-      h('span', { class: 'text-xs text-gray-500 dark:text-gray-400' }, `最终检索：${needsRetrieval(row) ? '是' : '否'}`),
-    ]),
+    render: row => {
+      const contract = taskContractFor(row)
+      return h('div', { class: 'flex min-w-0 flex-col gap-1.5 py-1' }, [
+        h('div', { class: 'flex items-center gap-1.5 whitespace-nowrap' }, [
+          h(NTag, { size: 'small', type: responseModeTagType(responseModeFor(row)), bordered: false }, () => responseModeLabel(responseModeFor(row))),
+          h(NTag, { size: 'small', type: retrievalPolicyTagType(retrievalPolicyFor(row)), bordered: false }, () => retrievalPolicyLabel(retrievalPolicyFor(row))),
+        ]),
+        h('span', { class: 'text-xs text-gray-500 dark:text-gray-400' }, `最终检索：${booleanDecisionLabel(needsRetrievalValue(row))}`),
+        contract
+          ? h('span', { class: 'text-xs text-gray-400' }, `合同：${readinessLabel(contract.readiness)} · ${contract.dispatch_authorized ? '允许执行' : '禁止执行'}`)
+          : null,
+      ])
+    },
   },
   {
     title: '策略原因', key: 'decision_reason', width: 220, align: 'left', titleAlign: 'left',
@@ -449,10 +646,18 @@ const logColumns = [
   },
   {
     title: '上下文', key: 'selected_kb_count', width: 125, align: 'center', titleAlign: 'center',
-    render: row => h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
-      h('span', { class: 'text-sm' }, `${row.selected_kb_count ?? 0} 个知识库`),
-      h('span', { class: 'text-xs text-gray-400' }, row.latency_ms === undefined || row.latency_ms === null ? '耗时 —' : `${row.latency_ms} ms`),
-    ]),
+    render: row => {
+      const diagnostics = diagnosticsFor(row)
+      const selectedKbCount = taskContractFor(row)?.selected_kb_count
+        ?? row.selected_kb_count ?? row.context?.selected_kb_count ?? 0
+      const latencyMs = diagnostics.latency_ms ?? row.latency_ms
+      const resolutionMode = queryResolutionModeFor(row)
+      return h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
+        h('span', { class: 'text-sm' }, `${selectedKbCount} 个知识库`),
+        resolutionMode ? h('span', { class: 'text-xs text-gray-400' }, queryResolutionLabel(resolutionMode)) : null,
+        h('span', { class: 'text-xs text-gray-400' }, latencyMs === undefined || latencyMs === null ? '耗时 —' : `${latencyMs} ms`),
+      ])
+    },
   },
   {
     title: '反馈', key: 'feedback', width: 100, align: 'center', titleAlign: 'center',
@@ -473,6 +678,15 @@ const logColumns = [
   },
 ]
 
+const testRouteDecision = computed(() => explicitRouteDecisionFor(testResult.value))
+const testTaskContract = computed(() => taskContractFor(testResult.value))
+const testDiagnostics = computed(() => diagnosticsFor(testResult.value))
+const testRequirements = computed(() => (
+  Array.isArray(testRouteDecision.value?.requirements) ? testRouteDecision.value.requirements : []
+))
+const testClarificationQuestion = computed(() => (
+  testRouteDecision.value?.clarification?.question || testRouteDecision.value?.clarification_question || ''
+))
 const testAction = computed(() => testResult.value?.action || testResult.value?.route_action || '')
 const testReason = computed(() => decisionReasonFor(testResult.value))
 
@@ -658,26 +872,62 @@ async function confirmDeleteCategory() {
   }
 }
 
+function addTestContextMessage() {
+  if (testContextMessages.value.length >= MAX_TEST_CONTEXT_MESSAGES) return
+  testContextMessageSequence += 1
+  testContextMessages.value.push({
+    id: `context-${testContextMessageSequence}`,
+    role: testContextMessages.value.at(-1)?.role === 'user' ? 'assistant' : 'user',
+    content: '',
+  })
+}
+
+function removeTestContextMessage(id) {
+  testContextMessages.value = testContextMessages.value.filter(item => item.id !== id)
+}
+
 async function runTest() {
   const query = testQuery.value.trim()
   if (!query) return
   testing.value = true
   testResult.value = null
   try {
-    const data = await testIntentRouting({ question: query })
-    testResult.value = data?.decision
-      ? {
-          ...data.decision,
-          latency_ms: data.latency_ms,
-          retrieval_executed: data.retrieval_executed ?? data.decision.retrieval_executed,
-          evidence_status: data.evidence_status ?? data.decision.evidence_status,
-          hit_count: data.hit_count ?? data.decision.hit_count,
-        }
-      : data
+    const contextMessages = testContextMessages.value
+      .map(item => ({ role: item.role, content: item.content.trim() }))
+      .filter(item => item.content)
+    const data = await testIntentRouting({
+      question: query,
+      current_input: query,
+      context_messages: contextMessages,
+      selected_kb_count: Math.max(0, Math.trunc(Number(testSelectedKbCount.value) || 0)),
+    })
+    testResult.value = normalizeTestResult(data)
   } catch (error) {
     showError(error, '测试路由失败')
   } finally {
     testing.value = false
+  }
+}
+
+function normalizeTestResult(data) {
+  const routeDecision = explicitRouteDecisionFor(data)
+  const taskContract = taskContractFor(data)
+  const diagnostics = {
+    ...diagnosticsFor(data),
+    latency_ms: diagnosticsFor(data).latency_ms ?? data?.latency_ms ?? null,
+  }
+  const legacyDecision = data?.decision && !routeDecision
+    ? data.decision
+    : (!routeDecision && !taskContract ? data : {})
+  return {
+    ...(legacyDecision || {}),
+    route_decision: routeDecision,
+    task_contract: taskContract,
+    diagnostics,
+    latency_ms: diagnostics.latency_ms,
+    retrieval_executed: data?.retrieval_executed ?? legacyDecision?.retrieval_executed,
+    evidence_status: data?.evidence_status ?? legacyDecision?.evidence_status,
+    hit_count: data?.hit_count ?? legacyDecision?.hit_count,
   }
 }
 
@@ -711,9 +961,162 @@ function actionTagType(action) {
   }[action] || 'default'
 }
 
+function explicitRouteDecisionFor(result) {
+  if (!result || typeof result !== 'object') return null
+  const nested = result.route_decision || result.semantic_decision || result.decision?.route_decision
+  if (nested && typeof nested === 'object') return nested
+  const nestedDecisionVersion = String(result.decision?.schema_version || '')
+  if (nestedDecisionVersion.startsWith('rag_route_decision.') || nestedDecisionVersion.startsWith('route_decision.')) {
+    return result.decision
+  }
+  const schemaVersion = String(result.schema_version || '')
+  return schemaVersion.startsWith('rag_route_decision.') || schemaVersion.startsWith('route_decision.')
+    ? result
+    : null
+}
+
+function taskContractFor(result) {
+  if (!result || typeof result !== 'object') return null
+  const contract = result.task_contract || result.contract || result.execution_contract
+    || result.route_summary || result.decision?.task_contract
+  if (contract && typeof contract === 'object') return contract
+  const nestedDecisionVersion = String(result.decision?.schema_version || '')
+  if (nestedDecisionVersion.startsWith('rag_task_contract.') || nestedDecisionVersion.startsWith('task_contract.')) {
+    return result.decision
+  }
+  const schemaVersion = String(result.schema_version || '')
+  return schemaVersion.startsWith('rag_task_contract.') || schemaVersion.startsWith('task_contract.')
+    ? result
+    : null
+}
+
+function diagnosticsFor(result) {
+  if (!result || typeof result !== 'object') return {}
+  const raw = result.diagnostics && typeof result.diagnostics === 'object' ? result.diagnostics : {}
+  const fallbackSignals = [
+    raw.fallback_model_used,
+    raw.safe_fallback_used,
+    result.fallback_model_used,
+    result.safe_fallback_used,
+  ].filter(value => typeof value === 'boolean')
+  return {
+    ...raw,
+    source: raw.source ?? taskContractFor(result)?.source ?? result.decision_source ?? result.source,
+    schema_valid: raw.schema_valid ?? result.schema_valid ?? result.route_schema_valid,
+    strict_schema_used: raw.strict_schema_used ?? result.strict_schema_used,
+    json_object_fallback_used: raw.json_object_fallback_used ?? result.json_object_fallback_used,
+    repair_used: raw.repair_used ?? raw.repair_attempted ?? result.repair_used,
+    fallback_used: raw.fallback_used ?? result.fallback_used
+      ?? (fallbackSignals.length ? fallbackSignals.some(Boolean) : undefined),
+    latency_ms: raw.latency_ms ?? result.latency_ms,
+  }
+}
+
+function semanticOperationFor(result) {
+  const decision = explicitRouteDecisionFor(result)
+  return decision?.operation || decision?.intent_code || result?.operation || result?.intent_code || result?.intent || ''
+}
+
+function relationFor(result) {
+  const decision = explicitRouteDecisionFor(result)
+  return decision?.relation || taskContractFor(result)?.relation
+    || result?.relation || result?.conversation_relation || ''
+}
+
+function readinessFor(result) {
+  return taskContractFor(result)?.readiness || semanticReadinessFor(result)
+}
+
+function semanticReadinessFor(result) {
+  const decision = explicitRouteDecisionFor(result)
+  return decision?.readiness || taskContractFor(result)?.readiness || result?.readiness || ''
+}
+
+function evidenceScopeFor(result) {
+  const decision = explicitRouteDecisionFor(result)
+  return decision?.evidence_scope || taskContractFor(result)?.evidence_scope || result?.evidence_scope || ''
+}
+
+function queryResolutionModeFor(result) {
+  const decision = explicitRouteDecisionFor(result)
+  return decision?.query_resolution?.mode || decision?.query_resolution_mode
+    || taskContractFor(result)?.query_mode || result?.query_resolution_mode || result?.query_mode || ''
+}
+
+function operationLabel(operation) {
+  return {
+    knowledge_qa: '知识库问答',
+    general_chat: '通用交流',
+    writing: '写作 / 润色',
+    platform_help: '平台帮助',
+    system_help: '平台帮助',
+    other: '未识别问题',
+  }[operation] || operation || '未记录'
+}
+
+function relationLabel(relation) {
+  return {
+    new: '新任务',
+    standalone: '独立问题',
+    followup: '追问',
+    refinement: '细化追问',
+    correction: '修正',
+    continuation: '继续任务',
+  }[relation] || relation || '未记录'
+}
+
+function readinessLabel(readiness) {
+  return {
+    ready: '可编译',
+    needs_clarification: '需要澄清',
+    blocked: '不可执行',
+  }[readiness] || readiness || '未记录'
+}
+
+function readinessTagType(readiness) {
+  return {
+    ready: 'success',
+    needs_clarification: 'warning',
+    blocked: 'error',
+  }[readiness] || 'default'
+}
+
+function evidenceScopeLabel(scope) {
+  return {
+    enterprise_kb: '企业知识库',
+    current_input: '当前输入',
+    general_world: '通用知识',
+    platform_self: '当前平台',
+    mixed: '混合范围',
+  }[scope] || scope || '未记录'
+}
+
+function queryResolutionLabel(mode) {
+  return {
+    current: '使用当前问题',
+    contextualize: '结合上下文解析',
+    use_current: '使用当前问题',
+    rewrite_with_context: '结合上下文改写',
+    use_context: '使用会话上下文',
+    clarify: '先澄清',
+  }[mode] || mode || '未记录'
+}
+
+function requirementRoleLabel(role) {
+  return {
+    answer: '回答需求',
+    bridge: '推理桥接',
+    constraint: '约束',
+  }[role] || role || '未分类'
+}
+
 function responseModeFor(result) {
   if (!result) return ''
+  const contract = taskContractFor(result)
+  const contractMode = contract?.response_mode || contract?.execution?.response_mode
+  if (contractMode) return contractMode
   if (result.response_mode) return result.response_mode
+  if (explicitRouteDecisionFor(result)) return ''
   return ({
     retrieve: 'grounded_qa',
     chat: 'general_chat',
@@ -742,8 +1145,15 @@ function responseModeTagType(mode) {
 
 function retrievalPolicyFor(result) {
   if (!result) return ''
+  const contract = taskContractFor(result)
+  const contractPolicy = contract?.retrieval_policy || contract?.retrieval?.policy || contract?.execution?.retrieval_policy
+  if (contractPolicy) return contractPolicy
   if (result.retrieval_policy) return result.retrieval_policy
-  return needsRetrieval(result) ? 'required' : 'skip'
+  if (explicitRouteDecisionFor(result)) return ''
+  const needRetrieval = needsRetrievalValue(result)
+  if (needRetrieval === true) return 'required'
+  if (needRetrieval === false) return 'skip'
+  return ''
 }
 
 function retrievalPolicyLabel(policy) {
@@ -763,7 +1173,8 @@ function retrievalPolicyTagType(policy) {
 }
 
 function decisionReasonFor(result) {
-  return result?.decision_reason || result?.reason || result?.message || ''
+  const contract = taskContractFor(result)
+  return contract?.decision_reason || contract?.reason || result?.decision_reason || result?.reason || result?.message || ''
 }
 
 function decisionReasonLabel(reason) {
@@ -849,11 +1260,42 @@ function formatConfidence(value) {
   return Number.isFinite(numeric) ? `${Math.round(numeric * 100)}%` : '—'
 }
 
-function needsRetrieval(result) {
-  if (!result) return false
-  if (result.need_retrieval !== undefined) return !!result.need_retrieval
-  if (result.needs_retrieval !== undefined) return !!result.needs_retrieval
-  return (result.action || result.route_action) === 'retrieve'
+function needsRetrievalValue(result) {
+  if (!result) return null
+  const contract = taskContractFor(result)
+  const contractValue = contract?.need_retrieval ?? contract?.needs_retrieval
+    ?? contract?.retrieval?.required ?? contract?.execution?.need_retrieval
+  if (typeof contractValue === 'boolean') return contractValue
+  if (typeof result.need_retrieval === 'boolean') return result.need_retrieval
+  if (typeof result.needs_retrieval === 'boolean') return result.needs_retrieval
+  if (explicitRouteDecisionFor(result) || contract) return null
+  const action = result.action || result.route_action
+  return action ? action === 'retrieve' : null
+}
+
+function dispatchAuthorizedFor(result) {
+  const contract = taskContractFor(result)
+  const value = contract?.dispatch_authorized ?? contract?.dispatchAuthorized
+    ?? contract?.execution?.dispatch_authorized ?? result?.dispatch_authorized
+  return typeof value === 'boolean' ? value : null
+}
+
+function booleanDecisionLabel(value) {
+  if (value === true) return '是'
+  if (value === false) return '否'
+  return '未记录'
+}
+
+function diagnosticBooleanLabel(value, trueLabel = '通过', falseLabel = '未通过') {
+  if (value === true) return trueLabel
+  if (value === false) return falseLabel
+  return '未记录'
+}
+
+function structuredOutputLabel(diagnostics) {
+  if (diagnostics?.json_object_fallback_used === true) return 'JSON Object 兼容模式'
+  if (diagnostics?.strict_schema_used === true) return 'Strict JSON Schema'
+  return '未记录'
 }
 
 function formatTime(value) {

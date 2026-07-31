@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ── Knowledge Base ──────────────────────────────────────────────
@@ -319,6 +319,7 @@ IntentEvidenceStatus = Literal[
     "version_mismatch",
     "no_hit",
     "unverified",
+    "needs_clarification",
     "error",
 ]
 IntentFeedback = Literal["correct", "incorrect"]
@@ -330,6 +331,9 @@ class IntentRouterConfigOut(BaseModel):
     confidence_threshold: float = Field(..., ge=0, le=1)
     fallback_intent_code: str = Field(..., min_length=1, max_length=64)
     allow_general_chat: bool
+    route_schema_version: str
+    contract_schema_version: str
+    prompt_version: str
 
 
 class IntentRouterConfigUpdate(BaseModel):
@@ -385,13 +389,38 @@ class IntentDecisionOut(BaseModel):
     source: str
 
 
+class IntentRouteContextMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
 class IntentRouteTestRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=12000)
+    # ``question`` is retained for old clients; the v1 sandbox uses
+    # ``current_input`` and never loads a real conversation or KB document.
+    question: str | None = Field(None, min_length=1, max_length=12000)
+    current_input: str | None = Field(None, min_length=1, max_length=12000)
+    context_messages: list[IntentRouteContextMessage] = Field(
+        default_factory=list,
+        max_length=6,
+    )
+    selected_kb_count: int = Field(0, ge=0, le=100)
     knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_current_input(self):
+        value = (self.current_input or self.question or "").strip()
+        if not value:
+            raise ValueError("current_input 或 question 不能为空")
+        self.current_input = value
+        self.question = value
+        return self
 
 
 class IntentRouteTestResponse(BaseModel):
     decision: IntentDecisionOut
+    route_decision: dict[str, Any] | None = None
+    task_contract: dict[str, Any] | None = None
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
     latency_ms: int = Field(..., ge=0)
 
 
@@ -413,6 +442,8 @@ class IntentRouteLogOut(BaseModel):
     retrieval_executed: bool | None = None
     evidence_status: IntentEvidenceStatus | None = None
     hit_count: int | None = None
+    trace_id: str | None = None
+    route_summary: dict[str, Any] | None = None
     feedback: IntentFeedback | None = None
     feedback_at: datetime | None = None
     created_at: datetime

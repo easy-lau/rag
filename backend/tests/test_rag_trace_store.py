@@ -13,6 +13,8 @@ from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
 from api.rag_traces import (
+    _TRACE_CORE_EVENTS,
+    _clarification_lifecycle_snapshot,
     _encode_bounded_trace_export,
     _load_bounded_export_events,
     _rag_trace_export_payload,
@@ -584,6 +586,7 @@ class RagTraceStoreTests(unittest.TestCase):
                 "added_candidate_count": 10,
                 "combined_candidate_count": 22,
                 "counts_by_origin": {
+                    "small_document_full": 15,
                     "document_scoped": 6,
                     "adjacent": 2,
                     "same_section": 2,
@@ -675,6 +678,12 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertEqual(
             snapshot["retrieval_expansion_result"]["combined_candidate_count"],
             22,
+        )
+        self.assertEqual(
+            snapshot["retrieval_expansion_result"]["counts_by_origin"][
+                "small_document_full"
+            ],
+            15,
         )
         self.assertEqual(snapshot["retrieval_expansion_result"]["error_count"], 0)
         self.assertEqual(snapshot["rerank_joint_result"]["model"], "rerank/model-v2")
@@ -802,6 +811,128 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertEqual([event.event for event in selected], ["intent.routing_decision", "chat.response"])
         self.assertTrue(stats["truncated"])
         self.assertEqual(stats["omitted_event_count"], 1)
+
+    def test_clarification_expired_is_core_and_has_safe_lifecycle_summary(self) -> None:
+        run, _events, timestamp = _stored_trace(content_included=False)
+        expired = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=1,
+            event="intent.clarification_expired",
+            payload={
+                "event": "intent.clarification_expired",
+                "route_state_revision": 3,
+                # Imported or legacy rows must not copy arbitrary fields into the
+                # compact diagnostic snapshot.
+                "clarification": "不应进入诊断摘要的业务正文",
+            },
+            created_at=timestamp,
+        )
+        verbose = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=2,
+            event="retrieval.candidate",
+            payload={"event": "retrieval.candidate", "candidate_content": "x" * 1000},
+            created_at=timestamp,
+        )
+        terminal = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=3,
+            event="chat.response",
+            payload={"event": "chat.response", "evidence_status": "skipped"},
+            created_at=timestamp,
+        )
+        all_events = [expired, verbose, terminal]
+        metadata = [
+            (event.id, event.sequence, event.event, len(json.dumps(event.payload)))
+            for event in all_events
+        ]
+        db = SimpleNamespace(execute=AsyncMock(side_effect=[
+            _TraceRowsResult(metadata),
+            _TraceEventsResult([expired, terminal]),
+        ]))
+
+        self.assertIn("intent.clarification_expired", _TRACE_CORE_EVENTS)
+        with patch("api.rag_traces.TRACE_EXPORT_MAX_EVENTS", 2):
+            selected, stats = asyncio.run(_load_bounded_export_events(db, run.trace_id))
+
+        self.assertEqual(
+            [event.event for event in selected],
+            ["intent.clarification_expired", "chat.response"],
+        )
+        self.assertTrue(stats["truncated"])
+
+        run.event_count = 2
+        run.observed_event_count = 2
+        snapshot = _rag_trace_export_payload(
+            run,
+            [expired, terminal],
+            exported_at=timestamp,
+        )["diagnostic_index"]["snapshot"]
+        lifecycle = snapshot["clarification_lifecycle"]
+        self.assertEqual(lifecycle["created_count"], 0)
+        self.assertEqual(lifecycle["resolved_count"], 0)
+        self.assertEqual(lifecycle["expired_count"], 1)
+        self.assertEqual(lifecycle["events"], [{
+            "event": "intent.clarification_expired",
+            "route_state_revision": 3,
+        }])
+        self.assertNotIn("clarification", lifecycle["events"][0])
+
+    def test_trace_export_summarizes_evidence_clarification_lifecycle(self) -> None:
+        events = [
+            {
+                "event": "evidence.clarification_created",
+                "payload": {
+                    "route_state_revision": 4,
+                    "selected_kb_count": 2,
+                    "choice_count": 2,
+                    "original_query": "不应进入摘要",
+                },
+            },
+            {
+                "event": "evidence.clarification_repeated",
+                "payload": {
+                    "route_state_revision": 4,
+                    "choice_count": 2,
+                    "clarification_message": "不应进入摘要",
+                },
+            },
+            {
+                "event": "evidence.clarification_resolved",
+                "payload": {
+                    "route_state_revision": 5,
+                    "selected_choice_keys": ["c2"],
+                },
+            },
+        ]
+
+        lifecycle = _clarification_lifecycle_snapshot(events)
+
+        self.assertEqual(lifecycle["created_count"], 1)
+        self.assertEqual(lifecycle["repeated_count"], 1)
+        self.assertEqual(lifecycle["resolved_count"], 1)
+        self.assertEqual(lifecycle["expired_count"], 0)
+        self.assertEqual(
+            lifecycle["events"][0],
+            {
+                "event": "evidence.clarification_created",
+                "route_state_revision": 4,
+                "selected_kb_count": 2,
+                "choice_count": 2,
+            },
+        )
+        self.assertNotIn("original_query", lifecycle["events"][0])
+        for event_name in (
+            "evidence.clarification_created",
+            "evidence.clarification_repeated",
+            "evidence.clarification_resolved",
+            "evidence.scope_filter_applied",
+            "generation.skipped",
+        ):
+            self.assertIn(event_name, _TRACE_CORE_EVENTS)
 
     def test_trace_export_limit_preserves_new_expansion_and_coverage_core_events(self) -> None:
         run, _events, timestamp = _stored_trace(content_included=False)
@@ -979,6 +1110,48 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertTrue(run.storage_truncated)
         self.assertEqual(run.status, "success")
         self.assertEqual(session.commits, 1)
+
+    def test_terminal_event_replaces_pipeline_duration_with_wall_clock_duration(self) -> None:
+        records = [
+            {
+                "trace_id": "trace-wall-clock",
+                "event": "chat.request",
+                "timestamp": "2026-07-30T10:00:00+00:00",
+            },
+            {
+                "trace_id": "trace-wall-clock",
+                "event": "generation.completed",
+                "timestamp": "2026-07-30T10:00:47.047+00:00",
+                "total_ms": 47_047,
+            },
+            {
+                "trace_id": "trace-wall-clock",
+                "event": "chat.response",
+                "timestamp": "2026-07-30T10:01:04.668+00:00",
+                # This is intentionally the pipeline-only value present in the
+                # supplied traces. Persistence must not retain it as E2E time.
+                "total_ms": 47_047,
+            },
+        ]
+        session = _PersistSession()
+        settings = SimpleNamespace(
+            rag_trace_max_events_per_run=10,
+            rag_trace_content_max_chars=50_000,
+        )
+
+        with (
+            patch("core.rag_trace_store.AsyncSessionLocal", return_value=session),
+            patch("core.rag_trace_store.get_settings", return_value=settings),
+        ):
+            asyncio.run(trace_store._persist_batch(records))
+
+        run = next(item for item in session.added if isinstance(item, RagTraceRun))
+        self.assertEqual(run.duration_ms, 64_668)
+        self.assertEqual(run.status, "success")
+        self.assertEqual(
+            run.completed_at,
+            datetime(2026, 7, 30, 10, 1, 4, 668000, tzinfo=UTC),
+        )
 
     def test_disabled_collection_still_starts_retention_cleanup(self) -> None:
         previous_queue = trace_store._queue

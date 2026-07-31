@@ -201,7 +201,7 @@ class ChatHistoricalSourceScopeTests(unittest.IsolatedAsyncioTestCase):
         conversation_id = uuid.uuid4()
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()
-        for evidence_status in ("no_hit", "skipped", "error"):
+        for evidence_status in ("no_hit", "skipped", "error", "needs_clarification"):
             with self.subTest(evidence_status=evidence_status):
                 row = Message(
                     id=uuid.uuid4(),
@@ -356,7 +356,7 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_answer_statuses_fail_closed_on_claimed_answer_sources(self) -> None:
         claimed_source = self._source(role="direct", filename="错误携带的证据.md")
-        for evidence_status in ("no_hit", "skipped", "error"):
+        for evidence_status in ("no_hit", "skipped", "error", "needs_clarification"):
             with self.subTest(evidence_status=evidence_status):
                 event = {
                     "type": "search_results",
@@ -491,6 +491,7 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
             [
                 "chat.request",
                 "conversation.context_resolved",
+                "conversation.context_candidates",
                 "conversation.reference_unresolved",
                 "chat.response",
             ],
@@ -608,6 +609,7 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
             [
                 "chat.request",
                 "conversation.context_resolved",
+                "conversation.context_candidates",
                 "intent.routing_decision",
                 "chat.error",
             ],

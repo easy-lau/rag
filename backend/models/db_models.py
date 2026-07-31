@@ -90,6 +90,12 @@ class Conversation(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # 每个会话最多保留一个版本化待澄清状态。状态只作为后续重新路由的输入，
+    # 不能作为恢复执行授权的依据；revision 供调用层做乐观并发控制。
+    pending_route_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    route_state_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation", cascade="all, delete-orphan")
@@ -245,6 +251,7 @@ class IntentRouteLog(Base):
     __table_args__ = (
         Index("ix_intent_route_logs_created_at", "created_at"),
         Index("ix_intent_route_logs_user_id_created_at", "user_id", "created_at"),
+        Index("ix_intent_route_logs_trace_id", "trace_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -254,6 +261,8 @@ class IntentRouteLog(Base):
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="SET NULL"), nullable=True
     )
+    # Trace 由异步存储独立维护并按保留期清理，因此这里只保存关联值，不建立外键。
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     intent_code: Mapped[str] = mapped_column(String(64), nullable=False)
     intent_name: Mapped[str] = mapped_column(String(100), nullable=False)
     # ``action`` 保留分类所绑定的原始动作，便于判断模型究竟选中了什么；以下字段
@@ -263,6 +272,9 @@ class IntentRouteLog(Base):
     retrieval_policy: Mapped[str] = mapped_column(String(16), nullable=False)
     need_retrieval: Mapped[bool] = mapped_column(Boolean, nullable=False)
     decision_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 只允许保存协议版本、枚举、数量等无正文摘要；完整语义合同仍进入受内容门禁
+    # 保护的 RAG Trace，避免 intent:read 日志复制用户或知识库正文。
+    route_summary: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -270,7 +282,10 @@ class IntentRouteLog(Base):
     # 实际检索结果在流式管线运行后回填；hit_count 仅统计 direct 回答证据，
     # 旧日志和被用户提前中止的请求允许为空。
     retrieval_executed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    evidence_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # ``needs_clarification`` is 19 characters; keep this aligned with the
+    # RAG trace status column so clarification responses can be committed in
+    # the same transaction as the assistant message and pending route state.
+    evidence_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     hit_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     feedback: Mapped[str | None] = mapped_column(String(16), nullable=True)
     feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

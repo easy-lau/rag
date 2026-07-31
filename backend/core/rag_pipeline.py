@@ -4,19 +4,24 @@ import uuid
 import logging
 import re
 import math
-from typing import AsyncGenerator
+from dataclasses import dataclass, replace
+from typing import AsyncGenerator, Sequence
 from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.retriever import (
+    MAX_EVIDENCE_SCOPE_DOCUMENTS,
     PER_DOCUMENT_RERANK_CHUNKS,
     RRF_K,
     TRIGRAM_MIN_SCORE,
+    fetch_small_document_candidates,
     hybrid_search,
+    search_within_documents,
 )
 from core.evidence_expansion import (
     ExpansionBudget,
     ExpansionOutcome,
     expand_evidence_candidates,
+    merge_expansion_candidates,
 )
 from core.reranker import (
     AnswerRequirement,
@@ -27,11 +32,25 @@ from core.reranker import (
     RerankOutcome,
     joint_rerank_with_coverage,
     rerank_with_status,
+    select_small_document_evidence_with_coverage,
 )
 from core.query_constraints import (
     QueryConstraints,
     evaluate_candidate_constraints,
     extract_query_constraints,
+    inherit_document_constraint_metadata,
+)
+from core.evidence_ambiguity import (
+    EvidenceAmbiguityDecision,
+    EvidenceScopeChoice,
+    ExplicitScopeComparisonPlan,
+    detect_evidence_scope_ambiguity,
+    query_requests_all_scopes,
+    resolve_explicit_scope_comparison,
+)
+from core.query_route_compiler import (
+    RagTaskContract,
+    require_rag_task_contract_dispatchable,
 )
 from core.openai_client import get_client
 from core.llm_stream import stream_with_retry_before_first_delta
@@ -45,6 +64,636 @@ from core.rag_trace import (
 from config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _EvidenceScopeChoiceFilter:
+    key: str
+    label: str
+    products: tuple[str, ...]
+    canonical_products: tuple[str, ...]
+    versions: tuple[str, ...]
+    projects: tuple[str, ...]
+    filenames: tuple[str, ...]
+    kb_ids: tuple[uuid.UUID, ...]
+    doc_ids: tuple[uuid.UUID, ...]
+    anchor_doc_ids: tuple[uuid.UUID, ...]
+    companion_doc_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True)
+class _EvidenceScopeFilter:
+    mode: str
+    kb_ids: tuple[uuid.UUID, ...]
+    doc_ids: tuple[uuid.UUID, ...]
+    choices: tuple[_EvidenceScopeChoiceFilter, ...]
+    valid: bool = True
+    invalid_reason: str | None = None
+
+    @property
+    def compare_all(self) -> bool:
+        return self.mode == "compare_all"
+
+    def label_by_document(self) -> dict[str, str]:
+        labels: dict[str, list[str]] = {}
+        allowed_doc_ids = {str(value) for value in self.doc_ids}
+        for choice in self.choices:
+            for doc_id in choice.doc_ids:
+                doc_key = str(doc_id)
+                if doc_key not in allowed_doc_ids:
+                    continue
+                values = labels.setdefault(doc_key, [])
+                if choice.label not in values:
+                    values.append(choice.label)
+        return {
+            doc_id: " / ".join(values)
+            for doc_id, values in labels.items()
+            if values
+        }
+
+
+def _bounded_text_values(value: object, *, limit: int = 20) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError("scope text values must be a list")
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise ValueError("scope text value must be a string")
+        item = raw.strip()
+        if not item or len(item) > 500:
+            raise ValueError("scope text value is empty or too long")
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+        if len(result) > limit:
+            raise ValueError("too many scope text values")
+    return tuple(result)
+
+
+def _bounded_uuid_values(value: object, *, limit: int) -> tuple[uuid.UUID, ...]:
+    if not isinstance(value, list):
+        raise ValueError("scope ids must be a list")
+    result: list[uuid.UUID] = []
+    seen: set[str] = set()
+    for raw in value:
+        try:
+            item = uuid.UUID(str(raw))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("scope id must be a UUID") from exc
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) > limit:
+            raise ValueError("too many scope ids")
+    return tuple(result)
+
+
+def _invalid_evidence_scope_filter(
+    mode: str,
+    reason: str,
+) -> _EvidenceScopeFilter:
+    return _EvidenceScopeFilter(
+        mode=mode if mode in {"single", "compare_all"} else "invalid",
+        kb_ids=(),
+        doc_ids=(),
+        choices=(),
+        valid=False,
+        invalid_reason=reason,
+    )
+
+
+def _normalize_evidence_scope_filter(
+    value: object,
+    *,
+    authorized_kb_ids: Sequence[uuid.UUID | str],
+) -> _EvidenceScopeFilter | None:
+    """Validate a request-local clarification selection without granting access.
+
+    The persisted pending state is only a set of user-selectable candidates.  The
+    current request's already-authorized ``kb_ids`` remain the security boundary;
+    selected document ids are additionally required to appear both at the top
+    level and inside one of the supplied choices.  Any malformed shape fails
+    closed to an empty scoped retrieval and never falls back to global search.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return _invalid_evidence_scope_filter("invalid", "filter_not_object")
+    mode = str(value.get("mode") or "").strip()
+    if mode not in {"single", "compare_all"}:
+        return _invalid_evidence_scope_filter(mode, "invalid_mode")
+
+    try:
+        requested_kb_ids = _bounded_uuid_values(value.get("kb_ids"), limit=100)
+        requested_doc_ids = _bounded_uuid_values(
+            value.get("doc_ids"),
+            limit=MAX_EVIDENCE_SCOPE_DOCUMENTS,
+        )
+        raw_choices = value.get("choices")
+        if not isinstance(raw_choices, list) or not raw_choices:
+            raise ValueError("choices must be a non-empty list")
+        if len(raw_choices) > 6:
+            raise ValueError("too many choices")
+
+        choices: list[_EvidenceScopeChoiceFilter] = []
+        choice_keys: set[str] = set()
+        for raw_choice in raw_choices:
+            if not isinstance(raw_choice, dict):
+                raise ValueError("choice must be an object")
+            key = str(raw_choice.get("key") or "").strip()
+            label = str(raw_choice.get("label") or "").strip()
+            if (
+                not re.fullmatch(r"c[1-9]\d*", key)
+                or len(key) > 40
+                or key in choice_keys
+            ):
+                raise ValueError("choice key is invalid")
+            if not label or len(label) > 500:
+                raise ValueError("choice label is invalid")
+            choice_keys.add(key)
+            choice_kb_ids = _bounded_uuid_values(
+                raw_choice.get("kb_ids"),
+                limit=100,
+            )
+            choice_doc_ids = _bounded_uuid_values(
+                raw_choice.get("doc_ids"),
+                limit=MAX_EVIDENCE_SCOPE_DOCUMENTS,
+            )
+            choice_anchor_doc_ids = _bounded_uuid_values(
+                raw_choice.get("anchor_doc_ids"),
+                limit=MAX_EVIDENCE_SCOPE_DOCUMENTS,
+            )
+            choice_companion_doc_ids = _bounded_uuid_values(
+                raw_choice.get("companion_doc_ids"),
+                limit=MAX_EVIDENCE_SCOPE_DOCUMENTS,
+            )
+            if (
+                not choice_kb_ids
+                or not choice_doc_ids
+                or not choice_anchor_doc_ids
+            ):
+                raise ValueError("choice scope ids must be non-empty")
+            choice_doc_keys = {str(item) for item in choice_doc_ids}
+            choice_anchor_keys = {
+                str(item) for item in choice_anchor_doc_ids
+            }
+            choice_companion_keys = {
+                str(item) for item in choice_companion_doc_ids
+            }
+            if (
+                choice_anchor_keys & choice_companion_keys
+                or choice_doc_keys
+                != choice_anchor_keys | choice_companion_keys
+            ):
+                raise ValueError("choice anchor/companion partition is invalid")
+            choices.append(
+                _EvidenceScopeChoiceFilter(
+                    key=key,
+                    label=label,
+                    products=_bounded_text_values(
+                        raw_choice.get("products"),
+                    ),
+                    canonical_products=_bounded_text_values(
+                        raw_choice.get("canonical_products"),
+                    ),
+                    versions=_bounded_text_values(
+                        raw_choice.get("versions"),
+                    ),
+                    projects=_bounded_text_values(
+                        raw_choice.get("projects"),
+                    ),
+                    filenames=_bounded_text_values(
+                        raw_choice.get("filenames"),
+                    ),
+                    kb_ids=choice_kb_ids,
+                    doc_ids=choice_doc_ids,
+                    anchor_doc_ids=choice_anchor_doc_ids,
+                    companion_doc_ids=choice_companion_doc_ids,
+                )
+            )
+    except (TypeError, ValueError):
+        return _invalid_evidence_scope_filter(mode, "malformed_filter")
+
+    if (mode == "single" and len(choices) != 1) or (
+        mode == "compare_all" and len(choices) < 2
+    ):
+        return _invalid_evidence_scope_filter(mode, "choice_count_mismatch")
+
+    # Anchor documents prove one mutually exclusive choice.  A caller must not
+    # be able to relabel a document shared by another included choice as an
+    # anchor and thereby let one generic hit satisfy several scopes.
+    for choice in choices:
+        anchor_keys = {str(item) for item in choice.anchor_doc_ids}
+        other_choice_doc_keys = {
+            str(item)
+            for other in choices
+            if other.key != choice.key
+            for item in other.doc_ids
+        }
+        if anchor_keys & other_choice_doc_keys:
+            return _invalid_evidence_scope_filter(
+                mode,
+                "anchor_not_choice_exclusive",
+            )
+
+    choice_kb_ids = {
+        str(item)
+        for choice in choices
+        for item in choice.kb_ids
+    }
+    choice_doc_ids = {
+        str(item)
+        for choice in choices
+        for item in choice.doc_ids
+    }
+    requested_kb_keys = {str(item) for item in requested_kb_ids}
+    requested_doc_keys = {str(item) for item in requested_doc_ids}
+    if (
+        not requested_kb_keys
+        or not requested_doc_keys
+        or requested_kb_keys != choice_kb_ids
+        or requested_doc_keys != choice_doc_ids
+    ):
+        return _invalid_evidence_scope_filter(mode, "scope_choice_mismatch")
+
+    authorized_by_key: dict[str, uuid.UUID] = {}
+    for raw in authorized_kb_ids:
+        try:
+            item = uuid.UUID(str(raw))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        authorized_by_key[str(item)] = item
+    if not requested_kb_keys.issubset(authorized_by_key):
+        return _invalid_evidence_scope_filter(mode, "kb_not_authorized")
+    scoped_kb_ids = tuple(
+        authorized_by_key[str(item)]
+        for item in requested_kb_ids
+    )
+
+    return _EvidenceScopeFilter(
+        mode=mode,
+        kb_ids=scoped_kb_ids,
+        doc_ids=requested_doc_ids,
+        choices=tuple(choices),
+    )
+
+
+def _resolved_comparison_scope_filter(
+    plan: ExplicitScopeComparisonPlan,
+    *,
+    authorized_kb_ids: Sequence[uuid.UUID | str],
+) -> _EvidenceScopeFilter | None:
+    """Turn a source-derived enumerated comparison into a fail-closed filter.
+
+    This is intentionally limited to explicitly enumerated scopes.  Generic
+    requests such as ``所有版本`` must first pass rerank relevance assessment;
+    otherwise an unrelated raw-retrieval document could be promoted into a
+    requested comparison scope merely because it declares another version.
+    """
+
+    if (
+        not plan.matched
+        or plan.reason != "explicit_enumerated_scopes"
+        or len(plan.choices) < 2
+    ):
+        return None
+    payload = {
+        "mode": "compare_all",
+        "kb_ids": list(dict.fromkeys(
+            kb_id
+            for choice in plan.choices
+            for kb_id in choice.kb_ids
+        )),
+        "doc_ids": list(dict.fromkeys(
+            doc_id
+            for choice in plan.choices
+            for doc_id in choice.doc_ids
+        )),
+        "choices": [
+            {
+                **choice.to_dict(),
+                "products": list(choice.products),
+                "canonical_products": list(choice.canonical_products),
+                "versions": list(choice.versions),
+                "projects": list(choice.projects),
+                "filenames": list(choice.filenames),
+                "kb_ids": list(choice.kb_ids),
+                "doc_ids": list(choice.doc_ids),
+                "anchor_doc_ids": list(choice.anchor_doc_ids),
+                "companion_doc_ids": list(choice.companion_doc_ids),
+            }
+            for choice in plan.choices
+        ],
+    }
+    normalized = _normalize_evidence_scope_filter(
+        payload,
+        authorized_kb_ids=authorized_kb_ids,
+    )
+    if normalized is None or not normalized.valid:
+        return None
+    if {str(value) for value in normalized.doc_ids} != set(plan.allowed_doc_ids):
+        return None
+    return normalized
+
+
+def _scope_choice_labels_by_document(
+    choices: Sequence[EvidenceScopeChoice],
+) -> dict[str, str]:
+    labels: dict[str, list[str]] = {}
+    for choice in choices:
+        for doc_id in choice.doc_ids:
+            values = labels.setdefault(str(doc_id), [])
+            if choice.label not in values:
+                values.append(choice.label)
+    return {
+        doc_id: " / ".join(values)
+        for doc_id, values in labels.items()
+        if values
+    }
+
+
+def _scope_filter_queries(
+    base_query: str,
+    scope_filter: _EvidenceScopeFilter,
+) -> tuple[str, list[str]]:
+    """Build a standalone question plus bounded document-search queries."""
+
+    original = str(base_query or "").strip()
+    if not scope_filter.valid:
+        return original, [original]
+    if scope_filter.compare_all:
+        # Rolling/custom callers may already have appended the display labels
+        # for semantic routing.  Remove those exact untrusted display strings
+        # from the Pipeline question so the first version cannot become a hard
+        # query constraint; the second scoped-search query below still carries
+        # every label for identity/header recall.
+        comparison_original = original
+        for choice in scope_filter.choices:
+            comparison_original = comparison_original.replace(choice.label, "")
+        comparison_original = re.sub(
+            r"[；;、\s]+$",
+            "",
+            comparison_original,
+        ).strip()
+        standalone = (
+            f"{comparison_original}\n用户已明确要求对所选全部适用范围分别对比回答。"
+        )
+        scope_terms = "；".join(choice.label for choice in scope_filter.choices)
+        original_search_query = comparison_original
+    else:
+        scope_terms = scope_filter.choices[0].label
+        standalone = f"{original}\n用户已明确选择适用范围：{scope_terms}"
+        original_search_query = original
+    return standalone, [
+        original_search_query,
+        f"{original_search_query}\n适用范围：{scope_terms}",
+    ]
+
+
+def _restrict_candidates_to_scope(
+    candidates: Sequence[dict],
+    scope_filter: _EvidenceScopeFilter | None,
+) -> tuple[list[dict], int]:
+    if scope_filter is None:
+        return [dict(item) for item in candidates], 0
+    if not scope_filter.valid:
+        return [], len(candidates)
+    allowed_kb_ids = {str(value) for value in scope_filter.kb_ids}
+    allowed_doc_ids = {str(value) for value in scope_filter.doc_ids}
+    selected = [
+        dict(item)
+        for item in candidates
+        if str(item.get("kb_id") or "") in allowed_kb_ids
+        and str(item.get("doc_id") or "") in allowed_doc_ids
+    ]
+    return selected, len(candidates) - len(selected)
+
+
+def _scope_candidate_identity(item: dict) -> str:
+    identity = str(item.get("id") or "").strip()
+    if identity:
+        return identity
+    return ":".join(
+        str(item.get(field) or "")
+        for field in ("kb_id", "doc_id", "chunk_index")
+    )
+
+
+def _candidate_matches_scope_choice(
+    item: dict,
+    choice: _EvidenceScopeChoiceFilter,
+) -> bool:
+    return (
+        str(item.get("kb_id") or "") in {str(value) for value in choice.kb_ids}
+        and str(item.get("doc_id") or "") in {str(value) for value in choice.doc_ids}
+    )
+
+
+def _scope_anchor_coverage(
+    candidates: Sequence[dict],
+    scope_filter: _EvidenceScopeFilter,
+) -> tuple[bool, tuple[str, ...]]:
+    """Return whether every selected choice has an anchor-document hit."""
+
+    hit_ids: list[str] = []
+    hit_id_set: set[str] = set()
+    covered_choice_keys: set[str] = set()
+    for choice in scope_filter.choices:
+        anchor_ids = {str(value) for value in choice.anchor_doc_ids}
+        for item in candidates:
+            doc_id = str(item.get("doc_id") or "")
+            if doc_id not in anchor_ids or not _candidate_matches_scope_choice(
+                item,
+                choice,
+            ):
+                continue
+            covered_choice_keys.add(choice.key)
+            if doc_id not in hit_id_set:
+                hit_id_set.add(doc_id)
+                hit_ids.append(doc_id)
+    return (
+        len(covered_choice_keys) == len(scope_filter.choices),
+        tuple(hit_ids),
+    )
+
+
+async def _ensure_scope_anchor_candidate_coverage(
+    db: AsyncSession,
+    *,
+    candidates: Sequence[dict],
+    scope_filter: _EvidenceScopeFilter,
+    base_query: str,
+    method: str,
+    candidate_limit: int,
+    trace_id: str | None,
+) -> tuple[list[dict], int, bool, tuple[str, ...]]:
+    """Guarantee at least one anchor candidate per selected scope choice.
+
+    The broad document-scoped query is globally ranked, so a high-scoring scope
+    can otherwise consume the total limit before another selected scope appears.
+    A shared companion document is useful context but does not prove any
+    mutually exclusive choice.  Only missing anchors receive a bounded second
+    lookup, always inside that choice's already-authorized KB/anchor-document
+    ids.  The caller fails closed when coverage remains incomplete.
+    """
+
+    def proves_choice(item: dict, choice: _EvidenceScopeChoiceFilter) -> bool:
+        return (
+            _candidate_matches_scope_choice(item, choice)
+            and str(item.get("doc_id") or "")
+            in {str(value) for value in choice.anchor_doc_ids}
+        )
+
+    merged = [dict(item) for item in candidates]
+    seen = {_scope_candidate_identity(item) for item in merged}
+    supplemental_count = 0
+    for choice in scope_filter.choices:
+        if any(proves_choice(item, choice) for item in merged):
+            continue
+        targeted_doc_ids = list(choice.anchor_doc_ids)
+        targeted = await search_within_documents(
+            db,
+            queries=[
+                base_query,
+                f"{base_query}\n适用范围：{choice.label}",
+            ],
+            kb_ids=list(choice.kb_ids),
+            doc_ids=targeted_doc_ids,
+            method=method,
+            per_document_limit=PER_DOCUMENT_RERANK_CHUNKS,
+            total_limit=PER_DOCUMENT_RERANK_CHUNKS,
+            max_document_count=len(targeted_doc_ids),
+            trace_id=trace_id,
+            surface="chat_evidence_scope_choice",
+        )
+        for raw_item in targeted:
+            item = dict(raw_item)
+            if not proves_choice(item, choice):
+                continue
+            identity = _scope_candidate_identity(item)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            merged.append(item)
+            supplemental_count += 1
+
+    anchor_hit, anchor_doc_ids = _scope_anchor_coverage(merged, scope_filter)
+
+    # Preserve one representative for every choice before filling the remaining
+    # rerank budget in retrieval order. Companion documents are kept as normal
+    # candidates but can never be selected as a choice representative.
+    selected: list[dict] = []
+    selected_ids: set[str] = set()
+    for choice in scope_filter.choices:
+        representative = next(
+            (item for item in merged if proves_choice(item, choice)),
+            None,
+        )
+        if representative is None:
+            continue
+        identity = _scope_candidate_identity(representative)
+        if identity in selected_ids:
+            continue
+        selected_ids.add(identity)
+        selected.append(representative)
+    bounded_limit = max(len(selected), candidate_limit)
+    for item in merged:
+        identity = _scope_candidate_identity(item)
+        if identity in selected_ids:
+            continue
+        selected_ids.add(identity)
+        selected.append(item)
+        if len(selected) >= bounded_limit:
+            break
+    return (
+        selected[:bounded_limit],
+        supplemental_count,
+        anchor_hit,
+        anchor_doc_ids,
+    )
+
+
+def _restrict_expansion_outcome_to_scope(
+    outcome: ExpansionOutcome,
+    scope_filter: _EvidenceScopeFilter | None,
+) -> tuple[ExpansionOutcome, int]:
+    if scope_filter is None:
+        return outcome, 0
+    candidates, dropped = _restrict_candidates_to_scope(
+        outcome.candidates,
+        scope_filter,
+    )
+    seeds, _ = _restrict_candidates_to_scope(
+        outcome.seed_candidates,
+        scope_filter,
+    )
+    scoped, _ = _restrict_candidates_to_scope(
+        outcome.scoped_candidates,
+        scope_filter,
+    )
+    structural, _ = _restrict_candidates_to_scope(
+        outcome.structural_candidates,
+        scope_filter,
+    )
+    full_document, _ = _restrict_candidates_to_scope(
+        outcome.full_document_candidates,
+        scope_filter,
+    )
+    added_keys = {
+        str(item.get("id") or f"{item.get('doc_id')}:{item.get('chunk_index')}")
+        for item in [*scoped, *structural, *full_document]
+    }
+    return (
+        replace(
+            outcome,
+            candidates=candidates,
+            seed_candidates=seeds,
+            scoped_candidates=scoped,
+            structural_candidates=structural,
+            full_document_candidates=full_document,
+            added_candidate_count=len(added_keys),
+        ),
+        dropped,
+    )
+
+
+def _clarification_trace_payload(
+    decision: EvidenceAmbiguityDecision,
+    *,
+    include_content: bool,
+) -> dict | None:
+    if not decision.needs_clarification:
+        return None
+    if include_content:
+        return decision.to_dict()
+    question_fields = content_fields("question", decision.question)
+    # ``include_content`` is captured once at request start.  Remove the raw
+    # field defensively even if a test or hot-reloaded settings object changes
+    # while the request is in flight.
+    question_fields.pop("question", None)
+    return {
+        "schema_version": "rag_evidence_clarification.v1",
+        "needs_clarification": True,
+        "dimension": decision.dimension,
+        "reason": decision.reason,
+        "choice_count": len(decision.choices),
+        "relevant_document_count": decision.relevant_document_count,
+        "choices": [
+            {
+                "key": choice.key,
+                "document_count": len(choice.doc_ids),
+                "version_count": len(choice.versions),
+                "project_count": len(choice.projects),
+            }
+            for choice in decision.choices
+        ],
+        **question_fields,
+    }
 
 
 def _step_event(step: str, status: str) -> str:
@@ -72,6 +721,9 @@ def _results_event(
     expansion_attempted: bool = False,
     missing_requirement_count: int = 0,
     joint_support_score: float | None = None,
+    clarification: dict | None = None,
+    evidence_scope_anchor_hit: bool | None = None,
+    evidence_scope_anchor_doc_ids: Sequence[str] | None = None,
 ) -> str:
     serializable = [json_safe(dict(r)) for r in results]
     serializable_answer_sources = [
@@ -111,7 +763,13 @@ def _results_event(
         "expansion_attempted": expansion_attempted,
         "missing_requirement_count": missing_requirement_count,
         "joint_support_score": joint_support_score,
+        "clarification": clarification,
     }
+    if evidence_scope_anchor_hit is not None:
+        payload["evidence_scope_anchor_hit"] = evidence_scope_anchor_hit
+        payload["evidence_scope_anchor_doc_ids"] = list(
+            evidence_scope_anchor_doc_ids or ()
+        )
     return f"data: {json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)}\n\n"
 
 
@@ -132,6 +790,19 @@ def _intent_event(intent: dict) -> str:
     return f"data: {json.dumps({'type': 'intent', 'decision': intent})}\n\n"
 
 
+def _evidence_clarification_event(
+    decision: EvidenceAmbiguityDecision,
+) -> str:
+    payload = {
+        "type": "evidence_clarification",
+        **decision.to_dict(),
+    }
+    return (
+        f"data: {json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False)}"
+        "\n\n"
+    )
+
+
 # 命中文档若小于该字符数，则整篇注入上下文，保证跨段落/跨表格的信息完整
 WHOLE_DOC_MAX_CHARS = 6000
 WHOLE_DOC_TOTAL_BUDGET = 12000
@@ -145,12 +816,18 @@ RELATED_REFERENCE_MIN_SUPPORT = 0.1
 RERANK_CANDIDATE_MIN = 12
 RERANK_CANDIDATE_MULTIPLIER = 3
 RERANK_CANDIDATE_MAX = 30
+SIMPLE_RERANK_CANDIDATE_MIN = 8
+SIMPLE_RERANK_CANDIDATE_MULTIPLIER = 2
+SIMPLE_RERANK_CANDIDATE_MAX = 20
 
 # 跨片段问答只在复杂问题上触发一次文档内补检。首轮最多保留 18 个候选，
 # 为新增的语义/结构片段预留联合重排预算；最终上下文仍受片段数与字符数双限界。
 EVIDENCE_EXPANSION_MAX_INITIAL_CANDIDATES = 18
 EVIDENCE_EXPANSION_MAX_COMPETING_CANDIDATES = 3
 FAILED_RERANK_SAFE_SEED_COUNT = 3
+PRE_RERANK_FULL_DOCUMENT_MAX_CHUNKS = 18
+PRE_RERANK_FULL_DOCUMENT_MAX_CHARS = 12_000
+PRE_RERANK_COMPETING_DOCUMENTS = 3
 JOINT_CONTEXT_MAX_CHUNKS = 12
 JOINT_CONTEXT_MAX_CHARS = 16000
 
@@ -172,10 +849,19 @@ _GENERIC_CJK_NGRAMS = {
 }
 
 
-def rerank_candidate_limit(top_k: int) -> int:
+def rerank_candidate_limit(top_k: int, *, simple: bool = False) -> int:
     """候选池应大于最终 Top K，但必须受模型上下文和成本上限约束。"""
 
     normalized = max(1, min(int(top_k), 20))
+    if simple:
+        return min(
+            SIMPLE_RERANK_CANDIDATE_MAX,
+            max(
+                normalized,
+                SIMPLE_RERANK_CANDIDATE_MIN,
+                normalized * SIMPLE_RERANK_CANDIDATE_MULTIPLIER,
+            ),
+        )
     return min(
         RERANK_CANDIDATE_MAX,
         max(RERANK_CANDIDATE_MIN, normalized * RERANK_CANDIDATE_MULTIPLIER),
@@ -669,25 +1355,31 @@ def _has_deterministic_lexical_signal(item: dict) -> bool:
     )
 
 
-def _resolve_failed_rerank_expansion_plan(
-    *,
-    question: str,
+def _dominant_document_lexical_seeds(
     results: list[dict],
     constraints: QueryConstraints,
-) -> tuple[ExpansionPlan | None, tuple[AnswerRequirement, ...], str]:
-    """仅在召回证据确定性很强时，允许首轮模型失败后做同文档补检。"""
+    *,
+    use_rerank_indexes: bool,
+) -> tuple[list[dict], str]:
+    """提取可安全触发同文档扩展的前三条确定性召回。
 
-    requirements = _required_answer_requirements((), question)
+    首轮模型失败后的兜底和首轮模型之前的小文档快速路径必须共用同一组
+    文档占优、词面信号和产品/版本约束，避免两条路径的安全门槛逐渐漂移。
+    """
+
     if len(results) < FAILED_RERANK_SAFE_SEED_COUNT:
-        return None, requirements, "rerank_failed_insufficient_dominance"
-
-    # 标签软加权可能改变展示顺序；失败兜底必须仍以原始召回序号判断“前三条
-    # 同文档”，不能让后处理排序人为制造文档占优。
-    retrieval_order = sorted(
-        results,
-        key=lambda item: _candidate_rerank_index(item) or (len(results) + 1),
+        return [], "insufficient_dominance"
+    ordered = (
+        sorted(
+            results,
+            key=lambda item: (
+                _candidate_rerank_index(item) or (len(results) + 1)
+            ),
+        )
+        if use_rerank_indexes
+        else list(results)
     )
-    leading = retrieval_order[:FAILED_RERANK_SAFE_SEED_COUNT]
+    leading = ordered[:FAILED_RERANK_SAFE_SEED_COUNT]
     doc_ids = {
         str(item.get("doc_id"))
         for item in leading
@@ -697,16 +1389,146 @@ def _resolve_failed_rerank_expansion_plan(
         item.get("id") is None or item.get("doc_id") is None
         for item in leading
     ):
-        return None, requirements, "rerank_failed_no_dominant_document"
+        return [], "no_dominant_document"
 
     for item in leading:
         status = str(item.get("constraint_status") or "")
+        if not status:
+            status = evaluate_candidate_constraints(constraints, item).status
         if status == "mismatch" or (
             constraints.has_product_constraint and status == "unknown"
         ):
-            return None, requirements, "rerank_failed_constraint_conflict"
+            return [], "constraint_conflict"
     if not any(_has_deterministic_lexical_signal(item) for item in leading):
-        return None, requirements, "rerank_failed_vector_only"
+        return [], "vector_only"
+    return leading, "dominant_document_lexical_signal"
+
+
+def _resolve_pre_rerank_small_document_plan(
+    *,
+    question: str,
+    fresh_results: list[dict],
+    merged_results: list[dict],
+    constraints: QueryConstraints,
+    allowed_kb_ids: Sequence[uuid.UUID | str],
+) -> tuple[ExpansionPlan | None, list[dict], uuid.UUID | str | None, str]:
+    """为一次联合重排准备目标种子和少量真实竞争片段。
+
+    这里只接受当前问题的原始召回顺序。目标文档的完整、小文档资格仍由
+    ``fetch_small_document_candidates`` 基于授权范围和实际片段统计最终确认。
+    """
+
+    allowed_kb_keys = {str(value) for value in allowed_kb_ids}
+    scoped_fresh_results = [
+        item
+        for item in fresh_results
+        if str(item.get("kb_id") or "") in allowed_kb_keys
+    ]
+    scoped_merged_results = [
+        item
+        for item in merged_results
+        if str(item.get("kb_id") or "") in allowed_kb_keys
+    ]
+    scoped_fresh_results = inherit_document_constraint_metadata(
+        scoped_fresh_results
+    )
+    scoped_merged_results = inherit_document_constraint_metadata(
+        scoped_merged_results
+    )
+    leading, reason = _dominant_document_lexical_seeds(
+        scoped_fresh_results,
+        constraints,
+        use_rerank_indexes=False,
+    )
+    if not leading:
+        return None, [], None, f"pre_rerank_{reason}"
+
+    target_doc_id = leading[0].get("doc_id")
+    target_doc_key = str(target_doc_id)
+    merged_by_id = {
+        str(item.get("id")): item
+        for item in scoped_merged_results
+        if item.get("id") is not None
+    }
+    seeds = [
+        dict(merged_by_id.get(str(item.get("id"))) or item)
+        for item in leading
+    ]
+
+    competitors: list[dict] = []
+    competing_doc_ids: set[str] = set()
+    for result in scoped_merged_results:
+        doc_id = result.get("doc_id")
+        chunk_id = result.get("id")
+        doc_key = str(doc_id or "")
+        if (
+            doc_id is None
+            or chunk_id is None
+            or doc_key == target_doc_key
+            or doc_key in competing_doc_ids
+        ):
+            continue
+        status = evaluate_candidate_constraints(constraints, result).status
+        if status == "mismatch" or (
+            constraints.has_product_constraint and status == "unknown"
+        ):
+            continue
+        competing_doc_ids.add(doc_key)
+        competitors.append(dict(result))
+        if len(competitors) >= PRE_RERANK_COMPETING_DOCUMENTS:
+            break
+
+    candidates = annotate_deterministic_constraints(
+        [*seeds, *competitors],
+        constraints,
+    )
+    candidates = [
+        {**item, "rerank_candidate_index": index}
+        for index, item in enumerate(candidates, start=1)
+    ]
+    queries = _scoped_expansion_queries(question, [question], constraints)
+    if not queries:
+        return None, [], None, "pre_rerank_missing_query"
+    plan = ExpansionPlan(
+        needed=True,
+        target_candidate_indexes=tuple(
+            range(1, FAILED_RERANK_SAFE_SEED_COUNT + 1)
+        ),
+        queries=queries,
+        missing_requirement_ids=(),
+        reason=(
+            "当前召回前三条来自同一文档且具有词面命中；"
+            "若该文档满足小文档完整性预算，则直接执行一次联合重排"
+        ),
+        model_requested=False,
+        overridden_reason="pre_rerank_dominant_small_document",
+    )
+    return (
+        plan,
+        candidates,
+        target_doc_id,
+        "pre_rerank_dominant_small_document",
+    )
+
+
+def _resolve_failed_rerank_expansion_plan(
+    *,
+    question: str,
+    results: list[dict],
+    constraints: QueryConstraints,
+) -> tuple[ExpansionPlan | None, tuple[AnswerRequirement, ...], str]:
+    """仅在召回证据确定性很强时，允许首轮模型失败后做同文档补检。"""
+
+    requirements = _required_answer_requirements((), question)
+    # 标签软加权可能改变展示顺序；失败兜底必须仍以原始召回序号判断“前三条
+    # 同文档”，不能让后处理排序人为制造文档占优。
+    leading, reason = _dominant_document_lexical_seeds(
+        results,
+        constraints,
+        use_rerank_indexes=True,
+    )
+    if not leading:
+        return None, requirements, f"rerank_failed_{reason}"
 
     target_indexes = tuple(
         index
@@ -849,6 +1671,231 @@ def _apply_joint_context_budget(
         max(0, len(candidates) - len(kept)),
         used_chars,
     )
+
+
+def _rescue_missing_joint_evidence(
+    joint_outcome: RerankOutcome,
+    first_pass_results: Sequence[dict],
+    requirements: Sequence[AnswerRequirement],
+) -> RerankOutcome:
+    """Recover an omitted answer chunk after a lossy joint JSON repair.
+
+    The initial reranker already evaluated the original retrieval candidates with
+    the locked requirement ids.  A malformed joint response may omit a valid
+    answer candidate while retaining only its bridge candidate.  Re-adding is
+    deliberately narrow: the candidate must be initial-rerank verified, declare
+    support for a missing explicit requirement, meet the direct-support threshold,
+    and belong to a document already represented by the selected joint set.
+    """
+
+    if not joint_outcome.succeeded or not joint_outcome.results:
+        return joint_outcome
+    required_ids = {
+        item.id
+        for item in requirements
+        if item.importance == "required" and item.source == "explicit"
+    }
+    missing_ids = set(joint_outcome.missing_requirement_ids) & required_ids
+    if not missing_ids:
+        return joint_outcome
+
+    selected = [
+        item for item in joint_outcome.results if item.get("jointly_selected")
+    ]
+    selected_doc_ids = {
+        str(item.get("doc_id") or "")
+        for item in selected
+        if item.get("doc_id")
+    }
+    if not selected_doc_ids:
+        return joint_outcome
+
+    initial_by_id = {
+        str(item.get("id")): item
+        for item in first_pass_results
+        if item.get("id")
+    }
+    rescues: dict[str, dict] = {}
+    for requirement_id in sorted(missing_ids):
+        candidates = [
+            item
+            for item in first_pass_results
+            if str(item.get("doc_id") or "") in selected_doc_ids
+            and requirement_id in (item.get("supports_requirement_ids") or [])
+            and item.get("rerank_status") in {"verified", "verified_legacy"}
+            and item.get("contribution_role")
+            in {"standalone_answer", "complement"}
+            and _safe_score(item.get("topic_relevance")) >= DIRECT_SUPPORT_THRESHOLD
+            and _safe_score(item.get("answer_support")) >= DIRECT_SUPPORT_THRESHOLD
+        ]
+        if candidates:
+            rescues[requirement_id] = max(
+                candidates,
+                key=lambda item: (
+                    _safe_score(item.get("answer_support")),
+                    _safe_score(item.get("topic_relevance")),
+                    _safe_score(item.get("retrieval_score")),
+                ),
+            )
+    if not rescues:
+        return joint_outcome
+
+    selected_set_id = joint_outcome.selected_evidence_set_id or "joint_rescue_set"
+    rescued_indexes: list[int] = []
+    updated_results: list[dict] = []
+    rescued_ids = {str(item.get("id")) for item in rescues.values()}
+    for result in joint_outcome.results:
+        identity = str(result.get("id") or "")
+        if identity not in rescued_ids:
+            updated_results.append(result)
+            continue
+        initial = initial_by_id.get(identity)
+        if initial is None:
+            updated_results.append(result)
+            continue
+        item = {**result, **initial}
+        candidate_index = int(result.get("rerank_candidate_index") or 0)
+        item.update(
+            {
+                "rerank_candidate_index": candidate_index,
+                "jointly_selected": True,
+                "evidence_set_id": selected_set_id,
+                "joint_support_score": (
+                    joint_outcome.joint_support_score
+                    if joint_outcome.joint_support_score is not None
+                    else 0.7
+                ),
+                "coverage_status": "complete",
+                "evidence_role": "direct",
+                "rerank_status": "verified_joint",
+                "joint_rerank_status": "verified_joint",
+                "pipeline_override_reason": "joint_response_omitted_verified_answer_chunk",
+            }
+        )
+        rescued_indexes.append(candidate_index)
+        updated_results.append(item)
+
+    covered_ids = tuple(dict.fromkeys(
+        [*joint_outcome.covered_requirement_ids, *rescues.keys()]
+    ))
+    remaining_missing = tuple(
+        requirement_id
+        for requirement_id in joint_outcome.missing_requirement_ids
+        if requirement_id not in rescues
+    )
+    rescued_complete = not (required_ids - set(covered_ids))
+    status = "complete" if rescued_complete else joint_outcome.coverage_status
+    selected_indexes = tuple(dict.fromkeys(
+        [*joint_outcome.selected_candidate_indexes, *rescued_indexes]
+    ))
+    return replace(
+        joint_outcome,
+        results=updated_results,
+        coverage_status=status,
+        selected_candidate_indexes=selected_indexes,
+        covered_requirement_ids=covered_ids,
+        missing_requirement_ids=remaining_missing,
+    )
+
+
+def _fallback_to_initial_verified_evidence(
+    results: Sequence[dict],
+    requirements: Sequence[AnswerRequirement],
+    *,
+    bridge_requirement_ids: Sequence[str] = (),
+) -> tuple[list[dict], bool]:
+    """Keep safe first-pass evidence when only the optional joint call times out.
+
+    This never promotes expansion candidates.  It requires at least one verified
+    answer/complement chunk, then may retain verified bridge chunks from the same
+    document so the generator receives the mapping context as well.
+    """
+
+    required_ids = {
+        item.id
+        for item in requirements
+        if item.importance == "required" and item.source == "explicit"
+    }
+    if not required_ids:
+        return [dict(item) for item in results], False
+    answer_candidates = [
+        item
+        for item in results
+        if item.get("rerank_status") in {"verified", "verified_legacy"}
+        and item.get("contribution_role")
+        in {"standalone_answer", "complement"}
+        and item.get("evidence_role") in {"direct", "related"}
+        and item.get("constraint_status") != "mismatch"
+        and not (
+            item.get("constraint_status") == "unknown"
+            and item.get("query_has_constraint")
+        )
+        and _safe_score(item.get("topic_relevance")) >= DIRECT_SUPPORT_THRESHOLD
+        and _safe_score(item.get("answer_support")) >= DIRECT_SUPPORT_THRESHOLD
+        and bool(
+            required_ids
+            & set(item.get("supports_requirement_ids") or [])
+        )
+    ]
+    covered_required_ids = {
+        requirement_id
+        for item in answer_candidates
+        for requirement_id in (item.get("supports_requirement_ids") or [])
+        if requirement_id in required_ids
+    }
+    if not answer_candidates or not required_ids.issubset(covered_required_ids):
+        return [dict(item) for item in results], False
+    answer_doc_ids = {str(item.get("doc_id") or "") for item in answer_candidates}
+    bridge_ids = set(bridge_requirement_ids)
+    bridge_candidates = [
+        item
+        for item in results
+        if str(item.get("doc_id") or "") in answer_doc_ids
+        and item.get("rerank_status") in {"verified", "verified_legacy"}
+        and item.get("contribution_role") == "bridge"
+        and item.get("constraint_status") != "mismatch"
+        and not (
+            item.get("constraint_status") == "unknown"
+            and item.get("query_has_constraint")
+        )
+        and _safe_score(item.get("topic_relevance")) >= DIRECT_SUPPORT_THRESHOLD
+        and _safe_score(item.get("answer_support")) >= DIRECT_SUPPORT_THRESHOLD
+        and (
+            not bridge_ids
+            or bool(
+                bridge_ids
+                & set(item.get("supports_requirement_ids") or [])
+            )
+        )
+    ]
+    covered_bridge_ids = {
+        requirement_id
+        for item in bridge_candidates
+        for requirement_id in (item.get("supports_requirement_ids") or [])
+        if requirement_id in bridge_ids
+    }
+    if not bridge_ids.issubset(covered_bridge_ids):
+        return [dict(item) for item in results], False
+    selected_ids = {
+        str(item.get("id") or "")
+        for item in [*answer_candidates, *bridge_candidates]
+    }
+    fallback: list[dict] = []
+    for result in results:
+        item = dict(result)
+        eligible = str(item.get("id") or "") in selected_ids
+        if eligible:
+            item.update(
+                {
+                    "jointly_selected": True,
+                    "evidence_set_id": "initial_rerank_fallback",
+                    "joint_support_score": _safe_score(item.get("answer_support")),
+                    "coverage_status": "partial",
+                    "joint_rerank_status": "fallback_initial_verified",
+                }
+            )
+        fallback.append(item)
+    return fallback, True
 
 
 def _merge_retrieval_candidates(
@@ -1122,7 +2169,7 @@ def annotate_deterministic_constraints(
     """
 
     annotated: list[dict] = []
-    for result in results:
+    for result in inherit_document_constraint_metadata(results):
         item = dict(result)
         evaluation = evaluate_candidate_constraints(constraints, item)
         item["constraint_status"] = evaluation.status
@@ -1142,7 +2189,7 @@ def _enforce_verified_constraints(
     """对重排成功结果再做一次独立代码门控，防止插件/旧重排器绕过约束。"""
 
     enforced: list[dict] = []
-    for result in results:
+    for result in inherit_document_constraint_metadata(results):
         item = dict(result)
         evaluation = evaluate_candidate_constraints(constraints, item)
         item["constraint_status"] = evaluation.status
@@ -1182,12 +2229,16 @@ def _select_unverified_evidence(
     if constraints.has_product_constraint and exact_or_compatible:
         primary = exact_or_compatible
         status = "unverified"
-    elif constraints.has_product_constraint and unknown:
-        primary = unknown
-        status = "unverified"
     elif constraints.has_product_constraint and mismatch:
         primary = mismatch
         status = "version_mismatch" if constraints.has_hard_constraint else "partial"
+    elif constraints.has_product_constraint:
+        # An explicit product/version query must fail closed when deterministic
+        # metadata cannot establish candidate scope.  In particular, generic
+        # vector neighbours such as travel or leave policies must not be shown
+        # or injected merely because the reranker was unavailable.
+        primary = []
+        status = "no_hit"
     else:
         primary = results
         status = "unverified" if primary else "no_hit"
@@ -1209,7 +2260,8 @@ def _select_unverified_evidence(
         status = "no_hit"
 
     display: list[dict] = []
-    for item in (*primary, *unknown, *mismatch):
+    display_tail = () if constraints.has_product_constraint else (*unknown, *mismatch)
+    for item in (*primary, *display_tail):
         if any(item is existing for existing in display):
             continue
         display.append(item)
@@ -1304,14 +2356,16 @@ def _build_system_prompt(
     retrieval_executed: bool,
     evidence_status: str,
     context: str,
+    evidence_scope_mode: str | None = None,
 ) -> str:
     if context:
         prompt = _grounded_prompt(response_mode, evidence_status)
     elif retrieval_executed and retrieval_policy == "required":
         if evidence_status == "error":
             prompt = (
-                "你是企业知识库问答助手。本次知识库检索暂时失败，无法获得可靠资料。"
-                "请简洁告知用户检索服务暂时不可用并建议稍后重试；禁止用自己的知识猜测企业事实。"
+                "你是企业知识库问答助手。本次知识库检索或证据验证暂时失败，"
+                "无法获得可靠资料。请简洁告知用户检索或验证服务暂时不可用并建议稍后重试；"
+                "禁止声称知识库中没有相关内容，也禁止用自己的知识猜测企业事实。"
             )
         else:
             prompt = (
@@ -1323,7 +2377,14 @@ def _build_system_prompt(
         # optional 检索没有形成可靠证据时，回落到原回答模式；它不是一次确定的
         # “知识库无答案”判定，因此不向用户输出误导性的未找到提示。
         prompt = _fallback_prompt(response_mode)
-    return f"{prompt}{_CONVERSATION_HISTORY_RULES}"
+    scope_rule = ""
+    if context and evidence_scope_mode == "compare_all":
+        scope_rule = (
+            "用户已经明确要求比较所选的多个适用范围。必须依据资料中的适用范围标签，"
+            "按产品、版本或项目分别组织答案；不得混合不同范围的配置、步骤或结论，"
+            "共同点和差异点都必须注明各自适用范围。"
+        )
+    return f"{prompt}{scope_rule}{_CONVERSATION_HISTORY_RULES}"
 
 
 def _knowledge_context_message(
@@ -1393,6 +2454,7 @@ async def _build_context(
     results: list[dict],
     *,
     allow_whole_document: bool = False,
+    scope_labels_by_document: dict[str, str] | None = None,
 ) -> str:
     """构建给 LLM 的上下文：命中的小文档整篇注入（保证跨段/跨表的完整信息），其余用命中片段。"""
     if any(result.get("jointly_selected") for result in results):
@@ -1424,8 +2486,11 @@ async def _build_context(
                 used += len(full)
 
     parts, seen, idx = [], set(), 1
+    scope_labels_by_document = scope_labels_by_document or {}
     for r in results:
         did = r.get("doc_id")
+        scope_label = scope_labels_by_document.get(str(did or ""), "").strip()
+        scope_prefix = f"；适用范围：{scope_label}" if scope_label else ""
         role = r.get("evidence_role")
         contribution = r.get("contribution_role")
         if r.get("jointly_selected") and contribution == "bridge":
@@ -1446,12 +2511,12 @@ async def _build_context(
                 continue
             seen.add(did)
             parts.append(
-                f"【证据角色：{role_label}；约束判定：{constraint}】\n"
+                f"【证据角色：{role_label}；约束判定：{constraint}{scope_prefix}】\n"
                 f"《{r.get('filename', '')}》（完整内容）：\n{whole[did]}"
             )
         else:
             parts.append(
-                f"【证据角色：{role_label}；约束判定：{constraint}】\n"
+                f"【证据角色：{role_label}；约束判定：{constraint}{scope_prefix}】\n"
                 f"[片段{idx}] 来源：{r.get('filename', '')}\n{r.get('content', '')}"
             )
             idx += 1
@@ -1473,7 +2538,8 @@ async def _needs_retrieval(question: str) -> bool:
                     "判断下面这句用户输入是否需要查询企业知识库/文档资料才能回答。\n"
                     "- 闲聊、问候、寒暄、感谢、自我介绍、与资料无关的常识或写作请求 → 不需要\n"
                     "- 涉及具体业务、制度、流程、数据、文档内容的提问 → 需要\n"
-                    '只返回 JSON：{"need_retrieval": true} 或 {"need_retrieval": false}。\n\n'
+                    '只返回合法的 json 对象（JSON object）：'
+                    '{"need_retrieval": true} 或 {"need_retrieval": false}。\n\n'
                     f"用户输入：{question}"
                 ),
             }],
@@ -1510,6 +2576,8 @@ async def run_rag_stream(
     carryover_sources: list[dict] | None = None,
     is_followup: bool = False,
     followup_reason: str | None = None,
+    task_contract: RagTaskContract | None = None,
+    evidence_scope_filter: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     s = get_settings()
     trace_include_content = getattr(s, "rag_trace_include_content", True)
@@ -1519,7 +2587,21 @@ async def run_rag_stream(
         True,
     )
     trace_id = trace_id or uuid.uuid4().hex
-    retrieval_query = (standalone_query or question).strip() or question
+    base_retrieval_query = (standalone_query or question).strip() or question
+    normalized_scope_filter = _normalize_evidence_scope_filter(
+        evidence_scope_filter,
+        authorized_kb_ids=kb_ids,
+    )
+    if normalized_scope_filter is not None:
+        retrieval_query, scoped_queries = _scope_filter_queries(
+            base_retrieval_query,
+            normalized_scope_filter,
+        )
+        retrieval_kb_ids = list(normalized_scope_filter.kb_ids)
+    else:
+        retrieval_query = base_retrieval_query
+        scoped_queries = [base_retrieval_query]
+        retrieval_kb_ids = list(kb_ids)
     conversation_history = [
         {
             "role": item.get("role"),
@@ -1553,12 +2635,55 @@ async def run_rag_stream(
             question_meta["question_sha256"],
         )
 
-    # Step 1: 问题分析。正常聊天接口会先完成可配置的智能路由；保留旧判断作为
-    # 兼容兜底，以便其他调用方仍可直接使用本函数。
+    # Step 1: 问题分析。v1 合同是唯一执行授权；legacy 调用方没有合同时继续
+    # 走兼容解析，但原始 route_decision 永远不能直接控制检索。
     yield _step_event("analyze", "active")
-    need_retrieval, retrieval_policy, response_mode, decision_reason = (
-        await _resolve_retrieval_plan(retrieval_query, kb_ids, intent)
-    )
+    locked_requirements: tuple[AnswerRequirement, ...] = ()
+    locked_bridge_requirement_ids: tuple[str, ...] = ()
+    if task_contract is not None:
+        require_rag_task_contract_dispatchable(
+            task_contract,
+            # The compiler binds to the selected KB set, not the transport
+            # array length.  Duplicate request IDs must not invalidate an
+            # otherwise identical authorized scope at the second gate.
+            selected_kb_count=len(set(kb_ids)),
+        )
+        need_retrieval = task_contract.need_retrieval
+        retrieval_policy = task_contract.retrieval_policy
+        response_mode = task_contract.response_mode
+        decision_reason = task_contract.decision_reason
+        locked_requirements = tuple(
+            AnswerRequirement(
+                id=item.id,
+                description=item.description,
+                importance=item.importance,
+                source=item.source,
+            )
+            for item in task_contract.requirements
+        )
+        locked_bridge_requirement_ids = tuple(
+            item.id
+            for item in task_contract.requirements
+            if item.role == "bridge"
+        )
+    else:
+        need_retrieval, retrieval_policy, response_mode, decision_reason = (
+            await _resolve_retrieval_plan(retrieval_query, kb_ids, intent)
+        )
+    if normalized_scope_filter is not None:
+        # A server-validated pending-scope selection is itself an explicit
+        # retrieval request.  A drifting/custom route contract must not turn it
+        # into general chat and then clear the pending state without ever
+        # querying the selected documents. Invalid filters are also forced into
+        # the retrieval branch so they fail closed rather than bypassing checks.
+        need_retrieval = True
+        retrieval_policy = "required"
+        response_mode = "grounded_qa"
+        decision_reason = (
+            "evidence_scope_selected"
+            if normalized_scope_filter.valid
+            else "evidence_scope_filter_invalid"
+        )
     if intent:
         yield _intent_event(intent)
         logger.info(
@@ -1580,13 +2705,65 @@ async def run_rag_stream(
     # Step 2: 对显式追问使用 API 层准备的独立问题，避免把“这些配置”等
     # 无实体原句直接交给约束提取、向量召回和重排。
     yield _step_event("expand", "active")
-    query_constraints = extract_query_constraints(retrieval_query)
+    constraint_query = (
+        base_retrieval_query
+        if normalized_scope_filter is not None and normalized_scope_filter.valid
+        else retrieval_query
+    )
+    # Scope labels are search hints, not user-authored constraints. A single
+    # compatibility choice may legitimately list several versions; parsing the
+    # appended display label would bind its first version and discard the rest.
+    query_constraints = extract_query_constraints(constraint_query)
+    explicit_all_scope_request = query_requests_all_scopes(retrieval_query)
+    explicit_comparison_plan = ExplicitScopeComparisonPlan(
+        matched=False,
+        reason="not_assessed",
+    )
+    resolved_comparison_filter_applied = False
+    if (
+        explicit_all_scope_request
+        or (
+            normalized_scope_filter is not None
+            and normalized_scope_filter.valid
+            and normalized_scope_filter.compare_all
+        )
+    ):
+        # A comparison selection is an explicit request to keep every chosen
+        # scope.  The document-id filter is the applicability boundary; a query
+        # parser that happens to see the first displayed version must not turn
+        # that one version/product into a hard constraint and discard the
+        # others. The same applies to an explicit first-turn comparison.
+        query_constraints = QueryConstraints(
+            extraction_reason=(
+                "用户已明确要求比较多个适用范围，不应用单一产品或版本硬约束"
+            ),
+        )
     yield _step_event("expand", "done")
 
     top_k = max(1, min(int(search_config.get("top_k", s.top_k)), 20))
+    if (
+        normalized_scope_filter is not None
+        and normalized_scope_filter.valid
+        and normalized_scope_filter.compare_all
+    ):
+        # The clarification UI may expose six mutually exclusive choices while
+        # the normal answer top_k defaults to five.  Reserve at least one final
+        # answer slot per explicitly selected scope; otherwise the sixth anchor
+        # is deterministically truncated and a valid "都对比" request fails the
+        # post-rerank anchor gate as a false no-hit.
+        top_k = min(20, max(top_k, len(normalized_scope_filter.choices)))
     method = search_config.get("method", "hybrid")
     rerank_requested = bool(search_config.get("rerank", s.rerank_enabled))
-    candidate_k = rerank_candidate_limit(top_k) if rerank_requested else top_k
+    simple_rerank = (
+        len(locked_requirements) == 1
+        and locked_requirements[0].importance == "required"
+        and locked_requirements[0].source == "explicit"
+    )
+    candidate_k = (
+        rerank_candidate_limit(top_k, simple=simple_rerank)
+        if rerank_requested
+        else top_k
+    )
     trace_event(
         "retrieval.plan",
         trace_id=trace_id,
@@ -1615,6 +2792,7 @@ async def run_rag_stream(
         rerank_candidate_min=RERANK_CANDIDATE_MIN,
         rerank_candidate_multiplier=RERANK_CANDIDATE_MULTIPLIER,
         rerank_candidate_max=RERANK_CANDIDATE_MAX,
+        rerank_profile="simple" if simple_rerank else "full",
         rerank=rerank_requested,
         selected_tags=(search_config.get("tags") or []) if trace_include_content else [],
         selected_tag_count=len(search_config.get("tags") or []),
@@ -1623,30 +2801,204 @@ async def run_rag_stream(
         followup_reason=followup_reason,
         history_message_count=len(conversation_history),
         carryover_source_count=len(carryover_sources),
+        evidence_scope_filter_mode=(
+            normalized_scope_filter.mode
+            if normalized_scope_filter is not None
+            else None
+        ),
+        evidence_scope_filter_valid=(
+            normalized_scope_filter.valid
+            if normalized_scope_filter is not None
+            else None
+        ),
+        evidence_scope_filter_reason=(
+            normalized_scope_filter.invalid_reason
+            if normalized_scope_filter is not None
+            else None
+        ),
+        evidence_scope_kb_count=(
+            len(normalized_scope_filter.kb_ids)
+            if normalized_scope_filter is not None
+            else 0
+        ),
+        evidence_scope_document_count=(
+            len(normalized_scope_filter.doc_ids)
+            if normalized_scope_filter is not None
+            else 0
+        ),
+        evidence_scope_choice_count=(
+            len(normalized_scope_filter.choices)
+            if normalized_scope_filter is not None
+            else 0
+        ),
         **content_fields("standalone_query", retrieval_query),
     )
+
+    if normalized_scope_filter is not None:
+        scope_description = "；".join(
+            choice.label for choice in normalized_scope_filter.choices
+        )
+        trace_event(
+            "evidence.scope_filter_applied",
+            trace_id=trace_id,
+            mode=normalized_scope_filter.mode,
+            valid=normalized_scope_filter.valid,
+            invalid_reason=normalized_scope_filter.invalid_reason,
+            current_authorized_kb_count=len(set(kb_ids)),
+            scoped_kb_count=len(normalized_scope_filter.kb_ids),
+            scoped_document_count=len(normalized_scope_filter.doc_ids),
+            choice_count=len(normalized_scope_filter.choices),
+            global_fallback_allowed=False,
+            **content_fields("scope_description", scope_description),
+        )
 
     # Step 3: 检索（扩大召回，给重排留足候选）；无需检索时跳过，results 保持为空
     yield _step_event("retrieve", "active")
     retrieval_executed = need_retrieval
     retrieval_error: Exception | None = None
     retrieval_elapsed_ms = 0
+    scope_coverage_supplement_count = 0
+    scope_anchor_hit: bool | None = (
+        False
+        if normalized_scope_filter is not None
+        and normalized_scope_filter.valid
+        else None
+    )
+    scope_anchor_doc_ids: tuple[str, ...] = ()
+    fresh_results: list[dict] = []
     if need_retrieval:
         t0 = time.perf_counter()
         try:
-            fresh_results = await hybrid_search(
-                db=db,
-                query=retrieval_query,
-                kb_ids=kb_ids,
-                top_k=candidate_k,
-                method=method,
-                trace_id=trace_id,
-                surface="chat",
+            if normalized_scope_filter is not None:
+                if not normalized_scope_filter.valid:
+                    raise ValueError(
+                        "invalid evidence scope filter: "
+                        f"{normalized_scope_filter.invalid_reason or 'unknown'}"
+                    )
+                fresh_results = await search_within_documents(
+                    db,
+                    queries=scoped_queries,
+                    kb_ids=retrieval_kb_ids,
+                    doc_ids=list(normalized_scope_filter.doc_ids),
+                    method=method,
+                    per_document_limit=PER_DOCUMENT_RERANK_CHUNKS,
+                    total_limit=candidate_k,
+                    max_document_count=len(normalized_scope_filter.doc_ids),
+                    trace_id=trace_id,
+                    surface="chat_evidence_scope",
+                )
+                (
+                    fresh_results,
+                    scope_coverage_supplement_count,
+                    scope_anchor_hit,
+                    scope_anchor_doc_ids,
+                ) = await _ensure_scope_anchor_candidate_coverage(
+                    db,
+                    candidates=fresh_results,
+                    scope_filter=normalized_scope_filter,
+                    base_query=base_retrieval_query,
+                    method=method,
+                    candidate_limit=candidate_k,
+                    trace_id=trace_id,
+                )
+                if not scope_anchor_hit:
+                    missing_choice_keys = [
+                        choice.key
+                        for choice in normalized_scope_filter.choices
+                        if not any(
+                            _candidate_matches_scope_choice(item, choice)
+                            and str(item.get("doc_id") or "")
+                            in {
+                                str(value)
+                                for value in choice.anchor_doc_ids
+                            }
+                            for item in fresh_results
+                        )
+                    ]
+                    raise ValueError(
+                        "scope anchor retrieval incomplete: "
+                        + ",".join(missing_choice_keys)
+                    )
+            else:
+                fresh_results = await hybrid_search(
+                    db=db,
+                    query=retrieval_query,
+                    kb_ids=retrieval_kb_ids,
+                    top_k=candidate_k,
+                    method=method,
+                    trace_id=trace_id,
+                    surface="chat",
+                )
+                explicit_comparison_plan = resolve_explicit_scope_comparison(
+                    query=retrieval_query,
+                    constraints=query_constraints,
+                    candidates=fresh_results,
+                )
+                resolved_scope_filter = _resolved_comparison_scope_filter(
+                    explicit_comparison_plan,
+                    authorized_kb_ids=kb_ids,
+                )
+                if resolved_scope_filter is not None:
+                    # The initial parser can bind only the first mentioned
+                    # product/version.  Once two or more source-backed aliases
+                    # uniquely resolve, their document allow-list becomes the
+                    # applicability boundary and the single-value constraint is
+                    # no longer allowed to discard the other named scope.
+                    normalized_scope_filter = resolved_scope_filter
+                    resolved_comparison_filter_applied = True
+                    explicit_all_scope_request = True
+                    query_constraints = QueryConstraints(
+                        extraction_reason=(
+                            "用户明确点名多个来源可验证的适用范围，"
+                            "改用文档范围 allowlist"
+                        ),
+                    )
+                    scope_anchor_hit, scope_anchor_doc_ids = (
+                        _scope_anchor_coverage(
+                            fresh_results,
+                            normalized_scope_filter,
+                        )
+                    )
+                    if not scope_anchor_hit:
+                        raise ValueError(
+                            "resolved comparison scope is missing an anchor"
+                        )
+                    trace_event(
+                        "evidence.explicit_comparison_resolved",
+                        trace_id=trace_id,
+                        reason=explicit_comparison_plan.reason,
+                        dimension=explicit_comparison_plan.dimension,
+                        choice_count=len(explicit_comparison_plan.choices),
+                        scoped_document_count=len(
+                            normalized_scope_filter.doc_ids
+                        ),
+                        rejected_scope_count=max(
+                            0,
+                            len({
+                                str(item.get("doc_id") or "")
+                                for item in fresh_results
+                                if item.get("doc_id") is not None
+                            })
+                            - len(normalized_scope_filter.doc_ids),
+                        ),
+                        **content_fields(
+                            "scope_description",
+                            "；".join(
+                                choice.label
+                                for choice in explicit_comparison_plan.choices
+                            ),
+                        ),
+                    )
+            fresh_results, scope_rejected_candidate_count = (
+                _restrict_candidates_to_scope(
+                    fresh_results,
+                    normalized_scope_filter,
+                )
             )
             fresh_candidate_count = len(fresh_results)
             results = _merge_retrieval_candidates(
                 fresh_results,
-                carryover_sources,
+                [] if normalized_scope_filter is not None else carryover_sources,
             )
             carryover_candidate_count = sum(
                 "carryover" in str(item.get("candidate_origin") or "")
@@ -1734,11 +3086,32 @@ async def run_rag_stream(
                     for channel in ("vector", "keyword", "trigram")
                 },
                 elapsed_ms=retrieval_elapsed_ms,
+                evidence_scope_filter_mode=(
+                    normalized_scope_filter.mode
+                    if normalized_scope_filter is not None
+                    else None
+                ),
+                evidence_scope_document_count=(
+                    len(normalized_scope_filter.doc_ids)
+                    if normalized_scope_filter is not None
+                    else 0
+                ),
+                evidence_scope_rejected_candidate_count=(
+                    scope_rejected_candidate_count
+                ),
+                evidence_scope_coverage_supplement_count=(
+                    scope_coverage_supplement_count
+                ),
+                evidence_scope_anchor_hit=scope_anchor_hit,
+                evidence_scope_anchor_doc_ids=list(scope_anchor_doc_ids),
             )
         except Exception as exc:
             # 已重新验证过的上一轮来源仍是合法候选。新检索失败时允许它们
             # 继续进入本轮重排；只有两路都不可用时才把整轮标记为检索失败。
-            results = _merge_retrieval_candidates([], carryover_sources)
+            results = _merge_retrieval_candidates(
+                [],
+                [] if normalized_scope_filter is not None else carryover_sources,
+            )
             carryover_candidate_count = len(results)
             fresh_candidate_count = 0
             retrieval_error = None if results else exc
@@ -1766,6 +3139,14 @@ async def run_rag_stream(
                 fresh_candidate_count=0,
                 carryover_candidate_count=carryover_candidate_count,
                 recovered_from_carryover=bool(results),
+                evidence_scope_filter_mode=(
+                    normalized_scope_filter.mode
+                    if normalized_scope_filter is not None
+                    else None
+                ),
+                evidence_scope_anchor_hit=scope_anchor_hit,
+                evidence_scope_anchor_doc_ids=list(scope_anchor_doc_ids),
+                global_fallback_used=False,
                 elapsed_ms=retrieval_elapsed_ms,
                 error=exc,
             )
@@ -1785,21 +3166,237 @@ async def run_rag_stream(
         )
     yield _step_event("retrieve", "done")
 
+    # 极窄的性能快速路径：新问题且没有历史来源时，如果当前召回前三条都
+    # 来自同一篇文档并带有 keyword/trigram 证据，先尝试一次有界全文加载。
+    # 只有数据库确认该文档是完整小文档后才跳过首轮逐片段重排；加载失败、
+    # 超出预算或授权范围不一致都无条件回到旧路径。
+    pre_rerank_joint_ready = False
+    pre_rerank_expansion_plan: ExpansionPlan | None = None
+    pre_rerank_expansion_inputs: list[dict] = []
+    pre_rerank_expansion_outcome: ExpansionOutcome | None = None
+    pre_rerank_expansion_trigger = "not_applicable"
+    pre_rerank_doc_id: uuid.UUID | str | None = None
+    pre_rerank_anchor_candidate_indexes: tuple[int, ...] = ()
+    pre_rerank_fast_path_eligible = (
+        task_contract is not None
+        and bool(locked_requirements)
+        and retrieval_executed
+        and retrieval_error is None
+        and retrieval_policy == "required"
+        and response_mode in {"grounded_qa", "writing"}
+        and rerank_requested
+        and not is_followup
+        and not carryover_sources
+        # A clarification selection already supplies an exact document set.
+        # The dominant-one-document fast path could otherwise collapse a
+        # compare-all or complementary single choice back to only its first
+        # document before every selected scope reaches the normal reranker.
+        and normalized_scope_filter is None
+        and bool(fresh_results)
+    )
+    if pre_rerank_fast_path_eligible:
+        (
+            pre_rerank_expansion_plan,
+            pre_rerank_expansion_inputs,
+            pre_rerank_doc_id,
+            pre_rerank_expansion_trigger,
+        ) = _resolve_pre_rerank_small_document_plan(
+            question=retrieval_query,
+            fresh_results=fresh_results,
+            merged_results=results,
+            constraints=query_constraints,
+            allowed_kb_ids=retrieval_kb_ids,
+        )
+        if pre_rerank_expansion_plan is not None and pre_rerank_doc_id is not None:
+            fast_path_expansion_started_at = time.perf_counter()
+            try:
+                loaded_full_document = await fetch_small_document_candidates(
+                    db,
+                    kb_ids=retrieval_kb_ids,
+                    doc_ids=[pre_rerank_doc_id],
+                    max_chunks=PRE_RERANK_FULL_DOCUMENT_MAX_CHUNKS,
+                    max_chars=PRE_RERANK_FULL_DOCUMENT_MAX_CHARS,
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                loaded_full_document = []
+                log_exception_safely(
+                    logger,
+                    "[快速联合重排] 小文档全文探测失败，回退首轮重排 trace=%s",
+                    trace_id,
+                    exc=exc,
+                )
+                trace_event(
+                    "rerank.fast_path_skipped",
+                    trace_id=trace_id,
+                    reason=f"loader_{type(exc).__name__}",
+                )
+
+            allowed_doc_id = str(pre_rerank_doc_id)
+            allowed_kb_ids = {str(value) for value in retrieval_kb_ids}
+            invalid_full_document = any(
+                str(item.get("doc_id") or "") != allowed_doc_id
+                or str(item.get("kb_id") or "") not in allowed_kb_ids
+                for item in loaded_full_document
+            )
+            full_document = (
+                [] if invalid_full_document else list(loaded_full_document)
+            )
+            if invalid_full_document:
+                trace_event(
+                    "rerank.fast_path_skipped",
+                    trace_id=trace_id,
+                    reason="loader_scope_mismatch",
+                    candidate_count=len(loaded_full_document),
+                )
+
+            if full_document:
+                merge = merge_expansion_candidates(
+                    pre_rerank_expansion_inputs,
+                    [],
+                    budget=ExpansionBudget(
+                        max_joint_candidates=PRE_RERANK_FULL_DOCUMENT_MAX_CHUNKS,
+                        max_added_chars=PRE_RERANK_FULL_DOCUMENT_MAX_CHARS,
+                    ),
+                    priority_added_candidates=full_document,
+                )
+                pre_rerank_expansion_outcome = ExpansionOutcome(
+                    candidates=merge.candidates,
+                    seed_candidates=pre_rerank_expansion_inputs[:3],
+                    scoped_candidates=[],
+                    structural_candidates=[],
+                    counts_by_origin=merge.counts_by_origin,
+                    added_candidate_count=merge.added_candidate_count,
+                    added_chars=merge.added_chars,
+                    deduplicated_count=merge.deduplicated_count,
+                    budget_dropped_count=merge.budget_dropped_count,
+                    expanded=True,
+                    full_document_candidates=full_document,
+                )
+                explicit_answer_requirement_count = sum(
+                    item.importance == "required"
+                    and item.source == "explicit"
+                    for item in locked_requirements
+                )
+                anchor_chunk_ids = tuple(
+                    str(candidate.get("id"))
+                    for candidate in pre_rerank_expansion_inputs[
+                        :FAILED_RERANK_SAFE_SEED_COUNT
+                    ]
+                    if candidate.get("id") is not None
+                )
+                pre_rerank_anchor_candidate_indexes = tuple(
+                    index
+                    for index, candidate in enumerate(
+                        merge.candidates,
+                        start=1,
+                    )
+                    if str(candidate.get("id")) in set(anchor_chunk_ids)
+                    and str(candidate.get("doc_id") or "")
+                    == str(pre_rerank_doc_id)
+                )
+                anchor_mapping_complete = bool(
+                    len(anchor_chunk_ids) == FAILED_RERANK_SAFE_SEED_COUNT
+                    and len(set(anchor_chunk_ids)) == len(anchor_chunk_ids)
+                    and len(pre_rerank_anchor_candidate_indexes)
+                    == len(anchor_chunk_ids)
+                )
+                # 小文档选择器本身就是有界、硬超时的唯一证据验证边界；即使没有
+                # 单独配置 rerank_model，也应回退到 chat_model 执行一次，而不是把
+                # 未验证全文直送生成或重新走两轮慢重排。
+                pre_rerank_joint_ready = bool(
+                    merge.candidates
+                    and response_mode == "grounded_qa"
+                    and explicit_answer_requirement_count >= 1
+                    and anchor_mapping_complete
+                )
+                if merge.candidates and not pre_rerank_joint_ready:
+                    trace_event(
+                        "rerank.fast_path_skipped",
+                        trace_id=trace_id,
+                        reason=(
+                            "small_document_anchor_mapping_incomplete"
+                            if not anchor_mapping_complete
+                            else "small_document_selector_not_eligible"
+                        ),
+                        explicit_answer_requirement_count=(
+                            explicit_answer_requirement_count
+                        ),
+                    )
+                if pre_rerank_joint_ready:
+                    results = pre_rerank_expansion_inputs
+                    trace_event(
+                        "retrieval.expansion_planned",
+                        trace_id=trace_id,
+                        should_expand=True,
+                        seed_document_count=1,
+                        seed_chunk_count=FAILED_RERANK_SAFE_SEED_COUNT,
+                        secondary_query_count=len(pre_rerank_expansion_plan.queries),
+                        adaptive_small_document_enabled=True,
+                        max_full_document_candidates=PRE_RERANK_FULL_DOCUMENT_MAX_CHUNKS,
+                        max_full_document_chars=PRE_RERANK_FULL_DOCUMENT_MAX_CHARS,
+                        trigger=pre_rerank_expansion_trigger,
+                    )
+                    trace_event(
+                        "retrieval.expansion_completed",
+                        trace_id=trace_id,
+                        initial_candidate_count=len(pre_rerank_expansion_inputs),
+                        full_document_count=1,
+                        full_document_candidate_count=len(full_document),
+                        semantic_fallback_document_count=0,
+                        added_candidate_count=merge.added_candidate_count,
+                        combined_candidate_count=len(merge.candidates),
+                        counts_by_origin=merge.counts_by_origin,
+                        deduplicated_count=merge.deduplicated_count,
+                        budget_dropped_count=merge.budget_dropped_count,
+                        added_chars=merge.added_chars,
+                        elapsed_ms=round(
+                            (
+                                time.perf_counter()
+                                - fast_path_expansion_started_at
+                            )
+                            * 1000
+                        ),
+                        fast_path=True,
+                    )
+
     # Step 4: 重排（大候选池上重排后，按相关度过滤+截断，剔除不相关文档）
     reranked = False
     rerank_constraints = query_constraints
     rerank_elapsed_ms = 0
     rerank_error_message: str | None = None
     initial_rerank_outcome: RerankOutcome | None = None
-    if rerank_requested and results:
+    if (
+        rerank_requested
+        and results
+        and not pre_rerank_joint_ready
+    ):
         yield _step_event("rerank", "active")
         t0 = time.perf_counter()
-        outcome = await rerank_with_status(retrieval_query, results)
+        outcome = await rerank_with_status(
+            retrieval_query,
+            results,
+            locked_requirements,
+        )
+        scoped_rerank_results, rerank_scope_rejected_count = (
+            _restrict_candidates_to_scope(
+                outcome.results,
+                normalized_scope_filter,
+            )
+        )
+        if rerank_scope_rejected_count:
+            outcome = replace(outcome, results=scoped_rerank_results)
         initial_rerank_outcome = outcome
         results = outcome.results
         reranked = outcome.succeeded
         rerank_error_message = outcome.error
-        rerank_constraints = outcome.constraints or query_constraints
+        rerank_constraints = (
+            query_constraints
+            if normalized_scope_filter is not None
+            and normalized_scope_filter.valid
+            and normalized_scope_filter.compare_all
+            else (outcome.constraints or query_constraints)
+        )
         results = (
             _enforce_verified_constraints(results, rerank_constraints)
             if reranked
@@ -1891,8 +3488,15 @@ async def run_rag_stream(
             ),
         )
     else:
+        if pre_rerank_joint_ready:
+            yield _step_event("rerank", "active")
         if results:
-            logger.info("[重排] 已关闭，跳过")
+            if pre_rerank_joint_ready:
+                logger.info(
+                    "[重排] 已确认高确定性小文档，跳过首轮模型并直接执行联合重排"
+                )
+            else:
+                logger.info("[重排] 已关闭，跳过")
             results = annotate_deterministic_constraints(results, query_constraints)
         trace_event(
             "rerank.completed",
@@ -1907,7 +3511,11 @@ async def run_rag_stream(
             answer_support_threshold=DIRECT_SUPPORT_THRESHOLD,
             candidate_count=len(results),
             elapsed_ms=0,
-            reason="no_candidates" if rerank_requested else "disabled",
+            reason=(
+                "pre_rerank_dominant_small_document"
+                if pre_rerank_joint_ready
+                else ("no_candidates" if rerank_requested else "disabled")
+            ),
         )
 
     # 标签软加权：命中用户所选标签的文档上浮排序（不改语义分、不排除未命中）
@@ -1923,18 +3531,31 @@ async def run_rag_stream(
     # 首轮失败时只有“前三条同文档且存在词面命中”才允许安全补检。新增片段
     # 必须经过联合重排才能进入上下文，任一验证失败都保持 fail-close。
     first_pass_results = list(results)
-    expansion_attempted = False
+    expansion_attempted = pre_rerank_joint_ready
     expansion_succeeded = False
     expansion_retry_exhausted = False
-    expansion_trigger = "not_applicable"
-    expansion_outcome: ExpansionOutcome | None = None
+    expansion_trigger = (
+        pre_rerank_expansion_trigger
+        if pre_rerank_joint_ready
+        else "not_applicable"
+    )
+    # 全文探测只有在 anchor 映射完整、快速选择真正获准时才能继承。否则后续
+    # 普通 expansion 异常时不得误用这份尚未验证的小文档候选。
+    expansion_outcome: ExpansionOutcome | None = (
+        pre_rerank_expansion_outcome if pre_rerank_joint_ready else None
+    )
     joint_outcome: RerankOutcome | None = None
     joint_coverage_status: str | None = None
-    joint_requirements: tuple[AnswerRequirement, ...] = ()
+    joint_requirements: tuple[AnswerRequirement, ...] = locked_requirements
     coverage_missing_ids: tuple[str, ...] = ()
     context_budget_dropped_count = 0
     context_budget_chars = 0
     force_no_related_context = False
+    expansion_error_message: str | None = None
+    evidence_validation_error_message: str | None = None
+    evidence_validation_error_stage: str | None = None
+    joint_rescued_candidate_count = 0
+    initial_verified_fallback_used = False
 
     enrichment_eligible = (
         retrieval_executed
@@ -1942,11 +3563,18 @@ async def run_rag_stream(
         and retrieval_policy == "required"
         and response_mode in {"grounded_qa", "writing"}
         and rerank_requested
-        and initial_rerank_outcome is not None
+        and (
+            initial_rerank_outcome is not None
+            or pre_rerank_joint_ready
+        )
         and bool(results)
     )
     if enrichment_eligible:
-        if reranked:
+        if pre_rerank_joint_ready:
+            expansion_plan = pre_rerank_expansion_plan
+            joint_requirements = locked_requirements
+            expansion_trigger = pre_rerank_expansion_trigger
+        elif reranked:
             expansion_plan, joint_requirements, expansion_trigger = (
                 _resolve_document_expansion_plan(
                     question=retrieval_query,
@@ -1955,6 +3583,11 @@ async def run_rag_stream(
                     constraints=rerank_constraints,
                 )
             )
+            if locked_requirements:
+                # The semantic router owns the answer contract.  The reranker
+                # may assess coverage and propose expansion, but cannot replace
+                # or downgrade these requirements.
+                joint_requirements = locked_requirements
         else:
             expansion_plan, joint_requirements, expansion_trigger = (
                 _resolve_failed_rerank_expansion_plan(
@@ -1963,11 +3596,17 @@ async def run_rag_stream(
                     constraints=rerank_constraints,
                 )
             )
+            if locked_requirements:
+                joint_requirements = locked_requirements
         if expansion_plan is not None:
             expansion_attempted = True
-            expansion_inputs = _bounded_initial_expansion_candidates(
-                results,
-                expansion_plan,
+            expansion_inputs = (
+                pre_rerank_expansion_inputs
+                if pre_rerank_joint_ready
+                else _bounded_initial_expansion_candidates(
+                    results,
+                    expansion_plan,
+                )
             )
             if trace_include_content:
                 logger.info(
@@ -1985,44 +3624,110 @@ async def run_rag_stream(
                     len(expansion_plan.queries),
                     len(expansion_inputs),
                 )
-            try:
-                expansion_outcome = await expand_evidence_candidates(
-                    db,
-                    question=retrieval_query,
-                    kb_ids=kb_ids,
-                    initial_candidates=expansion_inputs,
-                    plan=expansion_plan,
-                    method=method,
-                    budget=ExpansionBudget(),
-                    trace_id=trace_id,
-                    surface="chat",
-                )
-            except Exception as exc:
-                # CancelledError 不属于 Exception，会继续向上传播；普通补检故障只
-                # 降级本轮证据，不影响已有首轮结果和后续回答流。
-                log_exception_safely(
-                    logger,
-                    "[证据扩展] 执行失败 trace=%s",
-                    trace_id,
-                    exc=exc,
-                )
-                trace_event(
-                    "retrieval.expansion_completed",
-                    trace_id=trace_id,
-                    succeeded=False,
-                    added_candidate_count=0,
-                    combined_candidate_count=len(expansion_inputs),
-                    elapsed_ms=0,
-                    error=exc,
+            if not pre_rerank_joint_ready:
+                try:
+                    expansion_outcome = await expand_evidence_candidates(
+                        db,
+                        question=retrieval_query,
+                        kb_ids=retrieval_kb_ids,
+                        initial_candidates=expansion_inputs,
+                        plan=expansion_plan,
+                        method=method,
+                        budget=ExpansionBudget(),
+                        trace_id=trace_id,
+                        surface="chat",
+                    )
+                except Exception as exc:
+                    # CancelledError 不属于 Exception，会继续向上传播；普通补检故障
+                    # 转为本轮 evidence error，后续仍可生成明确的稍后重试提示。
+                    log_exception_safely(
+                        logger,
+                        "[证据扩展] 执行失败 trace=%s",
+                        trace_id,
+                        exc=exc,
+                    )
+                    trace_event(
+                        "retrieval.expansion_completed",
+                        trace_id=trace_id,
+                        succeeded=False,
+                        added_candidate_count=0,
+                        combined_candidate_count=len(expansion_inputs),
+                        elapsed_ms=0,
+                        error=exc,
+                    )
+                    expansion_error_message = f"{type(exc).__name__}: {exc}"
+
+            if expansion_outcome is not None and expansion_outcome.errors:
+                expansion_error_message = (
+                    "ExpansionError: " + "; ".join(expansion_outcome.errors)
                 )
 
-            if expansion_outcome is not None and expansion_outcome.added_candidate_count > 0:
-                try:
-                    joint_outcome = await joint_rerank_with_coverage(
-                        retrieval_query,
-                        expansion_outcome.candidates,
-                        joint_requirements,
+            if expansion_outcome is not None:
+                expansion_outcome, expansion_scope_rejected_count = (
+                    _restrict_expansion_outcome_to_scope(
+                        expansion_outcome,
+                        normalized_scope_filter,
                     )
+                )
+                if expansion_scope_rejected_count:
+                    trace_event(
+                        "evidence.scope_filter_rejected_candidates",
+                        trace_id=trace_id,
+                        stage="expansion",
+                        rejected_candidate_count=expansion_scope_rejected_count,
+                        mode=(
+                            normalized_scope_filter.mode
+                            if normalized_scope_filter is not None
+                            else None
+                        ),
+                    )
+
+            has_joint_candidates = (
+                expansion_outcome is not None
+                and (
+                    expansion_outcome.added_candidate_count > 0
+                    or (
+                        pre_rerank_joint_ready
+                        and bool(expansion_outcome.full_document_candidates)
+                    )
+                )
+            )
+            if has_joint_candidates:
+                joint_started_at = time.perf_counter()
+                try:
+                    if pre_rerank_joint_ready:
+                        target_doc_key = str(pre_rerank_doc_id or "")
+                        eligible_candidate_indexes = tuple(
+                            index
+                            for index, candidate in enumerate(
+                                expansion_outcome.candidates,
+                                start=1,
+                            )
+                            if str(candidate.get("doc_id") or "")
+                            == target_doc_key
+                        )
+                        joint_outcome = (
+                            await select_small_document_evidence_with_coverage(
+                                retrieval_query,
+                                expansion_outcome.candidates,
+                                joint_requirements,
+                                bridge_requirement_ids=(
+                                    locked_bridge_requirement_ids
+                                ),
+                                eligible_candidate_indexes=(
+                                    eligible_candidate_indexes
+                                ),
+                                anchor_candidate_indexes=(
+                                    pre_rerank_anchor_candidate_indexes
+                                ),
+                            )
+                        )
+                    else:
+                        joint_outcome = await joint_rerank_with_coverage(
+                            retrieval_query,
+                            expansion_outcome.candidates,
+                            joint_requirements,
+                        )
                 except Exception as exc:
                     # 联合重排是扩展证据进入生成上下文的唯一验证边界。调用异常时
                     # 构造失败结果走统一的 fail-closed 分支，绝不能退回单个桥接
@@ -2037,12 +3742,66 @@ async def run_rag_stream(
                         results=first_pass_results,
                         succeeded=False,
                         error=f"{type(exc).__name__}: {exc}",
-                        prompt_version=JOINT_RERANK_PROMPT_VERSION,
+                        prompt_version=(
+                            "small_document_unhandled_error"
+                            if pre_rerank_joint_ready
+                            else JOINT_RERANK_PROMPT_VERSION
+                        ),
                         candidate_count=len(expansion_outcome.candidates),
+                    )
+                scoped_joint_results, joint_scope_rejected_count = (
+                    _restrict_candidates_to_scope(
+                        joint_outcome.results,
+                        normalized_scope_filter,
+                    )
+                )
+                if joint_scope_rejected_count:
+                    joint_outcome = replace(
+                        joint_outcome,
+                        results=scoped_joint_results,
+                    )
+                    trace_event(
+                        "evidence.scope_filter_rejected_candidates",
+                        trace_id=trace_id,
+                        stage="joint_rerank",
+                        rejected_candidate_count=joint_scope_rejected_count,
+                        mode=(
+                            normalized_scope_filter.mode
+                            if normalized_scope_filter is not None
+                            else None
+                        ),
+                    )
+                if joint_outcome.succeeded:
+                    # 联合 JSON 修复可能只保留桥接片段，尽管首轮已验证的答案
+                    # 片段仍在同一文档候选中。先回收这类明确支撑缺失需求的片段，
+                    # 再记录联合结果并执行硬约束和上下文预算。
+                    before_rescue_selected = set(
+                        joint_outcome.selected_candidate_indexes
+                    )
+                    joint_outcome = _rescue_missing_joint_evidence(
+                        joint_outcome,
+                        first_pass_results,
+                        joint_requirements,
+                    )
+                    joint_rescued_candidate_count = len(
+                        set(joint_outcome.selected_candidate_indexes)
+                        - before_rescue_selected
+                    )
+                joint_elapsed_ms = round(
+                    (time.perf_counter() - joint_started_at) * 1000
+                )
+                if pre_rerank_joint_ready:
+                    rerank_elapsed_ms = (
+                        joint_outcome.elapsed_ms
+                        if joint_outcome.elapsed_ms is not None
+                        else joint_elapsed_ms
                     )
                 trace_event(
                     "rerank.joint_completed",
                     trace_id=trace_id,
+                    pass_name=(
+                        "joint_initial" if pre_rerank_joint_ready else "joint"
+                    ),
                     requested=True,
                     attempted=True,
                     succeeded=joint_outcome.succeeded,
@@ -2075,11 +3834,16 @@ async def run_rag_stream(
                     missing_requirement_count=len(
                         joint_outcome.missing_requirement_ids
                     ),
+                    rescued_candidate_count=joint_rescued_candidate_count,
                     retry_exhausted=(
                         not joint_outcome.succeeded
                         or joint_outcome.coverage_status != "complete"
                     ),
-                    elapsed_ms=joint_outcome.elapsed_ms,
+                    elapsed_ms=(
+                        joint_outcome.elapsed_ms
+                        if joint_outcome.elapsed_ms is not None
+                        else joint_elapsed_ms
+                    ),
                     error=(
                         joint_outcome.error
                         if trace_include_content
@@ -2090,7 +3854,11 @@ async def run_rag_stream(
                     for rank, result in enumerate(joint_outcome.results, start=1):
                         payload = {
                             "trace_id": trace_id,
-                            "pass_name": "joint",
+                            "pass_name": (
+                                "joint_initial"
+                                if pre_rerank_joint_ready
+                                else "joint"
+                            ),
                             "rank": rank,
                             "chunk_id": result.get("id"),
                             "doc_id": result.get("doc_id"),
@@ -2109,6 +3877,8 @@ async def run_rag_stream(
                             "evidence_set_id": result.get("evidence_set_id"),
                             "joint_support_score": result.get("joint_support_score"),
                             "coverage_status": result.get("coverage_status"),
+                            "assessment_mode": result.get("assessment_mode"),
+                            "score_semantics": result.get("score_semantics"),
                             **content_fields(
                                 "filename",
                                 str(result.get("filename") or ""),
@@ -2122,14 +3892,21 @@ async def run_rag_stream(
                         trace_event("rerank.candidate", **payload)
 
                 if joint_outcome.succeeded:
+                    joint_constraints = (
+                        rerank_constraints
+                        if normalized_scope_filter is not None
+                        and normalized_scope_filter.valid
+                        and normalized_scope_filter.compare_all
+                        else (joint_outcome.constraints or rerank_constraints)
+                    )
                     results = _enforce_verified_constraints(
                         joint_outcome.results,
-                        joint_outcome.constraints or rerank_constraints,
+                        joint_constraints,
                     )
                     # 首轮可能失败，但联合候选已完整通过当前问题的最终验证。
                     # 后续必须进入 verified 选择分支，不能再按原始召回兜底。
                     reranked = True
-                    rerank_constraints = joint_outcome.constraints or rerank_constraints
+                    rerank_constraints = joint_constraints
                     joint_coverage_status = joint_outcome.coverage_status or "insufficient"
                     coverage_missing_ids = joint_outcome.missing_requirement_ids
                     (
@@ -2155,17 +3932,45 @@ async def run_rag_stream(
                     )
                     force_no_related_context = joint_coverage_status == "insufficient"
                 else:
-                    # 联合模型失败时丢弃所有新增候选，只保留首轮已验证结果。
-                    results = first_pass_results
-                    joint_coverage_status = "insufficient"
+                    # 联合模型失败时绝不引入扩展候选；如果首轮已有明确的
+                    # 答案/补充证据且需求覆盖完整，则保留这些已验证片段并标记 partial，
+                    # 避免一次可选的联合请求超时把本来可回答的问题变成服务不可用。
+                    fallback_results, fallback_available = (
+                        _fallback_to_initial_verified_evidence(
+                            first_pass_results,
+                            joint_requirements,
+                            bridge_requirement_ids=(
+                                locked_bridge_requirement_ids
+                            ),
+                        )
+                    )
                     expansion_succeeded = False
                     expansion_retry_exhausted = True
-                    force_no_related_context = True
                     coverage_missing_ids = tuple(
                         item.id
                         for item in joint_requirements
                         if item.importance == "required" and item.source == "explicit"
                     )
+                    if fallback_available and not pre_rerank_joint_ready:
+                        results = fallback_results
+                        initial_verified_fallback_used = True
+                        reranked = True
+                        joint_coverage_status = "partial"
+                        force_no_related_context = False
+                        evidence_validation_error_message = None
+                        evidence_validation_error_stage = None
+                    else:
+                        results = first_pass_results
+                        joint_coverage_status = "insufficient"
+                        force_no_related_context = True
+                        evidence_validation_error_message = (
+                            joint_outcome.error or "JointRerankError: unknown failure"
+                        )
+                        evidence_validation_error_stage = "joint_rerank"
+                        if pre_rerank_joint_ready:
+                            evidence_validation_error_stage = (
+                                "small_document_evidence_selection"
+                            )
             else:
                 results = first_pass_results
                 joint_coverage_status = "insufficient"
@@ -2205,6 +4010,17 @@ async def run_rag_stream(
                 )
         else:
             expansion_retry_exhausted = False
+
+        # 扩展模块可能内部降级后返回 errors，而不是把异常继续抛出。只要其它
+        # 扩展通道和联合重排仍形成 complete/partial 的可信证据，就允许正常回答；
+        # 否则本轮是技术故障，不能伪装成知识库无命中。
+        if (
+            evidence_validation_error_message is None
+            and expansion_error_message is not None
+            and not expansion_succeeded
+        ):
+            evidence_validation_error_message = expansion_error_message
+            evidence_validation_error_stage = "expansion"
 
         explicit_required_count = sum(
             item.importance == "required" and item.source == "explicit"
@@ -2257,6 +4073,80 @@ async def run_rag_stream(
 
     yield _step_event("rerank", "done")
 
+    ambiguity_decision = EvidenceAmbiguityDecision(
+        needs_clarification=False,
+        reason="ambiguity_not_assessed",
+    )
+    if (
+        retrieval_executed
+        and retrieval_error is None
+        and evidence_validation_error_message is None
+    ):
+        ambiguity_decision = detect_evidence_scope_ambiguity(
+            query=retrieval_query,
+            constraints=rerank_constraints,
+            candidates=results,
+        )
+        comparison_scope_already_selected = bool(
+            normalized_scope_filter is not None
+            and normalized_scope_filter.valid
+            and normalized_scope_filter.compare_all
+        )
+        if (
+            comparison_scope_already_selected
+            and ambiguity_decision.needs_clarification
+        ):
+            # Every retained group was uniquely named by the user and is
+            # already bounded by the source-derived document filter.  The
+            # detector may not recognize every natural-language comparison
+            # cue, but it must not ask the user to choose between the exact
+            # scopes they have just requested to compare.
+            ambiguity_decision = EvidenceAmbiguityDecision(
+                needs_clarification=False,
+                dimension=(
+                    ambiguity_decision.dimension
+                    or explicit_comparison_plan.dimension
+                ),
+                reason="query_explicit_scope_comparison",
+                choices=(
+                    ambiguity_decision.choices
+                    or (
+                        explicit_comparison_plan.choices
+                        if resolved_comparison_filter_applied
+                        else ()
+                    )
+                ),
+                relevant_document_count=(
+                    ambiguity_decision.relevant_document_count
+                ),
+            )
+    trace_event(
+        "evidence.ambiguity_assessed",
+        trace_id=trace_id,
+        needs_clarification=ambiguity_decision.needs_clarification,
+        dimension=ambiguity_decision.dimension,
+        reason=ambiguity_decision.reason,
+        choice_count=len(ambiguity_decision.choices),
+        relevant_document_count=ambiguity_decision.relevant_document_count,
+        choices=(
+            [choice.to_dict() for choice in ambiguity_decision.choices]
+            if trace_include_content
+            else [
+                {
+                    "key": choice.key,
+                    "document_count": len(choice.doc_ids),
+                    "version_count": len(choice.versions),
+                }
+                for choice in ambiguity_decision.choices
+            ]
+        ),
+        **(
+            content_fields("clarification", ambiguity_decision.question)
+            if ambiguity_decision.needs_clarification
+            else {}
+        ),
+    )
+
     before_filter = len(results)
     context_results: list[dict] = []
     direct_evidence_count = 0
@@ -2272,6 +4162,12 @@ async def run_rag_stream(
         evidence_status = "error"
         results = []
         filter_mode = "检索异常"
+    elif evidence_validation_error_message is not None:
+        # 联合验证失败时连首轮桥接片段也不能进入生成上下文；但状态必须明确为
+        # 技术异常，不能把失败结果降格为 no_hit 并误导用户认为知识库无资料。
+        evidence_status = "error"
+        results = []
+        filter_mode = "证据扩展/验证异常"
     elif reranked or joint_coverage_status is not None:
         (
             results,
@@ -2352,6 +4248,108 @@ async def run_rag_stream(
         ) = _select_unverified_evidence(results, top_k, rerank_constraints)
         filter_mode = "required 召回优先（确定性约束 + 未验证）"
 
+    final_decision_reason = decision_reason
+    if ambiguity_decision.needs_clarification:
+        downgraded_results: list[dict] = []
+        for result in results:
+            item = dict(result)
+            if item.get("evidence_role") == "direct":
+                item["evidence_role"] = "related"
+                item["score"] = 0.0
+                item["pipeline_override_reason"] = (
+                    "检索到多个互斥适用范围，用户选择前不得作为回答依据"
+                )
+            downgraded_results.append(item)
+        results = downgraded_results
+        context_results = []
+        evidence_status = "needs_clarification"
+        direct_evidence_count = 0
+        related_reference_count = sum(
+            item.get("evidence_role") == "related" for item in results
+        )
+        filter_mode = "检索后多适用范围歧义澄清"
+        final_decision_reason = "evidence_scope_ambiguous"
+        trace_event(
+            "evidence.clarification_required",
+            trace_id=trace_id,
+            dimension=ambiguity_decision.dimension,
+            choice_count=len(ambiguity_decision.choices),
+            relevant_document_count=ambiguity_decision.relevant_document_count,
+            generation_authorized=False,
+            **content_fields("clarification", ambiguity_decision.question),
+        )
+    elif context_results:
+        context_anchor_hit = True
+        context_anchor_doc_ids: tuple[str, ...] = ()
+        if normalized_scope_filter is not None and normalized_scope_filter.valid:
+            context_anchor_hit, context_anchor_doc_ids = _scope_anchor_coverage(
+                context_results,
+                normalized_scope_filter,
+            )
+        elif explicit_all_scope_request and ambiguity_decision.choices:
+            context_doc_ids = {
+                str(item.get("doc_id") or "") for item in context_results
+            }
+            matched_anchor_ids: list[str] = []
+            context_anchor_hit = True
+            for choice in ambiguity_decision.choices:
+                choice_hits = [
+                    str(doc_id)
+                    for doc_id in choice.anchor_doc_ids
+                    if str(doc_id) in context_doc_ids
+                ]
+                if not choice_hits:
+                    context_anchor_hit = False
+                for doc_id in choice_hits:
+                    if doc_id not in matched_anchor_ids:
+                        matched_anchor_ids.append(doc_id)
+            context_anchor_doc_ids = tuple(matched_anchor_ids)
+
+        if not context_anchor_hit:
+            # Shared companion documents may add common prerequisites only after
+            # every selected applicability scope has an answer-bearing anchor.
+            # If rerank/selection drops an anchor, fail closed instead of letting
+            # a generic companion stand in for that product/version/project.
+            downgraded_results = []
+            for result in results:
+                item = dict(result)
+                if item.get("evidence_role") == "direct":
+                    item["evidence_role"] = "related"
+                    item["score"] = 0.0
+                    item["pipeline_override_reason"] = (
+                        "选定适用范围缺少可用于回答的锚点证据，"
+                        "通用资料不得单独作为该范围的回答依据"
+                    )
+                downgraded_results.append(item)
+            results = downgraded_results
+            context_results = []
+            evidence_status = "no_hit"
+            direct_evidence_count = 0
+            related_reference_count = sum(
+                item.get("evidence_role") == "related" for item in results
+            )
+            filter_mode = "适用范围回答锚点校验失败（通用资料不得单独回答）"
+            final_decision_reason = "evidence_scope_answer_anchor_incomplete"
+            if normalized_scope_filter is not None:
+                scope_anchor_hit = False
+                scope_anchor_doc_ids = context_anchor_doc_ids
+            trace_event(
+                "evidence.scope_answer_anchor_incomplete",
+                trace_id=trace_id,
+                mode=(
+                    normalized_scope_filter.mode
+                    if normalized_scope_filter is not None
+                    else "compare_all"
+                ),
+                selected_choice_count=(
+                    len(normalized_scope_filter.choices)
+                    if normalized_scope_filter is not None
+                    else len(ambiguity_decision.choices)
+                ),
+                context_anchor_doc_ids=list(context_anchor_doc_ids),
+                generation_authorized=False,
+            )
+
     def selected_trace_item(item: dict) -> dict:
         payload = {
             "doc_id": item.get("doc_id"),
@@ -2402,6 +4400,24 @@ async def run_rag_stream(
                 before_filter,
                 len(results),
             )
+    final_rerank_succeeded = (
+        False
+        if evidence_validation_error_message is not None
+        else (
+            joint_outcome.succeeded
+            if joint_outcome is not None
+            else (reranked if rerank_requested and before_filter else None)
+        )
+    )
+    final_rerank_error = (
+        evidence_validation_error_message
+        if evidence_validation_error_message is not None
+        else (
+            joint_outcome.error
+            if joint_outcome is not None
+            else rerank_error_message
+        )
+    )
     trace_event(
         "evidence.selection",
         trace_id=trace_id,
@@ -2424,8 +4440,43 @@ async def run_rag_stream(
         top_k_truncated_count=top_k_truncated_count,
         retrieval_elapsed_ms=retrieval_elapsed_ms,
         rerank_elapsed_ms=rerank_elapsed_ms,
-        rerank_succeeded=reranked if rerank_requested and before_filter else None,
+        # 此处记录最终验证边界，而不是仅记录首轮结果。联合重排失败时即使
+        # initial rerank 成功，也必须显示 succeeded=false 和最终 joint error。
+        rerank_succeeded=final_rerank_succeeded,
+        initial_verified_fallback_used=initial_verified_fallback_used,
+        rerank_error=(
+            final_rerank_error
+            if trace_include_content
+            else ((final_rerank_error or "").partition(":")[0] or None)
+        ),
+        initial_rerank_succeeded=(
+            initial_rerank_outcome.succeeded
+            if initial_rerank_outcome is not None
+            else None
+        ),
+        initial_rerank_error=(
+            rerank_error_message
+            if trace_include_content
+            else ((rerank_error_message or "").partition(":")[0] or None)
+        ),
+        joint_rerank_succeeded=(
+            joint_outcome.succeeded if joint_outcome is not None else None
+        ),
+        joint_rerank_error=(
+            joint_outcome.error
+            if trace_include_content and joint_outcome is not None
+            else (
+                ((joint_outcome.error or "").partition(":")[0] or None)
+                if joint_outcome is not None
+                else None
+            )
+        ),
+        evidence_error_stage=evidence_validation_error_stage,
         coverage_status=joint_coverage_status,
+        clarification=_clarification_trace_payload(
+            ambiguity_decision,
+            include_content=trace_include_content,
+        ),
         requirement_count=len(joint_requirements),
         missing_requirement_count=len(coverage_missing_ids),
         expansion_attempted=expansion_attempted,
@@ -2435,11 +4486,6 @@ async def run_rag_stream(
         ),
         context_budget_dropped_count=context_budget_dropped_count,
         context_budget_chars=context_budget_chars,
-        rerank_error=(
-            rerank_error_message
-            if trace_include_content
-            else ((rerank_error_message or "").partition(":")[0] or None)
-        ),
         selected=[selected_trace_item(item) for item in results],
         answer_sources=[selected_trace_item(item) for item in context_results],
     )
@@ -2448,7 +4494,7 @@ async def run_rag_stream(
         answer_sources=context_results,
         retrieval_executed=retrieval_executed,
         evidence_status=evidence_status,
-        decision_reason=decision_reason,
+        decision_reason=final_decision_reason,
         direct_evidence_count=direct_evidence_count,
         related_reference_count=related_reference_count,
         query_constraints=rerank_constraints.as_dict(),
@@ -2465,10 +4511,55 @@ async def run_rag_stream(
         joint_support_score=(
             joint_outcome.joint_support_score if joint_outcome else None
         ),
+        clarification=(
+            ambiguity_decision.to_dict()
+            if ambiguity_decision.needs_clarification
+            else None
+        ),
+        evidence_scope_anchor_hit=scope_anchor_hit,
+        evidence_scope_anchor_doc_ids=scope_anchor_doc_ids,
     )
+
+    if ambiguity_decision.needs_clarification:
+        yield _evidence_clarification_event(ambiguity_decision)
+        yield _delta_event(ambiguity_decision.question)
+        trace_event(
+            "generation.skipped",
+            trace_id=trace_id,
+            reason="evidence_scope_ambiguous",
+            evidence_status=evidence_status,
+        )
+        yield _done_event(conversation_id)
+        return
 
     # Step 5: LLM 生成
     yield _step_event("generate", "active")
+
+    scope_labels_by_document = (
+        normalized_scope_filter.label_by_document()
+        if normalized_scope_filter is not None
+        and normalized_scope_filter.valid
+        else None
+    )
+    evidence_scope_mode = (
+        normalized_scope_filter.mode
+        if normalized_scope_filter is not None
+        and normalized_scope_filter.valid
+        else None
+    )
+    if (
+        scope_labels_by_document is None
+        and explicit_all_scope_request
+        and len(ambiguity_decision.choices) >= 2
+    ):
+        # First-turn ``所有版本`` / ``所有项目`` comparisons do not carry a
+        # persisted pending filter.  The post-rerank source groups still need
+        # document-level labels so solution chunks without a repeated header
+        # cannot be mixed across applicability scopes by the answer model.
+        scope_labels_by_document = _scope_choice_labels_by_document(
+            ambiguity_decision.choices
+        )
+        evidence_scope_mode = "compare_all"
 
     context = await _build_context(
         db,
@@ -2476,6 +4567,7 @@ async def run_rag_stream(
         # 只注入实际召回并评估过的片段。整篇扩展会把其他未重排章节
         # 误标为相同证据角色，对无显式版本的问题同样会污染上下文。
         allow_whole_document=False,
+        scope_labels_by_document=scope_labels_by_document,
     )
     if retrieval_executed:
         logger.info(
@@ -2490,6 +4582,7 @@ async def run_rag_stream(
         retrieval_executed=retrieval_executed,
         evidence_status=evidence_status,
         context=context,
+        evidence_scope_mode=evidence_scope_mode,
     )
     system_prompt_fingerprint = content_fields("system_prompt", system_prompt)
     # 系统提示中包含已经记录过的知识上下文；这里只保留指纹与长度，避免在
@@ -2534,7 +4627,15 @@ async def run_rag_stream(
                 ),
             ),
         })
-    messages.append({"role": "user", "content": question})
+    messages.append({
+        "role": "user",
+        "content": (
+            retrieval_query
+            if normalized_scope_filter is not None
+            and normalized_scope_filter.valid
+            else question
+        ),
+    })
     create_kwargs = dict(
         model=s.chat_model,
         messages=messages,

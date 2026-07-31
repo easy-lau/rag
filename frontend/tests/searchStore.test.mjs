@@ -75,6 +75,42 @@ test('skipped 和 error 不保留异常候选或旧版命中统计', () => {
   }
 })
 
+test('needs_clarification 表示检索已执行但选择前没有回答依据', () => {
+  const store = freshStore()
+  const clarification = {
+    dimension: 'version',
+    choices: [
+      { id: 'c1', label: '云枢 6.0.1' },
+      { id: 'c2', label: '云枢 8.2.75' },
+    ],
+  }
+  store.setResults({
+    evidence_status: 'needs_clarification',
+    displayed_result_count: 2,
+    hit_count: 2,
+    direct_evidence_count: 2,
+    related_reference_count: 0,
+    context_evidence_count: 2,
+    answer_source_count: 2,
+    clarification,
+    results: [
+      { id: 'v6', evidence_role: 'direct' },
+      { id: 'v8', evidence_role: 'related' },
+    ],
+  })
+
+  assert.equal(store.searchMeta.evidence_status, 'needs_clarification')
+  assert.equal(store.searchMeta.retrieval_executed, true)
+  assert.equal(store.searchMeta.displayed_candidate_count, 2)
+  assert.equal(store.searchMeta.hit_count, 0)
+  assert.equal(store.searchMeta.direct_evidence_count, 0)
+  assert.equal(store.searchMeta.related_reference_count, 2)
+  assert.equal(store.searchMeta.context_evidence_count, 0)
+  assert.equal(store.searchMeta.answer_source_count, 0)
+  assert.deepEqual(store.searchMeta.clarification, clarification)
+  assert.deepEqual(store.results.map(item => item.evidence_role), ['related', 'related'])
+})
+
 test('旧协议明确未执行检索时优先判定为 skipped', () => {
   const store = freshStore()
   store.setResults({
@@ -174,4 +210,77 @@ test('仅有 results 的旧接口按待验证候选处理，不推导为有效�
   assert.equal(store.searchMeta.displayed_candidate_count, 1)
   assert.equal(store.searchMeta.hit_count, 0)
   assert.equal(store.searchMeta.unverified_reference_count, 1)
+})
+
+test('新语义协议只使用后端编译合同决定检索策略', () => {
+  const store = freshStore()
+  store.setIntentDecision({
+    action: 'chat',
+    route_decision: {
+      schema_version: 'rag_route_decision.v1',
+      intent_code: 'knowledge_qa',
+      relation: 'refinement',
+      readiness: 'ready',
+    },
+    task_contract: {
+      schema_version: 'rag_task_contract.v1',
+      response_mode: 'grounded_qa',
+      retrieval_policy: 'required',
+      need_retrieval: true,
+      decision_reason: 'compiled_knowledge_qa',
+    },
+  })
+
+  assert.equal(store.intentDecision.intent_code, 'knowledge_qa')
+  assert.equal(store.intentDecision.relation, 'refinement')
+  assert.equal(store.intentDecision.response_mode, 'grounded_qa')
+  assert.equal(store.intentDecision.retrieval_policy, 'required')
+  assert.equal(store.intentDecision.need_retrieval, true)
+  assert.equal(store.intentDecision.decision_reason, 'compiled_knowledge_qa')
+})
+
+test('新语义决定缺少编译合同时不从 action 猜测执行策略', () => {
+  const store = freshStore()
+  store.setIntentDecision({
+    action: 'retrieve',
+    route_decision: {
+      schema_version: 'rag_route_decision.v1',
+      intent_code: 'knowledge_qa',
+      relation: 'followup',
+      readiness: 'needs_clarification',
+    },
+  })
+
+  assert.equal(store.intentDecision.response_mode, '')
+  assert.equal(store.intentDecision.retrieval_policy, '')
+  assert.equal(store.intentDecision.need_retrieval, null)
+})
+
+test('新语义决定缺少合同时忽略矛盾的顶层旧执行字段', () => {
+  const store = freshStore()
+  store.setIntentDecision({
+    action: 'retrieve',
+    response_mode: 'grounded_qa',
+    retrieval_policy: 'required',
+    need_retrieval: true,
+    route_decision: {
+      schema_version: 'rag_route_decision.v1',
+      intent_code: 'knowledge_qa',
+      relation: 'followup',
+      readiness: 'needs_clarification',
+    },
+  })
+
+  assert.equal(store.intentDecision.response_mode, '')
+  assert.equal(store.intentDecision.retrieval_policy, '')
+  assert.equal(store.intentDecision.need_retrieval, null)
+})
+
+test('无协议版本的旧意图事件继续兼容 action 映射', () => {
+  const store = freshStore()
+  store.setIntentDecision({ action: 'retrieve', intent_code: 'knowledge_qa' })
+
+  assert.equal(store.intentDecision.response_mode, 'grounded_qa')
+  assert.equal(store.intentDecision.retrieval_policy, 'required')
+  assert.equal(store.intentDecision.need_retrieval, true)
 })

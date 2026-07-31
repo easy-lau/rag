@@ -254,11 +254,23 @@ const statusOptions = [
 
 const EVENT_LABELS = {
   'chat.request': '接收问答请求',
+  'conversation.context_candidates': '整理多轮候选',
   'conversation.context_resolved': '解析多轮上下文',
   'conversation.reference_unresolved': '等待补充追问对象',
   'intent.model_result': '评估意图模型结果',
   'intent.model_error': '意图模型调用失败',
+  'intent.contract_compiled': '编译路由执行合同',
   'intent.routing_decision': '确定智能路由策略',
+  'intent.clarification_created': '保存待澄清任务',
+  'intent.clarification_resolved': '完成待澄清任务',
+  'intent.clarification_expired': '待澄清任务已过期',
+  'evidence.ambiguity_assessed': '检查证据适用范围',
+  'evidence.clarification_required': '要求选择证据范围',
+  'evidence.clarification_created': '保存证据范围选项',
+  'evidence.clarification_repeated': '重复证据范围选项',
+  'evidence.clarification_resolved': '完成证据范围选择',
+  'evidence.scope_filter_applied': '应用证据范围过滤',
+  'evidence.scope_filter_rejected_candidates': '拦截范围外候选',
   'retrieval.plan': '制定检索计划',
   'retrieval.candidate': '召回候选片段',
   'retrieval.completed': '完成知识库召回',
@@ -268,6 +280,7 @@ const EVENT_LABELS = {
   'rerank.completed': '完成重排',
   'evidence.selection': '筛选回答证据',
   'generation.context': '组装生成上下文',
+  'generation.skipped': '跳过回答生成',
   'generation.completed': '完成模型生成',
   'chat.response': '保存回答摘要',
   'chat.cancelled': '问答流已中断',
@@ -279,7 +292,8 @@ const EVENT_LABELS = {
 }
 const EVIDENCE_LABELS = {
   hit: '直接命中', partial: '部分支撑', version_mismatch: '版本不匹配',
-  no_hit: '无有效证据', unverified: '未验证', skipped: '未检索', error: '检索异常',
+  needs_clarification: '等待选择范围', no_hit: '无有效证据',
+  unverified: '未验证', skipped: '未检索', error: '检索异常',
 }
 
 const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
@@ -455,8 +469,18 @@ function toggleEvent(sequence) {
 
 function eventTone(event) {
   if (event.includes('error')) return 'is-error'
-  if (event === 'chat.cancelled') return 'is-warning'
-  if (event.endsWith('completed') || event === 'chat.response') return 'is-success'
+  if (
+    event === 'chat.cancelled'
+    || event === 'intent.clarification_expired'
+    || event === 'evidence.clarification_required'
+    || event === 'evidence.clarification_repeated'
+  ) return 'is-warning'
+  if (
+    event.endsWith('completed')
+    || event === 'chat.response'
+    || event === 'intent.clarification_resolved'
+    || event === 'evidence.clarification_resolved'
+  ) return 'is-success'
   return 'is-info'
 }
 

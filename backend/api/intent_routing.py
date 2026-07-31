@@ -7,13 +7,17 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditLogger, get_audit
+from core.conversation_context import build_route_context_payloads
 from core.deps import require_permission
 from core.intent_router import (
+    ROUTE_PROMPT_VERSION,
     classify_intent_result,
     ensure_intent_routing_defaults,
     get_intent_router_config,
     list_intent_categories,
 )
+from core.query_route_compiler import TASK_CONTRACT_SCHEMA_VERSION
+from core.query_route_contract import ROUTE_DECISION_SCHEMA_VERSION
 from core.permissions import INTENT_MANAGE, INTENT_READ
 from database import get_db
 from models.db_models import IntentCategory, IntentRouteLog, IntentRouterConfig, User, now_utc
@@ -41,6 +45,9 @@ def _config_out(config: IntentRouterConfig) -> IntentRouterConfigOut:
         confidence_threshold=config.confidence_threshold,
         fallback_intent_code=config.fallback_intent_code,
         allow_general_chat=config.allow_general_chat,
+        route_schema_version=ROUTE_DECISION_SCHEMA_VERSION,
+        contract_schema_version=TASK_CONTRACT_SCHEMA_VERSION,
+        prompt_version=ROUTE_PROMPT_VERSION,
     )
 
 
@@ -260,14 +267,29 @@ async def test_route(
     """只测试决策，不写运行日志，也不访问用户未授权的知识库内容。"""
 
     await _ensure_defaults_and_commit(db)
+    context_messages = [item.model_dump() for item in payload.context_messages]
+    route_context = build_route_context_payloads(context_messages)
+    selected_kb_count = max(
+        payload.selected_kb_count,
+        len(set(payload.knowledge_base_ids)),
+    )
     result = await classify_intent_result(
         db,
-        payload.question,
-        selected_kb_ids=payload.knowledge_base_ids,
+        payload.current_input or payload.question or "",
+        selected_kb_ids=(),
+        selected_kb_count_override=selected_kb_count,
+        route_context=route_context,
         record_log=False,
     )
     return IntentRouteTestResponse(
         decision=IntentDecisionOut(**result.decision.to_dict()),
+        route_decision=(
+            result.route_decision.to_dict() if result.route_decision is not None else None
+        ),
+        task_contract=(
+            result.task_contract.to_dict() if result.task_contract is not None else None
+        ),
+        diagnostics=result.diagnostics,
         latency_ms=result.latency_ms,
     )
 

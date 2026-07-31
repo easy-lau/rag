@@ -6,8 +6,14 @@ from unittest.mock import AsyncMock, patch
 from core.query_constraints import (
     evaluate_candidate_constraints,
     extract_query_constraints,
+    inherit_document_constraint_metadata,
 )
-from core.reranker import rerank, rerank_with_status
+from core.reranker import (
+    SIMPLE_RERANK_PROMPT_VERSION,
+    AnswerRequirement,
+    rerank,
+    rerank_with_status,
+)
 
 
 def _client_with_payload(payload: dict):
@@ -201,8 +207,114 @@ class QueryConstraintTests(unittest.TestCase):
 
         self.assertEqual(evaluation.status, "unknown")
 
+    def test_product_generation_suffix_and_flattened_markdown_fields_are_normalized(self) -> None:
+        product_only = extract_query_constraints("云枢中想二开钉钉消息可以吗")
+        candidate = {
+            "filename": "二开发送钉钉工作通知",
+            "content": (
+                "【一、基本信息】\n"
+                "> 所属产品：云枢8>> 产品版本：8.2.75>> 所属项目：中青建安>"
+            ),
+        }
+
+        evaluation = evaluate_candidate_constraints(product_only, candidate)
+
+        self.assertEqual(evaluation.status, "neutral")
+        self.assertIn("8.2.75", evaluation.reason)
+        self.assertNotIn("所属项目", evaluation.candidate_products)
+
+        explicit_version = evaluate_candidate_constraints(
+            extract_query_constraints("云枢8.6中如何发送钉钉消息"),
+            candidate,
+        )
+        self.assertEqual(explicit_version.status, "mismatch")
+        self.assertIn("8.2.75", explicit_version.reason)
+
+    def test_registered_alias_with_generation_is_not_arbitrary_substring_match(self) -> None:
+        constraints = extract_query_constraints("云枢中如何配置消息")
+        same_product = evaluate_candidate_constraints(
+            constraints,
+            {
+                "metadata": {"product": "云枢8", "version": "8.2.75"},
+                "content": "消息配置",
+            },
+        )
+        conflicting = evaluate_candidate_constraints(
+            constraints,
+            {
+                "metadata": {"product": "非云枢8", "version": "8.2.75"},
+                "content": "消息配置",
+            },
+        )
+
+        self.assertEqual(same_product.status, "neutral")
+        self.assertEqual(conflicting.status, "mismatch")
+
+    def test_document_identity_is_inherited_only_within_same_kb_and_document(self) -> None:
+        candidates = [
+            {
+                "id": "basic",
+                "kb_id": "kb-a",
+                "doc_id": "doc-a",
+                "content": "所属产品：云枢8>> 产品版本：8.2.75>>",
+            },
+            {
+                "id": "solution",
+                "kb_id": "kb-a",
+                "doc_id": "doc-a",
+                "content": "调用 DingTalkMessageServiceImpl 发送消息",
+            },
+            {
+                "id": "other-document",
+                "kb_id": "kb-a",
+                "doc_id": "doc-b",
+                "content": "调用 DingTalkMessageServiceImpl 发送消息",
+            },
+            {
+                "id": "same-doc-id-other-kb",
+                "kb_id": "kb-b",
+                "doc_id": "doc-a",
+                "content": "调用 DingTalkMessageServiceImpl 发送消息",
+            },
+        ]
+        enriched = inherit_document_constraint_metadata(candidates)
+        constraints = extract_query_constraints("云枢中想二开钉钉消息可以吗")
+        evaluations = {
+            item["id"]: evaluate_candidate_constraints(constraints, item)
+            for item in enriched
+        }
+
+        self.assertEqual(evaluations["basic"].status, "neutral")
+        self.assertEqual(evaluations["solution"].status, "neutral")
+        self.assertIn("8.2.75", evaluations["solution"].reason)
+        self.assertEqual(evaluations["other-document"].status, "unknown")
+        self.assertEqual(evaluations["same-doc-id-other-kb"].status, "unknown")
+
 
 class RerankerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_single_locked_requirement_uses_compact_rerank_contract(self) -> None:
+        results = [{"id": "a", "content": "报销需先提交申请", "score": 0.02}]
+        client = _client_with_payload(
+            {"results": [_assessment(1, topic=0.9, support=0.9)]}
+        )
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=SimpleNamespace(chat_model="test")),
+        ):
+            outcome = await rerank_with_status(
+                "公司的报销流程是什么",
+                results,
+                [AnswerRequirement("r1", "回答公司的报销流程")],
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.prompt_version, SIMPLE_RERANK_PROMPT_VERSION)
+        request = client.chat.completions.create.await_args.kwargs
+        self.assertEqual(request["max_tokens"], 900)
+        self.assertIn("不要规划证据扩展", request["messages"][0]["content"])
+        self.assertNotIn("target_candidate_indexes", request["messages"][0]["content"])
+
     async def test_initial_rerank_uses_dedicated_model_when_configured(self) -> None:
         results = [{"id": "a", "content": "A", "score": 0.02}]
         client = _client_with_payload(
@@ -256,6 +368,35 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
         # 不原地覆盖检索器返回值，失败回退时才能保留原始分数语义。
         self.assertEqual(results[0]["score"], 0.02)
         self.assertNotIn("retrieval_score", results[0])
+
+    async def test_disabled_expansion_noise_does_not_invalidate_assessments(self) -> None:
+        results = [
+            {"id": str(index), "content": f"候选{index}", "score": 0.01}
+            for index in range(1, 16)
+        ]
+        client = _client_with_payload({
+            "results": [
+                _assessment(index, topic=0.8, support=0.8)
+                for index in range(1, 16)
+            ],
+            "expansion": {
+                "needed": False,
+                "target_candidate_indexes": list(range(1, 16)),
+                "queries": [],
+                "missing_requirement_ids": [],
+                "reason": "不需要扩展",
+            },
+        })
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=SimpleNamespace(chat_model="test")),
+        ):
+            outcome = await rerank_with_status("普通查询", results)
+
+        self.assertTrue(outcome.succeeded)
+        self.assertIsNotNone(outcome.expansion_plan)
+        self.assertFalse(outcome.expansion_plan.needed)
 
     async def test_high_semantic_score_cannot_override_version_mismatch(self) -> None:
         results = [
@@ -311,6 +452,60 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(item["answer_support"], 0.99)
             self.assertTrue(item["constraint_overridden"])
             self.assertIn("版本冲突", item["constraint_reason"])
+
+    async def test_rerank_inherits_product_scope_for_answer_chunk(self) -> None:
+        results = [
+            {
+                "id": "basic",
+                "kb_id": "kb",
+                "doc_id": "doc",
+                "filename": "二开发送钉钉工作通知",
+                "content": "所属产品：云枢8>> 产品版本：8.2.75>>",
+                "score": 0.03,
+            },
+            {
+                "id": "solution",
+                "kb_id": "kb",
+                "doc_id": "doc",
+                "filename": "二开发送钉钉工作通知",
+                "content": "调用 DingTalkMessageServiceImpl 发送钉钉工作通知",
+                "score": 0.01,
+            },
+        ]
+        client = _client_with_payload({
+            "results": [
+                _assessment(
+                    1,
+                    topic=0.8,
+                    support=0.1,
+                    role="related",
+                ),
+                _assessment(2, topic=1.0, support=0.98, role="direct"),
+            ]
+        })
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch(
+                "core.reranker.get_settings",
+                return_value=SimpleNamespace(chat_model="test"),
+            ),
+        ):
+            outcome = await rerank_with_status(
+                "云枢中想二开钉钉消息可以吗",
+                results,
+                [AnswerRequirement("r1", "确认是否支持二开发送钉钉消息")],
+            )
+
+        self.assertTrue(outcome.succeeded)
+        answer = next(item for item in outcome.results if item["id"] == "solution")
+        self.assertEqual(answer["constraint_status"], "neutral")
+        self.assertEqual(answer["evidence_role"], "direct")
+        self.assertIn("8.2.75", answer["constraint_reason"])
+        self.assertEqual(
+            answer["metadata"]["inherited_document_identity"]["version"],
+            ["8.2.75"],
+        )
 
     async def test_prompt_contains_filename_tags_metadata_and_more_than_300_chars(self) -> None:
         long_content = "甲" * 360 + "CONTENT_END_MARKER"

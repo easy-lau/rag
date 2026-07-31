@@ -10,15 +10,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 
 ConstraintStatus = Literal["exact", "compatible", "unknown", "mismatch", "neutral"]
 
 
-# 版本号允许单段（云枢 6/7）和多段（8.6/8.6.1），但所有使用处都必须
-# 检查完整边界，避免把 8.6.1 的前缀误判成 8.6。
-_VERSION_PATTERN = r"\d{1,3}(?:\.\d{1,3}){0,3}"
+# 版本号允许单段（产品 6/7、制度 2024）和多段（8.6/8.6.1），但所有
+# 使用处都必须检查完整边界，避免把 8.6.1 的前缀误判成 8.6。
+_VERSION_PATTERN = r"\d{1,4}(?:\.\d{1,4}){0,3}"
 _VERSION_BOUNDARY = rf"(?![\d.])"
 _QUERY_CUE_RE = re.compile(
     rf"(?:我是|我使用的是|我用的是|当前使用|正在使用|使用的是|用的是|使用|"
@@ -29,7 +29,7 @@ _QUERY_CUE_RE = re.compile(
 )
 _QUERY_ADJACENT_RE = re.compile(
     rf"(?P<product>[A-Za-z][A-Za-z0-9_.\-]{{1,30}}|[\u3400-\u9fff]{{2,16}})"
-    rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>\d{{1,3}}(?:\.\d{{1,3}}){{1,3}}){_VERSION_BOUNDARY}",
+    rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>\d{{1,4}}(?:\.\d{{1,4}}){{1,3}}){_VERSION_BOUNDARY}",
     re.IGNORECASE,
 )
 _QUERY_VERSION_LABEL_RE = re.compile(
@@ -64,6 +64,14 @@ _VERSION_METADATA_KEYS = {
     "版本",
     "产品版本",
 }
+_PROJECT_METADATA_KEYS = {
+    "project",
+    "project_name",
+    "projectname",
+    "项目",
+    "项目名称",
+    "所属项目",
+}
 _COMPATIBLE_VERSION_KEYS = {
     "compatible_versions",
     "compatible_version",
@@ -80,6 +88,10 @@ _NORMALIZED_PRODUCT_METADATA_KEYS = {
 _NORMALIZED_VERSION_METADATA_KEYS = {
     re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", item.casefold())
     for item in _VERSION_METADATA_KEYS
+}
+_NORMALIZED_PROJECT_METADATA_KEYS = {
+    re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", item.casefold())
+    for item in _PROJECT_METADATA_KEYS
 }
 _NORMALIZED_COMPATIBLE_VERSION_KEYS = {
     re.sub(r"[^a-z0-9\u3400-\u9fff]+", "", item.casefold())
@@ -103,6 +115,18 @@ _PRODUCT_ALIAS_GROUPS = (
 )
 _VERSION_UNIT_WORDS = re.compile(
     r"^\s*(?:个|台|套|节点|实例|用户|条|项|次|分钟|小时|天|人|页|条记录)"
+)
+_DOCUMENT_PRODUCT_FIELD_RE = re.compile(
+    r"(?:所属产品|产品名称|产品(?!版本))\s*[：:]\s*([^\n\r>,，;；]+)",
+    re.IGNORECASE,
+)
+_DOCUMENT_VERSION_FIELD_RE = re.compile(
+    r"产品版本\s*[：:]\s*([^\n\r>,，;；]+)",
+    re.IGNORECASE,
+)
+_DOCUMENT_PROJECT_FIELD_RE = re.compile(
+    r"(?:所属项目|项目名称|项目(?!版本))\s*[：:]\s*([^\n\r>,，;；]+)",
+    re.IGNORECASE,
 )
 
 
@@ -182,6 +206,19 @@ class ConstraintEvaluation:
     candidate_versions: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class DocumentConstraintIdentity:
+    """Explicit, document-level applicability facts anchored in source text."""
+
+    products: tuple[str, ...] = ()
+    canonical_products: tuple[str, ...] = ()
+    versions: tuple[str, ...] = ()
+    projects: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _normalize_version(value: str) -> str:
     raw = re.sub(r"^(?:版本|v)\s*", "", str(value).strip(), flags=re.IGNORECASE)
     parts = raw.split(".")
@@ -203,6 +240,16 @@ def _canonical_product(value: str) -> str:
             break
     for aliases in _PRODUCT_ALIAS_GROUPS:
         normalized_aliases = {_normalize_product(alias) for alias in aliases}
+        # 知识文档常把产品代际写进“所属产品”，例如“云枢8”或
+        # “CloudPivot 8”。这里的尾部数字是产品版本，不是一个名为
+        # “云枢8”的新产品；仅对注册过的产品别名和纯版本尾缀做该归一化，
+        # 不允许任意 substring 命中。
+        for alias in sorted(normalized_aliases, key=len, reverse=True):
+            if not normalized.startswith(alias):
+                continue
+            suffix = normalized[len(alias):]
+            if suffix and re.fullmatch(r"\d{1,12}(?:全系)?", suffix):
+                return min(normalized_aliases, key=len)
         if normalized in normalized_aliases:
             return min(normalized_aliases, key=len)
     return normalized
@@ -327,7 +374,137 @@ def _versions_from_value(value: Any) -> set[str]:
         raw = json.dumps(value, ensure_ascii=False, default=str)
     else:
         raw = str(value)
-    return {_normalize_version(item) for item in re.findall(_VERSION_PATTERN, raw)}
+    return {
+        _normalize_version(item)
+        for item in re.findall(
+            rf"(?<![\d.])({_VERSION_PATTERN})(?![\d.])",
+            raw,
+        )
+    }
+
+
+def _declared_document_identity(
+    candidate: dict[str, Any],
+) -> tuple[set[str], set[str], set[str]]:
+    """Extract only explicit document identity fields from one chunk."""
+
+    products: set[str] = set()
+    versions: set[str] = set()
+    projects: set[str] = set()
+    for key, value in _flatten_metadata(candidate.get("metadata") or {}):
+        normalized_key = _normalize_product(key)
+        if (
+            normalized_key in _NORMALIZED_PRODUCT_METADATA_KEYS
+            and value is not None
+            and str(value).strip()
+        ):
+            products.add(str(value).strip())
+        if normalized_key in _NORMALIZED_VERSION_METADATA_KEYS:
+            versions.update(_versions_from_value(value))
+        if (
+            normalized_key in _NORMALIZED_PROJECT_METADATA_KEYS
+            and value is not None
+            and str(value).strip()
+        ):
+            projects.add(str(value).strip())
+
+    content = str(candidate.get("content") or "")
+    for match in _DOCUMENT_PRODUCT_FIELD_RE.finditer(content):
+        value = match.group(1).strip()
+        if value:
+            products.add(value)
+    for match in _DOCUMENT_VERSION_FIELD_RE.finditer(content):
+        versions.update(_versions_from_value(match.group(1)))
+    for match in _DOCUMENT_PROJECT_FIELD_RE.finditer(content):
+        value = match.group(1).strip()
+        if value:
+            projects.add(value)
+    return products, versions, projects
+
+
+def extract_document_constraint_identity(
+    candidate: dict[str, Any],
+) -> DocumentConstraintIdentity:
+    """Return source-anchored document identity without query-dependent guesses."""
+
+    products, versions, projects = _declared_document_identity(candidate)
+    canonical_products = {
+        _canonical_product(product)
+        for product in products
+        if _canonical_product(product)
+    }
+    return DocumentConstraintIdentity(
+        products=tuple(sorted(products, key=str.casefold)),
+        canonical_products=tuple(sorted(canonical_products, key=str.casefold)),
+        versions=tuple(sorted(versions)),
+        projects=tuple(sorted(projects, key=str.casefold)),
+    )
+
+
+def canonical_product_name(value: str) -> str:
+    """Public canonicalization boundary shared by retrieval-scope consumers."""
+
+    return _canonical_product(value)
+
+
+def inherit_document_constraint_metadata(
+    candidates: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Copy explicit product/version identity to sibling chunks of a document.
+
+    Markdown and Word ingestion commonly put ``所属产品`` / ``产品版本`` in the
+    first chunk only.  Constraint checks are nevertheless performed per chunk;
+    without this propagation, the answer chunk from the same document becomes
+    ``unknown`` and is excluded.  Only explicit identity fields are inherited,
+    and grouping includes both knowledge-base and document ids so unrelated
+    documents cannot contaminate one another.
+    """
+
+    identities: dict[
+        tuple[str, str],
+        tuple[set[str], set[str], set[str]],
+    ] = {}
+    for candidate in candidates:
+        doc_id = candidate.get("doc_id")
+        if doc_id is None:
+            continue
+        key = (str(candidate.get("kb_id") or ""), str(doc_id))
+        group_products, group_versions, group_projects = identities.setdefault(
+            key,
+            (set(), set(), set()),
+        )
+        products, versions, projects = _declared_document_identity(candidate)
+        group_products.update(products)
+        group_versions.update(versions)
+        group_projects.update(projects)
+
+    enriched: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        doc_id = item.get("doc_id")
+        identity = (
+            identities.get((str(item.get("kb_id") or ""), str(doc_id)))
+            if doc_id is not None
+            else None
+        )
+        if identity is not None and (identity[0] or identity[1] or identity[2]):
+            raw_metadata = item.get("metadata")
+            metadata = (
+                dict(raw_metadata)
+                if isinstance(raw_metadata, dict)
+                else ({"source_metadata": raw_metadata} if raw_metadata else {})
+            )
+            inherited: dict[str, Any] = {}
+            if identity[0]:
+                inherited["product"] = sorted(identity[0], key=str.casefold)
+            if identity[1]:
+                inherited["version"] = sorted(identity[1])
+            if identity[2]:
+                inherited["project"] = sorted(identity[2], key=str.casefold)
+            metadata["inherited_document_identity"] = inherited
+            item["metadata"] = metadata
+        enriched.append(item)
+    return enriched
 
 
 def _same_product(left: str, right: str) -> bool:
@@ -467,16 +644,12 @@ def evaluate_candidate_constraints(
         candidate_products.add(match.group("product"))
 
     # metadata 未结构化时，仍识别常见的“所属产品：X / 产品版本：Y”写法。
-    for value in re.findall(r"(?:所属产品|产品名称|产品)\s*[：:]\s*([^\n\r,，;；]+)", searchable):
-        value = value.strip()
+    for match in _DOCUMENT_PRODUCT_FIELD_RE.finditer(searchable):
+        value = match.group(1).strip()
         if value:
             candidate_products.add(value)
-    for value in re.findall(
-        rf"产品版本\s*[：:]\s*([^\n\r,，;；]+)",
-        searchable,
-        flags=re.IGNORECASE,
-    ):
-        declared_versions.update(_versions_from_value(value))
+    for match in _DOCUMENT_VERSION_FIELD_RE.finditer(searchable):
+        declared_versions.update(_versions_from_value(match.group(1)))
     # 兼容“版本：云枢6”，但裸的“Java版本：8.6”/“数据库版本：8.6”
     # 不能被当成目标产品版本。
     for value in re.findall(
@@ -528,9 +701,16 @@ def evaluate_candidate_constraints(
             sorted_products = tuple(sorted(candidate_products, key=str.casefold))
             product_matches = True
         if product_matches:
+            version_scope = (
+                f"，文档声明版本为“{'、'.join(sorted(declared_versions))}”"
+                if declared_versions
+                else ""
+            )
             return ConstraintEvaluation(
                 status="neutral",
-                reason=f"候选明确标注产品“{product}”，查询未指定版本",
+                reason=(
+                    f"候选明确标注产品“{product}”{version_scope}，查询未指定版本"
+                ),
                 candidate_products=sorted_products,
                 candidate_versions=sorted_versions,
             )

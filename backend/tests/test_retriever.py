@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
 from core.retriever import (
+    MAX_EVIDENCE_SCOPE_DOCUMENTS,
     MAX_SCOPED_DOCUMENTS,
     MAX_SCOPED_EXACT_TOTAL_CHUNKS,
     MAX_SCOPED_QUERIES,
@@ -607,6 +608,33 @@ class DocumentScopedRetrieverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]["candidate_origin"], "document_scoped")
         self.assertEqual(results[0]["candidate_origins"], ["document_scoped"])
         self.assertEqual(results[0]["expansion_query_indexes"], [0, 1])
+
+    async def test_explicit_scope_search_can_validate_more_than_three_documents(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_ids = [uuid.uuid4() for _ in range(5)]
+        db = _SavepointDB([
+            _Rows([{
+                "total_chunk_count": 50,
+                "max_document_chunk_count": 10,
+            }]),
+            _Rows([]),
+        ])
+
+        results = await search_within_documents(
+            db,
+            queries=["消息接口怎么配置"],
+            kb_ids=[kb_id],
+            doc_ids=doc_ids,
+            method="keyword",
+            max_document_count=5,
+        )
+
+        self.assertEqual(results, [])
+        stats_params = db.execute.await_args_list[0].args[1]
+        search_params = db.execute.await_args_list[1].args[1]
+        self.assertEqual(stats_params["doc_ids"], doc_ids)
+        self.assertEqual(search_params["doc_ids"], doc_ids)
+        self.assertLessEqual(len(doc_ids), MAX_EVIDENCE_SCOPE_DOCUMENTS)
 
     async def test_each_statement_uses_savepoint_and_partial_query_success_survives(self) -> None:
         kb_id = uuid.uuid4()

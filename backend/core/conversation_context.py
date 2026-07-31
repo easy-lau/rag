@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from sqlalchemy import select
@@ -64,8 +64,11 @@ _UNRESOLVED_REFERENCE_RE = re.compile(
 _ELLIPTICAL_ENTITY_FOLLOWUP_RE = re.compile(
     # 裸“如果”通常会引出完整条件问题；只有“如果是 Redis 呢”这类
     # 明确省略被比较对象的表达才继承上一轮。
-    r"^\s*(?:那(?:么)?|如果是|改成|换成)\s*"
-    r"(?=\S).{1,48}?(?:呢|怎么样|如何|可以吗)[？?。.!！\s]*$",
+    r"^\s*(?:"
+    r"(?:那(?:么)?|如果是|改成|换成)\s*(?=\S).{1,48}?|"
+    r"(?:云\s*枢|cloudpivot(?:\s*platform)?)\s*"
+    r"\d{1,3}(?:\.\d{1,3}){0,3}"
+    r")\s*(?:呢|怎么样|如何|可以吗)[？?。.!！\s]*$",
     re.IGNORECASE,
 )
 _SHORT_FOLLOWUP_RE = re.compile(
@@ -316,6 +319,40 @@ class ConversationContext:
     carryover_sources: tuple[dict[str, Any], ...]
     previous_user_question: str | None = None
     unresolved_reference: bool = False
+    # ``t1`` is the newest completed/partial user turn, ``t2`` the one before
+    # it, and so on.  These request-local keys are the only historical
+    # identities exposed to the semantic router; database/message/chunk ids
+    # never enter the model contract.
+    route_turn_candidates: tuple["RouteTurnCandidate", ...] = ()
+    relation: str = "new"
+    query_resolution_mode: str = "current"
+    context_turn_keys: tuple[str, ...] = ()
+    pending_route_state: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class RouteTurnCandidate:
+    """A request-local historical turn candidate for semantic routing.
+
+    ``raw_sources`` remains application-only.  ``to_prompt_dict`` intentionally
+    emits only bounded dialogue text and a source-count flag, so the model can
+    choose ``t1``/``t2`` without learning persistent resource identities.
+    """
+
+    candidate_key: str
+    user_question: str
+    assistant_answer: str | None
+    raw_sources: tuple[dict[str, Any], ...] = ()
+
+    def to_prompt_dict(self) -> dict[str, Any]:
+        return {
+            "candidate_key": self.candidate_key,
+            "user_input": self.user_question[:1200],
+            "assistant_answer": (self.assistant_answer or "")[:1200],
+            "reusable_source_count": sum(
+                1 for source in self.raw_sources if _source_is_reusable(source)
+            ),
+        }
 
 
 def detect_followup(
@@ -400,6 +437,120 @@ def _source_is_reusable(source: dict[str, Any]) -> bool:
     if source.get("evidence_role") == "irrelevant":
         return False
     return bool(source.get("id") or source.get("chunk_id"))
+
+
+def _route_turn_candidates(
+    messages: Iterable[Message],
+    *,
+    limit: int = 3,
+) -> tuple[RouteTurnCandidate, ...]:
+    """Build newest-first, request-local turn candidates.
+
+    A failed or interrupted stream may leave a user message without an
+    assistant reply; it is still a valid topic candidate.  An assistant is
+    paired only with the user immediately preceding it, never with an older
+    user across another user boundary.
+    """
+
+    ordered = list(messages)
+    turns: list[tuple[Message, Message | None]] = []
+    index = 0
+    while index < len(ordered):
+        message = ordered[index]
+        if message.role != "user":
+            index += 1
+            continue
+        assistant: Message | None = None
+        cursor = index + 1
+        while cursor < len(ordered) and ordered[cursor].role != "user":
+            if assistant is None and ordered[cursor].role == "assistant":
+                assistant = ordered[cursor]
+            cursor += 1
+        turns.append((message, assistant))
+        index = cursor
+
+    candidates: list[RouteTurnCandidate] = []
+    for position, (user_message, assistant_message) in enumerate(
+        reversed(turns[-max(1, limit):]),
+        start=1,
+    ):
+        raw_sources = tuple(
+            source
+            for source in (assistant_message.sources or [])
+            if isinstance(source, dict)
+        ) if assistant_message is not None else ()
+        candidates.append(
+            RouteTurnCandidate(
+                candidate_key=f"t{position}",
+                user_question=(user_message.content or "").strip(),
+                assistant_answer=(
+                    (assistant_message.content or "").strip()
+                    if assistant_message is not None
+                    else None
+                ),
+                raw_sources=raw_sources,
+            )
+        )
+    return tuple(candidates)
+
+
+def route_context_payloads(
+    context: ConversationContext,
+) -> tuple[dict[str, Any], ...]:
+    """Return the bounded, identity-free candidate catalogue for the router."""
+
+    return tuple(candidate.to_prompt_dict() for candidate in context.route_turn_candidates)
+
+
+def build_route_context_payloads(
+    messages: Iterable[dict[str, Any]],
+    *,
+    limit: int = 3,
+) -> tuple[dict[str, Any], ...]:
+    """Build a synthetic candidate catalogue for the admin routing sandbox.
+
+    This helper never queries conversations, messages, knowledge bases or
+    documents.  The ``intent:read`` test endpoint can therefore exercise
+    multi-turn semantics without becoming a data-scope bypass.
+    """
+
+    normalized: list[dict[str, str]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().casefold()
+        content = str(item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            normalized.append({"role": role, "content": content})
+
+    turns: list[tuple[str, str]] = []
+    index = 0
+    while index < len(normalized):
+        item = normalized[index]
+        if item["role"] != "user":
+            index += 1
+            continue
+        assistant = ""
+        cursor = index + 1
+        while cursor < len(normalized) and normalized[cursor]["role"] != "user":
+            if not assistant and normalized[cursor]["role"] == "assistant":
+                assistant = normalized[cursor]["content"]
+            cursor += 1
+        turns.append((item["content"], assistant))
+        index = cursor
+
+    return tuple(
+        {
+            "candidate_key": f"t{position}",
+            "user_input": user_text[:1200],
+            "assistant_answer": assistant_text[:1200],
+            "reusable_source_count": 0,
+        }
+        for position, (user_text, assistant_text) in enumerate(
+            reversed(turns[-max(1, limit):]),
+            start=1,
+        )
+    )
 
 
 def _technical_terms(*texts: str, limit: int = 8) -> list[str]:
@@ -639,6 +790,7 @@ async def prepare_conversation_context(
     conversation_id: uuid.UUID,
     question: str,
     kb_ids: Iterable[uuid.UUID],
+    pending_route_state: dict[str, Any] | None = None,
 ) -> ConversationContext:
     """Load recent dialogue, resolve follow-up references and validate sources."""
 
@@ -651,6 +803,7 @@ async def prepare_conversation_context(
         )
     ).scalars().all()
     messages = list(reversed(rows))
+    route_turn_candidates = _route_turn_candidates(messages)
     # 上下文必须以最近一条 user 为锚点，而不是以最近一条
     # assistant 反向寻找 user。流式失败、用户中止或回答尚未落库时，
     # 最新 user 后可能没有 assistant；此时仍要继承该 user 的主题，
@@ -738,4 +891,146 @@ async def prepare_conversation_context(
         carryover_sources=carryover_sources,
         previous_user_question=previous_user.content if previous_user else None,
         unresolved_reference=reason.startswith("unresolved_reference:"),
+        route_turn_candidates=route_turn_candidates,
+        relation="followup" if is_followup else "new",
+        query_resolution_mode=("contextualize" if is_followup else "current"),
+        context_turn_keys=((route_turn_candidates[0].candidate_key,) if is_followup and route_turn_candidates else ()),
+        pending_route_state=pending_route_state,
     )
+
+
+async def resolve_routed_conversation_context(
+    db: AsyncSession,
+    *,
+    context: ConversationContext,
+    question: str,
+    kb_ids: Iterable[uuid.UUID],
+    route_decision: Any,
+) -> ConversationContext:
+    """Apply a validated semantic route to the local conversation context.
+
+    The router is allowed to say that a complete sentence is a refinement of
+    an earlier turn without forcing a query rewrite.  Historical evidence is
+    reloaded only after the compiler has selected request-local ``t*`` keys;
+    this is the key distinction missing from the legacy ``is_followup`` flag.
+    """
+
+    def read(name: str, default: Any = None) -> Any:
+        if isinstance(route_decision, dict):
+            return route_decision.get(name, default)
+        return getattr(route_decision, name, default)
+
+    relation = str(read("relation", "new") or "new")
+    readiness = str(read("readiness", "ready") or "ready")
+    query_resolution = read("query_resolution", {}) or {}
+    if isinstance(query_resolution, dict):
+        mode_value = query_resolution.get("mode", "current")
+        requested_keys = query_resolution.get("context_turn_keys", ()) or ()
+    else:
+        # Production passes the validated ``RouteQueryResolution`` dataclass,
+        # while compatibility callers may still pass a plain dictionary.
+        mode_value = getattr(query_resolution, "mode", "current")
+        requested_keys = getattr(query_resolution, "context_turn_keys", ()) or ()
+    mode = str(mode_value or "current")
+    if not isinstance(requested_keys, (list, tuple)):
+        requested_keys = ()
+    requested_keys = tuple(str(key).strip() for key in requested_keys if str(key).strip())
+    if relation == "new":
+        requested_keys = ()
+    candidate_map = {item.candidate_key: item for item in context.route_turn_candidates}
+    selected = tuple(candidate_map[key] for key in requested_keys if key in candidate_map)
+
+    # A malformed/unknown key must never silently widen history.  The contract
+    # compiler normally rejects it; this defensive branch makes direct callers
+    # safe as well.
+    unknown_key = any(key not in candidate_map for key in requested_keys)
+    if unknown_key:
+        selected = ()
+        mode = "clarify"
+        readiness = "needs_clarification"
+
+    is_contextual = relation != "new" and mode == "contextualize" and bool(selected)
+    is_followup = relation != "new" and bool(selected or mode == "current")
+    carryover_sources: tuple[dict[str, Any], ...] = ()
+    if selected:
+        raw_sources: list[dict[str, Any]] = []
+        for candidate in selected:
+            raw_sources.extend(candidate.raw_sources)
+        carryover_sources = await _reload_carryover_sources(db, raw_sources, kb_ids)
+
+    previous_candidate = selected[0] if selected else None
+    pending_slot_answer = bool(
+        is_contextual
+        and context.pending_route_state
+        and previous_candidate is not None
+        and _MISSING_ACTION_OBJECT_RE.fullmatch(previous_candidate.user_question.strip())
+        and _is_clarification_slot_answer(question)
+    )
+    if pending_slot_answer:
+        standalone_query = _merge_missing_action_object(
+            previous_candidate.user_question,
+            question,
+        )
+    elif is_contextual:
+        standalone_query = build_standalone_query(
+            question,
+            previous_user_question=(
+                previous_candidate.user_question if previous_candidate else None
+            ),
+            previous_assistant_answer=(
+                previous_candidate.assistant_answer if previous_candidate else None
+            ),
+            carryover_sources=carryover_sources,
+            followup_reason=(
+                "missing_action_object"
+                if _MISSING_ACTION_OBJECT_RE.fullmatch(question.strip())
+                else None
+            ),
+        )
+    else:
+        standalone_query = question.strip()
+
+    history_messages: tuple[dict[str, str], ...] = ()
+    if is_followup and selected:
+        # Keep the selected turns only.  This avoids sending unrelated older
+        # dialogue to the answer model while retaining the semantic relation.
+        prepared: list[dict[str, str]] = []
+        for candidate in reversed(selected):
+            if candidate.user_question:
+                prepared.append({"role": "user", "content": candidate.user_question[:HISTORY_MESSAGE_CHARS]})
+            if candidate.assistant_answer:
+                prepared.append({"role": "assistant", "content": candidate.assistant_answer[:HISTORY_MESSAGE_CHARS]})
+        history_messages = _bounded_history(
+            tuple(
+                _SyntheticMessage(role=item["role"], content=item["content"])
+                for item in prepared
+            )
+        )
+
+    unresolved = readiness == "needs_clarification" or mode == "clarify"
+    reason = (
+        "route_clarification"
+        if unresolved
+        else ("route_contextualized" if is_contextual else ("route_followup_current" if relation != "new" else "standalone_question"))
+    )
+    return replace(
+        context,
+        is_followup=is_followup,
+        followup_reason=reason,
+        standalone_query=standalone_query,
+        history_messages=history_messages,
+        carryover_sources=carryover_sources,
+        previous_user_question=(
+            previous_candidate.user_question if previous_candidate else context.previous_user_question
+        ),
+        unresolved_reference=unresolved,
+        relation=relation,
+        query_resolution_mode=mode,
+        context_turn_keys=tuple(candidate.candidate_key for candidate in selected),
+    )
+
+
+@dataclass(frozen=True)
+class _SyntheticMessage:
+    role: str
+    content: str

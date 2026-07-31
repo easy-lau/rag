@@ -202,6 +202,7 @@ const retrievalState = computed(() => ({
     type: 'warning',
   },
   version_mismatch: { label: '仅相近版本', type: 'warning' },
+  needs_clarification: { label: '等待选择范围', type: 'warning' },
   no_hit: { label: '未命中', type: 'warning' },
   unverified: {
     label: displayedCandidateCount.value ? `${displayedCandidateCount.value} 个待验证片段` : '状态未验证',
@@ -211,6 +212,9 @@ const retrievalState = computed(() => ({
 })[evidenceStatus.value] || { label: '等待执行', type: 'default' })
 
 const evidenceNotice = computed(() => {
+  if (evidenceStatus.value === 'needs_clarification') {
+    return '已找到多个适用范围的候选资料，请先在对话中选择所需范围；选择前这些片段不能作为回答依据。'
+  }
   if (evidenceStatus.value === 'version_mismatch') {
     return '已找到主题相关资料，但没有符合目标版本的直接依据。相近版本内容仅供参考。'
   }
@@ -263,9 +267,11 @@ const decisionReasonLabel = computed(() => ({
   retrieval_required: '检索策略要求执行知识库检索',
   retrieval_skipped: '检索策略明确跳过知识库检索',
   optional_auto_detection: '可选检索由轻量判断决定',
+  evidence_scope_ambiguous: '检索结果存在多个互斥适用范围，等待用户选择',
 })[decisionReason.value] || decisionReason.value)
 
 const retrievalExecutionLabel = computed(() => {
+  if (evidenceStatus.value === 'needs_clarification') return '已检索，等待选择适用范围'
   if (searchStore.searchMeta.retrieval_executed === true) return '已执行知识库检索'
   if (searchStore.searchMeta.retrieval_executed === false) return '已按策略跳过检索'
   if (evidenceStatus.value === 'error') return '检索执行失败'
@@ -281,6 +287,7 @@ const emptyResultText = computed(() => {
     skipped: '本次已跳过知识库检索',
     partial: '仅找到部分可用资料',
     version_mismatch: '未找到符合目标版本的回答依据',
+    needs_clarification: '已找到多个适用范围，等待选择',
     no_hit: '已完成检索，但没有找到相关内容',
     unverified: '检索状态暂未确认',
     error: '知识库检索失败',
@@ -293,6 +300,7 @@ const emptyResultHint = computed(() => ({
   skipped: '这是后端策略的最终执行结果，并非“检索后无命中”。',
   partial: '可以查看相近资料，但回答时只应采用已标记为“回答依据”的内容。',
   version_mismatch: '相近版本资料不能直接证明目标版本可用，建议补充对应版本文档。',
+  needs_clarification: '请在对话中回复序号、版本或“都对比”；选择前不会生成知识库答案。',
   no_hit: '可以调整问法、检索标签，或确认知识库中已录入相关文档。',
   unverified: '服务端未返回完整证据状态，结果可能来自旧版本接口或请求已中断。',
   error: '请稍后重试；若持续失败，可联系管理员检查检索服务。',
