@@ -76,7 +76,31 @@ class MigrationLineageTests(unittest.TestCase):
         )
         self.assertIn("WHERE observed_event_count IS NULL", sql)
 
-    def test_alembic_has_single_0026_head(self) -> None:
+    def test_document_structure_indexes_match_bounded_lookup_queries(self) -> None:
+        migration_27 = _load_migration(
+            "0027_add_document_structure_indexes.py"
+        )
+        recorder = _MigrationRecorder()
+
+        with patch.object(migration_27, "op", recorder):
+            migration_27.upgrade()
+
+        sql = "\n".join(recorder.executed)
+        for index_name in (
+            "ix_document_chunks_doc_chunk_index",
+            "ix_document_chunks_section_key_position",
+            "ix_document_chunks_heading_position",
+            "ix_document_chunks_table_part_position",
+        ):
+            with self.subTest(index_name=index_name):
+                self.assertIn(f"CREATE INDEX IF NOT EXISTS {index_name}", sql)
+        self.assertIn("ON document_chunks (doc_id, chunk_index)", sql)
+        self.assertIn("metadata->>'section_key'", sql)
+        self.assertIn("metadata->>'heading'", sql)
+        self.assertIn("metadata->>'table_id'", sql)
+        self.assertIn("~ '^[0-9]{1,9}$'", sql)
+
+    def test_alembic_has_single_0027_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -84,8 +108,8 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0026"])
-        self.assertEqual(scripts.get_revision("0026").down_revision, "0025")
+        self.assertEqual(scripts.get_heads(), ["0027"])
+        self.assertEqual(scripts.get_revision("0027").down_revision, "0026")
 
 
 if __name__ == "__main__":  # pragma: no cover

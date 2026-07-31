@@ -203,6 +203,31 @@ class QueryConstraintTests(unittest.TestCase):
 
 
 class RerankerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_rerank_uses_dedicated_model_when_configured(self) -> None:
+        results = [{"id": "a", "content": "A", "score": 0.02}]
+        client = _client_with_payload(
+            {"results": [_assessment(1, topic=0.9, support=0.9)]}
+        )
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch(
+                "core.reranker.get_settings",
+                return_value=SimpleNamespace(
+                    chat_model="chat-model",
+                    rerank_model=" fast-reranker ",
+                ),
+            ),
+        ):
+            outcome = await rerank_with_status("普通查询", results)
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.model, "fast-reranker")
+        self.assertEqual(
+            client.chat.completions.create.await_args.kwargs["model"],
+            "fast-reranker",
+        )
+
     async def test_complete_valid_assessments_are_trusted_and_sorted(self) -> None:
         results = [
             {"id": "a", "content": "A", "score": 0.02},

@@ -212,6 +212,25 @@ export const useSearchStore = defineStore('search', () => {
         - relatedReferenceCount
         - derivedIrrelevantCount,
     )
+    const contextEvidenceCount = hasNoAnswerEvidence
+      ? 0
+      : (nonNegativeCount(firstDefined(
+          data.context_evidence_count,
+          eventMeta.context_evidence_count,
+          data.answer_source_count,
+          eventMeta.answer_source_count,
+        )) ?? 0)
+    const rawCoverageStatus = firstDefined(
+      data.coverage_status,
+      eventMeta.coverage_status,
+    )
+    const coverageStatus = ['complete', 'partial', 'insufficient'].includes(rawCoverageStatus)
+      ? rawCoverageStatus
+      : ''
+    const missingRequirementCount = nonNegativeCount(firstDefined(
+      data.missing_requirement_count,
+      eventMeta.missing_requirement_count,
+    )) ?? 0
 
     searchMeta.value = {
       ...searchMeta.value,
@@ -235,6 +254,20 @@ export const useSearchStore = defineStore('search', () => {
       related_reference_count: relatedReferenceCount,
       irrelevant_reference_count: derivedIrrelevantCount,
       unverified_reference_count: unverifiedReferenceCount,
+      context_evidence_count: contextEvidenceCount,
+      answer_source_count: contextEvidenceCount,
+      coverage_status: coverageStatus,
+      missing_requirement_count: missingRequirementCount,
+      expansion_attempted: Boolean(firstDefined(
+        data.expansion_attempted,
+        eventMeta.expansion_attempted,
+        false,
+      )),
+      joint_support_score: firstDefined(
+        data.joint_support_score,
+        eventMeta.joint_support_score,
+        null,
+      ),
       evidence_role_known: evidenceRoleKnown,
       decision_reason: firstDefined(
         data.decision_reason,

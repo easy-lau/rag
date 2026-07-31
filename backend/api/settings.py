@@ -59,6 +59,7 @@ class SettingsOut(BaseModel):
     llm_base_url: str
     chat_model: str
     intent_model: str
+    rerank_model: str
     temperature: float
     max_tokens: int
     embedding_api_key: str
@@ -82,6 +83,7 @@ class SettingsUpdate(BaseModel):
     llm_base_url: str | None = None
     chat_model: str | None = None
     intent_model: str | None = Field(None, max_length=255)
+    rerank_model: str | None = Field(None, max_length=255)
     temperature: float | None = None
     max_tokens: int | None = None
     embedding_api_key: str | None = None
@@ -326,6 +328,7 @@ async def _load(db: AsyncSession) -> dict:
         "llm_base_url": _value_from_database(db_map, "llm_base_url", settings),
         "chat_model": _value_from_database(db_map, "chat_model", settings),
         "intent_model": _value_from_database(db_map, "intent_model", settings),
+        "rerank_model": _value_from_database(db_map, "rerank_model", settings),
         "temperature": _value_from_database(db_map, "temperature", settings),
         "max_tokens": _value_from_database(db_map, "max_tokens", settings),
         "embedding_api_key": _secret_status(db_map.get("embedding_api_key"), settings.embedding_api_key),
@@ -736,9 +739,10 @@ async def update_settings(
             updates.pop(key_field, None)
 
     settings = get_settings()
-    if "intent_model" in updates:
-        # 空值表示复用对话模型；统一去除首尾空白，避免模型 ID 隐性失效。
-        updates["intent_model"] = str(updates["intent_model"]).strip()
+    for optional_model_field in ("intent_model", "rerank_model"):
+        if optional_model_field in updates:
+            # 空值表示复用对话模型；统一去除首尾空白，避免模型 ID 隐性失效。
+            updates[optional_model_field] = str(updates[optional_model_field]).strip()
     _validate_model_base_url_updates(updates, settings)
     if any(key in SECRET_SETTING_KEYS for key in updates) and not settings.config_encryption_key:
         raise HTTPException(

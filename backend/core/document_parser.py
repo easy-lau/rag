@@ -1,10 +1,13 @@
+import hashlib
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 
 CHUNK_SIZE = 500      # CJK 目标字符数（中文字≈token）
 CHUNK_OVERLAP = 50
+CHUNK_METADATA_VERSION = 2
 
 # 句末标点（中英文）：在其后切句，标点保留在前句末尾
 _SENT_END_RE = re.compile(r'(?<=[。！？；!?;])')
@@ -168,6 +171,55 @@ def _ctx_prefix(title: str, heading_path: list) -> str:
     return " › ".join(p for p in parts if p)
 
 
+def _section_path(title: str, heading_path: list[tuple[int, str]]) -> list[str]:
+    """返回可序列化且顺序稳定的文档标题/章节路径。"""
+
+    return [
+        str(part).strip()
+        for part in [title, *(text for _, text in heading_path)]
+        if str(part).strip()
+    ]
+
+
+def _stable_structure_id(kind: str, *parts: object) -> str:
+    """为同一份输入生成跨进程稳定的 section/table 标识。"""
+
+    normalized = "\x1f".join(
+        re.sub(r"\s+", " ", str(part or "")).strip().casefold()
+        for part in parts
+    )
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return f"{kind}:{digest}"
+
+
+def _structured_chunk_metadata(
+    *,
+    source: str,
+    title: str,
+    heading_path: list[tuple[int, str]],
+    block_type: str,
+    section_chunk_counts: dict[str, int],
+    extra: dict | None = None,
+) -> dict:
+    path = _section_path(title, heading_path)
+    section_key = _stable_structure_id("section", *path)
+    section_chunk_index = section_chunk_counts.get(section_key, 0)
+    section_chunk_counts[section_key] = section_chunk_index + 1
+    metadata = {
+        "source": source,
+        # 保留旧字段，老检索逻辑和历史前端仍可读取 heading/type。
+        "heading": _ctx_prefix(title, heading_path),
+        "metadata_version": CHUNK_METADATA_VERSION,
+        "section_path": path,
+        "section_key": section_key,
+        "section_chunk_index": section_chunk_index,
+        "block_type": block_type,
+    }
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
 def _with_ctx(ctx: str, content: str) -> str:
     """给 chunk 内容加上标题路径上下文，提升检索命中率并让模型知道这段在讲什么。"""
     return f"【{ctx}】\n{content}" if ctx else content
@@ -182,6 +234,8 @@ def parse_markdown_content(content: str, source: str) -> list[dict]:
     heading_path: list[tuple[int, str]] = []
     prose: list[str] = []
     table: list[str] = []
+    section_chunk_counts: dict[str, int] = {}
+    table_sequence = 0
     discarded_placeholder_section = False
 
     def flush_prose():
@@ -198,10 +252,19 @@ def parse_markdown_content(content: str, source: str) -> list[dict]:
         section = raw_section.strip()
         ctx = _ctx_prefix(source, heading_path)
         for chunk in _split_text(section):
-            chunks.append({"content": _with_ctx(ctx, chunk),
-                           "metadata": {"source": source, "heading": ctx}})
+            chunks.append({
+                "content": _with_ctx(ctx, chunk),
+                "metadata": _structured_chunk_metadata(
+                    source=source,
+                    title=source,
+                    heading_path=heading_path,
+                    block_type="text",
+                    section_chunk_counts=section_chunk_counts,
+                ),
+            })
 
     def flush_table():
+        nonlocal table_sequence
         if not table:
             return
         md = "\n".join(table).strip()
@@ -209,9 +272,37 @@ def parse_markdown_content(content: str, source: str) -> list[dict]:
         if not md:
             return
         ctx = _ctx_prefix(source, heading_path)
-        for piece in _split_markdown_table(md):
-            chunks.append({"content": _with_ctx(ctx, piece),
-                           "metadata": {"source": source, "heading": ctx, "type": "table"}})
+        table_id = _stable_structure_id(
+            "table",
+            *_section_path(source, heading_path),
+            table_sequence,
+        )
+        table_sequence += 1
+        for part in _split_markdown_table_parts(md):
+            table_metadata = {
+                "type": "table",
+                "table_id": table_id,
+                "table_part_index": part.part_index,
+                "table_part_count": part.part_count,
+            }
+            if part.row_start is not None and part.row_end is not None:
+                table_metadata.update(
+                    {
+                        "table_row_start": part.row_start,
+                        "table_row_end": part.row_end,
+                    }
+                )
+            chunks.append({
+                "content": _with_ctx(ctx, part.content),
+                "metadata": _structured_chunk_metadata(
+                    source=source,
+                    title=source,
+                    heading_path=heading_path,
+                    block_type="table",
+                    section_chunk_counts=section_chunk_counts,
+                    extra=table_metadata,
+                ),
+            })
 
     for line in content.split("\n"):
         h = heading_re.match(line)
@@ -240,7 +331,16 @@ def parse_markdown_content(content: str, source: str) -> list[dict]:
     # 丢弃，不能再把整篇原文切分回来，否则过滤会失效。
     if not chunks and content.strip() and not discarded_placeholder_section:
         for chunk in _split_text(content):
-            chunks.append({"content": chunk, "metadata": {"source": source}})
+            chunks.append({
+                "content": chunk,
+                "metadata": _structured_chunk_metadata(
+                    source=source,
+                    title=source,
+                    heading_path=heading_path,
+                    block_type="text",
+                    section_chunk_counts=section_chunk_counts,
+                ),
+            })
     return chunks
 
 
@@ -318,25 +418,65 @@ def _docx_table_to_md(table) -> str:
     return _rows_to_md_table(rows[0], rows[1:])
 
 
-def _split_markdown_table(md: str, max_chars: int = 1800) -> list[str]:
-    """整张表尽量保留为一个 chunk；过大时按行拆分，每段重复表头。"""
-    if len(md) <= max_chars:
-        return [md]
+@dataclass(frozen=True)
+class _MarkdownTablePart:
+    content: str
+    part_index: int
+    part_count: int
+    row_start: int | None
+    row_end: int | None
+
+
+def _split_markdown_table_parts(
+    md: str,
+    max_chars: int = 1800,
+) -> list[_MarkdownTablePart]:
+    """按数据行切表，并保留每个分片对应的 1 基闭区间行号。"""
+
     lines = md.split("\n")
-    if len(lines) < 3:
-        return [md]
+    body_row_count = max(0, len(lines) - 2) if len(lines) >= 2 else 0
+    if len(md) <= max_chars or len(lines) < 3:
+        return [
+            _MarkdownTablePart(
+                content=md,
+                part_index=0,
+                part_count=1,
+                row_start=1 if body_row_count else None,
+                row_end=body_row_count or None,
+            )
+        ]
     header, body = lines[:2], lines[2:]
     base = sum(len(h) for h in header)
-    out, cur, cur_len = [], [], base
-    for row in body:
+    raw_parts: list[tuple[str, int, int]] = []
+    cur: list[str] = []
+    cur_len = base
+    current_start = 1
+    for row_number, row in enumerate(body, 1):
         if cur and cur_len + len(row) > max_chars:
-            out.append("\n".join(header + cur))
+            raw_parts.append(("\n".join(header + cur), current_start, row_number - 1))
             cur, cur_len = [], base
+            current_start = row_number
         cur.append(row)
         cur_len += len(row)
     if cur:
-        out.append("\n".join(header + cur))
-    return out
+        raw_parts.append(("\n".join(header + cur), current_start, len(body)))
+    part_count = len(raw_parts)
+    return [
+        _MarkdownTablePart(
+            content=content,
+            part_index=index,
+            part_count=part_count,
+            row_start=row_start,
+            row_end=row_end,
+        )
+        for index, (content, row_start, row_end) in enumerate(raw_parts)
+    ]
+
+
+def _split_markdown_table(md: str, max_chars: int = 1800) -> list[str]:
+    """兼容旧调用方的纯正文接口。"""
+
+    return [part.content for part in _split_markdown_table_parts(md, max_chars)]
 
 
 def _docx_heading_level(paragraph) -> int | None:
@@ -355,6 +495,8 @@ def _parse_docx(filepath: str, source: str) -> list[dict]:
     chunks: list[dict] = []
     heading_path: list[tuple[int, str]] = []
     text_buffer: list[str] = []
+    section_chunk_counts: dict[str, int] = {}
+    table_sequence = 0
 
     def flush_text():
         if not text_buffer:
@@ -363,8 +505,16 @@ def _parse_docx(filepath: str, source: str) -> list[dict]:
         text_buffer.clear()
         ctx = _ctx_prefix(title, heading_path)
         for chunk in _split_text(section):
-            chunks.append({"content": _with_ctx(ctx, chunk),
-                           "metadata": {"source": source, "heading": ctx}})
+            chunks.append({
+                "content": _with_ctx(ctx, chunk),
+                "metadata": _structured_chunk_metadata(
+                    source=source,
+                    title=title,
+                    heading_path=heading_path,
+                    block_type="text",
+                    section_chunk_counts=section_chunk_counts,
+                ),
+            })
 
     for kind, block in _iter_docx_blocks(doc):
         if kind == "paragraph":
@@ -382,9 +532,37 @@ def _parse_docx(filepath: str, source: str) -> list[dict]:
             md = _docx_table_to_md(block)
             if md:
                 ctx = _ctx_prefix(title, heading_path)
-                for piece in _split_markdown_table(md):
-                    chunks.append({"content": _with_ctx(ctx, piece),
-                                   "metadata": {"source": source, "heading": ctx, "type": "table"}})
+                table_id = _stable_structure_id(
+                    "table",
+                    *_section_path(title, heading_path),
+                    table_sequence,
+                )
+                table_sequence += 1
+                for part in _split_markdown_table_parts(md):
+                    table_metadata = {
+                        "type": "table",
+                        "table_id": table_id,
+                        "table_part_index": part.part_index,
+                        "table_part_count": part.part_count,
+                    }
+                    if part.row_start is not None and part.row_end is not None:
+                        table_metadata.update(
+                            {
+                                "table_row_start": part.row_start,
+                                "table_row_end": part.row_end,
+                            }
+                        )
+                    chunks.append({
+                        "content": _with_ctx(ctx, part.content),
+                        "metadata": _structured_chunk_metadata(
+                            source=source,
+                            title=title,
+                            heading_path=heading_path,
+                            block_type="table",
+                            section_chunk_counts=section_chunk_counts,
+                            extra=table_metadata,
+                        ),
+                    })
     flush_text()
     return chunks
 

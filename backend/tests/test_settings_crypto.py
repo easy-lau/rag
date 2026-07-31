@@ -14,6 +14,7 @@ from api.settings import (
     SettingsUpdate,
     _ModelListFetchError,
     _fetch_model_ids,
+    _load,
     _model_list_config,
     _run_model_connection_test,
     _secret_status,
@@ -43,6 +44,7 @@ class SettingsCryptoTests(unittest.TestCase):
                 "LLM_BASE_URL": "https://legacy.example.test/v1",
                 "CHAT_MODEL": "legacy-model",
                 "INTENT_MODEL": "legacy-intent-model",
+                "RERANK_MODEL": "legacy-rerank-model",
                 "EMBEDDING_DIMENSIONS": "1536",
                 "TEMPERATURE": "1.9",
                 "TOP_K": "20",
@@ -55,6 +57,7 @@ class SettingsCryptoTests(unittest.TestCase):
         self.assertEqual(settings.llm_base_url, "https://api.openai.com/v1")
         self.assertEqual(settings.chat_model, "gpt-4o")
         self.assertEqual(settings.intent_model, "")
+        self.assertEqual(settings.rerank_model, "")
         self.assertEqual(settings.embedding_dimensions, 2560)
         self.assertEqual(settings.temperature, 0.7)
         self.assertEqual(settings.top_k, 5)
@@ -134,6 +137,7 @@ def _runtime_settings(**overrides):
         "llm_base_url": "https://llm.example.test/v1",
         "chat_model": "chat-model",
         "intent_model": "",
+        "rerank_model": "",
         "temperature": 0.7,
         "max_tokens": 2048,
         "embedding_api_key": "",
@@ -268,6 +272,66 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
             audit.log.call_args.kwargs["detail"],
             {"changed": ["intent_model"]},
         )
+
+    async def test_update_normalizes_and_applies_rerank_model(self) -> None:
+        session = _Session()
+        audit = Mock()
+        settings = _runtime_settings()
+
+        with (
+            patch("api.settings.get_settings", return_value=settings),
+            patch(
+                "api.settings._load",
+                new=AsyncMock(return_value={"rerank_model": "fast-reranker"}),
+            ),
+        ):
+            result = await update_settings(
+                SettingsUpdate(rerank_model="  fast-reranker  "),
+                db=session,
+                audit=audit,
+                _=None,
+            )
+
+        self.assertEqual(result["rerank_model"], "fast-reranker")
+        self.assertEqual(settings.rerank_model, "fast-reranker")
+        self.assertEqual(session.added[0].key, "rerank_model")
+        self.assertEqual(session.added[0].value, "fast-reranker")
+        self.assertEqual(
+            audit.log.call_args.kwargs["detail"],
+            {"changed": ["rerank_model"]},
+        )
+
+    async def test_update_accepts_empty_rerank_model_for_chat_fallback(self) -> None:
+        row = SystemSetting(key="rerank_model", value="old-reranker")
+        session = _Session([row])
+        settings = _runtime_settings(rerank_model="old-reranker")
+
+        with (
+            patch("api.settings.get_settings", return_value=settings),
+            patch(
+                "api.settings._load",
+                new=AsyncMock(return_value={"rerank_model": ""}),
+            ),
+        ):
+            await update_settings(
+                SettingsUpdate(rerank_model="   "),
+                db=session,
+                audit=Mock(),
+                _=None,
+            )
+
+        self.assertEqual(row.value, "")
+        self.assertEqual(settings.rerank_model, "")
+
+    async def test_load_returns_saved_rerank_model(self) -> None:
+        session = _Session([
+            SystemSetting(key="rerank_model", value="fast-reranker"),
+        ])
+
+        with patch("api.settings.get_settings", return_value=_runtime_settings()):
+            result = await _load(session)
+
+        self.assertEqual(result["rerank_model"], "fast-reranker")
 
     async def test_update_rejects_base_url_change_without_a_new_key(self) -> None:
         session = _Session()

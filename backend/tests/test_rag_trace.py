@@ -90,6 +90,10 @@ class RagTraceTests(unittest.TestCase):
         self.assertTrue(trace_contains_business_content({
             "generation": {"context": "已筛选知识片段"}
         }))
+        self.assertTrue(trace_contains_business_content({
+            "expansion_queries": ["D级交通住宿标准"],
+            "requirements": [{"description": "确定普通员工适用等级"}],
+        }))
         self.assertFalse(trace_contains_business_content({
             "generation": {"model": "gpt-compatible", "total_tokens": 128}
         }))

@@ -1,18 +1,18 @@
 <template>
-  <button
-    type="button"
+  <component
+    :is="canPreview ? 'button' : 'div'"
+    :type="canPreview ? 'button' : undefined"
     class="document-result"
     :class="{ 'document-result--interactive': canPreview }"
-    :disabled="!canPreview"
-    :aria-label="canPreview ? `${evidenceMeta.label}，预览检索文档：${item.filename || '未命名文档'}` : undefined"
-    :title="canPreview ? '预览文档' : undefined"
+    :aria-label="canPreview ? previewAriaLabel : undefined"
+    :title="canPreview ? previewTitle : undefined"
     @click="openPreview"
   >
     <span class="document-result__rank">{{ rank }}</span>
-    <FileTypeIcon :type="item.file_type" class="shrink-0" />
+    <FileTypeIcon v-if="!fragmentMode" :type="item.file_type" class="shrink-0" />
     <div class="min-w-0 flex-1">
       <div class="document-result__heading">
-        <p class="document-result__title">{{ item.filename }}</p>
+        <p class="document-result__title" :title="itemTitle">{{ itemTitle }}</p>
         <n-tag
           size="small"
           round
@@ -24,7 +24,7 @@
           {{ evidenceMeta.label }}
         </n-tag>
       </div>
-      <p class="document-result__content">{{ item.content }}</p>
+      <p class="document-result__content">{{ displayedContent }}</p>
       <div class="document-result__meta">
         <ScoreTag
           :score="item.score"
@@ -39,9 +39,10 @@
         <span v-if="constraintMeta" class="document-result__constraint" :title="constraintMeta.hint">
           {{ constraintMeta.label }}
         </span>
+        <span v-if="canPreview && fragmentMode" class="document-result__action">定位原文</span>
       </div>
     </div>
-  </button>
+  </component>
 </template>
 
 <script setup>
@@ -49,37 +50,71 @@ import { computed } from 'vue'
 import { NTag } from 'naive-ui'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import ScoreTag from '@/components/common/ScoreTag.vue'
+import {
+  evidenceFragmentContent,
+  evidenceFragmentLabel,
+  evidenceSectionLabel,
+} from '@/utils/evidenceDocuments'
 
 const props = defineProps({
   item: Object,
   rank: Number,
   previewEnabled: { type: Boolean, default: true },
+  fragmentMode: { type: Boolean, default: false },
 })
 const emit = defineEmits(['preview'])
 
 const canPreview = computed(() => Boolean(
   props.previewEnabled && props.item?.kb_id && props.item?.doc_id
 ))
-const evidenceMeta = computed(() => ({
-  direct: {
-    label: '回答依据',
-    type: 'success',
-    hint: '该资料通过了当前问题的关键约束判定，可作为回答依据。',
-  },
-  related: {
-    label: '相近资料',
-    type: 'warning',
-    hint: '该资料与问题主题相关，但不能直接支撑目标版本或其他关键约束下的回答。',
-  },
-  irrelevant: {
-    label: '非回答依据',
+const fragmentName = computed(() => evidenceFragmentLabel(props.item, props.rank - 1))
+const sectionName = computed(() => evidenceSectionLabel(props.item))
+const itemTitle = computed(() => {
+  if (!props.fragmentMode) return props.item?.filename || '未命名文档'
+  return sectionName.value
+    ? `${fragmentName.value} · ${sectionName.value}`
+    : fragmentName.value
+})
+const displayedContent = computed(() => (
+  props.fragmentMode ? evidenceFragmentContent(props.item) : (props.item?.content || '')
+))
+const previewTitle = computed(() => (
+  props.fragmentMode ? '查看命中片段并定位原文' : '预览文档'
+))
+const previewAriaLabel = computed(() => (
+  props.fragmentMode
+    ? `${props.item?.filename || '未命名文档'}，${fragmentName.value}，${evidenceMeta.value.label}，查看并定位原文`
+    : `${evidenceMeta.value.label}，预览检索文档：${props.item?.filename || '未命名文档'}`
+))
+const evidenceMeta = computed(() => {
+  if (props.item?.jointly_selected && props.item?.coverage_status === 'partial') {
+    return {
+      label: '部分依据',
+      type: 'warning',
+      hint: '该片段已进入回答上下文并支撑部分必要信息，但当前证据集尚未完整覆盖问题。',
+    }
+  }
+  return ({
+    direct: {
+      label: '回答依据',
+      type: 'success',
+      hint: '该资料通过了当前问题的关键约束判定，可作为回答依据。',
+    },
+    related: {
+      label: '相近资料',
+      type: 'warning',
+      hint: '该资料与问题主题相关，但不能直接支撑目标版本或其他关键约束下的回答。',
+    },
+    irrelevant: {
+      label: '非回答依据',
+      type: 'default',
+      hint: '该资料不应作为当前回答的依据。',
+    },
+  })[props.item?.evidence_role] || {
+    label: '待验证',
     type: 'default',
-    hint: '该资料不应作为当前回答的依据。',
-  },
-})[props.item?.evidence_role] || {
-  label: '待验证',
-  type: 'default',
-  hint: '旧版结果或服务端尚未完成证据角色判定，相关度不等于答案可信度。',
+    hint: '旧版结果或服务端尚未完成证据角色判定，相关度不等于答案可信度。',
+  }
 })
 
 function scoreDisplay(value) {
@@ -146,10 +181,6 @@ function openPreview() {
   color: inherit;
   text-align: left;
   transition: border-color 150ms ease, background-color 150ms ease;
-}
-
-.document-result:disabled {
-  cursor: default;
 }
 
 .document-result--interactive {
@@ -222,11 +253,18 @@ function openPreview() {
 }
 
 .document-result__metric,
-.document-result__constraint {
+.document-result__constraint,
+.document-result__action {
   color: var(--ui-text-tertiary);
   font-size: 11px;
   line-height: 1.3;
   white-space: nowrap;
+}
+
+.document-result__action {
+  margin-left: auto;
+  color: var(--ui-primary);
+  font-weight: 600;
 }
 
 .document-result__constraint::before {

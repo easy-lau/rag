@@ -5,6 +5,7 @@
 """
 
 import json
+import math
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -33,6 +34,27 @@ TRACE_EXPORT_SCHEMA_VERSION = 1
 TRACE_EXPORT_MAX_EVENTS = 500
 TRACE_EXPORT_MAX_PAYLOAD_BYTES = 24 * 1024 * 1024
 _TRACE_VERBOSE_EVENTS = {"retrieval.candidate", "rerank.candidate"}
+_TRACE_EXPANSION_EVENTS = {
+    # Current names emitted by the document-expansion pipeline.
+    "retrieval.expansion_planned",
+    "retrieval.document_scoped_completed",
+    "retrieval.structure_expanded",
+    "retrieval.expansion_completed",
+    # Keep exports readable for traces produced by an intermediate build that
+    # used the more conventional dotted spelling.
+    "retrieval.expansion.planned",
+    "retrieval.document_scoped.completed",
+    "retrieval.structure.expanded",
+    "retrieval.expansion.completed",
+}
+_TRACE_JOINT_EVENTS = {
+    "rerank.joint_completed",
+    "rerank.joint.completed",
+}
+_TRACE_COVERAGE_EVENTS = {
+    "evidence.coverage_assessed",
+    "evidence.coverage",
+}
 _TRACE_TERMINAL_EVENTS = {
     "chat.response",
     "chat.error",
@@ -55,6 +77,9 @@ _TRACE_CORE_EVENTS = {
     "evidence.selection",
     "generation.context",
     "generation.completed",
+    *_TRACE_EXPANSION_EVENTS,
+    *_TRACE_JOINT_EVENTS,
+    *_TRACE_COVERAGE_EVENTS,
     *_TRACE_TERMINAL_EVENTS,
 }
 
@@ -154,6 +179,296 @@ def _trace_event_payload(
     return None
 
 
+def _trace_event_payloads(
+    events: list[dict[str, Any]],
+    event_names: set[str],
+) -> list[dict[str, Any]]:
+    """Return all matching payloads while preserving event sequence order.
+
+    Expansion and coverage can legitimately be emitted more than once (for
+    example an initial assessment followed by the post-expansion assessment).
+    The old snapshot helpers intentionally return only one payload; this
+    companion keeps that behaviour intact for old phases while making the new
+    phase history available to diagnostics.
+    """
+
+    payloads: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event") not in event_names:
+            continue
+        payload = event.get("payload")
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+# Trace events are persisted after a content-aware sanitizer, but the export
+# endpoint also has to defend against rows written by older builds or imported
+# manually.  New diagnostic summaries therefore use an explicit field/type
+# allow-list.  In particular, no ``query``, ``content``, ``reason`` or generic
+# ``error`` field is copied into these summaries.
+_DIAGNOSTIC_ENUM_FIELDS = {
+    "coverage_status",
+    "fallback_reason_code",
+    "pass",
+    "pass_name",
+    "scan_guard_reason",
+    "status",
+    "trigger",
+}
+_DIAGNOSTIC_TEXT_FIELDS = {
+    "model",
+    "prompt_version",
+    "selected_evidence_set_id",
+}
+_DIAGNOSTIC_BOOL_FIELDS = {
+    "should_expand",
+    "requested",
+    "attempted",
+    "succeeded",
+    "complete",
+    "expansion_attempted",
+    "expansion_succeeded",
+    "retry_exhausted",
+    "scan_guard_triggered",
+}
+_DIAGNOSTIC_INT_LIST_FIELDS = {
+    "selected_candidate_indexes",
+}
+_DIAGNOSTIC_ID_LIST_FIELDS = {
+    "covered_requirement_ids",
+    "missing_requirement_ids",
+}
+_DIAGNOSTIC_MAP_FIELDS = {
+    "channel_candidate_counts": {
+        "vector",
+        "keyword",
+        "trigram",
+    },
+    "counts_by_origin": {
+        "global_retrieval",
+        "adjacent",
+        "same_section",
+        "table_sibling",
+        "document_search",
+        "document_scoped",
+        "carryover",
+        "carryover_previous_turn",
+        "carryover_and_current_retrieval",
+    },
+}
+_EXPANSION_PLAN_DIAGNOSTIC_FIELDS = (
+    "should_expand",
+    "seed_document_count",
+    "seed_chunk_count",
+    "secondary_query_count",
+    "query_count",
+    "bridge_term_count",
+    "required_facet_count",
+    "missing_requirement_ids",
+    "max_added_candidates",
+    "max_joint_rerank_candidates",
+    "max_added_chars",
+)
+_DOCUMENT_SCOPED_DIAGNOSTIC_FIELDS = (
+    "succeeded",
+    "query_count",
+    "successful_query_count",
+    "failed_query_count",
+    "scoped_document_count",
+    "scoped_chunk_count",
+    "max_document_chunk_count",
+    "candidate_count",
+    "vector_fallback_count",
+    "scan_guard_triggered",
+    "scan_guard_reason",
+    "channel_candidate_counts",
+    "elapsed_ms",
+)
+_STRUCTURE_EXPANSION_DIAGNOSTIC_FIELDS = (
+    "seed_chunk_count",
+    "scoped_document_count",
+    "candidate_count",
+    "counts_by_origin",
+    "elapsed_ms",
+)
+_EXPANSION_RESULT_DIAGNOSTIC_FIELDS = (
+    "initial_candidate_count",
+    "added_candidate_count",
+    "combined_candidate_count",
+    "counts_by_origin",
+    "deduplicated_count",
+    "budget_dropped_count",
+    "error_count",
+    "added_chars",
+    "elapsed_ms",
+)
+_JOINT_RERANK_DIAGNOSTIC_FIELDS = (
+    "requested",
+    "attempted",
+    "succeeded",
+    "pass_name",
+    "model",
+    "prompt_version",
+    "candidate_count",
+    "selected_candidate_count",
+    "requirement_count",
+    "missing_requirement_count",
+    "evidence_set_count",
+    "selected_evidence_set_id",
+    "selected_candidate_indexes",
+    "coverage_status",
+    "joint_support_score",
+    "covered_requirement_ids",
+    "missing_requirement_ids",
+    "elapsed_ms",
+    "retry_exhausted",
+)
+_COVERAGE_DIAGNOSTIC_FIELDS = (
+    "attempted",
+    "succeeded",
+    "pass",
+    "pass_name",
+    "coverage_status",
+    "requirement_count",
+    "required_requirement_count",
+    "covered_requirement_count",
+    "missing_requirement_count",
+    "required_facet_count",
+    "covered_facet_count",
+    "missing_facet_count",
+    "selected_candidate_count",
+    "direct_evidence_count",
+    "related_reference_count",
+    "selected_evidence_set_id",
+    "joint_support_score",
+    "covered_requirement_ids",
+    "missing_requirement_ids",
+    "expansion_attempted",
+    "expansion_succeeded",
+    "retry_exhausted",
+    "context_budget_dropped_count",
+    "context_budget_chars",
+    "trigger",
+    "elapsed_ms",
+)
+
+
+def _bounded_diagnostic_text(value: Any, *, max_chars: int = 128) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > max_chars or "\n" in value or "\r" in value:
+        return None
+    # IDs and versions are intentionally restricted to a compact token.  This
+    # prevents an imported row from smuggling an arbitrary document excerpt
+    # through a field that is otherwise useful in diagnostics.
+    if not value.isascii() or not all(
+        ch.isalnum() or ch in "._:/-" for ch in value
+    ):
+        return None
+    return value
+
+
+def _diagnostic_field_value(key: str, value: Any) -> Any:
+    """Sanitize one allow-listed diagnostic field.
+
+    Return ``None`` for a malformed or potentially content-bearing value.  A
+    caller can then omit that field instead of weakening the export boundary.
+    """
+
+    if key in _DIAGNOSTIC_BOOL_FIELDS:
+        return value if isinstance(value, bool) else None
+    if key in _DIAGNOSTIC_ENUM_FIELDS:
+        return _bounded_diagnostic_text(value, max_chars=64)
+    if key in _DIAGNOSTIC_TEXT_FIELDS:
+        return _bounded_diagnostic_text(value)
+    if key in _DIAGNOSTIC_INT_LIST_FIELDS:
+        if not isinstance(value, (list, tuple)):
+            return None
+        output = []
+        for item in value[:64]:
+            if isinstance(item, bool) or not isinstance(item, int) or item < 1:
+                return None
+            output.append(item)
+        return output
+    if key in _DIAGNOSTIC_ID_LIST_FIELDS:
+        if not isinstance(value, (list, tuple)):
+            return None
+        output = []
+        for item in value[:64]:
+            text = _bounded_diagnostic_text(item, max_chars=80)
+            if text is None:
+                return None
+            output.append(text)
+        return output
+    if key in _DIAGNOSTIC_MAP_FIELDS:
+        if not isinstance(value, dict):
+            return None
+        allowed = _DIAGNOSTIC_MAP_FIELDS[key]
+        output: dict[str, int | float] = {}
+        for map_key, map_value in value.items():
+            if str(map_key) not in allowed:
+                continue
+            if isinstance(map_value, bool) or not isinstance(map_value, (int, float)):
+                continue
+            if not math.isfinite(float(map_value)):
+                continue
+            output[str(map_key)] = map_value
+        return output or None
+
+    # Counts, budgets, durations, and scores are all scalar metrics.  Keep the
+    # key allow-list at the call site; this suffix check only validates type.
+    if (
+        key.endswith((
+            "_count",
+            "_ms",
+            "_chars",
+            "_bytes",
+            "_candidates",
+            "_documents",
+            "_chunks",
+            "_queries",
+        ))
+        or key in {"joint_support_score", "added_chars"}
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(float(value)):
+            return None
+        return value
+    return None
+
+
+def _pick_diagnostic_fields(
+    payload: dict[str, Any] | None,
+    *keys: str,
+) -> dict[str, Any] | None:
+    """Pick and sanitize a phase's machine-readable, non-content metrics."""
+
+    if not payload:
+        return None
+    selected: dict[str, Any] = {}
+    for key in keys:
+        if key not in payload:
+            continue
+        value = _diagnostic_field_value(key, payload.get(key))
+        if value is not None:
+            selected[key] = value
+    return selected or None
+
+
+def _pick_diagnostic_history(
+    payloads: list[dict[str, Any]],
+    *keys: str,
+) -> list[dict[str, Any]]:
+    return [
+        selected
+        for payload in payloads
+        if (selected := _pick_diagnostic_fields(payload, *keys)) is not None
+    ]
+
+
 def _pick_trace_fields(
     payload: dict[str, Any] | None,
     *keys: str,
@@ -191,6 +506,43 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
             )
             if key in payload
         })
+
+    expansion_planned_payload = _trace_event_payload(
+        events,
+        "retrieval.expansion_planned",
+    ) or _trace_event_payload(events, "retrieval.expansion.planned")
+    document_scoped_payload = _trace_event_payload(
+        events,
+        "retrieval.document_scoped_completed",
+    ) or _trace_event_payload(events, "retrieval.document_scoped.completed")
+    structure_expanded_payload = _trace_event_payload(
+        events,
+        "retrieval.structure_expanded",
+    ) or _trace_event_payload(events, "retrieval.structure.expanded")
+    expansion_completed_payload = _trace_event_payload(
+        events,
+        "retrieval.expansion_completed",
+    ) or _trace_event_payload(events, "retrieval.expansion.completed")
+    joint_rerank_payload = _trace_event_payload(
+        events,
+        "rerank.joint_completed",
+    ) or _trace_event_payload(events, "rerank.joint.completed")
+    coverage_history_payloads = _trace_event_payloads(
+        events,
+        _TRACE_COVERAGE_EVENTS,
+    )
+    canonical_coverage_payloads = _trace_event_payloads(
+        events,
+        {"evidence.coverage_assessed"},
+    )
+    # Prefer the finalized event name when a trace contains both an
+    # intermediate-build alias and the current event. The history still keeps
+    # both in sequence order for investigations.
+    coverage_payload = (
+        canonical_coverage_payloads[-1]
+        if canonical_coverage_payloads
+        else (coverage_history_payloads[-1] if coverage_history_payloads else None)
+    )
 
     return {
         "conversation_context": _pick_trace_fields(
@@ -242,6 +594,24 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
             "channel_candidate_counts",
             "elapsed_ms",
         ),
+        # Expansion summaries contain metrics only. They remain ``None`` for
+        # traces created before document-scoped expansion was introduced.
+        "retrieval_expansion_plan": _pick_diagnostic_fields(
+            expansion_planned_payload,
+            *_EXPANSION_PLAN_DIAGNOSTIC_FIELDS,
+        ),
+        "retrieval_document_scoped_result": _pick_diagnostic_fields(
+            document_scoped_payload,
+            *_DOCUMENT_SCOPED_DIAGNOSTIC_FIELDS,
+        ),
+        "retrieval_structure_expansion": _pick_diagnostic_fields(
+            structure_expanded_payload,
+            *_STRUCTURE_EXPANSION_DIAGNOSTIC_FIELDS,
+        ),
+        "retrieval_expansion_result": _pick_diagnostic_fields(
+            expansion_completed_payload,
+            *_EXPANSION_RESULT_DIAGNOSTIC_FIELDS,
+        ),
         "rerank_result": _pick_trace_fields(
             _trace_event_payload(events, "rerank.completed"),
             "requested",
@@ -255,6 +625,22 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
             "elapsed_ms",
             "reason",
             "error",
+        ),
+        "rerank_joint_result": _pick_diagnostic_fields(
+            joint_rerank_payload,
+            *_JOINT_RERANK_DIAGNOSTIC_FIELDS,
+        ),
+        "rerank_joint_history": _pick_diagnostic_history(
+            _trace_event_payloads(events, _TRACE_JOINT_EVENTS),
+            *_JOINT_RERANK_DIAGNOSTIC_FIELDS,
+        ),
+        "evidence_coverage": _pick_diagnostic_fields(
+            coverage_payload,
+            *_COVERAGE_DIAGNOSTIC_FIELDS,
+        ),
+        "evidence_coverage_history": _pick_diagnostic_history(
+            coverage_history_payloads,
+            *_COVERAGE_DIAGNOSTIC_FIELDS,
         ),
         "evidence_result": _pick_trace_fields(
             _trace_event_payload(events, "evidence.selection"),
@@ -448,7 +834,10 @@ def _rag_trace_export_payload(
     return {
         "export_schema_version": TRACE_EXPORT_SCHEMA_VERSION,
         "exported_at": (exported_at or datetime.now(UTC)).isoformat(),
-        "purpose": "用于复盘 RAG 上下文、意图路由、召回、重排、证据筛选与生成链路",
+        "purpose": (
+            "用于复盘 RAG 上下文、意图路由、召回、文档内扩展、联合重排、"
+            "证据覆盖与生成链路"
+        ),
         "data_policy": {
             "source": "仅导出 rag_trace_runs 与 rag_trace_events 中已保存的数据",
             "content_included": content_included,
@@ -511,6 +900,8 @@ def _rag_trace_export_payload(
                 "检查 conversation 阶段是否正确继承或拒绝继承上一轮主题",
                 "检查 intent 阶段的模型结果、拒绝原因和安全兜底是否合理",
                 "检查 retrieval 查询、约束、召回通道和候选分数",
+                "检查文档内扩展是否受种子文档、候选数和字符预算约束",
+                "检查联合重排的证据组合是否覆盖必要回答维度",
                 "检查 rerank 与 evidence 阶段是否保留了真正支持答案的证据",
                 "检查 generation 阶段的上下文、输出、耗时、重试和错误",
             ],
@@ -522,7 +913,8 @@ def _rag_trace_export_payload(
             ),
             "suggested_prompt": (
                 "请按事件 sequence 复盘这次 RAG 调用，先判断上下文改写和意图路由是否正确，"
-                "再检查召回、重排、证据门控与生成。引用具体 sequence 和字段作为证据；"
+                "再检查召回、文档内扩展、联合重排、证据覆盖门控与生成。"
+                "引用具体 sequence 和字段作为证据；"
                 "区分已由日志证明的结论与推测，最后给出可验证的优化项和回归用例。"
             ),
             "expected_sections": [

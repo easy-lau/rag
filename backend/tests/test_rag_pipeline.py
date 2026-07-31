@@ -5,12 +5,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from core.rag_pipeline import (
+    _apply_joint_context_budget,
+    _bounded_initial_expansion_candidates,
     _build_context,
+    _generation_coverage_payload,
+    _knowledge_context_message,
     _merge_retrieval_candidates,
     _select_verified_evidence,
     run_rag_stream,
 )
-from core.reranker import RerankOutcome
+from core.evidence_expansion import ExpansionOutcome
+from core.reranker import AnswerRequirement, ExpansionPlan, RerankOutcome
 
 
 def _settings(**overrides):
@@ -74,6 +79,21 @@ def _search_event(chunks: list[str]) -> dict:
     return next(item for item in _event_payloads(chunks) if item["type"] == "search_results")
 
 
+def _expanded_outcome(initial: list[dict], added: list[dict]) -> ExpansionOutcome:
+    return ExpansionOutcome(
+        candidates=[*initial, *added],
+        seed_candidates=initial[:1],
+        scoped_candidates=added,
+        structural_candidates=[],
+        counts_by_origin={"global_retrieval": len(initial), "document_scoped": len(added)},
+        added_candidate_count=len(added),
+        added_chars=sum(len(str(item.get("content") or "")) for item in added),
+        deduplicated_count=0,
+        budget_dropped_count=0,
+        expanded=True,
+    )
+
+
 class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def _run(
         self,
@@ -87,11 +107,27 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         conversation_history: list[dict[str, str]] | None = None,
         carryover_sources: list[dict] | None = None,
         is_followup: bool = False,
+        expansion_outcome: ExpansionOutcome | None = None,
+        joint_outcome: RerankOutcome | None = None,
+        expansion_mock: AsyncMock | None = None,
+        joint_mock: AsyncMock | None = None,
     ) -> tuple[list[str], AsyncMock, _FakeClient]:
         search = AsyncMock(return_value=results)
         fake_client = _FakeClient()
         if rerank_outcome is None:
             rerank_outcome = RerankOutcome(results=results, succeeded=False, error="disabled")
+        expansion_call = expansion_mock or AsyncMock(
+            side_effect=AssertionError("当前场景不应触发文档内证据扩展")
+        )
+        if expansion_outcome is not None:
+            expansion_call.return_value = expansion_outcome
+            expansion_call.side_effect = None
+        joint_call = joint_mock or AsyncMock(
+            side_effect=AssertionError("当前场景不应触发联合重排")
+        )
+        if joint_outcome is not None:
+            joint_call.return_value = joint_outcome
+            joint_call.side_effect = None
 
         async def build_context(_db, selected, **_kwargs):
             return "\n".join(item["content"] for item in selected)
@@ -100,6 +136,8 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
             patch("core.rag_pipeline.get_settings", return_value=_settings()),
             patch("core.rag_pipeline.hybrid_search", new=search),
             patch("core.rag_pipeline.rerank_with_status", new=AsyncMock(return_value=rerank_outcome)),
+            patch("core.rag_pipeline.expand_evidence_candidates", new=expansion_call),
+            patch("core.rag_pipeline.joint_rerank_with_coverage", new=joint_call),
             patch("core.rag_pipeline._build_context", new=build_context),
             patch("core.rag_pipeline.get_client", return_value=fake_client),
         ):
@@ -702,6 +740,911 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
             message["content"] for message in client.completions.calls[0]["messages"]
         )
         self.assertNotIn("云枢旧版本相近资料", all_prompt_content)
+
+    def test_expansion_pool_keeps_target_document_and_real_competitor(self) -> None:
+        target_doc = uuid.uuid4()
+        competitor_doc = uuid.uuid4()
+        unrelated_doc = uuid.uuid4()
+        target_candidates = [
+            {
+                **_candidate(content=f"目标文档片段 {index}"),
+                "doc_id": target_doc,
+                "rerank_candidate_index": index,
+                "topic_relevance": 0.8,
+                "answer_support": 0.1,
+                "constraint_status": "neutral",
+                "evidence_role": "related",
+                "contribution_role": "background",
+            }
+            for index in range(1, 4)
+        ]
+        competitor = {
+            **_candidate(content="另一份真实相关的竞争证据"),
+            "doc_id": competitor_doc,
+            "rerank_candidate_index": 4,
+            "topic_relevance": 0.9,
+            "answer_support": 0.7,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "contribution_role": "standalone_answer",
+        }
+        unrelated = [
+            {
+                **_candidate(content=f"明显无关候选 {index}"),
+                "doc_id": unrelated_doc,
+                "rerank_candidate_index": index,
+                "topic_relevance": 0.01,
+                "answer_support": 0.0,
+                "constraint_status": "neutral",
+                "evidence_role": "irrelevant",
+                "contribution_role": "irrelevant",
+            }
+            for index in range(5, 13)
+        ]
+
+        bounded = _bounded_initial_expansion_candidates(
+            [*target_candidates, competitor, *unrelated],
+            ExpansionPlan(
+                needed=True,
+                target_candidate_indexes=(1,),
+                queries=("目标文档完整标准",),
+            ),
+        )
+
+        self.assertEqual(len(bounded), 4)
+        self.assertEqual(
+            {item["doc_id"] for item in bounded},
+            {target_doc, competitor_doc},
+        )
+        self.assertNotIn(unrelated_doc, {item["doc_id"] for item in bounded})
+
+    async def test_missing_helpful_requirement_is_promoted_for_joint_coverage(self) -> None:
+        document_id = uuid.uuid4()
+        requirements = (
+            AnswerRequirement("grade", "确定普通员工适用职级"),
+            AnswerRequirement(
+                "standard",
+                "职级对应的交通住宿和补贴标准",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        mapping = {
+            **_candidate(content="普通员工属于 D级", filename="公司出差管理标准.md"),
+            "doc_id": document_id,
+            "chunk_index": 2,
+            "rerank_candidate_index": 1,
+            "topic_relevance": 1.0,
+            "answer_support": 0.9,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "standalone_answer",
+            "supports_requirement_ids": ["grade"],
+        }
+        detail = {
+            **_candidate(
+                content="D级交通、住宿和补贴标准明细",
+                filename="公司出差管理标准.md",
+            ),
+            "doc_id": document_id,
+            "chunk_index": 3,
+            "candidate_origin": "document_scoped",
+        }
+        selected = [
+            {
+                **candidate,
+                "rerank_candidate_index": index,
+                "topic_relevance": 0.98,
+                "answer_support": 0.9,
+                "constraint_status": "neutral",
+                "evidence_role": "direct",
+                "rerank_status": "verified_joint",
+                "contribution_role": (
+                    "bridge" if index == 1 else "complement"
+                ),
+                "supports_requirement_ids": (
+                    ["grade"] if index == 1 else ["standard"]
+                ),
+                "jointly_selected": True,
+                "evidence_set_id": "set_1",
+                "joint_support_score": 0.93,
+                "coverage_status": "complete",
+            }
+            for index, candidate in enumerate((mapping, detail), start=1)
+        ]
+        expansion_mock = AsyncMock()
+        joint_mock = AsyncMock()
+
+        chunks, _search, _client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[mapping],
+            rerank_outcome=RerankOutcome(
+                results=[mapping],
+                succeeded=True,
+                requirements=requirements,
+                expansion_plan=ExpansionPlan(
+                    needed=True,
+                    target_candidate_indexes=(1,),
+                    queries=("D级完整出差标准",),
+                    missing_requirement_ids=("standard",),
+                ),
+            ),
+            expansion_outcome=_expanded_outcome([mapping], [detail]),
+            joint_outcome=RerankOutcome(
+                results=selected,
+                succeeded=True,
+                requirements=requirements,
+                coverage_status="complete",
+                selected_evidence_set_id="set_1",
+                selected_candidate_indexes=(1, 2),
+                joint_support_score=0.93,
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_awaited_once()
+        joint_mock.assert_awaited_once()
+        promoted = {item.id: item for item in joint_mock.await_args.args[2]}
+        self.assertEqual(promoted["standard"].importance, "required")
+        self.assertEqual(promoted["standard"].source, "explicit")
+        self.assertEqual(_search_event(chunks)["coverage_status"], "complete")
+
+    async def test_failed_initial_rerank_can_use_safe_document_expansion(self) -> None:
+        document_id = uuid.uuid4()
+        initial = [
+            {
+                **_candidate(
+                    content=content,
+                    filename="公司出差管理标准.md",
+                ),
+                "doc_id": document_id,
+                "chunk_index": index,
+                "active_channels": channels,
+            }
+            for index, content, channels in (
+                (1, "普通员工属于 D级", ["vector", "trigram"]),
+                (2, "出差审批和报销说明", ["trigram"]),
+                (3, "差旅等级说明", ["vector"]),
+            )
+        ]
+        detail = {
+            **_candidate(
+                content="D级住宿450/350/250元，餐饮100元，通讯50元，出差补贴100元",
+                filename="公司出差管理标准.md",
+            ),
+            "doc_id": document_id,
+            "chunk_index": 4,
+            "candidate_origin": "document_scoped",
+        }
+        selected = [
+            {
+                **candidate,
+                "rerank_candidate_index": index,
+                "topic_relevance": 0.98,
+                "answer_support": 0.9,
+                "constraint_status": "neutral",
+                "evidence_role": "direct",
+                "rerank_status": "verified_joint",
+                "contribution_role": (
+                    "bridge" if index == 1 else "complement"
+                ),
+                "supports_requirement_ids": ["answer"],
+                "jointly_selected": True,
+                "evidence_set_id": "set_1",
+                "joint_support_score": 0.92,
+                "coverage_status": "complete",
+            }
+            for index, candidate in enumerate((initial[0], detail), start=1)
+        ]
+        expansion_mock = AsyncMock()
+        joint_mock = AsyncMock()
+
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=initial,
+            rerank_outcome=RerankOutcome(
+                results=initial,
+                succeeded=False,
+                error="InternalServerError: 500 websocket EOF",
+            ),
+            expansion_outcome=_expanded_outcome(initial, [detail]),
+            joint_outcome=RerankOutcome(
+                results=selected,
+                succeeded=True,
+                coverage_status="complete",
+                selected_evidence_set_id="set_1",
+                selected_candidate_indexes=(1, 2),
+                joint_support_score=0.92,
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_awaited_once()
+        expansion_inputs = expansion_mock.await_args.kwargs["initial_candidates"]
+        self.assertEqual(len(expansion_inputs), 3)
+        self.assertEqual({item["doc_id"] for item in expansion_inputs}, {document_id})
+        self.assertEqual(
+            expansion_mock.await_args.kwargs["plan"].target_candidate_indexes,
+            (1, 2, 3),
+        )
+        joint_mock.assert_awaited_once()
+        self.assertEqual(
+            tuple(item.id for item in joint_mock.await_args.args[2]),
+            ("answer",),
+        )
+        event = _search_event(chunks)
+        self.assertEqual(event["evidence_status"], "hit")
+        self.assertEqual(event["coverage_status"], "complete")
+        self.assertTrue(event["expansion_attempted"])
+        prompt_content = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("住宿450/350/250元", prompt_content)
+
+    async def test_failed_initial_rerank_vector_only_does_not_expand(self) -> None:
+        document_id = uuid.uuid4()
+        initial = [
+            {
+                **_candidate(content=f"同文档向量候选 {index}"),
+                "doc_id": document_id,
+                "active_channels": ["vector"],
+            }
+            for index in range(3)
+        ]
+        expansion_mock = AsyncMock(
+            side_effect=AssertionError("纯向量召回不得触发失败后扩展")
+        )
+        joint_mock = AsyncMock(
+            side_effect=AssertionError("纯向量召回不得触发联合重排")
+        )
+
+        chunks, _search, _client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=initial,
+            rerank_outcome=RerankOutcome(
+                results=initial,
+                succeeded=False,
+                error="InternalServerError: 500",
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_not_awaited()
+        joint_mock.assert_not_awaited()
+        self.assertFalse(_search_event(chunks)["expansion_attempted"])
+
+    async def test_failed_initial_rerank_without_dominant_document_does_not_expand(self) -> None:
+        first_doc = uuid.uuid4()
+        second_doc = uuid.uuid4()
+        initial = [
+            {
+                **_candidate(content="第一文档词面命中"),
+                "doc_id": first_doc,
+                "active_channels": ["trigram"],
+            },
+            {
+                **_candidate(content="第二文档候选"),
+                "doc_id": second_doc,
+                "active_channels": ["vector"],
+            },
+            {
+                **_candidate(content="第一文档另一候选"),
+                "doc_id": first_doc,
+                "active_channels": ["vector"],
+            },
+        ]
+        expansion_mock = AsyncMock(
+            side_effect=AssertionError("前三条不属于同一文档时不得扩展")
+        )
+        joint_mock = AsyncMock(
+            side_effect=AssertionError("前三条不属于同一文档时不得联合重排")
+        )
+
+        chunks, _search, _client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=initial,
+            rerank_outcome=RerankOutcome(
+                results=initial,
+                succeeded=False,
+                error="InternalServerError: 500",
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_not_awaited()
+        joint_mock.assert_not_awaited()
+        self.assertFalse(_search_event(chunks)["expansion_attempted"])
+
+    async def test_failed_initial_and_joint_rerank_discards_all_unverified_context(self) -> None:
+        target_doc = uuid.uuid4()
+        unrelated_doc = uuid.uuid4()
+        dominant = [
+            {
+                **_candidate(
+                    content=f"目标文档召回片段 {index}",
+                    filename="公司出差管理标准.md",
+                ),
+                "doc_id": target_doc,
+                "active_channels": ["trigram"] if index == 1 else ["vector"],
+            }
+            for index in range(1, 4)
+        ]
+        unrelated = {
+            **_candidate(content="员工请假制度中的无关内容", filename="员工请假制度.md"),
+            "doc_id": unrelated_doc,
+            "active_channels": ["vector"],
+        }
+        detail = {
+            **_candidate(content="未经联合验证的D级住宿标准"),
+            "doc_id": target_doc,
+            "candidate_origin": "document_scoped",
+        }
+        expansion_mock = AsyncMock()
+        joint_mock = AsyncMock()
+
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[*dominant, unrelated],
+            rerank_outcome=RerankOutcome(
+                results=[*dominant, unrelated],
+                succeeded=False,
+                error="InternalServerError: 500 websocket EOF",
+            ),
+            expansion_outcome=_expanded_outcome(dominant, [detail]),
+            joint_outcome=RerankOutcome(
+                results=[*dominant, detail],
+                succeeded=False,
+                error="TimeoutError",
+                coverage_status="insufficient",
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_awaited_once()
+        expansion_inputs = expansion_mock.await_args.kwargs["initial_candidates"]
+        self.assertEqual({item["doc_id"] for item in expansion_inputs}, {target_doc})
+        joint_mock.assert_awaited_once()
+        event = _search_event(chunks)
+        self.assertEqual(event["evidence_status"], "no_hit")
+        self.assertEqual(event["answer_sources"], [])
+        prompt_content = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("员工请假制度中的无关内容", prompt_content)
+        self.assertNotIn("未经联合验证的D级住宿标准", prompt_content)
+
+    async def test_cross_chunk_bridge_expands_and_uses_complete_joint_evidence(self) -> None:
+        document_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        requirements = (
+            AnswerRequirement("grade", "确定普通员工适用职级"),
+            AnswerRequirement("traffic", "交通标准"),
+            AnswerRequirement("lodging", "住宿标准"),
+            AnswerRequirement("allowance", "餐饮和其他补贴"),
+        )
+        mapping = {
+            **_candidate(content="普通员工、专员属于 D级", filename="公司出差管理标准.md"),
+            "doc_id": document_id,
+            "kb_id": kb_id,
+            "chunk_index": 2,
+            "rerank_candidate_index": 1,
+            "topic_relevance": 1.0,
+            "answer_support": 0.55,
+            "constraint_status": "neutral",
+            "evidence_role": "related",
+            "rerank_status": "verified",
+            "contribution_role": "bridge",
+            "supports_requirement_ids": ["grade"],
+            "bridge_facts": [
+                {"subject": "普通员工", "relation": "属于", "object": "D级"}
+            ],
+        }
+        details = [
+            {
+                **_candidate(content=content, filename="公司出差管理标准.md"),
+                "doc_id": document_id,
+                "kb_id": kb_id,
+                "chunk_index": index,
+                "candidate_origin": "document_scoped",
+            }
+            for index, content in (
+                (3, "D级：飞机经济舱；高铁/动车二等座；普通火车硬卧"),
+                (6, "D级住宿：一线城市450元，二线350元，其他城市250元"),
+                (7, "D级餐饮100元/天；通讯50元/天；出差补贴100元/天"),
+            )
+        ]
+        requirement_ids = ("grade", "traffic", "lodging", "allowance")
+        supports = (["grade"], ["traffic"], ["lodging"], ["allowance"])
+        joint_results = []
+        for index, (candidate, supported) in enumerate(
+            zip([mapping, *details], supports),
+            start=1,
+        ):
+            joint_results.append({
+                **candidate,
+                "rerank_candidate_index": index,
+                "topic_relevance": 0.98,
+                "answer_support": 0.9 if index > 1 else 0.55,
+                "constraint_status": "neutral",
+                "evidence_role": "direct",
+                "rerank_status": "verified_joint",
+                "joint_rerank_status": "verified",
+                "contribution_role": "bridge" if index == 1 else "complement",
+                "supports_requirement_ids": supported,
+                "jointly_selected": True,
+                "evidence_set_id": "set_1",
+                "joint_support_score": 0.93,
+                "coverage_status": "complete",
+            })
+
+        plan = ExpansionPlan(
+            needed=True,
+            target_candidate_indexes=(1,),
+            queries=("D级交通住宿餐饮补贴标准",),
+            missing_requirement_ids=("traffic", "lodging", "allowance"),
+            reason="已找到职级映射，但缺少标准明细",
+        )
+        first_outcome = RerankOutcome(
+            results=[mapping],
+            succeeded=True,
+            requirements=requirements,
+            expansion_plan=plan,
+        )
+        final_outcome = RerankOutcome(
+            results=joint_results,
+            succeeded=True,
+            requirements=requirements,
+            coverage_status="complete",
+            joint_support_score=0.93,
+            selected_evidence_set_id="set_1",
+            selected_candidate_indexes=(1, 2, 3, 4),
+            missing_requirement_ids=(),
+            model="test-chat",
+            prompt_version="joint-test",
+            elapsed_ms=12,
+            candidate_count=4,
+        )
+        expansion_mock = AsyncMock()
+        joint_mock = AsyncMock()
+
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[mapping],
+            rerank_outcome=first_outcome,
+            expansion_outcome=_expanded_outcome([mapping], details),
+            joint_outcome=final_outcome,
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_awaited_once()
+        joint_mock.assert_awaited_once()
+        self.assertEqual(joint_mock.await_args.args[0], "普通员工的出差标准是什么")
+        self.assertEqual(
+            tuple(item.id for item in joint_mock.await_args.args[2]),
+            requirement_ids,
+        )
+        event = _search_event(chunks)
+        self.assertEqual(event["evidence_status"], "hit")
+        self.assertEqual(event["coverage_status"], "complete")
+        self.assertTrue(event["expansion_attempted"])
+        self.assertEqual(len(event["answer_sources"]), 4)
+        context_message = client.completions.calls[0]["messages"][1]["content"]
+        for expected in ("普通员工", "经济舱", "450元", "餐饮100元"):
+            self.assertIn(expected, context_message)
+
+    async def test_complete_single_chunk_uses_fast_path_without_expansion(self) -> None:
+        requirement = AnswerRequirement("answer", "默认密码修改方法")
+        result = {
+            **_candidate(content="修改 defaultPwd 后重启服务"),
+            "rerank_candidate_index": 1,
+            "topic_relevance": 0.98,
+            "answer_support": 0.95,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "standalone_answer",
+            "supports_requirement_ids": ["answer"],
+        }
+        expansion_mock = AsyncMock()
+        joint_mock = AsyncMock()
+        chunks, _search, _client = await self._run(
+            question="系统默认密码怎么修改",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[result],
+            rerank_outcome=RerankOutcome(
+                results=[result],
+                succeeded=True,
+                requirements=(requirement,),
+                expansion_plan=ExpansionPlan(needed=False),
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_not_awaited()
+        joint_mock.assert_not_awaited()
+        event = _search_event(chunks)
+        self.assertEqual(event["evidence_status"], "hit")
+        self.assertFalse(event["expansion_attempted"])
+
+    async def test_version_mismatch_cannot_seed_document_expansion(self) -> None:
+        old = {
+            **_candidate(
+                filename="云枢7配置.md",
+                content="云枢7：error_reply_same1: true",
+            ),
+            "rerank_candidate_index": 1,
+            "topic_relevance": 0.98,
+            "answer_support": 0.9,
+            "constraint_status": "mismatch",
+            "evidence_role": "related",
+            "rerank_status": "verified",
+            "contribution_role": "bridge",
+            "supports_requirement_ids": ["answer"],
+        }
+        expansion_mock = AsyncMock()
+        joint_mock = AsyncMock()
+        chunks, _search, _client = await self._run(
+            question="我是云枢8.6，用户名枚举怎么配置",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[old],
+            rerank_outcome=RerankOutcome(
+                results=[old],
+                succeeded=True,
+                requirements=(AnswerRequirement("answer", "目标版本配置"),),
+                expansion_plan=ExpansionPlan(
+                    needed=True,
+                    target_candidate_indexes=(1,),
+                    queries=("云枢7用户名枚举配置",),
+                    missing_requirement_ids=("answer",),
+                ),
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_not_awaited()
+        joint_mock.assert_not_awaited()
+        self.assertEqual(_search_event(chunks)["evidence_status"], "version_mismatch")
+
+    async def test_joint_failure_discards_new_chunks_and_fails_closed(self) -> None:
+        document_id = uuid.uuid4()
+        requirement = AnswerRequirement("answer", "员工适用的完整出差标准")
+        mapping = {
+            **_candidate(content="普通员工属于D级"),
+            "doc_id": document_id,
+            "chunk_index": 2,
+            "rerank_candidate_index": 1,
+            "topic_relevance": 1.0,
+            "answer_support": 0.5,
+            "constraint_status": "neutral",
+            # 即使首轮模型把桥接片段误标成 direct，补检失败后也不能把它当作
+            # 完整答案依据。这是 fail-closed 回归测试的关键前提。
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "bridge",
+            "supports_requirement_ids": ["answer"],
+            "bridge_facts": [
+                {"subject": "普通员工", "relation": "属于", "object": "D级"}
+            ],
+        }
+        unverified_detail = {
+            **_candidate(content="未经联合验证的D级标准"),
+            "doc_id": document_id,
+            "chunk_index": 3,
+            "candidate_origin": "document_scoped",
+        }
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[mapping],
+            rerank_outcome=RerankOutcome(
+                results=[mapping],
+                succeeded=True,
+                requirements=(requirement,),
+                expansion_plan=ExpansionPlan(
+                    needed=True,
+                    target_candidate_indexes=(1,),
+                    queries=("D级出差标准",),
+                    missing_requirement_ids=("answer",),
+                ),
+            ),
+            expansion_outcome=_expanded_outcome([mapping], [unverified_detail]),
+            joint_outcome=RerankOutcome(
+                results=[mapping, unverified_detail],
+                succeeded=False,
+                error="TimeoutError",
+                coverage_status="insufficient",
+            ),
+        )
+
+        event = _search_event(chunks)
+        self.assertEqual(event["evidence_status"], "no_hit")
+        self.assertEqual(event["answer_sources"], [])
+        prompt_content = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("未经联合验证", prompt_content)
+
+    async def test_expansion_exception_with_direct_bridge_fails_closed(self) -> None:
+        mapping = {
+            **_candidate(content="普通员工属于D级"),
+            "chunk_index": 2,
+            "rerank_candidate_index": 1,
+            "topic_relevance": 1.0,
+            "answer_support": 0.9,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "bridge",
+            "supports_requirement_ids": ["answer"],
+        }
+        expansion_mock = AsyncMock(side_effect=RuntimeError("scoped search failed"))
+        joint_mock = AsyncMock()
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[mapping],
+            rerank_outcome=RerankOutcome(
+                results=[mapping],
+                succeeded=True,
+                requirements=(AnswerRequirement("answer", "完整出差标准"),),
+                expansion_plan=ExpansionPlan(
+                    needed=True,
+                    target_candidate_indexes=(1,),
+                    queries=("D级出差标准",),
+                    missing_requirement_ids=("answer",),
+                ),
+            ),
+            expansion_mock=expansion_mock,
+            joint_mock=joint_mock,
+        )
+
+        expansion_mock.assert_awaited_once()
+        joint_mock.assert_not_awaited()
+        event = _search_event(chunks)
+        self.assertEqual(event["coverage_status"], "insufficient")
+        self.assertEqual(event["evidence_status"], "no_hit")
+        self.assertEqual(event["answer_sources"], [])
+        prompt_content = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("普通员工属于D级", prompt_content)
+
+    async def test_joint_exception_with_direct_bridge_fails_closed(self) -> None:
+        mapping = {
+            **_candidate(content="普通员工属于D级"),
+            "chunk_index": 2,
+            "rerank_candidate_index": 1,
+            "topic_relevance": 1.0,
+            "answer_support": 0.9,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "bridge",
+            "supports_requirement_ids": ["answer"],
+        }
+        unverified_detail = {
+            **_candidate(content="未经联合验证的D级住宿标准"),
+            "doc_id": mapping["doc_id"],
+            "chunk_index": 3,
+        }
+        joint_mock = AsyncMock(side_effect=RuntimeError("joint model failed"))
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[mapping],
+            rerank_outcome=RerankOutcome(
+                results=[mapping],
+                succeeded=True,
+                requirements=(AnswerRequirement("answer", "完整出差标准"),),
+                expansion_plan=ExpansionPlan(
+                    needed=True,
+                    target_candidate_indexes=(1,),
+                    queries=("D级出差标准",),
+                    missing_requirement_ids=("answer",),
+                ),
+            ),
+            expansion_outcome=_expanded_outcome([mapping], [unverified_detail]),
+            joint_mock=joint_mock,
+        )
+
+        joint_mock.assert_awaited_once()
+        event = _search_event(chunks)
+        self.assertEqual(event["coverage_status"], "insufficient")
+        self.assertEqual(event["evidence_status"], "no_hit")
+        self.assertEqual(event["answer_sources"], [])
+        prompt_content = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("普通员工属于D级", prompt_content)
+        self.assertNotIn("未经联合验证", prompt_content)
+
+    async def test_no_new_expansion_candidates_with_direct_bridge_fails_closed(self) -> None:
+        mapping = {
+            **_candidate(content="普通员工属于D级"),
+            "chunk_index": 2,
+            "rerank_candidate_index": 1,
+            "topic_relevance": 1.0,
+            "answer_support": 0.9,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "bridge",
+            "supports_requirement_ids": ["answer"],
+        }
+        empty_expansion = ExpansionOutcome(
+            candidates=[mapping],
+            seed_candidates=[mapping],
+            scoped_candidates=[],
+            structural_candidates=[],
+            counts_by_origin={"global_retrieval": 1},
+            added_candidate_count=0,
+            added_chars=0,
+            deduplicated_count=0,
+            budget_dropped_count=0,
+            expanded=False,
+        )
+        joint_mock = AsyncMock()
+        chunks, _search, client = await self._run(
+            question="普通员工的出差标准是什么",
+            intent={
+                "response_mode": "grounded_qa",
+                "retrieval_policy": "required",
+                "need_retrieval": True,
+                "decision_reason": "business_question",
+            },
+            results=[mapping],
+            rerank_outcome=RerankOutcome(
+                results=[mapping],
+                succeeded=True,
+                requirements=(AnswerRequirement("answer", "完整出差标准"),),
+                expansion_plan=ExpansionPlan(
+                    needed=True,
+                    target_candidate_indexes=(1,),
+                    queries=("D级出差标准",),
+                    missing_requirement_ids=("answer",),
+                ),
+            ),
+            expansion_outcome=empty_expansion,
+            joint_mock=joint_mock,
+        )
+
+        joint_mock.assert_not_awaited()
+        event = _search_event(chunks)
+        self.assertEqual(event["coverage_status"], "insufficient")
+        self.assertEqual(event["evidence_status"], "no_hit")
+        self.assertEqual(event["answer_sources"], [])
+        prompt_content = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("普通员工属于D级", prompt_content)
+
+    def test_context_budget_downgrades_complete_when_required_facet_is_dropped(self) -> None:
+        requirements = (
+            AnswerRequirement("mapping", "人员到等级映射"),
+            AnswerRequirement("standard", "等级对应标准"),
+        )
+        first = {
+            **_candidate(content="甲" * 16000),
+            "jointly_selected": True,
+            "supports_requirement_ids": ["mapping"],
+            "contribution_role": "bridge",
+        }
+        second = {
+            **_candidate(content="标准明细"),
+            "jointly_selected": True,
+            "supports_requirement_ids": ["standard"],
+            "contribution_role": "complement",
+        }
+
+        bounded, status, missing, dropped, used_chars = _apply_joint_context_budget(
+            [first, second],
+            "complete",
+            requirements,
+        )
+
+        self.assertEqual(status, "partial")
+        self.assertEqual(missing, ("standard",))
+        self.assertEqual(dropped, 1)
+        self.assertEqual(used_chars, 16000)
+        self.assertEqual(sum(bool(item.get("jointly_selected")) for item in bounded), 1)
+
+    def test_partial_coverage_tells_generation_which_generic_requirement_is_missing(self) -> None:
+        requirements = (
+            AnswerRequirement("tier", "确定项目采用的服务等级"),
+            AnswerRequirement("sla", "给出该等级的响应时限"),
+        )
+
+        coverage = _generation_coverage_payload(
+            "partial",
+            requirements,
+            ("sla",),
+        )
+        message = _knowledge_context_message(
+            "项目星河采用银牌服务。",
+            evidence_coverage=coverage,
+        )
+        payload = json.loads(message.split("\n", 1)[1])
+
+        self.assertTrue(payload["untrusted"])
+        self.assertEqual(payload["evidence_coverage"]["status"], "partial")
+        self.assertEqual(
+            payload["evidence_coverage"]["missing_requirements"],
+            [{"id": "sla", "description": "给出该等级的响应时限"}],
+        )
+        self.assertEqual(
+            len(payload["evidence_coverage"]["required_requirements"]),
+            2,
+        )
 
     async def test_trace_records_reproducible_algorithm_and_generation_config(self) -> None:
         result = _candidate(content="cloudpivot.organization.login.error_reply_same: true")

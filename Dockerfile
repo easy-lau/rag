@@ -11,7 +11,7 @@ ARG APP_REVISION=
 ENV VITE_APP_VERSION=${APP_VERSION} \
     VITE_APP_REVISION=${APP_REVISION}
 
-RUN npm run build
+RUN npm test && npm run build
 
 # 前后端合一运行镜像
 FROM python:3.11-slim-bookworm

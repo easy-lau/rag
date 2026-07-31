@@ -123,6 +123,44 @@
                     </p>
                   </div>
                 </n-form-item>
+
+                <n-form-item v-if="service.key === 'llm'" label="检索重排模型">
+                  <div class="model-picker-field">
+                    <div class="model-picker-row">
+                      <n-auto-complete
+                        v-model:value="form.rerank_model"
+                        :options="modelOptions('rerank', 'rerank_model')"
+                        :loading="modelLists.rerank.loading"
+                        :disabled="!canWrite"
+                        placeholder="留空则自动使用对话模型"
+                        :get-show="showModelOptions"
+                        class="model-picker-input"
+                      />
+                      <n-button
+                        secondary
+                        class="model-picker-button"
+                        :loading="modelLists.rerank.loading"
+                        :disabled="!canWrite || modelLists.rerank.loading"
+                        @click="loadModels('llm', 'rerank')"
+                      >
+                        <template #icon><n-icon><RefreshOutline /></n-icon></template>
+                        获取模型
+                      </n-button>
+                      <n-button
+                        secondary
+                        class="model-picker-button"
+                        :loading="connectionTests.rerank.loading"
+                        :disabled="!canWrite || connectionTests.rerank.loading"
+                        @click="handleTestRerankModel"
+                      >
+                        测试模型
+                      </n-button>
+                    </div>
+                    <p class="model-help min-h-5 text-xs leading-5" :class="modelListHelpClass('rerank', 'llm')" aria-live="polite">
+                      {{ modelListHelpText('rerank', 'llm') }}留空时自动使用对话模型。
+                    </p>
+                  </div>
+                </n-form-item>
               </div>
 
               <div v-if="service.key === 'llm'" class="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -152,6 +190,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { NAutoComplete, NButton, NForm, NFormItem, NIcon, NInput, NInputNumber, NSpin, NTag, useMessage } from 'naive-ui'
 import { LockClosedOutline, RefreshOutline } from '@vicons/ionicons5'
 import { getAvailableModels, testModelConnection } from '@/api/settings'
+import { normalizeOptionalModel, resolveOptionalLlmModel } from '@/utils/modelSettings'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import PageHeader from '@/components/ui/PageHeader.vue'
@@ -167,6 +206,7 @@ const serviceKeys = reactive({ llm: '', embedding: '', vision: '' })
 const connectionTests = ref({
   llm: { loading: false },
   intent: { loading: false },
+  rerank: { loading: false },
   embedding: { loading: false },
   vision: { loading: false },
 })
@@ -176,6 +216,7 @@ const modelSelectPlaceholder = '输入模型 ID，或获取后选择'
 const modelLists = reactive({
   llm: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
   intent: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
+  rerank: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
   embedding: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
   vision: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
 })
@@ -185,7 +226,7 @@ const modelServiceConfig = {
   vision: { baseUrlField: 'vision_base_url', modelField: 'vision_model', savedKeyField: 'vision_api_key' },
 }
 const services = [
-  { key: 'llm', title: '大语言模型', description: '对话生成与意图识别共用服务地址和密钥，模型可分别选择。', badge: 'Chat', dotClass: 'bg-blue-500', modelLabel: '对话模型', baseUrlField: 'llm_base_url', modelField: 'chat_model', savedKeyField: 'llm_api_key', testHint: '测试不会保存配置；变更 Base URL 时请重新填写密钥。' },
+  { key: 'llm', title: '大语言模型', description: '对话生成、意图识别与检索重排共用服务地址和密钥，模型可分别选择。', badge: 'Chat', dotClass: 'bg-blue-500', modelLabel: '对话模型', baseUrlField: 'llm_base_url', modelField: 'chat_model', savedKeyField: 'llm_api_key', testHint: '测试不会保存配置；变更 Base URL 时请重新填写密钥。' },
   { key: 'embedding', title: '向量模型', badge: 'Embedding', dotClass: 'bg-purple-500', modelLabel: 'Embedding 模型', baseUrlField: 'embedding_base_url', modelField: 'embedding_model', savedKeyField: 'embedding_api_key', testHint: '测试会校验向量维度；保存变更时也会校验。' },
   { key: 'vision', title: '多模态模型', description: '用于把上传的图片 / 截图通过视觉模型转写为可编辑文本。', badge: 'Vision', dotClass: 'bg-orange-500', modelLabel: '视觉模型', baseUrlField: 'vision_base_url', modelField: 'vision_model', savedKeyField: 'vision_api_key', testHint: '测试不会保存配置；变更 Base URL 时请重新填写密钥。' },
 ]
@@ -272,7 +313,10 @@ for (const service of Object.keys(modelServiceConfig)) {
   watch(() => [currentServiceBaseUrl(service), typedServiceKey(service)], ([nextUrl, nextKey], [previousUrl, previousKey]) => {
     if (nextUrl !== previousUrl || nextKey !== previousKey) {
       resetModelList(service)
-      if (service === 'llm') resetModelList('intent')
+      if (service === 'llm') {
+        resetModelList('intent')
+        resetModelList('rerank')
+      }
     }
   })
 }
@@ -309,10 +353,26 @@ async function handleTestIntentModel() {
   state.loading = true
   try {
     const payload = createConnectionPayload('llm')
-    payload.model = form.value.intent_model?.trim() || form.value.chat_model?.trim() || ''
+    payload.model = resolveOptionalLlmModel(form.value.intent_model, form.value.chat_model)
     const result = await testModelConnection(payload)
     const success = result.ok === true
     const message = result.message || (success ? '意图模型连接成功' : '连接测试失败，请检查模型配置后重试。')
+    if (success) msg.success(message)
+    else msg.error(message)
+  } catch (error) {
+    msg.error(error?.response?.data?.detail || '连接测试失败，请检查模型配置后重试。')
+  } finally { state.loading = false }
+}
+async function handleTestRerankModel() {
+  if (!canWrite.value) return
+  const state = connectionTests.value.rerank
+  state.loading = true
+  try {
+    const payload = createConnectionPayload('llm')
+    payload.model = resolveOptionalLlmModel(form.value.rerank_model, form.value.chat_model)
+    const result = await testModelConnection(payload)
+    const success = result.ok === true
+    const message = result.message || (success ? '重排模型连接成功' : '连接测试失败，请检查模型配置后重试。')
     if (success) msg.success(message)
     else msg.error(message)
   } catch (error) {
@@ -325,7 +385,8 @@ async function handleSave() {
   try {
     const payload = {
       chat_model: form.value.chat_model,
-      intent_model: form.value.intent_model?.trim() || '',
+      intent_model: normalizeOptionalModel(form.value.intent_model),
+      rerank_model: normalizeOptionalModel(form.value.rerank_model),
       temperature: form.value.temperature,
       max_tokens: form.value.max_tokens,
       embedding_model: form.value.embedding_model,

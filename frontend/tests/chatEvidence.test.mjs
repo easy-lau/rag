@@ -17,6 +17,29 @@ test('新版事件只把 answer_sources 挂到回答，右侧 results 不参与'
   }), [direct])
 })
 
+test('同一文档有多个候选时仍只持久化实际采用片段', () => {
+  const first = { id: 'chunk-1', doc_id: 'doc-1', evidence_role: 'related' }
+  const second = { id: 'chunk-2', doc_id: 'doc-1', evidence_role: 'related' }
+  const third = { id: 'chunk-3', doc_id: 'doc-1', evidence_role: 'related' }
+
+  assert.deepEqual(answerSourcesFromSearchEvent({
+    evidence_status: 'partial',
+    results: [first, second, third],
+    answer_sources: [first],
+  }), [first])
+})
+
+test('同一文档确有两个采用片段时不能按 doc_id 去重', () => {
+  const first = { id: 'chunk-1', doc_id: 'doc-1', evidence_role: 'direct' }
+  const second = { id: 'chunk-2', doc_id: 'doc-1', evidence_role: 'direct' }
+
+  assert.deepEqual(answerSourcesFromSearchEvent({
+    evidence_status: 'hit',
+    results: [first, second],
+    answer_sources: [first, second],
+  }), [first, second])
+})
+
 test('no_hit 即使携带 results 或异常 answer_sources 也不展示为回答依据', () => {
   assert.deepEqual(answerSourcesFromSearchEvent({
     evidence_status: 'no_hit',

@@ -66,23 +66,26 @@
             :id="evidencePanelId"
             class="message-evidence__panel"
             role="region"
-            :aria-label="`本条回答的知识库检索结果，共 ${sources.length} 条`"
+            :aria-label="`本条回答实际使用了 ${sourceDocumentCount} 篇知识库文档、${sources.length} 个片段`"
           >
             <div class="message-evidence__panel-head">
               <div>
-                <p class="message-evidence__panel-title">本条回答的知识库检索资料</p>
-                <p class="message-evidence__panel-hint">匹配分用于证据筛选，不代表答案正确率；相近资料不能作为直接依据。</p>
+                <p class="message-evidence__panel-title">本条回答使用的知识库片段</p>
+                <p class="message-evidence__panel-hint">这里仅展示实际进入回答上下文的片段；右侧候选可能更多。</p>
               </div>
-              <span class="message-evidence__count">{{ sources.length }} 条</span>
+              <span class="message-evidence__count">{{ sourceDocumentCount }} 篇 · {{ sources.length }} 个片段</span>
             </div>
 
             <div class="message-evidence__results">
-              <DocumentResultItem
-                v-for="(source, index) in sources"
-                :key="source._evidenceKey"
-                :item="source"
+              <DocumentEvidenceGroup
+                v-for="(group, index) in sourceGroups"
+                :key="group.key"
+                :group="group"
                 :rank="index + 1"
                 :preview-enabled="canPreviewSources"
+                :default-expanded="index === 0"
+                fragment-label="采用片段"
+                :id-prefix="`message-${message.id || 'streaming'}`"
                 @preview="openSource"
               />
             </div>
@@ -140,8 +143,9 @@ import { renderMarkdown } from '@/utils/markdown'
 import { useSettingsStore } from '@/stores/settings'
 import { useChatStore } from '@/stores/chat'
 import { useAuthStore } from '@/stores/auth'
-import DocumentResultItem from '@/components/search/DocumentResultItem.vue'
+import DocumentEvidenceGroup from '@/components/search/DocumentEvidenceGroup.vue'
 import { persistedAnswerSources } from '@/utils/chatEvidence'
+import { groupEvidenceByDocument, safeExternalSourceUrl } from '@/utils/evidenceDocuments'
 
 const props = defineProps({ message: Object })
 const emit = defineEmits(['retry', 'preview'])
@@ -226,6 +230,8 @@ const sources = computed(() => {
   }
   return out
 })
+const sourceGroups = computed(() => groupEvidenceByDocument(sources.value))
+const sourceDocumentCount = computed(() => sourceGroups.value.length)
 
 const hasPersistedEvidence = computed(() => (
   !isUser.value
@@ -246,6 +252,9 @@ function sourceSupportScore(source) {
 
 const evidenceSummary = computed(() => {
   const directSources = sources.value.filter(source => source.evidence_role === 'direct')
+  const partialSources = sources.value.filter(source => (
+    source.jointly_selected && source.coverage_status === 'partial'
+  ))
   const relatedSources = sources.value.filter(source => source.evidence_role === 'related')
   if (directSources.length) {
     const scores = directSources.map(sourceSupportScore).filter(score => score !== null)
@@ -259,26 +268,36 @@ const evidenceSummary = computed(() => {
       percent,
       tone: score !== null && score < 0.6 ? 'warning' : 'success',
       actionLabel: '查看依据',
-      ariaLabel: `本条回答使用了 ${directSources.length} 条知识库依据${scoreText}。该分数不是答案正确率`,
+      ariaLabel: `本条回答使用了 ${directSources.length} 个知识库片段${scoreText}。该分数不是答案正确率`,
+    }
+  }
+  if (partialSources.length) {
+    return {
+      label: '部分知识库依据',
+      level: `${partialSources.length} 个片段`,
+      percent: null,
+      tone: 'warning',
+      actionLabel: '查看依据',
+      ariaLabel: `本条回答使用了 ${partialSources.length} 个片段支撑部分内容，但知识库证据尚未完整覆盖问题`,
     }
   }
   if (relatedSources.length) {
     return {
       label: '相近资料',
-      level: `${relatedSources.length} 条`,
+      level: `${relatedSources.length} 个片段`,
       percent: null,
       tone: 'warning',
       actionLabel: '查看资料',
-      ariaLabel: `本条回答仅检索到 ${relatedSources.length} 条相近资料，不能作为直接回答依据`,
+      ariaLabel: `本条回答仅使用了 ${relatedSources.length} 个相近片段，不能作为直接回答依据`,
     }
   }
   return {
     label: '检索候选',
-    level: `${sources.value.length} 条`,
+    level: `${sources.value.length} 个片段`,
     percent: null,
     tone: 'neutral',
     actionLabel: '查看结果',
-    ariaLabel: `本条回答保存了 ${sources.value.length} 条尚待验证的检索候选`,
+    ariaLabel: `本条回答保存了 ${sources.value.length} 个尚待验证的检索片段`,
   }
 })
 
@@ -288,7 +307,13 @@ const evidencePanelId = computed(() => {
 })
 
 // 参考来源：只取带数据来源链接的来源，点击跳转外部 URL
-const urlSources = computed(() => sources.value.filter(s => s.source_url))
+const urlSources = computed(() => sourceGroups.value
+  .map(group => {
+    const source = group.items.find(item => safeExternalSourceUrl(item.source_url))
+    if (!source) return null
+    return { ...source, source_url: safeExternalSourceUrl(source.source_url) }
+  })
+  .filter(Boolean))
 
 function openSource(src) {
   // 不跳转，交给父组件在当前页弹出只读预览

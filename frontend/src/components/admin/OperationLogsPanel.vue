@@ -124,6 +124,7 @@ const FIELD_LABELS = {
   display_name: '显示名', role: '角色', is_active: '状态', password: '密码',
   name: '名称', description: '描述', permissions: '权限', kb_ids: '可访问知识库',
   enabled: '启用状态', mode: '判定模式', intent_model: '意图模型',
+  rerank_model: '检索重排模型',
   confidence_threshold: '置信度阈值', fallback_intent_code: '兜底意图',
   allow_general_chat: '通用问答开关', examples: '示例问题', action: '路由动作',
   priority: '优先级', code: '意图编码', feedback: '反馈结果', file_type: '文件类型',

@@ -74,25 +74,72 @@
     <!-- 来源文档只读预览（当前页弹窗，不跳转） -->
     <AppModal
       v-model:show="showPreview"
+      class="source-preview-modal"
       :title="previewTitle"
       width="min(90vw, 780px)"
       :loading="previewLoading"
       @close="closePreview"
     >
-      <p class="mb-3 text-sm leading-6 text-gray-500 dark:text-gray-400">查看命中文档原文，不会离开当前对话。</p>
-      <div class="relative" style="height: 70vh">
+      <div class="source-preview__intro">
+        <div>
+          <p class="source-preview__description">
+            {{ previewHasFragment ? '当前来源对应一个具体命中片段，可切换查看并定位文档全文。' : '查看命中文档全文，不会离开当前对话。' }}
+          </p>
+          <p v-if="previewHasFragment" class="source-preview__fragment-meta">
+            {{ previewFragmentName }}<template v-if="previewSectionName"> · {{ previewSectionName }}</template>
+          </p>
+        </div>
+        <n-tag v-if="previewHasFragment" size="small" round :bordered="false" type="info">
+          命中片段
+        </n-tag>
+      </div>
+
+      <div class="source-preview__body">
         <div v-if="previewLoading" class="absolute inset-0 flex items-center justify-center">
           <n-spin size="large" />
         </div>
+        <n-tabs
+          v-else-if="previewHasFragment"
+          v-model:value="previewPane"
+          type="segment"
+          size="small"
+          class="source-preview__tabs"
+          :animated="false"
+        >
+          <n-tab-pane name="fragment" tab="命中片段">
+            <div
+              class="source-preview__viewport markdown-body"
+              v-html="previewFragmentRendered"
+            />
+          </n-tab-pane>
+          <n-tab-pane name="document" tab="文档全文">
+            <div class="source-preview__document-pane">
+              <p
+                v-if="previewLocation.text"
+                class="source-preview__location"
+                :class="`source-preview__location--${previewLocation.type}`"
+                aria-live="polite"
+              >
+                {{ previewLocation.text }}
+              </p>
+              <div
+                ref="previewDocumentBody"
+                class="source-preview__viewport markdown-body"
+                v-html="previewRendered"
+              />
+            </div>
+          </n-tab-pane>
+        </n-tabs>
         <div
-          v-else
-          class="markdown-body h-full overflow-y-auto rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-200 p-4"
+          v-else-if="!previewLoading"
+          ref="previewDocumentBody"
+          class="source-preview__viewport markdown-body"
           v-html="previewRendered"
         />
       </div>
       <template #footer>
         <div class="flex w-full items-center justify-between gap-3">
-          <span class="text-xs text-gray-400">仅供预览</span>
+          <span class="text-xs text-gray-400">{{ previewHasFragment ? '片段评分属于当前检索，不代表答案正确率' : '仅供预览' }}</span>
           <n-button :disabled="previewLoading" @click="closePreview">关闭</n-button>
         </div>
       </template>
@@ -103,7 +150,7 @@
 <script setup>
 import { ref, watch, nextTick, onBeforeUnmount, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NSpin, NDrawer, useMessage } from 'naive-ui'
+import { NButton, NSpin, NDrawer, NTabPane, NTabs, NTag, useMessage } from 'naive-ui'
 import { useMediaQuery } from '@vueuse/core'
 import { useChatStore } from '@/stores/chat'
 import { useSettingsStore } from '@/stores/settings'
@@ -112,6 +159,12 @@ import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
 import { getDocument } from '@/api/document'
 import { renderDocMarkdown } from '@/utils/markdown'
+import {
+  evidenceFragmentContent,
+  evidenceFragmentLabel,
+  evidenceSectionLabel,
+  matchingEvidenceBlockIndexes,
+} from '@/utils/evidenceDocuments'
 import ChatMessage from '@/components/chat/ChatMessage.vue'
 import ChatInput from '@/components/chat/ChatInput.vue'
 import ChatWelcome from '@/components/chat/ChatWelcome.vue'
@@ -189,7 +242,18 @@ const showPreview = ref(false)
 const previewLoading = ref(false)
 const previewTitle = ref('')
 const previewContent = ref('')
+const previewSource = ref(null)
+const previewPane = ref('document')
+const previewDocumentBody = ref(null)
+const previewLocation = ref({ type: 'neutral', text: '' })
 const previewRendered = computed(() => renderDocMarkdown(previewContent.value))
+const previewFragmentContent = computed(() => evidenceFragmentContent(previewSource.value))
+const previewFragmentRendered = computed(() => renderDocMarkdown(previewFragmentContent.value))
+const previewHasFragment = computed(() => Boolean(
+  previewSource.value?._previewMode === 'fragment' && previewFragmentContent.value,
+))
+const previewFragmentName = computed(() => evidenceFragmentLabel(previewSource.value))
+const previewSectionName = computed(() => evidenceSectionLabel(previewSource.value))
 let previewRequestId = 0
 
 // 地址栏是当前会话的可恢复来源：刷新、复制链接、浏览器前进/后退都能回到同一段对话。
@@ -260,6 +324,11 @@ async function openSourcePreview(src) {
   previewLoading.value = true
   previewTitle.value = src.filename || '文档预览'
   previewContent.value = ''
+  previewSource.value = { ...src }
+  previewPane.value = src._previewMode === 'fragment' && evidenceFragmentContent(src)
+    ? 'fragment'
+    : 'document'
+  previewLocation.value = { type: 'neutral', text: '' }
   try {
     const doc = await getDocument(src.kb_id, src.doc_id)
     if (requestId !== previewRequestId) return
@@ -267,11 +336,62 @@ async function openSourcePreview(src) {
   } catch {
     if (requestId !== previewRequestId) return
     msg.error('加载文档内容失败')
-    showPreview.value = false
+    resetPreview()
   } finally {
-    if (requestId === previewRequestId) previewLoading.value = false
+    if (requestId === previewRequestId) {
+      previewLoading.value = false
+      if (previewPane.value === 'document') await locatePreviewFragment()
+    }
   }
 }
+
+async function locatePreviewFragment() {
+  if (!previewHasFragment.value || previewPane.value !== 'document') return
+  const requestId = previewRequestId
+  previewLocation.value = { type: 'neutral', text: '正在定位命中片段…' }
+  await nextTick()
+  if (requestId !== previewRequestId || previewPane.value !== 'document') return
+
+  let root = previewDocumentBody.value
+  if (!root) {
+    await nextTick()
+    if (requestId !== previewRequestId || previewPane.value !== 'document') return
+    root = previewDocumentBody.value
+  }
+  if (!root) {
+    previewLocation.value = {
+      type: 'warning',
+      text: '已展示命中片段，但全文视图暂时无法完成自动定位。',
+    }
+    return
+  }
+  const blocks = [...root.querySelectorAll('h1, h2, h3, h4, h5, h6, p, li, tr, pre')]
+  const indexes = matchingEvidenceBlockIndexes(
+    blocks.map(block => block.textContent || ''),
+    previewSource.value,
+  )
+
+  blocks.forEach(block => block.classList.remove('source-preview__matched-block'))
+  if (!indexes.length) {
+    previewLocation.value = {
+      type: 'warning',
+      text: '已展示命中片段，但该文档格式暂时无法在全文中精确定位。',
+    }
+    return
+  }
+
+  indexes.forEach(index => blocks[index]?.classList.add('source-preview__matched-block'))
+  const firstMatch = blocks[indexes[0]]
+  firstMatch?.scrollIntoView?.({ block: 'center', behavior: 'auto' })
+  previewLocation.value = {
+    type: 'success',
+    text: `已定位并突出显示${previewFragmentName.value}对应的原文位置。`,
+  }
+}
+
+watch(previewPane, pane => {
+  if (pane === 'document' && !previewLoading.value) locatePreviewFragment()
+})
 
 function closePreview() {
   if (previewLoading.value) return
@@ -283,6 +403,9 @@ function resetPreview() {
   showPreview.value = false
   previewLoading.value = false
   previewContent.value = ''
+  previewSource.value = null
+  previewPane.value = 'document'
+  previewLocation.value = { type: 'neutral', text: '' }
 }
 
 function closeResults() {
@@ -429,5 +552,152 @@ function setWelcomeQuestion(question) {
   justify-content: center;
   gap: 8px;
   margin-top: 20px;
+}
+
+.source-preview__intro {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+:global(.source-preview-modal.ui-app-modal.n-card) {
+  display: flex;
+  max-height: calc(100dvh - 16px);
+  flex-direction: column;
+}
+
+:global(.source-preview-modal.ui-app-modal .n-card__content) {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+
+:global(.source-preview-modal.ui-app-modal .n-card-header),
+:global(.source-preview-modal.ui-app-modal .n-card__footer) {
+  flex: 0 0 auto;
+}
+
+.source-preview__description {
+  margin: 0;
+  color: var(--ui-text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.source-preview__fragment-meta {
+  margin: 3px 0 0;
+  color: var(--ui-text-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.source-preview__body {
+  position: relative;
+  min-height: min(64dvh, 560px);
+}
+
+.source-preview__tabs :deep(.n-tabs-nav) {
+  margin-bottom: 10px;
+}
+
+.source-preview__document-pane {
+  display: flex;
+  height: min(62dvh, 600px);
+  min-height: min(320px, 50dvh);
+  flex-direction: column;
+  gap: 8px;
+}
+
+.source-preview__viewport {
+  height: min(64dvh, 620px);
+  min-height: min(320px, 50dvh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface);
+  padding: 16px;
+  color: var(--ui-text);
+}
+
+.source-preview__document-pane .source-preview__viewport {
+  min-height: 0;
+  flex: 1 1 auto;
+  height: auto;
+}
+
+.source-preview__location {
+  flex: 0 0 auto;
+  margin: 0;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface-muted);
+  padding: 7px 9px;
+  color: var(--ui-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.source-preview__location--success {
+  border-color: color-mix(in srgb, var(--ui-success) 35%, var(--ui-border));
+  color: var(--ui-success);
+}
+
+.source-preview__location--warning {
+  border-color: color-mix(in srgb, var(--ui-warning) 38%, var(--ui-border));
+  color: var(--ui-warning);
+}
+
+.source-preview__viewport :deep(.source-preview__matched-block) {
+  scroll-margin-block: 28px;
+  border-radius: 6px;
+  outline: 2px solid var(--ui-warning);
+  outline-offset: 3px;
+  background: color-mix(in srgb, var(--ui-warning) 14%, transparent);
+}
+
+.source-preview__viewport :deep(tr.source-preview__matched-block > th),
+.source-preview__viewport :deep(tr.source-preview__matched-block > td) {
+  background: color-mix(in srgb, var(--ui-warning) 14%, var(--ui-surface));
+}
+
+@media (max-width: 639px) {
+  .source-preview__body {
+    min-height: min(52dvh, 460px);
+  }
+
+  .source-preview__document-pane,
+  .source-preview__viewport {
+    height: min(52dvh, 460px);
+    min-height: min(220px, 44dvh);
+  }
+
+  .source-preview__intro {
+    align-items: center;
+  }
+}
+
+@media (max-height: 520px) {
+  .source-preview__intro {
+    margin-bottom: 8px;
+  }
+
+  .source-preview__body {
+    min-height: 0;
+  }
+
+  .source-preview__document-pane,
+  .source-preview__viewport {
+    height: 40dvh;
+    min-height: 120px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .source-preview__viewport {
+    scroll-behavior: auto;
+  }
 }
 </style>

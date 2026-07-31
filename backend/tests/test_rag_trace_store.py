@@ -436,6 +436,14 @@ class RagTraceStoreTests(unittest.TestCase):
             snapshot["routing_decision"]["intent"]["retrieval_policy"],
             "required",
         )
+        self.assertIsNone(snapshot["retrieval_expansion_plan"])
+        self.assertIsNone(snapshot["retrieval_document_scoped_result"])
+        self.assertIsNone(snapshot["retrieval_structure_expansion"])
+        self.assertIsNone(snapshot["retrieval_expansion_result"])
+        self.assertIsNone(snapshot["rerank_joint_result"])
+        self.assertEqual(snapshot["rerank_joint_history"], [])
+        self.assertIsNone(snapshot["evidence_coverage"])
+        self.assertEqual(snapshot["evidence_coverage_history"], [])
         self.assertEqual(payload["ai_analysis_guide"]["expected_sections"][-1], "优化建议及回归测试")
         self.assertIn("不可信数据", payload["ai_analysis_guide"]["untrusted_data_warning"])
 
@@ -505,6 +513,186 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["rerank_result"]["answer_support_threshold"], 0.78)
         self.assertEqual(snapshot["generation_context"]["temperature"], 0.2)
         self.assertEqual(snapshot["generation_context"]["system_prompt_sha256"], "c" * 64)
+
+    def test_diagnostic_snapshot_summarizes_expansion_joint_rerank_and_coverage_safely(self) -> None:
+        run, events, timestamp = _stored_trace(content_included=False)
+        secret = "普通员工属于D级，住宿标准为内部金额"
+
+        def trace_event(sequence: int, event: str, payload: dict) -> RagTraceEvent:
+            return RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=sequence,
+                event=event,
+                payload={"event": event, **payload},
+                created_at=timestamp + timedelta(milliseconds=sequence),
+            )
+
+        events.extend([
+            trace_event(3, "retrieval.expansion_planned", {
+                "should_expand": True,
+                "seed_document_count": 1,
+                "seed_chunk_count": 2,
+                "secondary_query_count": 1,
+                "bridge_term_count": 1,
+                "required_facet_count": 4,
+                "max_added_candidates": 24,
+                "max_joint_rerank_candidates": 30,
+                "max_added_chars": 30_000,
+                # These fields are intentionally not part of the diagnostic
+                # allow-list even if an old producer persisted them.
+                "secondary_queries": [secret],
+                "bridge_terms": [secret],
+                "reason": secret,
+            }),
+            trace_event(4, "retrieval.document_scoped_completed", {
+                "succeeded": True,
+                "query_count": 1,
+                "successful_query_count": 1,
+                "failed_query_count": 0,
+                "scoped_document_count": 1,
+                "scoped_chunk_count": 15,
+                "max_document_chunk_count": 15,
+                "candidate_count": 8,
+                "vector_fallback_count": 0,
+                "scan_guard_triggered": False,
+                "scan_guard_reason": "total_chunk_limit",
+                "channel_candidate_counts": {
+                    "vector": 5,
+                    "keyword": 2,
+                    "trigram": 1,
+                    "document_excerpt": 99,
+                },
+                "candidate_contents": [secret],
+                "elapsed_ms": 21,
+            }),
+            trace_event(5, "retrieval.structure_expanded", {
+                "seed_chunk_count": 2,
+                "scoped_document_count": 1,
+                "candidate_count": 6,
+                "counts_by_origin": {
+                    "adjacent": 2,
+                    "same_section": 2,
+                    "table_sibling": 2,
+                    secret: 99,
+                },
+                "elapsed_ms": 4,
+                "content": secret,
+            }),
+            trace_event(6, "retrieval.expansion_completed", {
+                "initial_candidate_count": 12,
+                "added_candidate_count": 10,
+                "combined_candidate_count": 22,
+                "counts_by_origin": {
+                    "document_scoped": 6,
+                    "adjacent": 2,
+                    "same_section": 2,
+                },
+                "deduplicated_count": 3,
+                "budget_dropped_count": 1,
+                "error_count": 0,
+                "added_chars": 8_000,
+                "elapsed_ms": 32,
+            }),
+            trace_event(7, "rerank.joint_completed", {
+                "requested": True,
+                "attempted": True,
+                "succeeded": True,
+                "pass_name": "joint",
+                "model": "rerank/model-v2",
+                "prompt_version": "joint-v1",
+                "candidate_count": 22,
+                "selected_candidate_count": 3,
+                "requirement_count": 4,
+                "missing_requirement_count": 2,
+                "evidence_set_count": 2,
+                "selected_evidence_set_id": "set-final",
+                "selected_candidate_indexes": [1, 4, 7],
+                "coverage_status": "partial",
+                "joint_support_score": 0.78,
+                "covered_requirement_ids": ["req-1", "req-2"],
+                "missing_requirement_ids": ["req-3", "req-4"],
+                "elapsed_ms": 45,
+                "requirements": [secret],
+                "error": secret,
+            }),
+            trace_event(9, "evidence.coverage", {
+                "pass": "initial",
+                "coverage_status": "partial",
+                "required_requirement_count": 4,
+                "covered_requirement_count": 1,
+                "missing_requirement_count": 3,
+                "selected_candidate_count": 1,
+                "missing_requirement_ids": ["req-2", "req-3", "req-4"],
+                "missing_requirements": [secret],
+            }),
+            trace_event(8, "evidence.coverage_assessed", {
+                "pass_name": "final",
+                "coverage_status": "complete",
+                "required_requirement_count": 4,
+                "covered_requirement_count": 4,
+                "missing_requirement_count": 0,
+                "selected_candidate_count": 3,
+                "selected_evidence_set_id": "set-final",
+                "joint_support_score": 0.91,
+                "covered_requirement_ids": ["req-1", "req-2", "req-3", "req-4"],
+                "missing_requirement_ids": [],
+                "expansion_attempted": True,
+                "expansion_succeeded": True,
+                "retry_exhausted": False,
+                "context_budget_dropped_count": 1,
+                "context_budget_chars": 12_345,
+                "trigger": "model_plan",
+                "elapsed_ms": 2,
+                "answer_preview": secret,
+            }),
+        ])
+        run.event_count = len(events)
+        run.observed_event_count = len(events)
+
+        snapshot = _rag_trace_export_payload(
+            run,
+            events,
+            exported_at=timestamp,
+        )["diagnostic_index"]["snapshot"]
+
+        self.assertTrue(snapshot["retrieval_expansion_plan"]["should_expand"])
+        self.assertEqual(
+            snapshot["retrieval_document_scoped_result"]["channel_candidate_counts"],
+            {"vector": 5, "keyword": 2, "trigram": 1},
+        )
+        self.assertFalse(
+            snapshot["retrieval_document_scoped_result"]["scan_guard_triggered"]
+        )
+        self.assertEqual(
+            snapshot["retrieval_document_scoped_result"]["scoped_chunk_count"],
+            15,
+        )
+        self.assertEqual(
+            snapshot["retrieval_structure_expansion"]["counts_by_origin"],
+            {"adjacent": 2, "same_section": 2, "table_sibling": 2},
+        )
+        self.assertEqual(
+            snapshot["retrieval_expansion_result"]["combined_candidate_count"],
+            22,
+        )
+        self.assertEqual(snapshot["retrieval_expansion_result"]["error_count"], 0)
+        self.assertEqual(snapshot["rerank_joint_result"]["model"], "rerank/model-v2")
+        self.assertEqual(
+            snapshot["rerank_joint_result"]["selected_candidate_indexes"],
+            [1, 4, 7],
+        )
+        self.assertTrue(snapshot["rerank_joint_result"]["requested"])
+        self.assertEqual(snapshot["rerank_joint_result"]["pass_name"], "joint")
+        self.assertEqual(snapshot["rerank_joint_result"]["selected_candidate_count"], 3)
+        self.assertEqual(snapshot["evidence_coverage"]["pass_name"], "final")
+        self.assertEqual(snapshot["evidence_coverage"]["coverage_status"], "complete")
+        self.assertTrue(snapshot["evidence_coverage"]["expansion_succeeded"])
+        self.assertEqual(snapshot["evidence_coverage"]["context_budget_dropped_count"], 1)
+        self.assertEqual(snapshot["evidence_coverage"]["context_budget_chars"], 12_345)
+        self.assertEqual(snapshot["evidence_coverage"]["trigger"], "model_plan")
+        self.assertEqual(len(snapshot["evidence_coverage_history"]), 2)
+        self.assertNotIn(secret, json.dumps(snapshot, ensure_ascii=False))
 
     def test_trace_export_downloads_every_stored_event_with_expected_filename(self) -> None:
         run, events, _ = _stored_trace(content_included=True)
@@ -612,6 +800,63 @@ class RagTraceStoreTests(unittest.TestCase):
             )
 
         self.assertEqual([event.event for event in selected], ["intent.routing_decision", "chat.response"])
+        self.assertTrue(stats["truncated"])
+        self.assertEqual(stats["omitted_event_count"], 1)
+
+    def test_trace_export_limit_preserves_new_expansion_and_coverage_core_events(self) -> None:
+        run, _events, timestamp = _stored_trace(content_included=False)
+        event_names = [
+            "retrieval.expansion_planned",
+            "retrieval.document_scoped_completed",
+            "retrieval.structure_expanded",
+            "retrieval.expansion_completed",
+            "rerank.joint_completed",
+            "evidence.coverage_assessed",
+        ]
+        core_events = [
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=index,
+                event=event_name,
+                payload={"event": event_name, "candidate_count": index},
+                created_at=timestamp + timedelta(milliseconds=index),
+            )
+            for index, event_name in enumerate(event_names, start=1)
+        ]
+        verbose = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=7,
+            event="retrieval.candidate",
+            payload={"event": "retrieval.candidate", "candidate_content": "x" * 1000},
+            created_at=timestamp,
+        )
+        terminal = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=8,
+            event="chat.response",
+            payload={"event": "chat.response", "evidence_status": "hit"},
+            created_at=timestamp,
+        )
+        all_events = [*core_events, verbose, terminal]
+        metadata = [
+            (event.id, event.sequence, event.event, len(json.dumps(event.payload)))
+            for event in all_events
+        ]
+        db = SimpleNamespace(execute=AsyncMock(side_effect=[
+            _TraceRowsResult(metadata),
+            _TraceEventsResult([*core_events, terminal]),
+        ]))
+
+        with patch("api.rag_traces.TRACE_EXPORT_MAX_EVENTS", 7):
+            selected, stats = asyncio.run(_load_bounded_export_events(db, run.trace_id))
+
+        self.assertEqual(
+            [event.event for event in selected],
+            [*event_names, "chat.response"],
+        )
         self.assertTrue(stats["truncated"])
         self.assertEqual(stats["omitted_event_count"], 1)
 

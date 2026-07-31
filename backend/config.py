@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     intent_model: str = Field(
         "", validation_alias="__DATABASE_SETTINGS_ONLY_INTENT_MODEL"
     )
+    # 检索重排与对话共用 LLM 服务凭据；留空时运行时自动复用 chat_model。
+    rerank_model: str = Field(
+        "", validation_alias="__DATABASE_SETTINGS_ONLY_RERANK_MODEL"
+    )
     temperature: float = Field(
         0.7, validation_alias="__DATABASE_SETTINGS_ONLY_TEMPERATURE"
     )
