@@ -80,6 +80,22 @@ class QueryPlanV2ContractTests(unittest.TestCase):
                 source="local",
             )
 
+    def test_multi_hop_plan_requires_an_explicit_bridge(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bridge requirement"):
+            QueryPlanV2(
+                original_query="实体对应的额度是多少",
+                answer_shape="multi_hop",
+                retrieval_queries=("实体对应的额度是多少",),
+                requirements=(
+                    AnswerRequirementV2(
+                        id="r1",
+                        description="实体对应的额度是多少",
+                    ),
+                ),
+                confidence=0.9,
+                source="local",
+            )
+
 
 class EvidenceContractTests(unittest.TestCase):
     def test_evidence_role_and_requirement_ids_are_first_class(self) -> None:
@@ -142,7 +158,10 @@ class EvidenceContractTests(unittest.TestCase):
         )
         bundle = EvidenceBundle(
             state=state,
-            items=(_item(),),
+            items=(_item(
+                role="direct",
+                supports_requirement_ids=("r1",),
+            ),),
             context_item_ids=("c1",),
             answer_source_ids=("c1",),
             missing_requirement_ids=("r2",),
@@ -151,6 +170,21 @@ class EvidenceContractTests(unittest.TestCase):
         self.assertTrue(bundle.state.may_build_context)
         self.assertTrue(bundle.state.is_soft_degraded)
         self.assertEqual([item.chunk_id for item in bundle.context_items], ["c1"])
+
+    def test_answer_source_requires_positive_role_and_requirement_mapping(self) -> None:
+        state = EvidenceState("ok", "retrieved", "partial")
+        for item in (
+            _item(role="background"),
+            _item(role="direct"),
+        ):
+            with self.subTest(role=item.role):
+                with self.assertRaises(ValueError):
+                    EvidenceBundle(
+                        state=state,
+                        items=(item,),
+                        context_item_ids=("c1",),
+                        answer_source_ids=("c1",),
+                    )
 
     def test_rejects_unauthorized_or_mismatched_context(self) -> None:
         state = EvidenceState(

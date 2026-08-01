@@ -1,19 +1,47 @@
 import { defineStore } from 'pinia'
-import { ref, watch } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { createChatStream, getChatHistory, getMessages, renameConversation as renameConversationRequest, deleteConversation } from '@/api/chat'
 import { useSearchStore } from './search'
 import { answerSourcesFromSearchEvent } from '@/utils/chatEvidence'
+import {
+  restoreConversationMessages,
+  restoreHistoryMessageState,
+  searchSnapshotFromEvent,
+  searchSnapshotFromHistoryMessage,
+} from '@/utils/chatHistory'
 import {
   applyClarificationLifecycleEvent,
   attachEvidenceClarification,
   clarificationFromSearchEvent,
   invalidateEvidenceClarification,
   isClarificationActive,
+  isClarificationSubmittable,
   lockMessageClarificationEvidence,
   markClarificationSubmitted,
   normalizeEvidenceClarification,
-  restoreHistoryMessageClarification,
+  restoreClarificationSubmissionForRetry,
 } from '@/utils/chatClarification'
+import {
+  captureAssistantPresentationForRetry,
+  chatRequestHttpFailure,
+  coalesceLogicalTurnMessages,
+  createClientRequestId,
+  normalizeClientRequestId,
+  normalizeTraceId,
+  normalizeTurnId,
+  resetAssistantForLogicalRetry,
+  responseHeader,
+  restoreAssistantPresentationAfterUnconfirmedRetry,
+  streamEventConfirmsAssistantPresentation,
+  traceIdFromResponse,
+} from '@/utils/chatRequest'
+import {
+  applyTurnLifecycleState,
+  shouldReloadCompletedEmptyAssistant,
+  eventConfirmsPendingClarification,
+  isPendingTurnReplay,
+  isPersistenceFailureEvent,
+} from '@/utils/chatTurnState'
 import {
   appendStreamText,
   appendUniqueStreamError,
@@ -29,6 +57,7 @@ export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentConvId = ref(null)
   const isStreaming = ref(false)
+  const activeRequestId = ref('')
   const isConversationLoading = ref(false)
   // 加载失败时保留当前会话 ID 与深链，供页面提供明确的重试/返回选择；
   // 不能把网络或服务端临时错误误当成“会话不存在”。
@@ -46,6 +75,10 @@ export const useChatStore = defineStore('chat', () => {
   let conversationRequestId = 0
   // 停止生成后使旧 SSE 事件失效，避免其 done 事件把已新建的空会话切回旧会话。
   let streamRunId = 0
+  // Only one stream can be active.  Keeping its source outside the async
+  // stack lets Stop/Abort restore a choice immediately without allowing an
+  // older stream callback to revive it later.
+  let activeTurnContext = null
 
   function latestPendingClarificationMessage() {
     return [...messages.value].reverse().find(message => {
@@ -66,27 +99,173 @@ export const useChatStore = defineStore('chat', () => {
     return clarification
   }
 
-  async function sendMessage(question) {
+  function bindTraceId(aiMsg, searchStore, value) {
+    const traceId = normalizeTraceId(value)
+    if (!traceId) return ''
+    aiMsg.trace_id = traceId
+    aiMsg.search_meta = { ...(aiMsg.search_meta || {}), trace_id: traceId }
+    if (aiMsg.search_snapshot) aiMsg.search_snapshot.trace_id = traceId
+    searchStore.setTraceId(traceId)
+    return traceId
+  }
+
+  function restoreSubmittedClarification(
+    context,
+    searchStore,
+    reason,
+    { reuseRequestId = true } = {},
+  ) {
+    const clarification = restoreClarificationSubmissionForRetry(
+      context?.clarificationSource,
+      reuseRequestId ? context?.requestId : '',
+      reason,
+    )
+    if (clarification) lockClarificationEvidence(context.clarificationSource, searchStore, clarification)
+    return clarification
+  }
+
+  function markTurnFailed(aiMsg, context, searchStore, reason) {
+    applyTurnLifecycleState(aiMsg, {
+      type: 'error',
+      turn_status: 'failed',
+      persistence_status: reason === 'persistence_failed' ? 'failed' : 'unknown',
+    })
+    aiMsg.failure_reason = reason
+    // Do not reopen a picker solely because fetch/SSE failed.  The pending
+    // route may have been consumed server-side; recovery verifies it below.
+  }
+
+  function maybeRestoreClarificationFromEvent(context, searchStore, event, reason) {
+    const sourceClarification = normalizeEvidenceClarification(context?.clarificationSource?.clarification)
+    if (!eventConfirmsPendingClarification(event, sourceClarification)) return false
+    return Boolean(restoreSubmittedClarification(context, searchStore, reason))
+  }
+
+  async function recoverClarificationFromHistory(
+    context,
+    searchStore,
+    reason,
+    { reuseRequestId = true } = {},
+  ) {
+    const source = context?.clarificationSource
+    const attempted = normalizeEvidenceClarification(source?.clarification)
+    const conversationId = currentConvId.value == null ? '' : String(currentConvId.value)
+    if (!source || !attempted?.submission_pending || !conversationId) return false
+    try {
+      const rows = await getMessages(conversationId)
+      const authoritative = (Array.isArray(rows) ? rows : [])
+        .map(restoreHistoryMessageState)
+        .find(message => {
+          const clarification = normalizeEvidenceClarification(message?.clarification)
+          return Boolean(
+            clarification
+            && isClarificationActive(clarification)
+            && clarification.pending_state_id === attempted.pending_state_id
+            && clarification.clarification_message_id === attempted.clarification_message_id
+            && clarification.route_state_revision === attempted.route_state_revision
+          )
+        })
+      if (!authoritative) {
+        source.clarification = {
+          ...attempted,
+          submitted: false,
+          submitted_reply: null,
+          submission_pending: false,
+          invalidated: true,
+          invalid_reason: 'pending_state_not_active',
+        }
+        lockClarificationEvidence(source, searchStore, source.clarification)
+        return false
+      }
+      // The history endpoint has rechecked current KB/document permissions and
+      // confirmed the same pending revision.  Only now is it safe to reopen.
+      source.clarification = {
+        ...authoritative.clarification,
+        submitted: true,
+        submitted_reply: attempted.submitted_reply,
+        submission_pending: true,
+        submission_request_id: reuseRequestId ? context.requestId : null,
+        last_submission_request_id: reuseRequestId
+          ? authoritative.clarification?.last_submission_request_id || null
+          : null,
+      }
+      return Boolean(restoreSubmittedClarification(
+        context,
+        searchStore,
+        reason,
+        { reuseRequestId },
+      ))
+    } catch (error) {
+      console.warn('[chat] 无法复验待澄清状态', { conversationId, error })
+      return false
+    }
+  }
+
+  async function sendMessage(question, options = {}) {
     const normalizedQuestion = typeof question === 'string' ? question.trim() : ''
     if (isStreaming.value || !normalizedQuestion) return
     const runId = ++streamRunId
+    const requestedRequestId = normalizeClientRequestId(options.requestId)
+    const requestId = requestedRequestId || createClientRequestId()
+    const logicalTurn = requestedRequestId
+      ? coalesceLogicalTurnMessages(messages.value, requestId)
+      : null
+    if (logicalTurn?.removedCount) messages.value = logicalTurn.messages
+    const priorTurn = requestedRequestId
+      ? [...messages.value].reverse().find(message => (
+          (
+            normalizeClientRequestId(message?.request_id)
+            || normalizeClientRequestId(message?.server_request_id)
+          ) === requestId
+          && normalizeTurnId(message?.turn_id)
+        ))
+      : null
+    const turnId = requestedRequestId
+      ? (normalizeTurnId(options.turnId) || normalizeTurnId(priorTurn?.turn_id))
+      : ''
 
     // Any new user turn closes the currently displayed picker. A button click
     // marks it first; a manually typed selection/new question reaches the same
     // state here, so stale choices cannot be submitted again later.
-    const pendingClarification = latestPendingClarificationMessage()
+    const explicitSource = options.clarificationSource
+      ? messages.value.find(item => item === options.clarificationSource
+        || (options.clarificationSource?.id != null && item?.id === options.clarificationSource.id))
+      : null
+    const pendingClarification = explicitSource || latestPendingClarificationMessage()
+    let clarificationSource = null
     if (pendingClarification) {
-      markClarificationSubmitted(pendingClarification, normalizedQuestion, { allowFreeText: true })
+      const marked = markClarificationSubmitted(
+        pendingClarification,
+        normalizedQuestion,
+        {
+          allowFreeText: !explicitSource || options.allowFreeText === true,
+          requestId,
+        },
+      )
+      if (!marked && explicitSource) return
+      if (marked) clarificationSource = pendingClarification
     }
+    const clarificationIdentity = normalizeEvidenceClarification(clarificationSource?.clarification)
+    const turnContext = { requestId, clarificationSource }
+    activeTurnContext = turnContext
+    activeRequestId.value = requestId
 
     const searchStore = useSearchStore()
     searchStore.resetSteps()
     isStreaming.value = true
     aborted = false
 
-    messages.value.push({ id: Date.now(), role: 'user', content: normalizedQuestion, created_at: new Date() })
-    messages.value.push({
-      id: Date.now() + 1,
+    const now = new Date()
+    const createUserMessage = () => ({
+      id: `client-user-${requestId}-${runId}`,
+      role: 'user',
+      content: normalizedQuestion,
+      request_id: requestId,
+      delivery_status: 'sent',
+      created_at: now,
+    })
+    const createAssistantMessage = () => ({
+      id: `client-assistant-${requestId}-${runId}`,
       role: 'assistant',
       content: '',
       sources: [],
@@ -94,30 +273,112 @@ export const useChatStore = defineStore('chat', () => {
       tokens: null,
       clarification: null,
       stream_errors: [],
-      created_at: new Date(),
+      request_id: requestId,
+      trace_id: null,
+      evidence_status: null,
+      retrieval_executed: null,
+      delivery_status: 'streaming',
+      persistence_status: 'pending',
+      retryable: false,
+      search_snapshot: null,
+      search_meta: null,
+      clarification_parent_message_id: clarificationSource?.id || null,
+      created_at: now,
     })
-    const aiMsg = messages.value[messages.value.length - 1]
+    let userMsg = logicalTurn?.userMessage || null
+    let aiMsg = logicalTurn?.assistantMessage || null
+    const reusedAssistant = Boolean(aiMsg)
+    if (requestedRequestId && (userMsg || aiMsg)) {
+      const nextMessages = [...messages.value]
+      if (!userMsg) {
+        userMsg = createUserMessage()
+        const assistantIndex = nextMessages.indexOf(aiMsg)
+        nextMessages.splice(assistantIndex >= 0 ? assistantIndex : nextMessages.length, 0, userMsg)
+      }
+      if (!aiMsg) {
+        aiMsg = createAssistantMessage()
+        const userIndex = nextMessages.indexOf(userMsg)
+        nextMessages.splice(userIndex >= 0 ? userIndex + 1 : nextMessages.length, 0, aiMsg)
+      }
+      messages.value = nextMessages
+    } else {
+      userMsg = createUserMessage()
+      aiMsg = createAssistantMessage()
+      messages.value.push(userMsg, aiMsg)
+    }
+
+    // `ref([])` exposes array entries as reactive proxies, but the local
+    // variable created above still points at the original plain object.  SSE
+    // writes through that raw reference do not invalidate computed consumers
+    // such as ChatMessage's clarification picker.  Reuse Vue's cached proxy so
+    // live clarification -> ack -> done mutations render immediately, just as
+    // the same message does after a history reload.
+    aiMsg = reactive(aiMsg)
 
     const { promise, abort } = createChatStream({
       question: normalizedQuestion,
       conversation_id: currentConvId.value,
       knowledge_base_ids: selectedKbIds.value,
       search_config: searchConfig.value,
-    })
+      request_id: requestId,
+      turn_id: turnId || undefined,
+      pending_route_revision: clarificationIdentity?.route_state_revision ?? undefined,
+      pending_state_id: clarificationIdentity?.pending_state_id || undefined,
+    }, { requestId })
     abortFn = abort
+    let sawDone = false
+    let sawCompletedTurnState = false
+    let presentationConfirmed = false
+    let retryPresentation = null
+    let retryPresentationActive = false
+    const restoreUnconfirmedAssistant = () => {
+      if (!retryPresentationActive || presentationConfirmed) return false
+      const currentErrors = Array.isArray(aiMsg.stream_errors) ? [...aiMsg.stream_errors] : []
+      const restored = restoreAssistantPresentationAfterUnconfirmedRetry(aiMsg, retryPresentation)
+      retryPresentationActive = false
+      if (restored) currentErrors.forEach(error => appendUniqueStreamError(aiMsg, error))
+      return restored
+    }
+    turnContext.restoreUnconfirmedAssistant = restoreUnconfirmedAssistant
+    turnContext.hasConfirmedPresentation = () => presentationConfirmed
 
     try {
       const res = await promise
+      const responseTraceId = traceIdFromResponse(res)
+      const responseTurnId = responseHeader(res, 'X-RAG-Turn-ID')
+      const responseRequestId = normalizeClientRequestId(responseHeader(res, 'X-RAG-Request-ID')) || requestId
       if (!res.ok) {
-        let detail = '请求失败，请稍后重试'
+        let body = null
         try {
-          const body = await res.json()
-          detail = body?.detail || detail
+          body = await res.json()
         } catch {}
+        const failure = chatRequestHttpFailure(res.status, body)
+        bindTraceId(aiMsg, searchStore, responseTraceId)
+        aiMsg.turn_id = responseTurnId || aiMsg.turn_id || null
+        aiMsg.server_request_id = responseRequestId
         const publicError = new Error('chat request failed')
-        publicError.publicMessage = detail
+        publicError.publicMessage = failure.publicMessage
+        publicError.httpStatus = failure.status
+        publicError.errorDetail = failure.detail
+        publicError.errorCode = failure.errorCode
+        publicError.failureReason = failure.failureReason
+        publicError.retryWithNewRequestId = failure.retryWithNewRequestId
+        publicError.sameRequestRecoverable = failure.sameRequestRecoverable
         throw publicError
       }
+
+      // Do not erase a visible answer while fetch is still unconfirmed. Once
+      // the server accepts the replay, clear transient output in place; if the
+      // connection then dies before an authoritative replacement event, the
+      // snapshot below is restored so the prior answer never disappears.
+      if (reusedAssistant) {
+        retryPresentation = captureAssistantPresentationForRetry(aiMsg)
+        retryPresentationActive = Boolean(retryPresentation)
+        resetAssistantForLogicalRetry(aiMsg, requestId)
+      }
+      bindTraceId(aiMsg, searchStore, responseTraceId)
+      aiMsg.turn_id = responseTurnId || aiMsg.turn_id || null
+      aiMsg.server_request_id = responseRequestId
 
       // 新会话在后端已提交；先从响应头绑定 ID，避免用户刚开始生成就停止时丢失会话上下文。
       const startedConversationId = res.headers.get('X-Conversation-ID')
@@ -135,15 +396,27 @@ export const useChatStore = defineStore('chat', () => {
         } catch (error) {
           console.warn('[chat] SSE 数据解析失败', { error })
           invalidateClarification(aiMsg, searchStore, 'protocol_parse_error')
+          markTurnFailed(aiMsg, turnContext, searchStore, 'protocol_parse_error')
           appendUniqueStreamError(aiMsg, SSE_PARSE_ERROR_MESSAGE)
           return
         }
         if (!data) return
         try {
-          handleEvent(data, aiMsg, searchStore, runId)
+          handleEvent(data, aiMsg, searchStore, runId, turnContext, () => { sawDone = true })
+          if (
+            data.type === 'turn_state'
+            && String(data.turn_status ?? data.status ?? '').trim().toLowerCase() === 'completed'
+          ) {
+            sawCompletedTurnState = true
+          }
+          if (streamEventConfirmsAssistantPresentation(data)) {
+            presentationConfirmed = true
+            retryPresentationActive = false
+          }
         } catch (error) {
           console.error('[chat] SSE 事件处理失败', { eventType: data.type || 'unknown', error })
           invalidateClarification(aiMsg, searchStore, 'protocol_handler_error')
+          markTurnFailed(aiMsg, turnContext, searchStore, 'protocol_handler_error')
           appendUniqueStreamError(aiMsg, SSE_HANDLER_ERROR_MESSAGE)
         }
       }
@@ -167,17 +440,64 @@ export const useChatStore = defineStore('chat', () => {
       }
     } catch (e) {
       if (runId !== streamRunId) return
+      restoreUnconfirmedAssistant()
+      const failureReason = e.name === 'AbortError'
+        ? 'stream_aborted'
+        : (e.failureReason || 'request_failed')
+      markTurnFailed(
+        aiMsg,
+        turnContext,
+        searchStore,
+        failureReason,
+      )
+      if (Number.isFinite(Number(e.httpStatus))) aiMsg.http_status = Number(e.httpStatus)
+      if (e.errorDetail !== undefined) aiMsg.error_detail = e.errorDetail
+      if (typeof e.errorCode === 'string' && e.errorCode) aiMsg.error_code = e.errorCode
+      if (typeof e.sameRequestRecoverable === 'boolean') {
+        aiMsg.same_request_recoverable = e.sameRequestRecoverable
+      }
+      if (e.retryWithNewRequestId === true) {
+        aiMsg.retry_with_new_request_id = true
+        aiMsg.same_request_recoverable = false
+      }
       invalidateClarification(
         aiMsg,
         searchStore,
-        e.name === 'AbortError' ? 'stream_aborted' : 'request_failed',
+        failureReason,
       )
       if (e.name !== 'AbortError') appendUniqueStreamError(aiMsg, publicRequestError(e))
     } finally {
       if (runId !== streamRunId) return
+      restoreUnconfirmedAssistant()
+      if (!sawDone && !sawCompletedTurnState && !aborted && !aiMsg.retryable) {
+        markTurnFailed(aiMsg, turnContext, searchStore, 'stream_incomplete')
+        appendUniqueStreamError(aiMsg, '响应未完整结束，请重试')
+      }
+      if (!aborted && aiMsg.retryable && !String(aiMsg.content || '').trim()) {
+        const retryNotice = aiMsg.failure_reason === 'persistence_unrecoverable'
+          ? '请求未能完成，且没有可恢复的已生成回答。请重新发送。'
+          : (aiMsg.failure_reason === 'persistence_failed'
+              ? '回答保存尚未完成，请点击“恢复回答”。'
+              : (aiMsg.failure_reason === 'request_conflict'
+                  ? '请求上下文已变化，请点击“重新发送”。'
+                  : '请求未能完成，请重试。'))
+        appendUniqueStreamError(aiMsg, retryNotice)
+      }
       const clarification = normalizeEvidenceClarification(aiMsg.clarification)
       if (clarification && !clarification.acknowledged && !clarification.invalidated) {
         invalidateClarification(aiMsg, searchStore, 'missing_persistence_ack')
+      }
+      if (
+        aiMsg.retryable
+        && aiMsg.failure_reason !== 'turn_in_progress'
+        && turnContext.clarificationSource
+      ) {
+        await recoverClarificationFromHistory(
+          turnContext,
+          searchStore,
+          aiMsg.failure_reason || 'turn_failed',
+          { reuseRequestId: aiMsg.retry_with_new_request_id !== true },
+        )
       }
       isStreaming.value = false
       abortFn = null
@@ -185,19 +505,69 @@ export const useChatStore = defineStore('chat', () => {
       if (aborted) {
         // 用户主动停止：标记为已停止，模板据此显示"已停止生成"，避免一直卡在"思考中"
         aiMsg.stopped = true
+        aiMsg.delivery_status = 'stopped'
         aborted = false
       } else {
+        const shouldReloadCompletedTurn = shouldReloadCompletedEmptyAssistant(aiMsg, {
+          sawDone,
+          sawCompletedTurnState,
+        })
+        if (
+          (
+            shouldReloadCompletedTurn
+            || (
+              (aiMsg.replayed === true || (!sawDone && sawCompletedTurnState))
+              && aiMsg.turn_status === 'completed'
+            )
+          )
+          && currentConvId.value
+        ) {
+          // A completed replay is authoritative, but its compact SSE does not
+          // necessarily repeat an active clarification payload. Rehydrate the
+          // transcript so duplicate local bubbles disappear and any currently
+          // authorized picker/search snapshot is restored from durable state.
+          try {
+            const authoritativeConversationId = String(currentConvId.value)
+            const replayedMessages = await getMessages(authoritativeConversationId)
+            if (
+              runId === streamRunId
+              && String(currentConvId.value) === authoritativeConversationId
+            ) {
+              messages.value = Array.isArray(replayedMessages)
+                ? restoreConversationMessages(replayedMessages)
+                : messages.value
+              restoreLatestMessageSearch()
+            }
+          } catch (error) {
+            console.warn('[chat] 已完成回答无法刷新权威历史，保留当前消息状态', { error })
+          }
+        }
         await loadHistory().catch(() => {})
       }
+      if (activeTurnContext === turnContext) activeTurnContext = null
+      if (activeRequestId.value === requestId) activeRequestId.value = ''
     }
   }
 
-  function handleEvent(data, aiMsg, searchStore, runId) {
+  function handleEvent(data, aiMsg, searchStore, runId, turnContext = {}, markDone = () => {}) {
     if (runId !== streamRunId) return
+    bindTraceId(aiMsg, searchStore, data.trace_id || data.search_meta?.trace_id || data.meta?.trace_id)
     if (data.type === 'conversation_started') {
       if (data.conversation_id) currentConvId.value = data.conversation_id
+      if (data.turn_id) aiMsg.turn_id = data.turn_id
+    } else if (data.type === 'turn_state') {
+      if (data.turn_id) aiMsg.turn_id = data.turn_id
+      if (data.request_id) aiMsg.server_request_id = data.request_id
+      if (typeof data.error_code === 'string' && data.error_code) aiMsg.error_code = data.error_code
+      if (data.evidence_status) aiMsg.evidence_status = data.evidence_status
+      if (typeof data.retrieval_executed === 'boolean') aiMsg.retrieval_executed = data.retrieval_executed
+      applyTurnLifecycleState(aiMsg, data)
+      if (aiMsg.retryable) {
+        aiMsg.failure_reason = data.status === 'persist_failed' ? 'persistence_failed' : 'server_error'
+      }
     } else if (data.type === 'intent') {
-      searchStore.setIntentDecision(data.decision || data)
+      aiMsg.intent_decision = data.decision || data
+      searchStore.setIntentDecision(aiMsg.intent_decision)
     } else if (data.type === 'search_step') {
       searchStore.updateStep(data.step, data.status)
     } else if (data.type === 'search_results') {
@@ -221,10 +591,17 @@ export const useChatStore = defineStore('chat', () => {
         ? 'needs_clarification'
         : (data.evidence_status ?? eventMeta.evidence_status)
       aiMsg.search_meta = {
+        ...(aiMsg.search_meta || {}),
         ...eventMeta,
         retrieval_executed: aiMsg.retrieval_executed,
         evidence_status: aiMsg.evidence_status,
       }
+      aiMsg.search_snapshot = searchSnapshotFromEvent(data, {
+        trace_id: aiMsg.trace_id,
+        evidence_status: aiMsg.evidence_status,
+        retrieval_executed: aiMsg.retrieval_executed,
+        intent_decision: aiMsg.intent_decision,
+      })
       if (clarification) {
         const attached = attachEvidenceClarification(aiMsg, clarification)
         lockClarificationEvidence(aiMsg, searchStore, attached)
@@ -254,9 +631,21 @@ export const useChatStore = defineStore('chat', () => {
     } else if (data.type === 'usage') {
       aiMsg.tokens = data.total_tokens
     } else if (data.type === 'done') {
+      markDone()
       if (data.conversation_id) currentConvId.value = data.conversation_id
       const clarification = applyClarificationLifecycleEvent(aiMsg, data)
       if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
+      applyTurnLifecycleState(aiMsg, data)
+      if (isPendingTurnReplay(data)) {
+        aiMsg.failure_reason = 'turn_in_progress'
+        aiMsg.retryable = true
+        if (!String(aiMsg.content || '').trim()) {
+          aiMsg.content = '同一请求仍在处理中，请稍后点击“获取结果”。'
+        }
+      }
+      if (aiMsg.retryable) {
+        maybeRestoreClarificationFromEvent(turnContext, searchStore, data, 'turn_failed')
+      }
       searchStore.finishSteps()
     } else if (data.type === 'error') {
       // 正常管线会先发送 search_results；若异常发生得更早，则显式标记为
@@ -272,6 +661,15 @@ export const useChatStore = defineStore('chat', () => {
       }
       const clarification = applyClarificationLifecycleEvent(aiMsg, data)
       if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
+      if (typeof data.error_code === 'string' && data.error_code) aiMsg.error_code = data.error_code
+      const persistenceFailed = isPersistenceFailureEvent(data)
+      applyTurnLifecycleState(aiMsg, persistenceFailed
+        ? { ...data, turn_status: 'persist_failed', persistence_status: 'failed' }
+        : data)
+      aiMsg.failure_reason = persistenceFailed
+        ? (data.same_request_recoverable === false ? 'persistence_unrecoverable' : 'persistence_failed')
+        : 'server_error'
+      maybeRestoreClarificationFromEvent(turnContext, searchStore, data, aiMsg.failure_reason)
       appendUniqueStreamError(aiMsg, data.message || '服务端处理失败，请稍后重试')
     }
   }
@@ -282,26 +680,46 @@ export const useChatStore = defineStore('chat', () => {
       item === message || (message?.id != null && item?.id === message.id)
     ))
     if (!target || target !== latestPendingClarificationMessage()) return false
-    if (!markClarificationSubmitted(target, reply)) return false
+    const clarification = normalizeEvidenceClarification(target.clarification)
+    if (!isClarificationSubmittable(clarification)) return false
 
     // Reuse the exact same request/conversation/SSE path as typed questions.
-    void sendMessage(target.clarification.submitted_reply)
+    void sendMessage(reply, {
+      clarificationSource: target,
+      allowFreeText: false,
+      requestId: clarification.retryable
+        ? clarification.last_submission_request_id
+        : null,
+    })
     return true
   }
 
   function stopStreaming() {
     if (!isStreaming.value) return
+    const turnContext = activeTurnContext
     aborted = true
     streamRunId += 1
     abortFn?.()
     abortFn = null
     isStreaming.value = false
+    activeRequestId.value = ''
+    if (!turnContext?.hasConfirmedPresentation?.()) turnContext?.restoreUnconfirmedAssistant?.()
     const lastAssistantMessage = [...messages.value].reverse().find(m => m.role === 'assistant')
     const searchStore = useSearchStore()
     if (lastAssistantMessage) {
       lastAssistantMessage.stopped = true
       invalidateClarification(lastAssistantMessage, searchStore, 'stream_aborted')
+      applyTurnLifecycleState(lastAssistantMessage, {
+        type: 'error',
+        turn_status: 'failed',
+        persistence_status: 'unknown',
+      })
+      lastAssistantMessage.delivery_status = 'stopped'
     }
+    if (turnContext?.clarificationSource) {
+      void recoverClarificationFromHistory(turnContext, searchStore, 'stream_aborted')
+    }
+    activeTurnContext = null
     searchStore.finishSteps()
     // 后端在流式开始前已保存会话；停止后刷新侧栏，保留这次未完成的记录入口。
     loadHistory().catch(() => {})
@@ -309,6 +727,23 @@ export const useChatStore = defineStore('chat', () => {
 
   async function loadHistory() {
     conversations.value = await getChatHistory()
+  }
+
+  function restoreMessageSearch(message) {
+    const snapshot = searchSnapshotFromHistoryMessage(message)
+    const searchStore = useSearchStore()
+    if (!snapshot) {
+      searchStore.resetSteps()
+      return false
+    }
+    return searchStore.restoreSnapshot(snapshot)
+  }
+
+  function restoreLatestMessageSearch() {
+    const latest = [...messages.value].reverse().find(message => (
+      message?.role === 'assistant' && searchSnapshotFromHistoryMessage(message)
+    ))
+    return latest ? restoreMessageSearch(latest) : (useSearchStore().resetSteps(), false)
   }
 
   async function loadConversation(convId) {
@@ -319,15 +754,14 @@ export const useChatStore = defineStore('chat', () => {
     messages.value = []
     isConversationLoading.value = true
     conversationLoadError.value = null
-    // 右侧检索面板只描述当前这次实时提问；历史会话没有可恢复的完整检索过程，
-    // 切换时必须清空，不能沿用上一个会话的命中片段和路由信息。
+    // 切换时先清空，随后只从服务端持久化的最后一轮 snapshot 恢复；
+    // 没有 snapshot 时保持空面板，不能沿用上一个会话的命中片段。
     useSearchStore().resetSteps()
     try {
       const loadedMessages = await getMessages(conversationId)
       if (requestId !== conversationRequestId || currentConvId.value !== conversationId) return
-      messages.value = Array.isArray(loadedMessages)
-        ? loadedMessages.map(restoreHistoryMessageClarification)
-        : []
+      messages.value = restoreConversationMessages(loadedMessages)
+      restoreLatestMessageSearch()
       conversationLoadError.value = null
     } catch (error) {
       // 仅处理当前仍被选中的请求；旧请求失败不应打断后来已切换的会话。
@@ -350,6 +784,7 @@ export const useChatStore = defineStore('chat', () => {
     currentConvId.value = null
     messages.value = []
     isConversationLoading.value = false
+    activeRequestId.value = ''
     conversationLoadError.value = null
     const searchStore = useSearchStore()
     searchStore.resetSteps()
@@ -371,9 +806,10 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   return {
-    messages, conversations, currentConvId, isStreaming, isConversationLoading, conversationLoadError,
+    messages, conversations, currentConvId, isStreaming, activeRequestId, isConversationLoading, conversationLoadError,
     searchConfig, selectedKbIds,
     sendMessage, submitClarification, stopStreaming, loadHistory, loadConversation,
     newConversation, renameConversation, removeConversation,
+    restoreMessageSearch, restoreLatestMessageSearch,
   }
 })

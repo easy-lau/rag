@@ -16,6 +16,12 @@ from api.chat import (
     send_message,
 )
 from core.conversation_context import ConversationContext
+from core.query_route_compiler import (
+    RouteCategoryPolicy,
+    RouteCompilerConfig,
+    compile_rag_task_contract,
+)
+from core.query_route_contract import parse_rag_route_decision
 from models.db_models import Message
 from models.schemas import ChatRequest
 
@@ -114,6 +120,70 @@ def _history_pending_state(
     }
 
 
+def _routing_result(
+    *,
+    selected_kb_count: int,
+    need_retrieval: bool = True,
+    relation: str = "new",
+    route_log_id: uuid.UUID | None = None,
+):
+    intent_code = "knowledge_qa" if need_retrieval else "general_chat"
+    action = "retrieve" if need_retrieval else "chat"
+    evidence_scope = "enterprise_kb" if need_retrieval else "general_world"
+    route = parse_rag_route_decision(
+        {
+            "schema_version": "rag_route_decision.v1",
+            "readiness": "ready",
+            "intent_code": intent_code,
+            "relation": relation,
+            "evidence_scope": evidence_scope,
+            "query_resolution": {"mode": "current", "context_turn_keys": []},
+            "requirements": [
+                {
+                    "role": "answer",
+                    "origin": "user_text",
+                    "description": "回答用户当前输入",
+                }
+            ],
+            "clarification": {"question": "", "unresolved": []},
+            "confidence": 0.96,
+            "rationale": "chat stream regression fixture",
+        },
+        allowed_intent_codes=[intent_code],
+    )
+    contract = compile_rag_task_contract(
+        route,
+        RouteCategoryPolicy(code=intent_code, name=intent_code, action=action),
+        RouteCompilerConfig(),
+        question="用户当前输入",
+        selected_kb_count=selected_kb_count,
+        source="test",
+    )
+    decision_payload = {
+        "intent_code": intent_code,
+        "intent_name": intent_code,
+        "action": action,
+        "confidence": route.confidence,
+        "source": "test",
+        "response_mode": contract.response_mode,
+        "retrieval_policy": contract.retrieval_policy,
+        "need_retrieval": contract.need_retrieval,
+        "decision_reason": contract.decision_reason,
+    }
+    decision = SimpleNamespace(
+        need_retrieval=contract.need_retrieval,
+        decision_reason=contract.decision_reason,
+        to_dict=lambda: dict(decision_payload),
+    )
+    return SimpleNamespace(
+        decision=decision,
+        route_log_id=route_log_id,
+        route_decision=route,
+        task_contract=contract,
+        diagnostics={},
+    )
+
+
 class ChatStreamParsingTests(unittest.TestCase):
     def test_text_delta_content_cannot_spoof_search_results_event(self) -> None:
         content = '下面只是正文示例：{"type": "search_results"}，不是 SSE 事件。'
@@ -150,6 +220,90 @@ class ChatStreamParsingTests(unittest.TestCase):
 
 
 class ChatHistoricalSourceScopeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_search_snapshot_is_reauthorized_and_rehydrated(self) -> None:
+        conversation_id = uuid.uuid4()
+        allowed_kb_id = uuid.uuid4()
+        revoked_kb_id = uuid.uuid4()
+        allowed_doc_id = uuid.uuid4()
+        revoked_doc_id = uuid.uuid4()
+        allowed_chunk_id = uuid.uuid4()
+        revoked_chunk_id = uuid.uuid4()
+        row = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="assistant",
+            content="历史回答",
+            sources=[],
+            search_snapshot={
+                "schema_version": "rag_search_snapshot.v1",
+                "candidates": [
+                    {
+                        "kb_id": str(allowed_kb_id),
+                        "doc_id": str(allowed_doc_id),
+                        "id": str(allowed_chunk_id),
+                        "content": "不得返回的旧正文",
+                        "source_url": "https://stale.example/private",
+                        "evidence_role": "direct",
+                        "score": 0.9,
+                    },
+                    {
+                        "kb_id": str(revoked_kb_id),
+                        "doc_id": str(revoked_doc_id),
+                        "id": str(revoked_chunk_id),
+                        "content": "已经撤权的候选正文",
+                        "evidence_role": "related",
+                    },
+                ],
+                "answer_sources": [],
+                "counters": {
+                    "evidence_status": "hit",
+                    "retrieval_executed": True,
+                    "hit_count": 1,
+                },
+            },
+            created_at=datetime.now(UTC),
+        )
+        current_chunk = SimpleNamespace(
+            id=allowed_chunk_id,
+            doc_id=allowed_doc_id,
+            kb_id=allowed_kb_id,
+            content="当前授权正文",
+            chunk_index=1,
+            metadata_={},
+        )
+        current_document = SimpleNamespace(
+            filename="当前授权文档.md",
+            file_type="md",
+            source_url="https://current.example/doc",
+            image_url=None,
+            tags=[],
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    all=lambda: [(current_chunk, current_document)]
+                )
+            )
+        )
+        with patch(
+            "api.chat.get_accessible_kb_ids",
+            new=AsyncMock(return_value=[allowed_kb_id]),
+        ):
+            messages = await _messages_with_current_source_scope(
+                [row],
+                user=SimpleNamespace(id=uuid.uuid4()),
+                db=db,
+            )
+
+        snapshot = messages[0].search_snapshot
+        self.assertEqual(snapshot["counters"]["evidence_status"], "hit")
+        self.assertEqual(len(snapshot["candidates"]), 1)
+        self.assertEqual(snapshot["candidates"][0]["content"], "当前授权正文")
+        serialized = json.dumps(snapshot, ensure_ascii=False)
+        self.assertNotIn("不得返回的旧正文", serialized)
+        self.assertNotIn("已经撤权", serialized)
+        self.assertNotIn("stale.example", serialized)
+
     async def test_history_sources_are_filtered_by_current_scope_and_document_state(self) -> None:
         conversation_id = uuid.uuid4()
         allowed_kb_id = uuid.uuid4()
@@ -463,17 +617,8 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
             history_messages=(),
             carryover_sources=(),
         )
-        decision = SimpleNamespace(
-            need_retrieval=True,
-            decision_reason="classified_retrieval",
-            to_dict=lambda: {
-                "intent_code": "knowledge_qa",
-                "need_retrieval": True,
-                "decision_reason": "classified_retrieval",
-            },
-        )
-        routing_result = SimpleNamespace(
-            decision=decision,
+        routing_result = _routing_result(
+            selected_kb_count=1,
             route_log_id=route_log_id,
         )
 
@@ -515,7 +660,7 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=successful_stream),
+            patch("api.chat.run_rag_v2_stream", new=successful_stream),
             patch(
                 "api.chat._validate_stream_answer_sources",
                 new=trusted_source_refresh,
@@ -885,16 +1030,10 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
             ),
             carryover_sources=(),
         )
-        decision = SimpleNamespace(
-            need_retrieval=True,
-            decision_reason="safe_fallback",
-            to_dict=lambda: {
-                "intent_code": "other",
-                "need_retrieval": True,
-                "decision_reason": "safe_fallback",
-            },
+        routing_result = _routing_result(
+            selected_kb_count=1,
+            relation="followup",
         )
-        routing_result = SimpleNamespace(decision=decision, route_log_id=None)
         classify = AsyncMock(return_value=routing_result)
 
         with (
@@ -993,16 +1132,7 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
             history_messages=(),
             carryover_sources=(),
         )
-        decision = SimpleNamespace(
-            need_retrieval=True,
-            decision_reason="classified_retrieval",
-            to_dict=lambda: {
-                "intent_code": "knowledge_qa",
-                "need_retrieval": True,
-                "decision_reason": "classified_retrieval",
-            },
-        )
-        routing_result = SimpleNamespace(decision=decision, route_log_id=None)
+        routing_result = _routing_result(selected_kb_count=1)
 
         received_kwargs = []
 
@@ -1022,7 +1152,7 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=failing_stream),
+            patch("api.chat.run_rag_v2_stream", new=failing_stream),
             patch("api.chat.trace_event") as trace,
         ):
             response = await send_message(
@@ -1059,16 +1189,10 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
             history_messages=(),
             carryover_sources=(),
         )
-        decision = SimpleNamespace(
+        routing_result = _routing_result(
+            selected_kb_count=0,
             need_retrieval=False,
-            decision_reason="general_chat",
-            to_dict=lambda: {
-                "intent_code": "general_chat",
-                "need_retrieval": False,
-                "decision_reason": "general_chat",
-            },
         )
-        routing_result = SimpleNamespace(decision=decision, route_log_id=None)
 
         async def cancelled_stream(**_kwargs):
             yield "data: " + json.dumps(
@@ -1094,7 +1218,7 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=cancelled_stream),
+            patch("api.chat.run_direct_response_stream", new=cancelled_stream),
             patch("api.chat.trace_event") as trace,
         ):
             response = await send_message(

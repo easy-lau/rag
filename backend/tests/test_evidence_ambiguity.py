@@ -8,6 +8,7 @@ from core.evidence_ambiguity import (
     resolve_explicit_scope_comparison,
 )
 from core.query_constraints import extract_query_constraints
+from core.rag_v2.query_plan import plan_query_locally
 
 
 def _candidate(
@@ -125,6 +126,210 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         )
 
         self.assertFalse(decision.needs_clarification)
+
+    def test_cross_document_employee_classification_and_travel_rule_are_complementary(
+        self,
+    ) -> None:
+        query = "普通员工的出差标准是什么"
+        plan = plan_query_locally(query)
+        candidates = [
+            _candidate(
+                chunk_id="employee-level",
+                doc_id="doc-employee-level",
+                filename="员工职级分类.docx",
+                content="普通员工对应D级。",
+                topic=0.92,
+                support=0.82,
+            ),
+            _candidate(
+                chunk_id="travel-rule",
+                doc_id="doc-travel-rule",
+                filename="公司出差管理标准.docx",
+                content="D级出差标准包括交通、住宿和餐补。",
+                topic=0.90,
+                support=0.86,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+            requirements=plan.requirements,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_cross_document_worker_classification_and_lodging_rule_are_complementary(
+        self,
+    ) -> None:
+        query = "合同工住宿标准是多少"
+        plan = plan_query_locally(query)
+        candidates = [
+            _candidate(
+                chunk_id="worker-class",
+                doc_id="doc-worker-class",
+                filename="人员分类.docx",
+                content="合同工属于L2类。",
+                topic=0.91,
+                support=0.80,
+            ),
+            _candidate(
+                chunk_id="lodging-rule",
+                doc_id="doc-lodging-rule",
+                filename="住宿标准.docx",
+                content="L2类住宿标准为300元/天。",
+                topic=0.89,
+                support=0.87,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+            requirements=plan.requirements,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_cross_document_risk_explanation_and_configuration_are_complementary(
+        self,
+    ) -> None:
+        query = "登录用户名枚举要配置什么"
+        plan = plan_query_locally(query)
+        candidates = [
+            _candidate(
+                chunk_id="risk-explanation",
+                doc_id="doc-risk-explanation",
+                filename="安全风险说明.docx",
+                content="登录用户名枚举属于账号安全风险。",
+                topic=0.91,
+                support=0.76,
+            ),
+            _candidate(
+                chunk_id="security-config",
+                doc_id="doc-security-config",
+                filename="安全配置手册.docx",
+                content="用户名枚举防护需配置统一错误提示。",
+                topic=0.90,
+                support=0.88,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+            requirements=plan.requirements,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_multi_part_requirements_anchor_complementary_documents(self) -> None:
+        query = "报销提交时限是多久？需要提供哪些凭证？"
+        plan = plan_query_locally(query)
+        candidates = [
+            _candidate(
+                chunk_id="deadline",
+                doc_id="doc-deadline",
+                filename="制度附件一.docx",
+                content="费用报销时限：出差结束后5个工作日内提交。",
+                topic=0.90,
+                support=0.84,
+            ),
+            _candidate(
+                chunk_id="receipts",
+                doc_id="doc-receipts",
+                filename="制度附件二.docx",
+                content="报销凭证：必须提供正规发票、行程单及住宿发票。",
+                topic=0.89,
+                support=0.85,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+            requirements=plan.requirements,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_vague_employee_standard_still_clarifies_with_plan_requirements(
+        self,
+    ) -> None:
+        query = "员工标准是什么"
+        plan = plan_query_locally(query)
+        candidates = [
+            _candidate(
+                chunk_id="leave-vague",
+                doc_id="doc-leave-vague",
+                filename="员工请假管理办法.docx",
+                content="员工请假制度、审批流程和休假要求。",
+                topic=0.90,
+                support=0.80,
+            ),
+            _candidate(
+                chunk_id="travel-vague",
+                doc_id="doc-travel-vague",
+                filename="公司出差管理标准.docx",
+                content="员工出差交通、住宿和餐饮标准。",
+                topic=0.88,
+                support=0.78,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+            requirements=plan.requirements,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "document")
+
+    def test_version_conflict_still_clarifies_with_complementary_requirement_signal(
+        self,
+    ) -> None:
+        query = "普通员工的出差标准是什么"
+        plan = plan_query_locally(query)
+        candidates = [
+            _candidate(
+                chunk_id="travel-2024",
+                doc_id="doc-travel-2024",
+                filename="差旅制度2024版.docx",
+                content="普通员工住宿标准。",
+                metadata={"version": "2024"},
+                topic=0.94,
+                support=0.88,
+            ),
+            _candidate(
+                chunk_id="travel-2025",
+                doc_id="doc-travel-2025",
+                filename="差旅制度2025版.docx",
+                content="普通员工住宿标准。",
+                metadata={"version": "2025"},
+                topic=0.95,
+                support=0.89,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+            requirements=plan.requirements,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
 
     def test_document_topic_gate_respects_explicit_all_documents_request(self) -> None:
         candidates = [

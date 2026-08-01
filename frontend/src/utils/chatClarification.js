@@ -108,6 +108,9 @@ export function normalizeEvidenceClarification(value) {
   const submittedReply = boundedText(payload.submitted_reply, MAX_REPLY_CHARS)
   const pendingStateId = boundedIdentifier(payload.pending_state_id)
   const clarificationMessageId = boundedIdentifier(payload.clarification_message_id)
+  const submissionRequestId = boundedIdentifier(payload.submission_request_id)
+  const lastSubmissionRequestId = boundedIdentifier(payload.last_submission_request_id)
+  const lastSubmittedReply = boundedText(payload.last_submitted_reply, MAX_REPLY_CHARS)
   const revision = routeStateRevision(payload.route_state_revision)
   const persisted = payload.persisted === true
   // An acknowledgement is only actionable when it identifies a concrete,
@@ -138,6 +141,12 @@ export function normalizeEvidenceClarification(value) {
     route_state_revision: revision,
     conversation_id: boundedIdentifier(payload.conversation_id) || null,
     ack_schema_version: boundedText(payload.ack_schema_version, 80) || null,
+    submission_pending: payload.submission_pending === true && payload.submitted === true,
+    submission_request_id: submissionRequestId || null,
+    retryable: payload.retryable === true && payload.submitted !== true,
+    retry_reason: boundedText(payload.retry_reason, 80) || null,
+    last_submitted_reply: lastSubmittedReply || null,
+    last_submission_request_id: lastSubmissionRequestId || null,
   }
 }
 
@@ -196,6 +205,12 @@ export function attachEvidenceClarification(message, payload) {
     route_state_revision: previous?.route_state_revision ?? clarification.route_state_revision,
     conversation_id: previous?.conversation_id || clarification.conversation_id,
     ack_schema_version: previous?.ack_schema_version || null,
+    submission_pending: previous?.submission_pending === true,
+    submission_request_id: previous?.submission_request_id || null,
+    retryable: previous?.retryable === true,
+    retry_reason: previous?.retry_reason || null,
+    last_submitted_reply: previous?.last_submitted_reply || null,
+    last_submission_request_id: previous?.last_submission_request_id || null,
   }
   return target.clarification
 }
@@ -356,7 +371,11 @@ export function restoreHistoryMessageClarification(message) {
   }
 }
 
-export function markClarificationSubmitted(message, reply, { allowFreeText = false } = {}) {
+export function markClarificationSubmitted(
+  message,
+  reply,
+  { allowFreeText = false, requestId = null } = {},
+) {
   const target = recordValue(message)
   const clarification = normalizeEvidenceClarification(target?.clarification)
   const normalizedReply = boundedText(reply, MAX_REPLY_CHARS)
@@ -374,8 +393,52 @@ export function markClarificationSubmitted(message, reply, { allowFreeText = fal
     ...clarification,
     submitted: true,
     submitted_reply: normalizedReply,
+    submission_pending: true,
+    submission_request_id: boundedIdentifier(requestId) || null,
+    retryable: false,
+    retry_reason: null,
+    last_submission_request_id: clarification.last_submission_request_id || null,
   }
   return true
+}
+
+/**
+ * Re-open a persisted picker when the request created by a user's choice did
+ * not complete.  Matching the client request id prevents an old failed stream
+ * from reactivating a newer attempt after an out-of-order callback.
+ */
+export function restoreClarificationSubmissionForRetry(
+  message,
+  requestId,
+  reason = 'request_failed',
+) {
+  const target = recordValue(message)
+  const clarification = normalizeEvidenceClarification(target?.clarification)
+  const expectedRequestId = boundedIdentifier(requestId)
+  if (
+    !target
+    || !clarification
+    || !clarification.submitted
+    || !clarification.submission_pending
+  ) return null
+  if (
+    expectedRequestId
+    && clarification.submission_request_id
+    && clarification.submission_request_id !== expectedRequestId
+  ) return null
+
+  target.clarification = {
+    ...clarification,
+    submitted: false,
+    submitted_reply: null,
+    submission_pending: false,
+    submission_request_id: null,
+    retryable: true,
+    retry_reason: boundedText(reason, 80) || 'request_failed',
+    last_submitted_reply: clarification.submitted_reply,
+    last_submission_request_id: clarification.submission_request_id || expectedRequestId || null,
+  }
+  return target.clarification
 }
 
 export { MAX_CLARIFICATION_CHOICES }

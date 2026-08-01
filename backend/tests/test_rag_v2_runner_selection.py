@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 from api.chat import _select_rag_pipeline_version, send_message
@@ -25,6 +26,7 @@ def _task_contract(
     response_mode: str = "grounded_qa",
     need_retrieval: bool = True,
     dispatch_authorized: bool = True,
+    selected_kb_count: int = 1,
 ) -> RagTaskContract:
     return RagTaskContract(
         schema_version="rag_task_contract.v1",
@@ -44,7 +46,7 @@ def _task_contract(
         need_retrieval=need_retrieval,
         dispatch_authorized=dispatch_authorized,
         decision_reason="test_contract",
-        selected_kb_count=1,
+        selected_kb_count=selected_kb_count,
         requirements=(
             CompiledAnswerRequirement(
                 id="r1",
@@ -140,28 +142,57 @@ class RagPipelineSelectionTests(unittest.TestCase):
     def test_eligible_grounded_qa_selects_v2(self) -> None:
         self.assertEqual(self._select(), ("v2", "eligible_grounded_qa"))
 
-    def test_missing_contract_general_chat_and_writing_stay_on_v1(self) -> None:
+    def test_v2_routes_direct_modes_without_legacy_fallback(self) -> None:
         cases = {
-            "missing_contract": (None, "missing_or_invalid_task_contract"),
-            "dispatch_not_authorized": (
-                _task_contract(dispatch_authorized=False),
-                "dispatch_not_authorized",
-            ),
             "general_chat": (
                 _task_contract(response_mode="general_chat", need_retrieval=False),
-                "retrieval_not_required",
+                "verified_general_chat",
             ),
-            "writing": (
-                _task_contract(response_mode="writing", need_retrieval=True),
-                "unsupported_response_mode",
+            "inline_writing": (
+                _task_contract(response_mode="writing", need_retrieval=False),
+                "verified_writing",
+            ),
+            "platform_help": (
+                _task_contract(response_mode="platform_help", need_retrieval=False),
+                "verified_platform_help",
             ),
         }
         for name, (contract, expected_reason) in cases.items():
             with self.subTest(name=name):
                 self.assertEqual(
                     self._select(task_contract=contract),
-                    ("v1", expected_reason),
+                    ("direct", expected_reason),
                 )
+
+    def test_v2_rejects_invalid_contracts_instead_of_using_v1(self) -> None:
+        cases = {
+            "missing_contract": (None, "missing_or_invalid_task_contract"),
+            "dispatch_not_authorized": (
+                _task_contract(dispatch_authorized=False),
+                "dispatch_not_authorized",
+            ),
+            "invalid_direct": (
+                _task_contract(response_mode="grounded_qa", need_retrieval=False),
+                "invalid_task_contract:grounded_mode_requires_retrieval",
+            ),
+        }
+        for name, (contract, expected_reason) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self._select(task_contract=contract),
+                    ("reject", expected_reason),
+                )
+
+    def test_knowledge_grounded_writing_selects_v2(self) -> None:
+        self.assertEqual(
+            self._select(
+                task_contract=_task_contract(
+                    response_mode="writing",
+                    need_retrieval=True,
+                )
+            ),
+            ("v2", "eligible_knowledge_writing"),
+        )
 
     def test_evidence_scope_selection_enters_v2_with_followup_context(self) -> None:
         self.assertEqual(
@@ -574,6 +605,207 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(selection.kwargs["version"], "v2")
         self.assertEqual(selection.kwargs["reason"], "eligible_grounded_qa")
+
+    async def test_verified_general_chat_calls_only_direct_runner(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query="你好",
+            history_messages=(),
+            carryover_sources=(),
+        )
+        contract = _task_contract(
+            response_mode="general_chat",
+            need_retrieval=False,
+            selected_kb_count=0,
+        )
+        decision = SimpleNamespace(
+            need_retrieval=False,
+            decision_reason="exact_greeting",
+            to_dict=lambda: {
+                "intent_code": "general_chat",
+                "need_retrieval": False,
+                "decision_reason": "exact_greeting",
+            },
+        )
+        route_decision = SimpleNamespace(
+            schema_version="rag_route_decision.v1",
+            relation="new",
+            evidence_scope="general_world",
+            to_dict=lambda: {"schema_version": "rag_route_decision.v1"},
+        )
+        routing_result = SimpleNamespace(
+            decision=decision,
+            route_decision=route_decision,
+            task_contract=contract,
+            diagnostics={},
+            route_log_id=None,
+        )
+        received_kwargs = []
+
+        async def direct_stream(**kwargs):
+            received_kwargs.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": False,
+                "evidence_status": "skipped",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps(
+                {"type": "text_delta", "content": "你好，有什么可以帮你？"},
+                ensure_ascii=False,
+            ) + "\n\n"
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.resolve_routed_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=SimpleNamespace(
+                    rag_trace_include_content=False,
+                    rag_pipeline_version="v2",
+                ),
+            ),
+            patch("api.chat.run_rag_stream") as v1_stream,
+            patch("api.chat.run_rag_v2_stream") as v2_stream,
+            patch("api.chat.run_direct_response_stream", new=direct_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question="你好",
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[],
+                ),
+                db=request_db,
+                user=user,
+            )
+            chunks = [chunk async for chunk in response.body_iterator]
+
+        self.assertTrue(chunks)
+        self.assertEqual(len(received_kwargs), 1)
+        v1_stream.assert_not_called()
+        v2_stream.assert_not_called()
+        selection = next(
+            call
+            for call in trace.call_args_list
+            if call.args and call.args[0] == "chat.pipeline_selected"
+        )
+        self.assertEqual(selection.kwargs["version"], "direct")
+        self.assertEqual(selection.kwargs["reason"], "verified_general_chat")
+
+    async def test_runner_contract_rejection_503_requires_new_request_id(
+        self,
+    ) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RequestDB(conversation)
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query="查询采购审批额度",
+            history_messages=(),
+            carryover_sources=(),
+        )
+        decision = SimpleNamespace(
+            need_retrieval=True,
+            decision_reason="classified_retrieval",
+            to_dict=lambda: {
+                "intent_code": "knowledge_qa",
+                "need_retrieval": True,
+                "decision_reason": "classified_retrieval",
+            },
+        )
+        routing_result = SimpleNamespace(
+            decision=decision,
+            route_decision=None,
+            task_contract=None,
+            diagnostics={},
+            route_log_id=None,
+        )
+
+        with (
+            patch(
+                "api.chat.get_accessible_kb_ids",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=SimpleNamespace(
+                    rag_trace_include_content=False,
+                    rag_pipeline_version="v2",
+                ),
+            ),
+            patch("api.chat.trace_event"),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await send_message(
+                    ChatRequest(
+                        question="查询采购审批额度",
+                        conversation_id=conversation_id,
+                        knowledge_base_ids=[kb_id],
+                        request_id="runner-rejected-request",
+                    ),
+                    db=request_db,
+                    user=user,
+                )
+
+        self.assertEqual(raised.exception.status_code, 503)
+        self.assertEqual(
+            raised.exception.detail,
+            {
+                "message": "请求执行合同校验失败，请重新发送",
+                "error_code": "runner_contract_rejected",
+                "same_request_recoverable": False,
+                "retry_with_new_request_id": True,
+            },
+        )
 
     async def test_evidence_scope_selection_skips_router_and_calls_v2(
         self,

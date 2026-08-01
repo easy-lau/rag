@@ -77,6 +77,8 @@ app.add_middleware(
     expose_headers=[
         "X-Conversation-ID",
         "X-RAG-Trace-ID",
+        "X-RAG-Request-ID",
+        "X-RAG-Turn-ID",
         "X-RAG-Trace-Truncated",
         "X-RAG-Trace-Omitted-Events",
         "Retry-After",

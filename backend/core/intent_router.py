@@ -44,6 +44,7 @@ from core.query_route_contract import (
     parse_rag_route_decision,
 )
 from core.rag_trace import content_fields, exception_log_text, trace_event
+from core.rag_v2.query_plan import infer_implicit_bridge
 from models.db_models import (
     IntentCategory,
     IntentRouteLog,
@@ -756,6 +757,10 @@ def _route_system_prompt() -> str:
         "requirements 在检索前拆出回答目标，最多 6 项。用户明确要求的内容使用"
         "role=answer, origin=user_text；为回答必须先建立、且必须由证据验证的实体关系"
         "使用 role=bridge, origin=semantically_entailed；不要凭空添加硬性答案维度。"
+        "当用户给出身份、状态、阶段、版本或适用条件，并询问其标准、额度、权限、天数、"
+        "流程等属性，而资料可能先把该对象映射到类别/等级/规则时，必须同时输出 answer 和"
+        "bridge；不能把这类隐含映射压缩成单一 answer。bridge 只描述待验证关系，绝不能猜"
+        "具体类别、等级或结果。"
         "readiness=ready 时 requirements 至少包含一个 role=answer 的回答目标；"
         "needs_clarification 时 requirements 可以暂时为空。\n"
         "readiness=ready 时 clarification.question 必须为空且 unresolved=[]；"
@@ -1589,13 +1594,22 @@ async def _route_with_llm(
 
 
 def _rule_route_requirements(question: str) -> tuple[RouteRequirement, ...]:
-    return (
+    requirements = [
         RouteRequirement(
             role="answer",
             origin="user_text",
             description=question.strip()[:240],
         ),
-    )
+    ]
+    inferred_bridge = infer_implicit_bridge(question)
+    if inferred_bridge is not None:
+        description, _ = inferred_bridge
+        requirements.append(RouteRequirement(
+            role="bridge",
+            origin="semantically_entailed",
+            description=description[:240],
+        ))
+    return tuple(requirements)
 
 
 def _rule_route_decision(
@@ -1675,13 +1689,7 @@ def _safe_route_decision(
         relation=relation,
         evidence_scope="enterprise_kb",
         query_resolution=RouteQueryResolution(mode=mode, context_turn_keys=keys),
-        requirements=(
-            RouteRequirement(
-                role="answer",
-                origin="user_text",
-                description=question.strip()[:240],
-            ),
-        ),
+        requirements=_rule_route_requirements(question),
         clarification=clarification,
         confidence=0.0,
         rationale="语义路由不可用，使用本地安全合同",
@@ -2240,6 +2248,7 @@ def build_verified_evidence_scope_result(
         "evidence_scope_refined" if refined else "evidence_scope_selected"
     )
     requirement_description = normalized_question[:240]
+    route_requirements = _rule_route_requirements(requirement_description)
     clarification = RouteClarification(question="", unresolved=())
     route = RagRouteDecision(
         schema_version=ROUTE_DECISION_SCHEMA_VERSION,
@@ -2251,13 +2260,7 @@ def build_verified_evidence_scope_result(
             mode="current",
             context_turn_keys=(),
         ),
-        requirements=(
-            RouteRequirement(
-                role="answer",
-                origin="user_text",
-                description=requirement_description,
-            ),
-        ),
+        requirements=route_requirements,
         clarification=clarification,
         confidence=1.0,
         rationale="服务端已验证证据范围，使用确定性续问合同",
@@ -2281,15 +2284,22 @@ def build_verified_evidence_scope_result(
         dispatch_authorized=True,
         decision_reason=decision_reason,
         selected_kb_count=len(selected_kb_id_list),
-        requirements=(
+        requirements=tuple(
             CompiledAnswerRequirement(
-                id="r1",
-                role="answer",
-                origin="user_text",
-                description=requirement_description,
-                importance="required",
-                source="explicit",
-            ),
+                id=f"r{index}",
+                role=item.role,
+                origin=item.origin,
+                description=item.description,
+                importance=(
+                    "required"
+                    if item.role == "answer" and item.origin == "user_text"
+                    else "helpful"
+                ),
+                source=(
+                    "explicit" if item.origin == "user_text" else "inferred"
+                ),
+            )
+            for index, item in enumerate(route_requirements, start=1)
         ),
         clarification=clarification,
     )

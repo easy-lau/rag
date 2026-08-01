@@ -3,7 +3,9 @@
     <!-- Results header -->
     <div class="shrink-0 px-4 py-3 border-b border-gray-200 dark:border-gray-700">
       <div class="flex items-center justify-between">
-        <span class="font-medium text-sm text-gray-800 dark:text-gray-200">检索候选</span>
+        <span class="font-medium text-sm text-gray-800 dark:text-gray-200">
+          {{ isHistorical ? '历史检索摘要' : '检索候选' }}
+        </span>
         <div class="flex items-center gap-1.5">
           <n-tag v-if="searchStore.hasResultEvent" size="small" :type="retrievalState.type" :bordered="false" round>
             {{ retrievalState.label }}
@@ -56,6 +58,9 @@
       >
         策略原因：{{ decisionReasonLabel }}
       </p>
+      <p v-if="isHistorical" class="search-history-note" role="status">
+        这是已保存的本轮最终状态，不代表当前仍在执行检索。
+      </p>
     </div>
 
     <!-- Result list -->
@@ -82,8 +87,13 @@
 
     <!-- Search process -->
     <div class="shrink-0 px-4 py-3 border-t border-gray-200 dark:border-gray-700">
-      <div class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-3">检索过程</div>
-      <SearchProcess />
+      <div class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-3">
+        {{ isHistorical ? '历史执行记录' : '检索过程' }}
+      </div>
+      <SearchProcess v-if="!isHistorical" />
+      <p v-else class="search-history-process" role="status">
+        页面未重放实时步骤，仅展示服务端保存的证据和执行结论。
+      </p>
 
       <!-- Meta info -->
       <div v-if="showExecutionMeta" class="mt-3 space-y-1.5">
@@ -105,6 +115,10 @@
             {{ displayedDocumentCount }} 篇文档 · {{ displayedCandidateCount }} 个片段
           </span>
         </div>
+        <div v-if="traceId" class="flex justify-between gap-3 text-xs">
+          <span class="shrink-0 text-gray-500">Trace ID</span>
+          <code class="min-w-0 break-all text-right text-gray-700 dark:text-gray-300" :title="traceId">{{ traceId }}</code>
+        </div>
       </div>
     </div>
   </aside>
@@ -119,10 +133,14 @@ import { useAuthStore } from '@/stores/auth'
 import DocumentEvidenceGroup from './DocumentEvidenceGroup.vue'
 import { groupEvidenceByDocument } from '@/utils/evidenceDocuments'
 import SearchProcess from './SearchProcess.vue'
+import { normalizeTraceId } from '@/utils/chatRequest'
+import { normalizeEvidenceClarification } from '@/utils/chatClarification'
 
 const searchStore = useSearchStore()
 const authStore = useAuthStore()
 const canPreviewSources = computed(() => authStore.hasPerm('doc:read'))
+const isHistorical = computed(() => searchStore.contextMode === 'history')
+const traceId = computed(() => normalizeTraceId(searchStore.searchMeta.trace_id))
 defineProps({
   inDrawer: { type: Boolean, default: false },
 })
@@ -149,6 +167,13 @@ const retrievalPolicyLabel = computed(() => ({
 })[searchStore.intentDecision?.retrieval_policy] || (searchStore.intentDecision?.need_retrieval ? '需要检索' : '无需检索'))
 
 const evidenceStatus = computed(() => searchStore.searchMeta.evidence_status || '')
+const clarification = computed(() => normalizeEvidenceClarification(
+  searchStore.searchMeta.clarification,
+))
+const clarificationRequiresRefinement = computed(() => Boolean(
+  evidenceStatus.value === 'needs_clarification'
+  && clarification.value?.requires_refinement,
+))
 const documentGroups = computed(() => groupEvidenceByDocument(searchStore.results))
 const resultBatchKey = computed(() => searchStore.searchMeta.trace_id || 'legacy-result')
 const displayedDocumentCount = computed(() => documentGroups.value.length)
@@ -202,7 +227,10 @@ const retrievalState = computed(() => ({
     type: 'warning',
   },
   version_mismatch: { label: '仅相近版本', type: 'warning' },
-  needs_clarification: { label: '等待选择范围', type: 'warning' },
+  needs_clarification: {
+    label: clarificationRequiresRefinement.value ? '等待补充范围' : '等待选择范围',
+    type: 'warning',
+  },
   no_hit: { label: '未命中', type: 'warning' },
   unverified: {
     label: displayedCandidateCount.value ? `${displayedCandidateCount.value} 个待验证片段` : '状态未验证',
@@ -213,7 +241,9 @@ const retrievalState = computed(() => ({
 
 const evidenceNotice = computed(() => {
   if (evidenceStatus.value === 'needs_clarification') {
-    return '已找到多个适用范围的候选资料，请先在对话中选择所需范围；选择前这些片段不能作为回答依据。'
+    return clarificationRequiresRefinement.value
+      ? '已找到多个可能范围，但无法安全列成有限选项。请在输入框补充具体产品、版本、项目或制度名称；补充前这些片段不能作为回答依据。'
+      : '已找到多个适用范围的候选资料，请先在对话中选择所需范围；选择前这些片段不能作为回答依据。'
   }
   if (evidenceStatus.value === 'version_mismatch') {
     return '已找到主题相关资料，但没有符合目标版本的直接依据。相近版本内容仅供参考。'
@@ -271,7 +301,11 @@ const decisionReasonLabel = computed(() => ({
 })[decisionReason.value] || decisionReason.value)
 
 const retrievalExecutionLabel = computed(() => {
-  if (evidenceStatus.value === 'needs_clarification') return '已检索，等待选择适用范围'
+  if (evidenceStatus.value === 'needs_clarification') {
+    return clarificationRequiresRefinement.value
+      ? '已检索，等待补充具体范围'
+      : '已检索，等待选择适用范围'
+  }
   if (searchStore.searchMeta.retrieval_executed === true) return '已执行知识库检索'
   if (searchStore.searchMeta.retrieval_executed === false) return '已按策略跳过检索'
   if (evidenceStatus.value === 'error') return '检索执行失败'
@@ -287,7 +321,9 @@ const emptyResultText = computed(() => {
     skipped: '本次已跳过知识库检索',
     partial: '仅找到部分可用资料',
     version_mismatch: '未找到符合目标版本的回答依据',
-    needs_clarification: '已找到多个适用范围，等待选择',
+    needs_clarification: clarificationRequiresRefinement.value
+      ? '已找到多个可能范围，等待补充'
+      : '已找到多个适用范围，等待选择',
     no_hit: '已完成检索，但没有找到相关内容',
     unverified: '检索状态暂未确认',
     error: '知识库检索失败',
@@ -300,7 +336,9 @@ const emptyResultHint = computed(() => ({
   skipped: '这是后端策略的最终执行结果，并非“检索后无命中”。',
   partial: '可以查看相近资料，但回答时只应采用已标记为“回答依据”的内容。',
   version_mismatch: '相近版本资料不能直接证明目标版本可用，建议补充对应版本文档。',
-  needs_clarification: '请在对话中回复序号、版本或“都对比”；选择前不会生成知识库答案。',
+  needs_clarification: clarificationRequiresRefinement.value
+    ? '请在输入框补充具体产品、版本、项目或制度名称；补充前不会生成知识库答案。'
+    : '请在对话中回复序号、版本或“都对比”；选择前不会生成知识库答案。',
   no_hit: '可以调整问法、检索标签，或确认知识库中已录入相关文档。',
   unverified: '服务端未返回完整证据状态，结果可能来自旧版本接口或请求已中断。',
   error: '请稍后重试；若持续失败，可联系管理员检查检索服务。',
@@ -308,6 +346,18 @@ const emptyResultHint = computed(() => ({
 </script>
 
 <style scoped>
+.search-history-note,
+.search-history-process {
+  margin-top: 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface-muted);
+  padding: 7px 9px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .evidence-notice {
   margin-top: 8px;
   border: 1px solid var(--ui-border);

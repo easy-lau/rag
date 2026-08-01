@@ -83,12 +83,19 @@ def _route(
     )
 
 
-def _compile(route, *, selected_kb_count=1, config=None, **guards):
+def _compile(
+    route,
+    *,
+    selected_kb_count=1,
+    config=None,
+    question="普通员工的出差标准是什么？",
+    **guards,
+):
     return compile_rag_task_contract(
         route,
         CATEGORIES[route.intent_code],
         config or RouteCompilerConfig(),
-        question="普通员工的出差标准是什么？",
+        question=question,
         selected_kb_count=selected_kb_count,
         available_turn_keys=["t1", "t2", "t3"],
         source="llm",
@@ -284,6 +291,41 @@ class RagTaskCompilerPolicyTests(unittest.TestCase):
 
 
 class RagTaskCompilerContractTests(unittest.TestCase):
+    def test_implicit_mapping_gets_local_bridge_when_route_model_omits_it(self) -> None:
+        contract = _compile(_route(requirements=[{
+            "role": "answer",
+            "origin": "user_text",
+            "description": "普通员工的出差标准是什么？",
+        }]))
+
+        self.assertEqual(
+            [item.role for item in contract.requirements],
+            ["answer", "bridge"],
+        )
+        self.assertEqual(contract.requirements[1].source, "inferred")
+        removed_bridge = replace(
+            contract,
+            requirements=(contract.requirements[0],),
+        )
+        self.assertEqual(
+            rag_task_contract_gate_reason(removed_bridge),
+            "implicit_mapping_missing_bridge",
+        )
+
+    def test_original_question_restores_bridge_after_model_summary_drops_qualifier(self) -> None:
+        contract = _compile(_route(requirements=[{
+            "role": "answer",
+            "origin": "user_text",
+            "description": "查询出差标准",
+        }]))
+
+        self.assertEqual(
+            [item.role for item in contract.requirements],
+            ["answer", "bridge"],
+        )
+        self.assertIn("普通员工", contract.requirements[1].description)
+        self.assertNotIn("D级", contract.requirements[1].description)
+
     def test_requirements_receive_stable_ids_and_safe_coverage_semantics(self) -> None:
         route = _route(
             requirements=[
@@ -396,7 +438,8 @@ class RagTaskCompilerContractTests(unittest.TestCase):
                         "description": "高度敏感的业务问题正文",
                     }
                 ]
-            )
+            ),
+            question="请查询当前业务问题",
         )
         summary = safe_rag_task_contract_summary(contract)
         serialized = repr(summary)
@@ -405,6 +448,7 @@ class RagTaskCompilerContractTests(unittest.TestCase):
         self.assertNotIn("question", summary)
         self.assertEqual(summary["requirement_count"], 1)
         self.assertEqual(summary["required_requirement_count"], 1)
+        self.assertEqual(summary["bridge_requirement_count"], 0)
         self.assertEqual(contract.safe_summary(), summary)
 
     def test_category_and_source_mismatch_fail_before_contract_creation(self) -> None:

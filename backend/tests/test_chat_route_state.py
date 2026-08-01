@@ -13,6 +13,7 @@ from api.chat import (
     _parse_sse_payload,
     _parse_evidence_scope_reply,
     _route_clarification_response,
+    _refined_evidence_query,
     _scope_anchor_coverage_from_sources,
     _validate_stream_answer_sources,
     _scoped_evidence_query,
@@ -959,6 +960,95 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("error", [item["type"] for item in payloads if item])
 
+    async def test_local_query_plan_clarification_stops_v2_before_retrieval(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        question = "该值取决于前一项"
+        conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+        )
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+        )
+        db = _RouteStateDB(conv)
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch("api.chat.run_rag_v2_stream", new=AsyncMock()) as rag_v2,
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=db,
+                user=user,
+            )
+            payloads = [
+                _parse_sse_payload(
+                    chunk.decode() if isinstance(chunk, bytes) else chunk
+                )
+                async for chunk in response.body_iterator
+            ]
+
+        rag_v2.assert_not_awaited()
+        self.assertEqual(
+            conv.pending_route_state["schema_version"],
+            "rag_pending_clarification.v1",
+        )
+        self.assertEqual(
+            conv.pending_route_state["unresolved"][0]["role"],
+            "query_plan",
+        )
+        intent = next(
+            item["decision"] for item in payloads if item and item["type"] == "intent"
+        )
+        self.assertEqual(intent["readiness"], "needs_clarification")
+        self.assertFalse(intent["dispatch_authorized"])
+        answer = "".join(
+            str(item.get("content") or "")
+            for item in payloads
+            if item and item["type"] == "text_delta"
+        )
+        self.assertIn("对应关系", answer)
+        self.assertIn("标准或数值", answer)
+        trace_events = [call.args[0] for call in trace.call_args_list if call.args]
+        self.assertNotIn("retrieval.plan", trace_events)
+        self.assertIn("query.plan", trace_events)
+
+    def test_broad_refinement_remains_one_query_plan(self) -> None:
+        refined = _refined_evidence_query("员工标准是什么", "2025版")
+
+        self.assertNotIn("\n", refined)
+        self.assertNotIn("；", refined)
+        self.assertIn("员工标准是什么", refined)
+        self.assertIn("用户补充的适用范围：2025版", refined)
+
     async def test_pipeline_evidence_clarification_creates_v2_pending_state(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -990,19 +1080,13 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             history_messages=(),
             carryover_sources=(),
         )
-        decision = SimpleNamespace(
-            need_retrieval=True,
-            decision_reason="classified_retrieval",
-            to_dict=lambda: {
-                "intent_code": "knowledge_qa",
-                "need_retrieval": True,
-                "decision_reason": "classified_retrieval",
-            },
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
         )
-        routing_result = SimpleNamespace(
-            decision=decision,
-            route_log_id=route_log_id,
-        )
+        routing_result.route_log_id = route_log_id
         contradictory_source = {
             "id": str(uuid.uuid4()),
             "doc_id": pending_template["choices"][1]["doc_ids"][0],
@@ -1083,7 +1167,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=clarification_stream),
+            patch("api.chat.run_rag_v2_stream", new=clarification_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -1189,16 +1273,12 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             history_messages=(),
             carryover_sources=(),
         )
-        decision = SimpleNamespace(
-            need_retrieval=True,
-            decision_reason="classified_retrieval",
-            to_dict=lambda: {
-                "intent_code": "knowledge_qa",
-                "need_retrieval": True,
-                "decision_reason": "classified_retrieval",
-            },
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
         )
-        routing_result = SimpleNamespace(decision=decision, route_log_id=None)
 
         async def clarification_stream(**_kwargs):
             yield "data: " + json.dumps(
@@ -1226,7 +1306,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=clarification_stream),
+            patch("api.chat.run_rag_v2_stream", new=clarification_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -2400,16 +2480,12 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             carryover_sources=(),
             pending_route_state=None,
         )
-        decision = SimpleNamespace(
-            need_retrieval=False,
-            decision_reason="general_chat",
-            to_dict=lambda: {
-                "intent_code": "general_chat",
-                "need_retrieval": False,
-                "decision_reason": "general_chat",
-            },
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="general_chat",
+            action="chat",
+            evidence_scope="general_world",
+            selected_kb_count=1,
         )
-        routing_result = SimpleNamespace(decision=decision, route_log_id=None)
         prepare = AsyncMock(return_value=context)
         classify = AsyncMock(return_value=routing_result)
 

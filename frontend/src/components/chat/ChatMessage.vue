@@ -23,11 +23,19 @@
           v-html="rendered"
           @click="handleMarkdownClick"
         />
-        <div v-else-if="message.stopped" class="flex items-center gap-2 text-gray-400 text-sm">
+        <div v-else-if="emptyPresentation.kind === 'stopped'" class="flex items-center gap-2 text-gray-400 text-sm">
           <n-icon><StopCircleOutline /></n-icon><span>已停止生成</span>
         </div>
-        <div v-else class="flex items-center gap-2 text-gray-400 text-sm">
-          <n-spin size="small" /><span>思考中...</span>
+        <div v-else-if="emptyPresentation.kind === 'thinking'" class="flex items-center gap-2 text-gray-400 text-sm" role="status" aria-live="polite">
+          <n-spin size="small" /><span>{{ emptyPresentation.text }}</span>
+        </div>
+        <div
+          v-else-if="emptyPresentation.kind !== 'hidden'"
+          class="flex items-center gap-2 text-gray-400 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <span>{{ emptyPresentation.text }}</span>
         </div>
 
         <section
@@ -193,7 +201,37 @@
           </n-button>
           <n-button text size="tiny" :disabled="chatStore.isStreaming" @click="$emit('retry', message)">
             <template #icon><n-icon><RefreshOutline /></n-icon></template>
-            重新生成
+            {{ retryActionLabel }}
+          </n-button>
+          <n-button
+            v-if="canInspectSearch"
+            text
+            size="tiny"
+            aria-label="查看本条回答的检索摘要"
+            @click="$emit('inspect', message)"
+          >
+            <template #icon><n-icon><DocumentTextOutline /></n-icon></template>
+            检索摘要
+          </n-button>
+        </div>
+
+        <div
+          v-if="showTraceDiagnostic"
+          class="message-trace"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="message-trace__label">错误追踪 ID</span>
+          <code :title="traceId">{{ traceId }}</code>
+          <n-button
+            text
+            size="tiny"
+            class="message-trace__copy"
+            aria-label="复制错误追踪 ID"
+            @click="copyTraceId"
+          >
+            <template #icon><n-icon><CopyOutline /></n-icon></template>
+            复制
           </n-button>
         </div>
       </div>
@@ -224,9 +262,12 @@ import DocumentEvidenceGroup from '@/components/search/DocumentEvidenceGroup.vue
 import { persistedAnswerSources } from '@/utils/chatEvidence'
 import { groupEvidenceByDocument, safeExternalSourceUrl } from '@/utils/evidenceDocuments'
 import { isClarificationSubmittable, normalizeEvidenceClarification } from '@/utils/chatClarification'
+import { hasSearchSnapshot } from '@/utils/chatHistory'
+import { normalizeTraceId } from '@/utils/chatRequest'
+import { emptyAssistantPresentation } from '@/utils/chatTurnState'
 
 const props = defineProps({ message: Object })
-const emit = defineEmits(['retry', 'preview', 'clarify'])
+const emit = defineEmits(['retry', 'preview', 'clarify', 'inspect'])
 
 const msg = useMessage()
 const { copy: copyText } = useClipboard()
@@ -236,6 +277,10 @@ const authStore = useAuthStore()
 const evidenceExpanded = ref(false)
 
 const isUser = computed(() => props.message.role === 'user')
+const emptyPresentation = computed(() => emptyAssistantPresentation(props.message, {
+  isStreaming: chatStore.isStreaming,
+  activeRequestId: chatStore.activeRequestId,
+}))
 const clarification = computed(() => (
   isUser.value ? null : normalizeEvidenceClarification(props.message.clarification)
 ))
@@ -248,6 +293,7 @@ const clarificationStatusId = computed(() => {
 })
 const clarificationEyebrow = computed(() => {
   if (clarification.value?.submitted) return '已确认'
+  if (clarification.value?.retryable) return '可以重试'
   if (clarification.value?.invalidated) return '选择已失效'
   if (!clarification.value?.acknowledged) return '正在保存'
   return '需要你确认'
@@ -255,6 +301,9 @@ const clarificationEyebrow = computed(() => {
 const clarificationStatusText = computed(() => {
   const value = clarification.value
   if (!value || value.submitted) return ''
+  if (value.retryable) {
+    return '上次选择未完成，系统已确认原澄清状态仍有效。你可以再次选择，重复点击不会创建新的逻辑请求。'
+  }
   if (value.invalidated) {
     if (value.invalid_reason === 'stream_aborted') {
       return '生成已停止，本次范围选择没有生效。请重新提问。'
@@ -277,6 +326,43 @@ const clarificationSubmittedText = computed(() => {
   return selected
     ? `已提交第 ${selected.index} 项：${selected.label}`
     : '已提交补充范围，查询结果会显示在下方。'
+})
+const canInspectSearch = computed(() => (
+  !isUser.value && hasSearchSnapshot(props.message)
+))
+const traceId = computed(() => normalizeTraceId(
+  props.message.trace_id
+    || props.message.traceId
+    || props.message.search_meta?.trace_id
+    || props.message.search_snapshot?.trace_id,
+))
+const showTraceDiagnostic = computed(() => Boolean(
+  traceId.value
+  && (
+    (Array.isArray(props.message.stream_errors) && props.message.stream_errors.length)
+    || ['failed', 'incomplete', 'stopped'].includes(props.message.delivery_status)
+    || props.message.persistence_status === 'failed'
+  ),
+))
+const retryActionLabel = computed(() => {
+  if (props.message.failure_reason === 'turn_in_progress') return '获取结果'
+  if (
+    props.message.retry_with_new_request_id === true
+    || props.message.failure_reason === 'persistence_unrecoverable'
+    || (
+      ['failed', 'cancelled'].includes(props.message.turn_status)
+      && props.message.error_code
+      && props.message.same_request_recoverable !== true
+    )
+  ) return '重新发送'
+  if (
+    props.message.failure_reason === 'persistence_failed'
+    || (
+      props.message.persistence_status === 'failed'
+      && props.message.turn_status === 'persist_failed'
+    )
+  ) return '恢复回答'
+  return '重新生成'
 })
 // 系统设置「显示参考来源」总开关：关闭则隐藏所有来源行（默认显示）
 const showSources = computed(() => settingsStore.data.show_sources !== false)
@@ -448,6 +534,13 @@ function selectClarification(reply) {
 function copy() {
   copyText(props.message.content)
   msg.success('已复制')
+}
+
+function copyTraceId() {
+  if (!traceId.value) return
+  Promise.resolve(copyText(traceId.value))
+    .then(() => msg.success('Trace ID 已复制'))
+    .catch(() => msg.error('复制失败，请手动选择 Trace ID'))
 }
 
 // 浏览器从块级气泡复制文本时可能把元素边界转换成首尾换行。
@@ -788,6 +881,42 @@ function formatTime(t) {
   outline-offset: 2px;
 }
 
+.message-trace {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  border: 1px solid color-mix(in srgb, var(--ui-danger) 28%, var(--ui-border));
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-danger-subtle);
+  padding: 7px 9px;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.message-trace__label {
+  flex: 0 0 auto;
+  color: var(--ui-danger);
+  font-weight: 650;
+}
+
+.message-trace code {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--ui-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-trace__copy {
+  flex: 0 0 auto;
+}
+
 @media (max-width: 639px) {
   .message-clarification__choice {
     min-height: 40px;
@@ -815,6 +944,15 @@ function formatTime(t) {
 
   .message-evidence__results {
     max-height: none;
+  }
+
+  .message-trace {
+    min-height: 40px;
+    flex-wrap: wrap;
+  }
+
+  .message-trace code {
+    flex-basis: calc(100% - 92px);
   }
 }
 

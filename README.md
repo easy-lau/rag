@@ -1,6 +1,6 @@
 # RAG 检索系统
 
-企业知识库问答系统：文档（PDF / Word / PPT / Excel / Markdown / 图片）入库 → 向量与关键词混合检索 → 重排 → LLM 基于知识库作答。包含用户、角色、细粒度权限、智能路由、登录日志、操作审计和站点设置。
+企业知识库问答系统：文档（PDF / Word / PPT / Excel / Markdown / 图片）入库 → 向量与关键词混合检索 → 确定性证据装配 → LLM 基于知识库作答。包含用户、角色、细粒度权限、智能路由、可恢复会话、登录日志、操作审计和站点设置。
 
 ## 技术栈
 
@@ -126,7 +126,7 @@ docker compose logs --tail=100 postgres migrate app
 
 - `postgres`、`app` 为 `running/healthy`
 - `migrate` 为 `Exited (0)`，这是一次性迁移成功后的正常状态
-- Alembic 显示 `0020 (head)` 或仓库后续更新后的最新 head
+- Alembic 显示 `0030 (head)` 或仓库后续更新后的最新 head
 
 默认访问地址为 `http://服务器IP:8001`。初始用户名为 `admin`，密码是首次迁移前填写的 `ADMIN_INIT_PASSWORD`；数据库初始化后再修改该环境变量不会修改现有管理员密码。首次登录后，请进入“管理后台 → 模型管理”配置 Chat、Embedding 和 Vision（可选）模型；检索策略与站点品牌信息仍在“系统设置”中维护。
 

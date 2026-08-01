@@ -44,6 +44,7 @@
             :message="msg"
             @retry="handleRetry"
             @clarify="handleClarification"
+            @inspect="inspectMessageSearch"
             @preview="openSourcePreview"
           />
         </div>
@@ -160,6 +161,7 @@ import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
 import { getDocument } from '@/api/document'
 import { renderDocMarkdown } from '@/utils/markdown'
+import { recoverableRetryRequestId } from '@/utils/chatRequest'
 import {
   evidenceFragmentContent,
   evidenceFragmentLabel,
@@ -507,7 +509,11 @@ function handleRetry(answerMessage) {
     return
   }
   autoFollowLatest.value = true
-  chatStore.sendMessage(targetUser.content)
+  chatStore.sendMessage(targetUser.content, {
+    // Transport/save recovery reuses the logical request.  A completed answer's
+    // “重新生成” action intentionally gets a fresh id and a fresh model run.
+    requestId: recoverableRetryRequestId(answerMessage, targetUser) || null,
+  })
 }
 
 function handleClarification({ message, reply } = {}) {
@@ -516,6 +522,16 @@ function handleClarification({ message, reply } = {}) {
   if (!chatStore.submitClarification(message, reply)) {
     msg.warning('该范围选择已失效，请在输入框重新说明需要查询的范围')
   }
+}
+
+function inspectMessageSearch(message) {
+  if (!chatStore.restoreMessageSearch(message)) {
+    msg.info('这条回答没有可恢复的检索快照')
+    return
+  }
+  // The existing header toggle remains the single entry point; selecting a
+  // historical answer simply loads its snapshot and opens that same panel.
+  ui.chatSearchOpen = true
 }
 
 function setWelcomeQuestion(question) {

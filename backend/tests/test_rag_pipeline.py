@@ -96,6 +96,7 @@ def _task_contract(
     selected_kb_count: int = 1,
     requirements: list[dict] | None = None,
     source: str = "llm",
+    question: str = "回答用户当前问题",
 ):
     route = parse_rag_route_decision(
         {
@@ -130,7 +131,7 @@ def _task_contract(
             action=action,
         ),
         RouteCompilerConfig(),
-        question="普通员工的出差标准是什么？",
+        question=question,
         selected_kb_count=selected_kb_count,
         source=source,
     )
@@ -2827,6 +2828,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         answer_requirement_id = contract.requirements[0].id
+        bridge_requirement_id = contract.requirements[1].id
         rerank_mock = AsyncMock(
             side_effect=AssertionError("小文档快速路径不得调用首轮模型重排")
         )
@@ -2837,9 +2839,12 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         async def select_once(_query, candidates, requirements, **kwargs):
             self.assertEqual(
                 [item.id for item in requirements],
-                [answer_requirement_id],
+                [answer_requirement_id, bridge_requirement_id],
             )
-            self.assertEqual(kwargs["bridge_requirement_ids"], ())
+            self.assertEqual(
+                kwargs["bridge_requirement_ids"],
+                (bridge_requirement_id,),
+            )
             self.assertEqual(kwargs["eligible_candidate_indexes"], tuple(range(1, 16)))
             self.assertEqual(kwargs["anchor_candidate_indexes"], (1, 2, 3))
             selected_indexes = (3, 4, 5, 6, 7, 8, 9, 10)
@@ -2859,7 +2864,11 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
                         "bridge" if candidate_index == 3 else "complement"
                     ),
                     "supports_requirement_ids": [
-                        answer_requirement_id
+                        (
+                            bridge_requirement_id
+                            if candidate_index == 3
+                            else answer_requirement_id
+                        )
                     ],
                     "bridge_facts": (
                         [{
@@ -2880,7 +2889,10 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
                 succeeded=True,
                 requirements=tuple(requirements),
                 coverage_status="complete",
-                covered_requirement_ids=(answer_requirement_id,),
+                covered_requirement_ids=(
+                    answer_requirement_id,
+                    bridge_requirement_id,
+                ),
                 selected_evidence_set_id="small_document_set",
                 selected_candidate_indexes=selected_indexes,
                 joint_support_score=0.9,

@@ -33,13 +33,17 @@
 | `conversation.reference_unresolved` | 追问缺少可消解对象，直接要求用户补充信息且不盲目检索 |
 | `intent.model_result` / `intent.model_error` | 意图模型原始分类是否被接受、精确拒绝原因、模型与 Prompt 版本；空响应同时记录 `finish_reason`、choice 数、推理内容长度和 token 用量，但不记录模型推理正文 |
 | `intent.routing_decision` | 规则、模型和安全策略合并后的最终响应模式与检索策略 |
+| `chat.pipeline_selected` | 本轮唯一执行器：显式回滚 `v1`、知识检索 `v2` 或无检索 `direct`；V2 合同异常不会静默回退 V1 |
+| `chat.turn_reclaimed` | 同一 `request_id` 的 `accepted/generating` 执行租约已过期，由当前请求安全接管并重新执行 |
+| `direct.plan` | 已验证的通用交流、平台帮助或内联写作直答计划；该链路明确不执行检索 |
+| `query.plan` | V2 本地查询形状、检索子问题、answer/bridge requirement 与是否需要澄清 |
 | `retrieval.plan` | 是否检索、检索策略、候选数、Top K 和查询硬约束 |
 | `retrieval.candidate` | 每个召回片段的向量、关键词、三元组、RRF 排名和分数 |
 | `retrieval.completed` | 召回是否成功、候选数、激活通道与耗时 |
 | `retrieval.channel_error` / `retrieval.error` | 单通道或整体召回失败，以及是否由其它通道或上一轮合法证据恢复 |
 | `rerank.candidate` | 主题相关度、可回答性、产品/版本约束、证据角色和模型理由 |
 | `rerank.completed` | 重排是否尝试、成功、降级原因、候选数和耗时 |
-| `evidence.ambiguity_assessed` / `evidence.clarification_required` | 根据重排后的真实相关文档判断是否存在互斥产品、版本或项目范围；要求澄清时禁止生成 |
+| `evidence.ambiguity_assessed` / `evidence.clarification_required` | 根据通过准入的真实相关文档判断是否存在互斥产品、版本或项目范围；要求澄清时禁止生成 |
 | `evidence.clarification_created` / `evidence.clarification_repeated` / `evidence.clarification_resolved` | 证据范围选项的保存、无效短回复重复和最终选择；pending state 只保存候选，不授予执行权限 |
 | `evidence.scope_filter_applied` | 用户选择后应用的知识库、文档和选项数量；`global_fallback_allowed=false` 表示禁止退回全库检索 |
 | `evidence.selection` | 直接证据、相近资料、淘汰数量及最终证据状态 |
@@ -64,17 +68,25 @@
 - `context_evidence_count`：实际注入生成模型的片段数，正常情况下等于 `answer_source_count`；单独保留该指标便于检查生成上下文是否与持久化来源一致。
 - `hit_count` / `direct_evidence_count`：通过直接证据门控的数量。Trace schema `v2` 中两者语义一致；历史 `v1.hit_count` 曾表示前端候选数，只能按旧口径解释。
 
-## 当前检索与排序链路
+## 当前 V2 检索与证据链路
 
-1. 扩大候选池，并行使用向量、PostgreSQL FTS 和 `pg_trgm` 词面通道召回。
-2. 2560 维向量先使用 `halfvec(2560)` HNSW 近邻索引召回，再在小候选池中用原始 `vector(2560)` 距离精排。
-3. 三个通道用 RRF 按片段名次融合，原始余弦相似度、FTS 分数和三元组分数不直接相加。每篇文档最多保留 3 个高排名片段进入重排，避免“问题描述：无”等占位片段挤掉同文档的真正解决方案。
-4. 重排同时评估 `topic_relevance` 和 `answer_support`；只有两者都达到 `0.3` 的 `direct` 候选才能进入确定回答。`answer_support < 0.1` 的零支撑/极低支撑占位片段连相近资料也不展示；`0.1 <= answer_support < 0.3` 的候选最多作为相近资料展示，不进入生成上下文。
-5. 产品/版本使用代码级硬约束复核；重排模型的高分不能覆盖明确的版本冲突。兼容声明必须同时绑定产品和版本。
-6. `required` 检索可在明确风险提示下使用有支撑的 `related` 资料；`optional` 检索只允许 `direct` 证据进入生成上下文，`related` 只用于前端展示，避免一次相近误召回劫持普通问答。
-7. 生成模型只获得已召回并评估的片段，不再自动将同文档其他未重排章节扩展进上下文。
+1. 后端先编译并校验 `rag_task_contract.v1`。知识问答和“依据知识库写作”进入 V2；问候、平台帮助和已附原文写作进入独立 `direct` runner。只有部署显式配置 `RAG_PIPELINE_VERSION=v1` 才使用旧主链，V2 合同缺失、漂移或越权一律拒绝执行。
+2. V2 本地规划器只按问题结构拆分 `fact / process / list / comparison / multi_part / multi_hop`。诸如“普通员工的餐补”会生成最终 answer requirement 和身份到等级的 bridge requirement，不在代码中猜测 D 级、金额或其它业务值。
+3. 向量、PostgreSQL FTS 和 `pg_trgm` 并行召回，使用 RRF 做稳定排序。文档准入只接受真实词面得分或达到绝对门槛且接近本轮最佳值的原始向量分；RRF 名次本身不能冒充相关性。
+4. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
+5. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
+6. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
+7. V2 不调用旧的生成式 reranker；`rerank.completed` 会明确记录 `attempted=false`。最终回答模型最多调用一次，并且只看到预算内的已授权 evidence bundle。`error / no_hit / version_mismatch` 等无上下文终态由本地固定文案直接返回，避免再花时间让模型改写失败信息。
 
-分数相同时不依赖数据库的未定义顺序。重排按“证据角色 → 约束状态 → 回答支持度 → 主题相关度 → 原始召回分 → 文件名 / 文档 ID / 片段序号 / 片段 ID”稳定排序；因此相同输入和相同候选集会得到可复现的顺序。
+旧 V1 仍保留作为显式紧急回滚路径，其 `rerank.candidate`、`topic_relevance` 和 `answer_support` 字段仅用于 V1 Trace；不能与 V2 的确定性证据口径混算。
+
+## 回答交付与恢复
+
+1. 浏览器为每个逻辑请求生成 `request_id`；服务端同时用 `user_id + request_id` 和 `conversation_id + request_id` 保证幂等。新会话即使尚无 `conversation_id`，网络重试也会定位到原会话。
+2. `ChatTurn` 按 `accepted → generating → generated → completed` 推进。生成正文先写入恢复账本，再写 assistant 消息；保存失败停在 `generated/persist_failed`，相同 request 重试只补保存，不重新检索或调用模型。`accepted/generating` 使用有界执行租约，进程异常退出后可由同一请求接管，正常运行中的任务不会被重复执行。
+3. 路由失败、流异常和用户取消分别落入明确终态；保存最多有限重试三次。回答提交与 pending 澄清状态使用分离事务，后者 CAS 冲突不会回滚已经保存的回答，也不会发送虚假的澄清 ACK。
+4. 回答历史保存最终 `search_snapshot`，候选最多 20 条且不保存正文。重新打开历史或重放幂等请求时，服务端按当前 RBAC、文档 active/ready 状态重新加载正文；撤权后保留用户自己的回答文本和计数，但不再披露旧来源。
+5. 前端绑定响应头中的 Trace/Turn/Request ID。`error` 后即使收到尾随 `done` 也保持失败状态；保存/传输不确定时复用原 request 恢复，已完成回答的“重新生成”会创建新的逻辑 request。
 
 ## 路由判定矩阵
 
@@ -98,9 +110,9 @@
 
 1. 每轮最多读取最近 6 条消息，并把历史正文限制在 6000 字符内，避免会话无限增长挤占模型上下文。
 2. 只有“这些配置”“上述内容”“那 8.6 呢”或“云枢中如何配置”这类动作完整但宾语省略的问题才继承上一轮；“换个问题”等显式新话题，以及“云枢中如何配置默认密码”这类已经包含对象的完整问题不会继承。
-3. 当前问题中明确出现的产品和版本优先于历史约束。系统生成独立检索问题，并统一交给意图路由、约束提取、召回和重排。
+3. 当前问题中明确出现的产品和版本优先于历史约束。系统生成独立检索问题，并统一交给意图路由、约束提取、召回和当前执行器的证据判定。
 4. 上一轮来源不能直接作为本轮事实：系统会按当前用户选择的知识库范围，重新检查文档是否启用且处理完成，再加载真实片段。
-5. 上一轮片段与本轮新召回按 chunk 去重，并针对本轮问题重新重排；旧的召回分和回答支持分不会沿用。
+5. 上一轮片段与本轮新召回按 chunk 去重，并针对本轮问题重新检索和判定；旧的召回分和回答支持分不会沿用。
 6. 新会话直接询问“这些配置有什么影响”时，系统返回确定性澄清提示，不调用意图模型、检索器或生成模型。
 7. 若系统刚要求补充“配置什么”，用户下一轮只回答“登录用户名枚举”等短对象，系统会填回上一轮缺失槽位并生成“云枢中如何配置登录用户名枚举”，不会再次丢失上下文；完整的新问题不会被该规则吞并。
 8. 历史 assistant 回答只帮助模型理解指代，不是事实证据。只有本轮通过证据门控的知识片段可以支撑确定回答；`answer_support < 0.1` 的资料会直接淘汰，达到相近资料最低门槛但未达到直接证据门槛的片段也不能冒充确定回答依据。
@@ -129,7 +141,7 @@
 docker compose logs app | rg 'rag.trace' | rg '你的-trace-id'
 ```
 
-后台下载的 JSON 可以直接交给 AI 分析。`diagnostic_index.snapshot` 汇总了上下文、主/备用分类、最终路由、召回、重排、证据和生成结论，并记录 RRF、三元组门槛、候选池、重排模型与阈值、Prompt 版本、生成参数和 system prompt 指纹，便于跨版本复现；`ai_analysis_guide` 提供建议分析提示及不可信数据边界；`diagnostic_index.recommended_checks` 给出检查顺序。`diagnostic_index.integrity` 只检查已入库行与导出选择：队列在写库前丢弃的事件尚未分配 sequence，因此连续编号不能证明原始链路零丢失。`data_policy.content_included=false` 表示生产环境未保存正文，AI 只能基于哈希、指标和对象 ID 判断链路，不能从导出接口恢复原文。
+后台下载的 JSON 可以直接交给 AI 分析。`diagnostic_index.snapshot` 汇总了上下文、主/备用分类、执行器选择、V2 查询规划或 direct 计划、召回、证据和生成结论；V1 调用链还会保留重排模型与阈值，V2 则明确记录未执行模型重排。快照同时保留 RRF、三元组门槛、候选池、Prompt 版本、生成参数和 system prompt 指纹，便于跨版本复现；`ai_analysis_guide` 提供按 `v1 / v2 / direct` 分支分析的提示及不可信数据边界；`diagnostic_index.recommended_checks` 给出检查顺序。`diagnostic_index.integrity` 只检查已入库行与导出选择：队列在写库前丢弃的事件尚未分配 sequence，因此连续编号不能证明原始链路零丢失。`data_policy.content_included=false` 表示生产环境未保存正文，AI 只能基于哈希、指标和对象 ID 判断链路，不能从导出接口恢复原文。
 
 导出 JSONL（日志前缀在第一个 `{` 前被移除）：
 

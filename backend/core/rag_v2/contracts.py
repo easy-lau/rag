@@ -227,6 +227,15 @@ class QueryPlanV2:
         if len(set(requirement_ids)) != len(requirement_ids):
             raise ValueError("query plan contains duplicate requirement ids")
 
+        # A multi-hop plan is a claim about a relationship, not merely a
+        # differently named fact lookup.  Without an explicit bridge target
+        # the evidence layer cannot prove the intermediate mapping and must
+        # not be allowed to mark the answer complete.
+        if self.answer_shape == "multi_hop" and not any(
+            item.role == "bridge" for item in requirements
+        ):
+            raise ValueError("multi_hop query plans require a bridge requirement")
+
         reason = re.sub(r"\s+", " ", str(self.reason or "")).strip()
         if len(reason) > _MAX_REASON_CHARS:
             raise ValueError(f"plan reason exceeds {_MAX_REASON_CHARS} characters")
@@ -465,6 +474,25 @@ class EvidenceBundle:
             raise ValueError("context item ids must reference bundle items")
         if any(value not in set(context_ids) for value in source_ids):
             raise ValueError("answer source ids must reference context items")
+        # Positive evidence is a two-part contract: its role says how the
+        # chunk contributes, while the requirement ids say what it supports.
+        # Allowing either half alone is how unrelated context leaks into
+        # citations after a reranker/route failure.
+        for item in items:
+            if item.role in {"direct", "bridge", "complement"} and not item.supports_requirement_ids:
+                raise ValueError(
+                    "positive evidence roles require supports_requirement_ids"
+                )
+        for chunk_id in source_ids:
+            source = item_by_id[chunk_id]
+            if source.role not in {"direct", "bridge", "complement"}:
+                raise ValueError(
+                    "answer sources must have a positive evidence role"
+                )
+            if not source.supports_requirement_ids:
+                raise ValueError(
+                    "answer sources require supports_requirement_ids"
+                )
         for chunk_id in context_ids:
             if item_by_id[chunk_id].constraint_status == "mismatch":
                 raise ValueError("constraint-mismatched evidence cannot enter context")

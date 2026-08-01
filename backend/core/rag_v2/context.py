@@ -8,7 +8,7 @@ therefore never leak into the generation prompt.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from core.rag_v2.contracts import EvidenceBundle, EvidenceItem
 
@@ -42,7 +42,18 @@ def _validate_budget(max_chunks: int, max_chars: int) -> None:
 
 def _ordered_context_items(bundle: EvidenceBundle) -> tuple[EvidenceItem, ...]:
     allowed_ids = set(bundle.context_item_ids)
-    selected = [item for item in bundle.items if item.chunk_id in allowed_ids]
+    # The generation prompt and the public ``answer_sources`` list must have
+    # the same trust boundary.  Background/conflicting candidates remain in
+    # the search result diagnostics, but exposing their text to the model
+    # would let an unquoted source influence the answer.  A positive role also
+    # needs an explicit requirement mapping; provenance alone is not support.
+    selected = [
+        item
+        for item in bundle.items
+        if item.chunk_id in allowed_ids
+        and item.role in {"direct", "bridge", "complement"}
+        and item.supports_requirement_ids
+    ]
     first_document_position: dict[tuple[str, str], int] = {}
     for position, item in enumerate(selected):
         first_document_position.setdefault((item.kb_id, item.doc_id), position)
@@ -104,31 +115,21 @@ def build_evidence_context(
         header = _block_header(item)
         remaining = max_chars - sum(len(part) for part in parts) - len(separator)
         if remaining <= len(header):
+            truncated_ids.append(item.chunk_id)
             truncated = True
-            break
+            continue
         available_content_chars = remaining - len(header)
         content = item.content
         if len(content) > available_content_chars:
-            # The requirement annotation describes the complete chunk.  Once
-            # the renderer can expose only a prefix, the prompt must not retain
-            # a positive role/support claim that may refer to omitted text.
-            safe_item = replace(
-                item,
-                role="background",
-                supports_requirement_ids=(),
-            )
-            header = _block_header(safe_item)
-            available_content_chars = remaining - len(header)
-            if available_content_chars <= 0:
-                truncated = True
-                break
-            content = content[:available_content_chars]
+            # A prefix is not guaranteed to contain the clause that justified
+            # the requirement mapping.  Do not downgrade and still expose the
+            # prefix as hidden background context: omit the entire item so
+            # every model-visible fact remains represented in answer_sources.
             truncated_ids.append(item.chunk_id)
             truncated = True
+            continue
         parts.append(f"{separator}{header}{content}")
         used_ids.append(item.chunk_id)
-        if len(content) < len(item.content):
-            break
 
     used_set = set(used_ids)
     dropped_ids = tuple(

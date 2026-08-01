@@ -25,6 +25,28 @@ def _candidate(
 
 
 class EvidenceBundleAssemblyTests(unittest.TestCase):
+    def test_normal_v2_shape_requires_typed_requirements(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-empty requirements"):
+            assemble_evidence_bundle(
+                query="查询标准",
+                answer_shape="fact",
+                candidates=[_candidate("seed")],
+            )
+
+    def test_multi_hop_shape_requires_bridge_requirement(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bridge requirement"):
+            assemble_evidence_bundle(
+                query="对象对应的额度是多少",
+                answer_shape="multi_hop",
+                candidates=[_candidate("seed")],
+                requirements=(
+                    AnswerRequirementV2(
+                        id="r1",
+                        description="对象对应的额度是多少",
+                    ),
+                ),
+            )
+
     def test_single_requirement_uses_current_retrieval_seed_as_complement(self) -> None:
         requirement = AnswerRequirementV2(id="r1", description="某项标准")
         bundle = assemble_evidence_bundle(
@@ -69,7 +91,7 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             for item in bundle.answer_sources
         ))
 
-    def test_query_indexes_map_each_chunk_to_the_aligned_requirement(self) -> None:
+    def test_query_indexes_preserve_visible_per_requirement_mapping(self) -> None:
         requirements = (
             AnswerRequirementV2(id="r1", description="交通要求"),
             AnswerRequirementV2(id="r2", description="住宿要求"),
@@ -79,13 +101,13 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             candidates=[
                 _candidate(
                     "lodging",
-                    content="第二个召回片段",
+                    content="住宿要求：每天不超过450元。",
                     expansion_query_indexes=[1],
                 ),
                 _candidate(
                     "transport",
                     chunk_index=1,
-                    content="第一个召回片段",
+                    content="交通要求：乘坐高铁二等座。",
                     expansion_query_indexes=[0],
                 ),
             ],
@@ -97,9 +119,276 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         by_id = {item.chunk_id: item for item in bundle.items}
         self.assertEqual(by_id["transport"].supports_requirement_ids, ("r1",))
         self.assertEqual(by_id["lodging"].supports_requirement_ids, ("r2",))
-        self.assertEqual(by_id["transport"].role, "complement")
+        self.assertEqual(by_id["transport"].role, "direct")
         self.assertEqual(bundle.missing_requirement_ids, ())
         self.assertEqual(set(bundle.answer_source_ids), {"transport", "lodging"})
+        self.assertEqual(bundle.state.completeness, "complete")
+
+    def test_merged_query_indexes_cannot_manufacture_missing_answer(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="普通员工出差的住宿标准是多少",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="普通员工出差的交通标准是多少",
+            ),
+            AnswerRequirementV2(
+                id="r3",
+                description="普通员工出差的餐补标准是多少",
+            ),
+            AnswerRequirementV2(
+                id="r4",
+                description=(
+                    "确认普通员工对应的适用分类、等级、类别或阶段"
+                    "（用于确定住宿标准）"
+                ),
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        all_query_indexes = [0, 1, 2, 3]
+        bundle = assemble_evidence_bundle(
+            query="普通员工出差的住宿、交通和餐补标准分别是多少？",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "lodging",
+                    content="D级住宿标准：一线城市不超过450元/天。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+                _candidate(
+                    "transport",
+                    chunk_index=1,
+                    content="D级交通标准：飞机经济舱、高铁二等座。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+                _candidate(
+                    "classification",
+                    chunk_index=2,
+                    content="职级分类：普通员工对应D级。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=tuple(
+                requirement.description for requirement in requirements
+            ),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["lodging"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["transport"].supports_requirement_ids, ("r2",))
+        self.assertEqual(
+            by_id["classification"].supports_requirement_ids,
+            ("r4",),
+        )
+        self.assertEqual(bundle.missing_requirement_ids, ("r3",))
+        self.assertEqual(bundle.state.completeness, "partial")
+
+    def test_common_subject_terms_cannot_cover_coordinated_answers(self) -> None:
+        requirements = (
+            AnswerRequirementV2(id="r1", description="普通员工住宿标准"),
+            AnswerRequirementV2(id="r2", description="普通员工交通标准"),
+            AnswerRequirementV2(id="r3", description="普通员工餐补标准"),
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通员工住宿、交通和餐补标准分别是多少？",
+            answer_shape="multi_part",
+            candidates=[
+                _candidate(
+                    "common-subject",
+                    content="普通员工制度适用于公司全体员工。",
+                    expansion_query_indexes=[0, 1, 2],
+                )
+            ],
+            requirements=requirements,
+            retrieval_queries=tuple(
+                requirement.description for requirement in requirements
+            ),
+            completeness="complete",
+        )
+
+        self.assertEqual(bundle.items[0].supports_requirement_ids, ())
+        self.assertEqual(bundle.answer_source_ids, ())
+        self.assertEqual(bundle.missing_requirement_ids, ("r1", "r2", "r3"))
+        self.assertEqual(bundle.state.completeness, "partial")
+
+    def test_merged_query_indexes_keep_each_visible_coordinated_answer(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="普通员工出差的住宿标准是多少",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="普通员工出差的交通标准是多少",
+            ),
+            AnswerRequirementV2(
+                id="r3",
+                description="普通员工出差的餐补标准是多少",
+            ),
+            AnswerRequirementV2(
+                id="r4",
+                description=(
+                    "确认普通员工对应的适用分类、等级、类别或阶段"
+                    "（用于确定住宿标准）"
+                ),
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        all_query_indexes = [0, 1, 2, 3]
+        bundle = assemble_evidence_bundle(
+            query="普通员工出差的住宿、交通和餐补标准分别是多少？",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "lodging",
+                    content="D级住宿标准：一线城市不超过450元/天。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+                _candidate(
+                    "transport",
+                    chunk_index=1,
+                    content="D级交通标准：飞机经济舱、高铁二等座。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+                _candidate(
+                    "meal",
+                    chunk_index=2,
+                    content="D级餐补标准：每天100元。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+                _candidate(
+                    "classification",
+                    chunk_index=3,
+                    content="职级分类：普通员工对应D级。",
+                    expansion_query_indexes=all_query_indexes,
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=tuple(
+                requirement.description for requirement in requirements
+            ),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["lodging"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["transport"].supports_requirement_ids, ("r2",))
+        self.assertEqual(by_id["meal"].supports_requirement_ids, ("r3",))
+        self.assertEqual(
+            by_id["classification"].supports_requirement_ids,
+            ("r4",),
+        )
+        self.assertEqual(bundle.missing_requirement_ids, ())
+        self.assertEqual(bundle.state.completeness, "complete")
+
+    def test_reimbursement_fragments_cannot_cover_each_other(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="报销提交时限是多久",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="需要提供哪些凭证",
+            ),
+        )
+        all_query_indexes = [0, 1]
+        deadline = _candidate(
+            "deadline",
+            content="费用报销时限：出差结束后5个工作日内提交。",
+            expansion_query_indexes=all_query_indexes,
+        )
+        receipts = _candidate(
+            "receipts",
+            chunk_index=1,
+            content="报销凭证：必须提供正规发票、行程单及住宿发票。",
+            expansion_query_indexes=all_query_indexes,
+        )
+        values = {
+            "query": "报销提交时限是多久？需要提供哪些凭证？",
+            "answer_shape": "multi_part",
+            "requirements": requirements,
+            "retrieval_queries": tuple(
+                requirement.description for requirement in requirements
+            ),
+            "completeness": "complete",
+        }
+
+        complete = assemble_evidence_bundle(
+            candidates=[deadline, receipts],
+            **values,
+        )
+        by_id = {item.chunk_id: item for item in complete.items}
+        self.assertEqual(by_id["deadline"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["receipts"].supports_requirement_ids, ("r2",))
+        self.assertEqual(complete.missing_requirement_ids, ())
+        self.assertEqual(complete.state.completeness, "complete")
+
+        deadline_only = assemble_evidence_bundle(
+            candidates=[deadline],
+            **values,
+        )
+        self.assertEqual(deadline_only.missing_requirement_ids, ("r2",))
+        self.assertEqual(deadline_only.state.completeness, "partial")
+
+        receipts_only = assemble_evidence_bundle(
+            candidates=[receipts],
+            **values,
+        )
+        self.assertEqual(receipts_only.missing_requirement_ids, ("r1",))
+        self.assertEqual(receipts_only.state.completeness, "partial")
+
+    def test_bridge_query_index_cannot_promote_value_only_chunk(self) -> None:
+        requirements = (
+            AnswerRequirementV2(id="r1", description="查询普通岗位的餐补金额"),
+            AnswerRequirementV2(
+                id="r2",
+                description="确认普通岗位对应的职级",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通岗位的餐饮补贴是多少",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "amount",
+                    content="餐饮补贴：D级为100元/天。",
+                    candidate_origins=["initial_retrieval"],
+                    expansion_query_indexes=[0, 1],
+                ),
+                _candidate(
+                    "classification",
+                    chunk_index=1,
+                    content="职级分类：普通岗位对应D级。",
+                    expansion_query_indexes=[1],
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=(
+                "普通岗位的餐饮补贴是多少",
+                "普通岗位 对应的适用分类 等级 类别 阶段",
+            ),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["amount"].supports_requirement_ids, ("r1",))
+        self.assertEqual(
+            by_id["classification"].supports_requirement_ids,
+            ("r2",),
+        )
+        self.assertEqual(bundle.missing_requirement_ids, ())
         self.assertEqual(bundle.state.completeness, "complete")
 
     def test_explicit_support_ids_are_filtered_to_known_requirements(self) -> None:
@@ -300,6 +589,56 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(by_id["wrong-answer"].role, "background")
         self.assertEqual(bundle.answer_source_ids, ("bridge",))
         self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+
+    def test_cross_domain_implicit_mappings_join_only_the_resolved_value(self) -> None:
+        cases = (
+            (
+                "合同工住宿标准",
+                "合同工属于L2类。",
+                "住宿标准：L2类为300元/天。",
+            ),
+            (
+                "试用期年假天数",
+                "试用期属于入职阶段P0。",
+                "年假天数：P0为0天。",
+            ),
+            (
+                "外包人员的系统权限是什么",
+                "外包人员归属于访客角色R1。",
+                "系统权限：R1仅可查看公开数据。",
+            ),
+        )
+
+        from core.rag_v2.query_plan import plan_query_locally
+
+        for question, bridge_content, answer_content in cases:
+            with self.subTest(question=question):
+                plan = plan_query_locally(question)
+                bundle = assemble_evidence_bundle(
+                    query=question,
+                    answer_shape=plan.answer_shape,
+                    candidates=[
+                        _candidate(
+                            "answer",
+                            content=answer_content,
+                            candidate_origins=["initial_retrieval"],
+                        ),
+                        _candidate(
+                            "bridge",
+                            chunk_index=1,
+                            content=bridge_content,
+                        ),
+                    ],
+                    requirements=plan.requirements,
+                    retrieval_queries=plan.retrieval_queries,
+                    completeness="complete",
+                )
+
+                self.assertEqual(bundle.missing_requirement_ids, ())
+                self.assertEqual(
+                    set(bundle.answer_source_ids),
+                    {"answer", "bridge"},
+                )
 
     def test_required_coverage_precedes_higher_scored_background_under_budget(self) -> None:
         requirements = (
@@ -526,7 +865,7 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(bundle.state.confidence, "retrieved")
         self.assertEqual(bundle.state.completeness, "complete")
         self.assertEqual([item.chunk_id for item in bundle.context_items], ["retrieved"])
-        self.assertEqual([item.chunk_id for item in bundle.answer_sources], ["retrieved"])
+        self.assertEqual(bundle.answer_sources, ())
         self.assertIn("rerank_degraded", bundle.state.reasons)
 
     def test_expansion_degradation_is_independent_from_confidence_and_completeness(self) -> None:
@@ -583,6 +922,13 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             query="这份制度的总则是什么",
             candidates=candidates,
             answer_shape="overview",
+            requirements=(
+                AnswerRequirementV2(
+                    id="r1",
+                    description="这份制度的总则是什么",
+                ),
+            ),
+            retrieval_queries=("这份制度的总则是什么",),
             max_context_chunks=1,
         )
 
@@ -604,6 +950,13 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                     content="不属于已授权召回文档的全文。",
                 ),
             ],
+            requirements=(
+                AnswerRequirementV2(
+                    id="r1",
+                    description="请概述这份制度的主要内容",
+                ),
+            ),
+            retrieval_queries=("请概述这份制度的主要内容",),
             rerank_succeeded=True,
         )
 

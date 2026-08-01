@@ -441,8 +441,19 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.decision.source, "rule")
                 self.assertTrue(result.task_contract.dispatch_authorized)
                 self.assertEqual(result.task_contract.retrieval_policy, "required")
-                self.assertEqual(len(result.task_contract.requirements), 1)
+                expected_count = (
+                    2 if question.startswith("普通员工") else 1
+                )
+                self.assertEqual(
+                    len(result.task_contract.requirements),
+                    expected_count,
+                )
                 self.assertEqual(result.task_contract.requirements[0].role, "answer")
+                if expected_count == 2:
+                    self.assertEqual(
+                        result.task_contract.requirements[1].role,
+                        "bridge",
+                    )
         create.assert_not_awaited()
 
     async def test_selected_kb_without_enterprise_source_still_uses_route_model(

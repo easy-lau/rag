@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from core.query_constraints import (
     QueryConstraints,
@@ -772,10 +772,6 @@ _TOPIC_PRIMARY_ORIGIN_TOKENS = frozenset({
     "current_retrieval",
     "carryover_current_retrieval",
 })
-_TOPIC_CONJUNCTION_RE = re.compile(
-    r"(?:和|与|及|以及|并且|同时|分别|还有|另外|兼顾)",
-    re.IGNORECASE,
-)
 
 
 def _topic_terms(value: Any) -> set[str]:
@@ -936,10 +932,75 @@ def _topic_groups_to_choices(rows: list[dict[str, Any]]) -> tuple[EvidenceScopeC
     return tuple(choices)
 
 
+def _requirement_descriptions(requirements: Iterable[Any] | None) -> tuple[str, ...]:
+    """Read bounded requirement prose without depending on a planner class.
+
+    The ambiguity module is also used by compatibility callers, so accepting
+    mappings and simple objects keeps the signal generic while avoiding a
+    dependency on ``rag_v2`` contracts.  Requirement text is only a negative
+    document-picker signal: it may prove that several documents are needed
+    together, but can never create or select an applicability scope.
+    """
+
+    descriptions: list[str] = []
+    seen: set[str] = set()
+    for raw in requirements or ():
+        if isinstance(raw, str):
+            value = raw
+        elif isinstance(raw, Mapping):
+            value = raw.get("description")
+        else:
+            value = getattr(raw, "description", None)
+        description = re.sub(r"\s+", " ", str(value or "")).strip()
+        key = description.casefold()
+        if not description or key in seen:
+            continue
+        seen.add(key)
+        descriptions.append(description[:500])
+        if len(descriptions) >= 8:
+            break
+    return tuple(descriptions)
+
+
+def _uniquely_anchored_document_indexes(
+    values: Iterable[Any],
+    *,
+    rows: list[dict[str, Any]],
+    document_terms: list[set[str]],
+    allow_short_terms: bool = False,
+) -> set[int]:
+    """Return documents independently anchored by concrete request terms.
+
+    A term occurring in one document is an anchor, not proof that the other
+    documents are alternatives.  If different concrete terms anchor different
+    documents, the documents are normally complementary parts of the requested
+    answer (for example classification + amount, or risk explanation + config).
+    Short CJK n-grams retain the existing filename-only safety rule.
+    """
+
+    anchored: set[int] = set()
+    for value in values:
+        for term in _topic_terms(value):
+            matched = {
+                index for index, terms in enumerate(document_terms) if term in terms
+            }
+            if len(matched) != 1:
+                continue
+            matched_index = next(iter(matched))
+            if (
+                len(term) >= 3
+                or allow_short_terms
+                or term in _topic_terms(rows[matched_index]["filename"])
+            ):
+                anchored.add(matched_index)
+    return anchored
+
+
 def _detect_topic_document_ambiguity(
     *,
     query: str,
     candidates: list[dict[str, Any]],
+    requirements: Iterable[Any] | None = None,
 ) -> EvidenceAmbiguityDecision | None:
     """Detect a broad query whose equally relevant hits are different docs.
 
@@ -982,27 +1043,37 @@ def _detect_topic_document_ambiguity(
             relevant_document_count=len(rows),
         )
 
-    query_terms = _topic_terms(text)
     document_terms = [_topic_terms(row["text"]) for row in rows]
-    unique_docs: set[int] = set()
-    for term in query_terms:
-        matched = {
-            index for index, terms in enumerate(document_terms) if term in terms
-        }
-        if len(matched) == 1:
-            # Two-character CJK n-grams are trusted only when they occur in a
-            # source label; content-only short overlaps are often accidental.
-            matched_index = next(iter(matched))
-            if len(term) >= 3 or term in _topic_terms(rows[matched_index]["filename"]):
-                unique_docs.update(matched)
-    if unique_docs:
-        # A query explicitly combining two document-specific subjects is a
-        # legitimate multi-document request, not an ambiguity to resolve.
-        if len(unique_docs) > 1 and _TOPIC_CONJUNCTION_RE.search(text):
-            return None
-        # One document-specific subject gives retrieval a deterministic anchor.
-        if len(unique_docs) == 1:
-            return None
+    query_anchors = _uniquely_anchored_document_indexes(
+        (text,),
+        rows=rows,
+        document_terms=document_terms,
+    )
+    if query_anchors:
+        # One concrete subject identifies a deterministic source.  Several
+        # concrete subjects distributed across documents mean the request needs
+        # those documents together; Chinese compact questions often omit an
+        # explicit conjunction, so requiring ``和/与`` here turns normal
+        # cross-document evidence chains into a false document choice.
+        return None
+
+    requirement_descriptions = _requirement_descriptions(requirements)
+    requirement_anchors = _uniquely_anchored_document_indexes(
+        requirement_descriptions,
+        rows=rows,
+        document_terms=document_terms,
+        # Two or more explicit answer targets are already a strong structural
+        # signal that independently matching documents are complementary.  In
+        # that narrow negative-picker check, short Chinese nouns such as
+        # ``时限`` and ``凭证`` are safe anchors: they can only suppress a
+        # filename choice and can never select a product/version scope.
+        allow_short_terms=len(requirement_descriptions) >= 2,
+    )
+    if len(requirement_anchors) >= 2:
+        # The planner decomposed one answer across independently anchored
+        # documents.  This signal can suppress only the filename/topic picker;
+        # product/version/project conflicts are resolved before this function.
+        return None
 
     # If there are raw retrieval scores, reject a long-tail candidate whose
     # support is less than roughly half of the best document.  RRF values are
@@ -1342,6 +1413,7 @@ def detect_evidence_scope_ambiguity(
     query: str,
     constraints: QueryConstraints,
     candidates: list[dict[str, Any]],
+    requirements: Iterable[Any] | None = None,
 ) -> EvidenceAmbiguityDecision:
     """Return a clarification decision for mutually exclusive relevant scopes."""
 
@@ -1435,6 +1507,7 @@ def detect_evidence_scope_ambiguity(
         topic_decision = _detect_topic_document_ambiguity(
             query=query,
             candidates=candidates,
+            requirements=requirements,
         )
         if topic_decision is not None:
             return topic_decision

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from database import get_db
 from models.db_models import (
+    ChatTurn,
     Conversation,
     Document,
     DocumentChunk,
@@ -20,9 +21,31 @@ from models.db_models import (
     User,
     now_utc,
 )
+from core.chat_turns import (
+    MAX_PERSIST_ATTEMPTS,
+    RECOVERABLE_TURN_STATUSES,
+    TurnRequestConflict,
+    assert_turn_request_matches,
+    build_turn_request_context,
+    commit_with_retry,
+    find_turn_for_user,
+    message_turn_metadata,
+    normalize_request_id,
+    normalize_turn_id,
+    reclaim_stale_turn,
+    renew_turn_lease,
+    reserve_turn,
+    transition_turn,
+    turn_lease_expired,
+)
 from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
 from core.rag_pipeline import run_rag_stream
-from core.rag_v2.pipeline import run_rag_v2_stream
+from core.rag_v2.pipeline import (
+    _plan_with_contract_requirements,
+    run_rag_v2_stream,
+)
+from core.rag_v2.query_plan import plan_query_locally
+from core.direct_response import run_direct_response_stream
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import CHAT_USE
 from core.intent_router import (
@@ -37,7 +60,9 @@ from core.conversation_context import (
 )
 from core.query_route_compiler import (
     RagTaskContract,
+    rag_task_contract_gate_reason,
 )
+from core.query_route_contract import RouteClarification, RouteUnresolvedSlot
 from core.rag_trace import content_fields, log_exception_safely, trace_event
 from config import get_settings
 
@@ -135,19 +160,42 @@ def _select_rag_pipeline_version(
     selected_tags: list[str],
     is_followup: bool,
     carryover_sources: tuple[dict, ...] | list[dict],
-) -> tuple[Literal["v1", "v2"], str]:
-    """Choose one pipeline before streaming; never retry through another version."""
+    selected_kb_count: int | None = None,
+) -> tuple[Literal["v1", "v2", "direct", "reject"], str]:
+    """Choose exactly one runner; V2 never silently falls back to legacy RAG.
+
+    ``v1`` remains an explicit deployment rollback switch.  Once a deployment
+    selects V2, however, a missing/invalid contract is a protocol failure, not
+    permission to execute the old heuristic pipeline.  Retrieval-dependent
+    QA/writing use V2, while verified non-retrieval contracts use the isolated
+    direct-response runner.
+    """
 
     if configured_version != "v2":
         return "v1", "configured_v1"
     if not isinstance(task_contract, RagTaskContract):
-        return "v1", "missing_or_invalid_task_contract"
+        return "reject", "missing_or_invalid_task_contract"
     if not task_contract.dispatch_authorized:
-        return "v1", "dispatch_not_authorized"
+        return "reject", "dispatch_not_authorized"
+    contract_gate_reason = rag_task_contract_gate_reason(
+        task_contract,
+        selected_kb_count=selected_kb_count,
+    )
+    if contract_gate_reason is not None:
+        return "reject", f"invalid_task_contract:{contract_gate_reason}"
     if not task_contract.need_retrieval:
-        return "v1", "retrieval_not_required"
-    if task_contract.response_mode != "grounded_qa":
-        return "v1", "unsupported_response_mode"
+        if (
+            task_contract.retrieval_policy == "skip"
+            and task_contract.response_mode
+            in {"general_chat", "writing", "platform_help"}
+        ):
+            return "direct", f"verified_{task_contract.response_mode}"
+        return "reject", "invalid_direct_task_contract"
+    if (
+        task_contract.retrieval_policy != "required"
+        or task_contract.response_mode not in {"grounded_qa", "writing"}
+    ):
+        return "reject", "invalid_retrieval_task_contract"
     # V2 preserves the existing tag semantics as a soft ordering boost.  Tags
     # neither widen authorization nor bypass the deterministic relevance gate,
     # so they no longer require falling back to the slow model-rerank pipeline.
@@ -160,6 +208,8 @@ def _select_rag_pipeline_version(
         return "v2", "eligible_evidence_scope_refinement"
     if is_followup or carryover_sources:
         return "v2", "eligible_grounded_followup"
+    if task_contract.response_mode == "writing":
+        return "v2", "eligible_knowledge_writing"
     return "v2", "eligible_grounded_qa"
 
 
@@ -684,7 +734,7 @@ def _scoped_evidence_query(original_query: str, scope_filter: dict) -> str:
 
 def _refined_evidence_query(original_query: str, refinement: str) -> str:
     return (
-        f"{original_query.strip()}\n"
+        f"{original_query.strip()}。"
         f"用户补充的适用范围：{str(refinement or '').strip()}"
     ).strip()
 
@@ -776,22 +826,69 @@ async def _route_clarification_response(
     selected_kb_ids: list[uuid.UUID],
     task_contract: RagTaskContract | None,
     emit_clarification_event: bool = True,
+    turn: ChatTurn | None = None,
 ) -> StreamingResponse:
     """Persist a versioned, non-executable clarification and stream it."""
 
+    input_route_state_revision = (
+        _stored_pending_request_identity(turn)[0]
+        if turn is not None
+        else int(getattr(conv, "route_state_revision", 0) or 0)
+    )
+    if turn is not None and turn.status == "accepted":
+        transition_turn(turn, "generating", trace_id=trace_id)
+    user_metadata = (
+        message_turn_metadata(turn, status="generating") if turn is not None else {}
+    )
     user_msg = Message(
         id=uuid.uuid4(),
         conversation_id=conv.id,
         role="user",
         content=question,
+        **user_metadata,
     )
+    if turn is not None:
+        turn.user_message_id = user_msg.id
+        transition_turn(
+            turn,
+            "generated",
+            trace_id=trace_id,
+            evidence_status="skipped",
+            retrieval_executed=False,
+            answer_content=clarification_message,
+            answer_sources=[],
+            search_snapshot={
+                "schema_version": "rag_search_snapshot.v1",
+                "candidates": [],
+                "answer_sources": [],
+                "counters": {
+                    "retrieval_executed": False,
+                    "evidence_status": "skipped",
+                    "displayed_result_count": 0,
+                    "answer_source_count": 0,
+                    "hit_count": 0,
+                    "trace_id": trace_id,
+                },
+            },
+            tokens=0,
+        )
+        transition_turn(turn, "completed", assistant_message_id=uuid.uuid4())
+        assistant_id = turn.assistant_message_id
+        assistant_metadata = message_turn_metadata(turn, status="completed")
+    else:
+        assistant_id = uuid.uuid4()
+        assistant_metadata = {}
     assistant_msg = Message(
-        id=uuid.uuid4(),
+        id=assistant_id,
         conversation_id=conv.id,
         role="assistant",
         content=clarification_message,
         sources=[],
+        **assistant_metadata,
     )
+    if turn is not None:
+        for key, value in assistant_metadata.items():
+            setattr(user_msg, key, value)
     created_at = now_utc()
     unresolved = (
         task_contract.clarification.unresolved if task_contract is not None else ()
@@ -819,7 +916,71 @@ async def _route_clarification_response(
     }
     conv.route_state_revision = int(getattr(conv, "route_state_revision", 0) or 0) + 1
     db.add_all([user_msg, assistant_msg])
-    await db.commit()
+    final_pending_route_state = json.loads(
+        json.dumps(conv.pending_route_state, ensure_ascii=False)
+    )
+    final_route_state_revision = int(conv.route_state_revision)
+    if turn is not None:
+        turn_values = {
+            "status": turn.status,
+            "trace_id": turn.trace_id,
+            "evidence_status": turn.evidence_status,
+            "retrieval_executed": turn.retrieval_executed,
+            "error_code": turn.error_code,
+            "answer_content": turn.answer_content,
+            "answer_sources": list(turn.answer_sources or []),
+            "search_snapshot": turn.search_snapshot,
+            "tokens": turn.tokens,
+            "user_message_id": turn.user_message_id,
+            "assistant_message_id": turn.assistant_message_id,
+            "generated_at": turn.generated_at,
+            "completed_at": turn.completed_at,
+            "updated_at": turn.updated_at,
+            "lease_owner": None,
+            "lease_expires_at": None,
+        }
+        message_specs = (
+            {
+                "id": user_msg.id,
+                "conversation_id": conv.id,
+                "role": "user",
+                "content": question,
+                "sources": None,
+                "tokens": None,
+                **assistant_metadata,
+            },
+            {
+                "id": assistant_msg.id,
+                "conversation_id": conv.id,
+                "role": "assistant",
+                "content": clarification_message,
+                "sources": [],
+                "tokens": None,
+                **assistant_metadata,
+            },
+        )
+        conversation_id = conv.id
+        turn_id = turn.id
+
+        async def reapply(session: AsyncSession):
+            nonlocal conv, turn
+            persisted_conv, persisted_turn = await _reapply_immediate_response(
+                session,
+                conversation_id=conversation_id,
+                final_pending_route_state=final_pending_route_state,
+                final_route_state_revision=final_route_state_revision,
+                input_route_state_revision=input_route_state_revision,
+                messages=message_specs,
+                turn_id=turn_id,
+                turn_values=turn_values,
+            )
+            conv = persisted_conv
+            if persisted_turn is not None:
+                turn = persisted_turn
+
+        await commit_with_retry(db, reapply=reapply)
+    else:
+        await commit_with_retry(db)
 
     if emit_clarification_event:
         trace_event(
@@ -855,8 +1016,18 @@ async def _route_clarification_response(
 
     async def generate_clarification():
         events: list[dict] = [
-            {"type": "conversation_started", "conversation_id": str(conv.id)},
+            {
+                "type": "conversation_started",
+                "conversation_id": str(conv.id),
+                **(
+                    {"turn_id": str(turn.id), "request_id": turn.request_id}
+                    if turn is not None
+                    else {}
+                ),
+            },
         ]
+        if turn is not None:
+            events.append(_turn_state_event(turn))
         if task_contract is not None:
             # The clarification branch does not enter ``run_rag_stream``, so
             # publish the same contract-authoritative intent state here.  Do
@@ -914,13 +1085,9 @@ async def _route_clarification_response(
     return StreamingResponse(
         generate_clarification(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-            "X-Conversation-ID": str(conv.id),
-            "X-RAG-Trace-ID": trace_id,
-        },
+        headers=_turn_response_headers(
+            conversation_id=conv.id, trace_id=trace_id, turn=turn
+        ),
     )
 
 
@@ -934,8 +1101,15 @@ async def _evidence_pending_direct_response(
     trace_id: str,
     action: Literal["repeat", "cancel"],
     repeat_reason: str | None = None,
+    turn: ChatTurn | None = None,
 ) -> StreamingResponse:
     """Repeat selectable evidence scopes or cancel them without model dispatch."""
+
+    input_route_state_revision = (
+        _stored_pending_request_identity(turn)[0]
+        if turn is not None
+        else int(getattr(conv, "route_state_revision", 0) or 0)
+    )
 
     if action == "cancel":
         answer = "已取消上一次资料范围选择。你可以继续提出新问题。"
@@ -962,19 +1136,60 @@ async def _evidence_pending_direct_response(
         evidence_status = "needs_clarification"
         decision_reason = "evidence_scope_selection_invalid"
 
+    if turn is not None and turn.status == "accepted":
+        transition_turn(turn, "generating", trace_id=trace_id)
+    user_metadata = (
+        message_turn_metadata(turn, status="generating") if turn is not None else {}
+    )
     user_msg = Message(
         id=uuid.uuid4(),
         conversation_id=conv.id,
         role="user",
         content=question,
+        **user_metadata,
     )
+    if turn is not None:
+        turn.user_message_id = user_msg.id
+        transition_turn(
+            turn,
+            "generated",
+            trace_id=trace_id,
+            evidence_status=evidence_status,
+            retrieval_executed=False,
+            answer_content=answer,
+            answer_sources=[],
+            search_snapshot={
+                "schema_version": "rag_search_snapshot.v1",
+                "candidates": [],
+                "answer_sources": [],
+                "counters": {
+                    "retrieval_executed": False,
+                    "evidence_status": evidence_status,
+                    "displayed_result_count": 0,
+                    "answer_source_count": 0,
+                    "hit_count": 0,
+                    "trace_id": trace_id,
+                },
+            },
+            tokens=0,
+        )
+        transition_turn(turn, "completed", assistant_message_id=uuid.uuid4())
+        assistant_id = turn.assistant_message_id
+        assistant_metadata = message_turn_metadata(turn, status="completed")
+    else:
+        assistant_id = uuid.uuid4()
+        assistant_metadata = {}
     assistant_msg = Message(
-        id=uuid.uuid4(),
+        id=assistant_id,
         conversation_id=conv.id,
         role="assistant",
         content=answer,
         sources=[],
+        **assistant_metadata,
     )
+    if turn is not None:
+        for key, value in assistant_metadata.items():
+            setattr(user_msg, key, value)
     if action == "cancel":
         current = getattr(conv, "pending_route_state", None)
         if isinstance(current, dict) and current.get("state_id") == pending_state.get("state_id"):
@@ -983,7 +1198,75 @@ async def _evidence_pending_direct_response(
                 getattr(conv, "route_state_revision", 0) or 0
             ) + 1
     db.add_all([user_msg, assistant_msg])
-    await db.commit()
+    final_pending_route_state = (
+        json.loads(json.dumps(conv.pending_route_state, ensure_ascii=False))
+        if isinstance(getattr(conv, "pending_route_state", None), dict)
+        else None
+    )
+    final_route_state_revision = int(
+        getattr(conv, "route_state_revision", 0) or 0
+    )
+    if turn is not None:
+        turn_values = {
+            "status": turn.status,
+            "trace_id": turn.trace_id,
+            "evidence_status": turn.evidence_status,
+            "retrieval_executed": turn.retrieval_executed,
+            "error_code": turn.error_code,
+            "answer_content": turn.answer_content,
+            "answer_sources": list(turn.answer_sources or []),
+            "search_snapshot": turn.search_snapshot,
+            "tokens": turn.tokens,
+            "user_message_id": turn.user_message_id,
+            "assistant_message_id": turn.assistant_message_id,
+            "generated_at": turn.generated_at,
+            "completed_at": turn.completed_at,
+            "updated_at": turn.updated_at,
+            "lease_owner": None,
+            "lease_expires_at": None,
+        }
+        message_specs = (
+            {
+                "id": user_msg.id,
+                "conversation_id": conv.id,
+                "role": "user",
+                "content": question,
+                "sources": None,
+                "tokens": None,
+                **assistant_metadata,
+            },
+            {
+                "id": assistant_msg.id,
+                "conversation_id": conv.id,
+                "role": "assistant",
+                "content": answer,
+                "sources": [],
+                "tokens": None,
+                **assistant_metadata,
+            },
+        )
+        conversation_id = conv.id
+        turn_id = turn.id
+
+        async def reapply(session: AsyncSession):
+            nonlocal conv, turn
+            persisted_conv, persisted_turn = await _reapply_immediate_response(
+                session,
+                conversation_id=conversation_id,
+                final_pending_route_state=final_pending_route_state,
+                final_route_state_revision=final_route_state_revision,
+                input_route_state_revision=input_route_state_revision,
+                messages=message_specs,
+                turn_id=turn_id,
+                turn_values=turn_values,
+            )
+            conv = persisted_conv
+            if persisted_turn is not None:
+                turn = persisted_turn
+
+        await commit_with_retry(db, reapply=reapply)
+    else:
+        await commit_with_retry(db)
 
     if action == "cancel":
         trace_event(
@@ -1027,7 +1310,15 @@ async def _evidence_pending_direct_response(
 
     async def generate_direct():
         events: list[dict] = [
-            {"type": "conversation_started", "conversation_id": str(conv.id)},
+            {
+                "type": "conversation_started",
+                "conversation_id": str(conv.id),
+                **(
+                    {"turn_id": str(turn.id), "request_id": turn.request_id}
+                    if turn is not None
+                    else {}
+                ),
+            },
             {"type": "search_step", "step": "analyze", "status": "done"},
             {
                 "type": "search_results",
@@ -1048,6 +1339,8 @@ async def _evidence_pending_direct_response(
                 "carryover_source_count": 0,
             },
         ]
+        if turn is not None:
+            events.insert(1, _turn_state_event(turn))
         if action == "repeat" and repeat_reason != "scope_unavailable":
             events.append(
                 {
@@ -1085,13 +1378,9 @@ async def _evidence_pending_direct_response(
     return StreamingResponse(
         generate_direct(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-            "X-Conversation-ID": str(conv.id),
-            "X-RAG-Trace-ID": trace_id,
-        },
+        headers=_turn_response_headers(
+            conversation_id=conv.id, trace_id=trace_id, turn=turn
+        ),
     )
 
 
@@ -1103,6 +1392,93 @@ def _parse_sse_payload(chunk: str) -> dict | None:
     except (TypeError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _bounded_source_identity_snapshot(value: object) -> dict | None:
+    """Keep identity/ranking fields only; never persist producer content."""
+
+    if not isinstance(value, dict):
+        return None
+    identity = _source_snapshot_identity(value)
+    if identity is None:
+        return None
+    kb_id, doc_id, chunk_id = identity
+    item: dict[str, object] = {
+        "id": str(chunk_id),
+        "chunk_id": str(chunk_id),
+        "doc_id": str(doc_id),
+        "kb_id": str(kb_id),
+    }
+    for key in (
+        "filename",
+        "file_type",
+        "chunk_index",
+        "score",
+        "retrieval_score",
+        "vector_score",
+        "keyword_score",
+        "trigram_score",
+        "answer_support",
+        "topic_relevance",
+        "constraint_status",
+        "constraint_reason",
+        "evidence_role",
+        "rerank_status",
+        "rerank_reason",
+        "active_channels",
+    ):
+        value_item = value.get(key)
+        if value_item is None:
+            continue
+        if isinstance(value_item, (str, int, float, bool, list, dict)):
+            item[key] = value_item
+    return item
+
+
+def _bounded_search_snapshot(payload: object) -> dict:
+    """Build a bounded, content-free final search state for history/replay."""
+
+    data = payload if isinstance(payload, dict) else {}
+    candidates: list[dict] = []
+    raw_results = data.get("results")
+    if isinstance(raw_results, list):
+        for raw in raw_results:
+            item = _bounded_source_identity_snapshot(raw)
+            if item is not None:
+                candidates.append(item)
+            if len(candidates) >= 20:
+                break
+    answer_sources: list[dict] = []
+    raw_answer_sources = data.get("answer_sources")
+    if isinstance(raw_answer_sources, list):
+        for raw in raw_answer_sources:
+            item = _bounded_source_identity_snapshot(raw)
+            if item is not None:
+                answer_sources.append(item)
+            if len(answer_sources) >= 20:
+                break
+    counters = {}
+    for key in (
+        "total",
+        "displayed_result_count",
+        "answer_source_count",
+        "context_evidence_count",
+        "hit_count",
+        "direct_evidence_count",
+        "related_reference_count",
+        "retrieval_executed",
+        "evidence_status",
+        "coverage_status",
+        "trace_id",
+    ):
+        if key in data:
+            counters[key] = data.get(key)
+    return {
+        "schema_version": "rag_search_snapshot.v1",
+        "candidates": candidates,
+        "answer_sources": answer_sources,
+        "counters": counters,
+    }
 
 
 def _clarification_locked_search_results(payload: dict, *, trace_id: str) -> dict:
@@ -1553,6 +1929,20 @@ async def _messages_with_current_source_scope(
             if accessible_set is not None and kb_id not in accessible_set:
                 continue
             referenced_sources.add(identity)
+        raw_snapshot = getattr(row, "search_snapshot", None)
+        if isinstance(raw_snapshot, dict):
+            for collection_key in ("candidates", "answer_sources"):
+                collection = raw_snapshot.get(collection_key)
+                if not isinstance(collection, list):
+                    continue
+                for source in collection[:20]:
+                    identity = _source_snapshot_identity(source)
+                    if identity is None:
+                        continue
+                    kb_id, _, _ = identity
+                    if accessible_set is not None and kb_id not in accessible_set:
+                        continue
+                    referenced_sources.add(identity)
 
     current_sources: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], dict] = {}
     if referenced_sources:
@@ -1601,6 +1991,54 @@ async def _messages_with_current_source_scope(
                 current = current_sources.get(identity) if identity else None
                 if current is not None:
                     visible_sources.append({**dict(source), **current})
+        visible_search_snapshot = None
+        raw_search_snapshot = getattr(row, "search_snapshot", None)
+        if isinstance(raw_search_snapshot, dict):
+            counters = raw_search_snapshot.get("counters")
+            safe_counters = {}
+            if isinstance(counters, dict):
+                for key in (
+                    "total",
+                    "displayed_result_count",
+                    "answer_source_count",
+                    "context_evidence_count",
+                    "hit_count",
+                    "direct_evidence_count",
+                    "related_reference_count",
+                    "retrieval_executed",
+                    "evidence_status",
+                    "coverage_status",
+                    "trace_id",
+                ):
+                    value = counters.get(key)
+                    if isinstance(value, (str, int, float, bool)) or value is None:
+                        safe_counters[key] = value
+
+            def refreshed_snapshot_items(key: str) -> list[dict]:
+                refreshed_items: list[dict] = []
+                raw_items = raw_search_snapshot.get(key)
+                if not isinstance(raw_items, list):
+                    return refreshed_items
+                for raw_item in raw_items[:20]:
+                    safe_identity = _bounded_source_identity_snapshot(raw_item)
+                    identity = _source_snapshot_identity(safe_identity)
+                    current = current_sources.get(identity) if identity else None
+                    if safe_identity is not None and current is not None:
+                        # ``safe_identity`` contains only bounded ranking and
+                        # identity fields; every body/URL/name comes from the
+                        # current authorized active+ready document row.
+                        refreshed_items.append({**safe_identity, **current})
+                return refreshed_items
+
+            visible_search_snapshot = {
+                "schema_version": "rag_search_snapshot.v1",
+                "candidates": refreshed_snapshot_items("candidates"),
+                "answer_sources": refreshed_snapshot_items("answer_sources"),
+                # Keep outcome/counters even when current authorization removes
+                # every candidate so the UI can still distinguish no-hit from
+                # a historical hit whose evidence is no longer accessible.
+                "counters": safe_counters,
+            }
         # 历史脏数据可能把 sources 存成 dict；不先让 Pydantic 验证 ORM
         # 对象，否则一条异常消息会让整个会话返回 500。
         serialized = MessageOut(
@@ -1617,6 +2055,17 @@ async def _messages_with_current_source_scope(
                 else None
             ),
             tokens=row.tokens,
+            turn_id=getattr(row, "turn_id", None),
+            request_id=getattr(row, "request_id", None),
+            status=getattr(row, "turn_status", None),
+            turn_status=getattr(row, "turn_status", None),
+            trace_id=getattr(row, "trace_id", None),
+            evidence_status=getattr(row, "evidence_status", None),
+            retrieval_executed=getattr(row, "retrieval_executed", None),
+            error_code=getattr(row, "error_code", None),
+            delivery_status=getattr(row, "delivery_status", None),
+            persistence_status=getattr(row, "persistence_status", None),
+            search_snapshot=visible_search_snapshot,
             created_at=row.created_at,
         )
         output.append(serialized)
@@ -1636,6 +2085,656 @@ def _public_stream_error_message(exc: BaseException) -> str:
     return "回答生成失败，请稍后重试"
 
 
+def _durable_turn_supported(session: object) -> bool:
+    """Whether the injected session is a real enough session for turn ledger.
+
+    A handful of legacy unit tests use tiny ``add/commit`` doubles that predate
+    the turn protocol.  Production ``AsyncSession`` always exposes ``execute``
+    and ``flush``; retaining this capability check keeps those tests focused on
+    SSE parsing while the real path remains fully durable.
+    """
+
+    return callable(getattr(session, "execute", None)) and callable(
+        getattr(session, "flush", None)
+    )
+
+
+def _pending_route_identity(conv: Conversation) -> tuple[int, str | None]:
+    revision = max(0, int(getattr(conv, "route_state_revision", 0) or 0))
+    pending = _active_pending_route_state(
+        getattr(conv, "pending_route_state", None)
+    )
+    return revision, (str(pending["state_id"]) if pending is not None else None)
+
+
+def _request_context_for_payload(
+    payload: ChatRequest,
+    *,
+    conversation_id: uuid.UUID,
+    pending_route_revision: int,
+    pending_state_id: str | None,
+) -> dict:
+    return build_turn_request_context(
+        question=payload.question,
+        conversation_id=conversation_id,
+        knowledge_base_ids=payload.knowledge_base_ids,
+        search_config=payload.search_config.model_dump(),
+        pending_route_revision=pending_route_revision,
+        pending_state_id=pending_state_id,
+    )
+
+
+def _stored_pending_request_identity(turn: ChatTurn) -> tuple[int, str | None]:
+    context = getattr(turn, "request_context", None)
+    pending = context.get("pending_route") if isinstance(context, dict) else None
+    if not isinstance(pending, dict):
+        return 0, None
+    try:
+        revision = max(0, int(pending.get("revision") or 0))
+    except (TypeError, ValueError):
+        revision = 0
+    state_id = str(pending.get("state_id") or "").strip() or None
+    return revision, state_id
+
+
+def _stored_resume_identity(turn: ChatTurn) -> tuple[int, str | None] | None:
+    context = getattr(turn, "resume_context", None)
+    if not isinstance(context, dict):
+        return None
+    try:
+        revision = max(0, int(context.get("revision") or 0))
+    except (TypeError, ValueError):
+        return None
+    state_id = str(context.get("state_id") or "").strip() or None
+    return revision, state_id
+
+
+async def _reapply_immediate_response(
+    session: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    final_pending_route_state: dict | None,
+    final_route_state_revision: int,
+    input_route_state_revision: int,
+    messages: tuple[dict, ...],
+    turn_id: uuid.UUID | None,
+    turn_values: dict | None,
+) -> tuple[Conversation, ChatTurn | None]:
+    """Reconstruct an immediate clarification/direct-response transaction.
+
+    This callback runs only after a failed commit and rollback.  Every ORM row
+    is loaded again; repeated invocation is an idempotent upsert rather than an
+    empty commit of detached objects.
+    """
+
+    persisted_turn: ChatTurn | None = None
+    if turn_id is not None:
+        persisted_turn = await session.get(
+            ChatTurn,
+            turn_id,
+            with_for_update=True,
+        )
+        if not isinstance(persisted_turn, ChatTurn):
+            raise RuntimeError("chat turn 不存在，无法重试保存即时回答")
+    persisted_conv = await session.get(
+        Conversation,
+        conversation_id,
+        with_for_update=True,
+    )
+    if not isinstance(persisted_conv, Conversation):
+        raise RuntimeError("会话不存在，无法重试保存即时回答")
+    if persisted_turn is not None:
+        if persisted_turn.status != "completed":
+            persisted_revision = int(
+                getattr(persisted_conv, "route_state_revision", 0) or 0
+            )
+            if persisted_revision != input_route_state_revision:
+                raise RuntimeError("会话范围状态已变化，拒绝覆盖重试")
+
+    # A commit acknowledgement can fail after PostgreSQL already committed.
+    # In that case the completed turn is authoritative and no state is replayed.
+    already_completed = bool(
+        persisted_turn is not None and persisted_turn.status == "completed"
+    )
+    if not already_completed:
+        persisted_conv.pending_route_state = final_pending_route_state
+        persisted_conv.route_state_revision = final_route_state_revision
+        if persisted_turn is not None and turn_values is not None:
+            for key, value in turn_values.items():
+                setattr(persisted_turn, key, value)
+
+    for spec in messages:
+        message_id = spec["id"]
+        persisted_message = await session.get(Message, message_id)
+        if not isinstance(persisted_message, Message):
+            persisted_message = Message(**spec)
+            session.add(persisted_message)
+        elif not already_completed:
+            for key, value in spec.items():
+                if key != "id":
+                    setattr(persisted_message, key, value)
+    return persisted_conv, persisted_turn
+
+
+def _turn_state_event(turn: ChatTurn, *, replayed: bool = False) -> dict:
+    persistence_status = (
+        "completed"
+        if turn.status == "completed"
+        else (
+            "failed"
+            if turn.status in {"persist_failed", "failed"}
+            else turn.status
+        )
+    )
+    return {
+        "type": "turn_state",
+        "turn_id": str(turn.id),
+        "request_id": turn.request_id,
+        "status": turn.status,
+        "trace_id": turn.trace_id,
+        "evidence_status": turn.evidence_status,
+        "retrieval_executed": turn.retrieval_executed,
+        "error_code": turn.error_code,
+        "persistence_status": persistence_status,
+        "same_request_recoverable": bool(
+            turn.status in RECOVERABLE_TURN_STATUSES
+            and turn.answer_content is not None
+        ),
+        "replayed": replayed,
+    }
+
+
+def _turn_response_headers(
+    *,
+    conversation_id: uuid.UUID,
+    trace_id: str | None,
+    turn: ChatTurn | None,
+) -> dict[str, str]:
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+        "X-Conversation-ID": str(conversation_id),
+    }
+    if trace_id:
+        headers["X-RAG-Trace-ID"] = str(trace_id)
+    if turn is not None:
+        headers["X-RAG-Request-ID"] = str(turn.request_id)
+        headers["X-RAG-Turn-ID"] = str(turn.id)
+    return headers
+
+
+def _turn_replay_response(
+    *,
+    conv: Conversation,
+    turn: ChatTurn,
+    status_code: int = 200,
+    replayed: bool = True,
+) -> StreamingResponse:
+    """Replay a durable result without invoking routing/retrieval/model code."""
+
+    async def stream():
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "conversation_started",
+                    "conversation_id": str(conv.id),
+                    "turn_id": str(turn.id),
+                    "request_id": turn.request_id,
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
+        yield "data: " + json.dumps(
+            _turn_state_event(turn, replayed=replayed), ensure_ascii=False
+        ) + "\n\n"
+        if turn.status in {"failed", "cancelled", "persist_failed"}:
+            same_request_recoverable = bool(
+                turn.status == "persist_failed"
+                and turn.answer_content is not None
+            )
+            if same_request_recoverable:
+                message = (
+                    "回答已生成但仍未完成保存，请稍后使用相同 request_id 重试"
+                )
+            elif turn.status == "cancelled":
+                message = "该请求已取消，请重新发送并使用新的 request_id"
+            else:
+                message = (
+                    "该请求未能完成，且没有可恢复的已生成回答。"
+                    "请重新发送问题并使用新的 request_id。"
+                )
+            yield "data: " + json.dumps(
+                {
+                    "type": "error",
+                    "message": message,
+                    "turn_id": str(turn.id),
+                    "request_id": turn.request_id,
+                    "status": turn.status,
+                    "error_code": turn.error_code,
+                    "persistence_status": (
+                        "failed" if turn.status != "cancelled" else "cancelled"
+                    ),
+                    "same_request_recoverable": same_request_recoverable,
+                    "retry_with_new_request_id": not same_request_recoverable,
+                    "replayed": replayed,
+                },
+                ensure_ascii=False,
+            ) + "\n\n"
+        if turn.status not in {"failed", "cancelled"} and turn.answer_content:
+            sources = (
+                list(turn.answer_sources or [])
+                if isinstance(turn.answer_sources, list)
+                else []
+            )
+            snapshot = (
+                turn.search_snapshot
+                if isinstance(turn.search_snapshot, dict)
+                else {}
+            )
+            candidates = snapshot.get("candidates")
+            if not isinstance(candidates, list):
+                candidates = sources
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "search_results",
+                        "results": candidates,
+                        "answer_sources": sources,
+                        "total": len(candidates),
+                        "displayed_result_count": len(candidates),
+                        "answer_source_count": len(sources),
+                        "context_evidence_count": len(sources),
+                        "hit_count": sum(
+                            str(item.get("evidence_role") or "").casefold() == "direct"
+                            for item in sources
+                            if isinstance(item, dict)
+                        ),
+                        "retrieval_executed": turn.retrieval_executed,
+                        "evidence_status": turn.evidence_status,
+                        "trace_id": turn.trace_id,
+                        "replayed": replayed,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "text_delta", "content": turn.answer_content},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+        if turn.tokens is not None:
+            yield "data: " + json.dumps(
+                {"type": "usage", "total_tokens": turn.tokens}, ensure_ascii=False
+            ) + "\n\n"
+        yield "data: " + json.dumps(
+            {
+                "type": "done",
+                "conversation_id": str(conv.id),
+                "turn_id": str(turn.id),
+                "request_id": turn.request_id,
+                "status": turn.status,
+                "replayed": replayed,
+            },
+            ensure_ascii=False,
+        ) + "\n\n"
+
+    return StreamingResponse(
+        stream(),
+        status_code=status_code,
+        media_type="text/event-stream",
+        headers=_turn_response_headers(
+            conversation_id=conv.id, trace_id=turn.trace_id, turn=turn
+        ),
+    )
+
+
+async def _recover_turn_answer(
+    *,
+    conv: Conversation,
+    turn: ChatTurn,
+) -> ChatTurn:
+    """Finish a generated/persist-failed turn in a fresh retryable session."""
+
+    from database import AsyncSessionLocal
+
+    last_error: BaseException | None = None
+    for attempt in range(MAX_PERSIST_ATTEMPTS):
+        try:
+            async with AsyncSessionLocal() as save_db:
+                persisted = await save_db.get(ChatTurn, turn.id)
+                if not isinstance(persisted, ChatTurn):
+                    # Lightweight test doubles may not model the new table;
+                    # use the already-loaded object and keep the operation
+                    # idempotent for them.
+                    persisted = turn
+                if persisted.status == "completed":
+                    return persisted
+                if persisted.status not in RECOVERABLE_TURN_STATUSES:
+                    return persisted
+                if persisted.answer_content is None:
+                    raise RuntimeError("turn 缺少可恢复的已生成回答")
+                assistant_id = persisted.assistant_message_id or uuid.uuid4()
+                persisted.assistant_message_id = assistant_id
+                transition_turn(
+                    persisted,
+                    "completed",
+                    assistant_message_id=assistant_id,
+                )
+                persisted.error_code = None
+                existing = await save_db.get(Message, assistant_id)
+                metadata = message_turn_metadata(persisted, status="completed")
+                if persisted.user_message_id is not None:
+                    persisted_user = await save_db.get(
+                        Message, persisted.user_message_id
+                    )
+                    if isinstance(persisted_user, Message):
+                        for key, value in metadata.items():
+                            setattr(persisted_user, key, value)
+                if isinstance(existing, Message):
+                    existing.content = persisted.answer_content
+                    existing.sources = list(persisted.answer_sources or [])
+                    existing.tokens = persisted.tokens
+                    for key, value in metadata.items():
+                        setattr(existing, key, value)
+                else:
+                    save_db.add(
+                        Message(
+                            id=assistant_id,
+                            conversation_id=conv.id,
+                            role="assistant",
+                            content=persisted.answer_content,
+                            sources=list(persisted.answer_sources or []),
+                            tokens=persisted.tokens,
+                            **metadata,
+                        )
+                    )
+                await save_db.commit()
+                turn.status = persisted.status
+                turn.assistant_message_id = persisted.assistant_message_id
+                turn.completed_at = persisted.completed_at
+                turn.updated_at = persisted.updated_at
+                turn.error_code = persisted.error_code
+                return turn
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < MAX_PERSIST_ATTEMPTS:
+                await asyncio.sleep(0)
+    assert last_error is not None
+    raise last_error
+
+
+async def _mark_turn_persist_failed(
+    *,
+    turn: ChatTurn,
+    trace_id: str,
+    error_code: str = "assistant_persistence_failed",
+) -> bool:
+    """Mark a staged payload recoverable and return whether disk proves it.
+
+    An in-memory ``generated`` object is not recovery evidence: the process may
+    have failed before that payload reached PostgreSQL.  Retry guidance is
+    emitted only when this function commits a row whose answer payload exists.
+    """
+
+    from database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as save_db:
+            persisted = await save_db.get(ChatTurn, turn.id)
+            if isinstance(persisted, ChatTurn):
+                if persisted.status != "completed":
+                    # ``generated`` and ``persist_failed`` are the only states
+                    # that can retain an answer for recovery.
+                    if (
+                        persisted.status == "generated"
+                        and persisted.answer_content is not None
+                    ):
+                        transition_turn(
+                            persisted,
+                            "persist_failed",
+                            trace_id=trace_id,
+                            error_code=error_code,
+                        )
+                    elif (
+                        persisted.status == "persist_failed"
+                        and persisted.answer_content is not None
+                    ):
+                        persisted.error_code = error_code
+                        persisted.trace_id = trace_id
+                    elif persisted.status in {
+                        "accepted",
+                        "generating",
+                        "generated",
+                        "persist_failed",
+                    }:
+                        # The generated payload itself could not be staged, so
+                        # there is nothing a same-id retry can safely recover.
+                        transition_turn(
+                            persisted,
+                            "failed",
+                            trace_id=trace_id,
+                            error_code="generated_payload_not_persisted",
+                        )
+                await save_db.commit()
+                turn.status = persisted.status
+                turn.error_code = persisted.error_code
+                turn.trace_id = persisted.trace_id
+                turn.answer_content = persisted.answer_content
+                turn.generated_at = persisted.generated_at
+                return bool(
+                    persisted.status in RECOVERABLE_TURN_STATUSES
+                    and persisted.answer_content is not None
+                )
+            else:
+                # A missing row (including a lightweight test double) cannot
+                # prove that the generated payload survived the process.
+                turn.status = "failed"
+                turn.error_code = "generated_payload_not_persisted"
+                turn.trace_id = trace_id
+                return False
+    except Exception as exc:
+        log_exception_safely(
+            logger,
+            "[chat/turn persist-failed marker] turn=%s trace=%s",
+            turn.id,
+            trace_id,
+            exc=exc,
+        )
+    return False
+
+
+async def _mark_turn_terminal(
+    *,
+    turn: ChatTurn | None,
+    status: Literal["failed", "cancelled"],
+    trace_id: str,
+    error_code: str,
+    evidence_status: str | None = None,
+    retrieval_executed: bool | None = None,
+) -> None:
+    if turn is None:
+        return
+    from database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as save_db:
+            persisted = await save_db.get(ChatTurn, turn.id)
+            if not isinstance(persisted, ChatTurn):
+                persisted = turn
+            if persisted.status in {"accepted", "generating"}:
+                transition_turn(
+                    persisted,
+                    status,
+                    trace_id=trace_id,
+                    evidence_status=evidence_status,
+                    retrieval_executed=retrieval_executed,
+                    error_code=error_code,
+                )
+                await save_db.commit()
+            turn.status = persisted.status
+            turn.error_code = persisted.error_code
+            turn.evidence_status = persisted.evidence_status
+            turn.retrieval_executed = persisted.retrieval_executed
+    except Exception as exc:
+        log_exception_safely(
+            logger,
+            "[chat/turn terminal marker] turn=%s trace=%s status=%s",
+            turn.id,
+            trace_id,
+            status,
+            exc=exc,
+        )
+
+
+async def _stage_generated_turn(
+    *,
+    turn: ChatTurn,
+    conv: Conversation,
+    answer: str,
+    sources: list,
+    tokens: int | None,
+    evidence_status: str | None,
+    retrieval_executed: bool | None,
+    trace_id: str,
+    search_snapshot: dict | None = None,
+) -> ChatTurn:
+    """Durably stage the answer before the assistant message transaction."""
+
+    from database import AsyncSessionLocal
+
+    last_error: BaseException | None = None
+    for attempt in range(MAX_PERSIST_ATTEMPTS):
+        try:
+            async with AsyncSessionLocal() as save_db:
+                persisted = await save_db.get(ChatTurn, turn.id)
+                if not isinstance(persisted, ChatTurn):
+                    persisted = turn
+                if persisted.status == "completed":
+                    return persisted
+                if persisted.status not in {"accepted", "generating", "generated", "persist_failed"}:
+                    return persisted
+                if persisted.status in {"accepted", "generating"}:
+                    transition_turn(persisted, "generated")
+                elif persisted.status == "persist_failed":
+                    transition_turn(persisted, "generated")
+                # ``generated`` -> ``generated`` is intentionally avoided by
+                # transition_turn; update its payload directly on retries.
+                persisted.answer_content = answer
+                persisted.answer_sources = list(sources or [])
+                persisted.search_snapshot = search_snapshot
+                persisted.tokens = tokens
+                persisted.evidence_status = evidence_status
+                persisted.retrieval_executed = retrieval_executed
+                persisted.trace_id = trace_id
+                persisted.error_code = None
+                persisted.assistant_message_id = (
+                    persisted.assistant_message_id or uuid.uuid4()
+                )
+                persisted.persistence_attempts = int(
+                    getattr(persisted, "persistence_attempts", 0) or 0
+                ) + 1
+                await save_db.commit()
+                turn.status = persisted.status
+                turn.answer_content = persisted.answer_content
+                turn.answer_sources = persisted.answer_sources
+                turn.search_snapshot = persisted.search_snapshot
+                turn.tokens = persisted.tokens
+                turn.evidence_status = persisted.evidence_status
+                turn.retrieval_executed = persisted.retrieval_executed
+                turn.trace_id = persisted.trace_id
+                turn.assistant_message_id = persisted.assistant_message_id
+                turn.generated_at = persisted.generated_at
+                turn.updated_at = persisted.updated_at
+                return turn
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < MAX_PERSIST_ATTEMPTS:
+                await asyncio.sleep(0)
+    assert last_error is not None
+    raise last_error
+
+
+async def _existing_turn_response(
+    *,
+    conv: Conversation,
+    turn: ChatTurn,
+    user: User,
+    db: AsyncSession,
+) -> StreamingResponse:
+    """Resolve duplicate request ids without dispatching retrieval again."""
+
+    if turn.status in RECOVERABLE_TURN_STATUSES:
+        try:
+            turn = await _recover_turn_answer(conv=conv, turn=turn)
+        except Exception as exc:
+            await _mark_turn_persist_failed(
+                turn=turn,
+                trace_id=turn.trace_id or uuid.uuid4().hex,
+            )
+            trace_event(
+                "chat.persistence_error",
+                trace_id=turn.trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                operation="recover_turn_answer",
+                error=exc,
+            )
+    # A retry may arrive after the user's KB scope changed or a document was
+    # disabled/re-chunked.  Reuse the history authorization boundary so the
+    # durable identity snapshot is reloaded from current active+ready rows;
+    # never replay stale turn JSON directly.
+    replay_row = Message(
+        id=turn.assistant_message_id or uuid.uuid4(),
+        conversation_id=conv.id,
+        role="assistant",
+        content=turn.answer_content or "",
+        sources=list(turn.answer_sources or []),
+        tokens=turn.tokens,
+        turn_id=turn.id,
+        request_id=turn.request_id,
+        turn_status=turn.status,
+        trace_id=turn.trace_id,
+        evidence_status=turn.evidence_status,
+        retrieval_executed=turn.retrieval_executed,
+        error_code=turn.error_code,
+        delivery_status=("delivered" if turn.status == "completed" else "pending"),
+        persistence_status=(
+            "completed" if turn.status == "completed" else turn.status
+        ),
+        search_snapshot=turn.search_snapshot,
+        created_at=turn.completed_at or turn.updated_at or turn.created_at or now_utc(),
+    )
+    visible = await _messages_with_current_source_scope(
+        [replay_row],
+        user=user,
+        db=db,
+    )
+    if visible:
+        turn.answer_sources = list(visible[0].sources or [])
+        turn.search_snapshot = visible[0].search_snapshot
+    status_code = 200
+    if turn.status in {"accepted", "generating"}:
+        status_code = 202
+    return _turn_replay_response(
+        conv=conv,
+        turn=turn,
+        status_code=status_code,
+        replayed=True,
+    )
+
+
 @router.post("/send")
 async def send_message(
     payload: ChatRequest,
@@ -1643,25 +2742,246 @@ async def send_message(
     user: User = Depends(require_permission(CHAT_USE)),
 ):
     trace_id = uuid.uuid4().hex
+    request_search_config = payload.search_config.model_dump()
+    try:
+        request_id = normalize_request_id(payload.request_id)
+        requested_turn_id = normalize_turn_id(payload.turn_id) if payload.turn_id else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     # 流式开始前校验请求的知识库都在可访问范围内（accessible 为 None 表示全部）
     accessible = await get_accessible_kb_ids(user, db)
     if accessible is not None and not set(payload.knowledge_base_ids).issubset(set(accessible)):
         raise HTTPException(status_code=403, detail="无权访问部分知识库")
 
+    durable_turn_enabled = _durable_turn_supported(db)
+    durable_turn: ChatTurn | None = None
+    conv: Conversation | None = None
+    if durable_turn_enabled:
+        existing_user_turn = await find_turn_for_user(db, user.id, request_id)
+        if existing_user_turn is not None:
+            if (
+                requested_turn_id is not None
+                and requested_turn_id != existing_user_turn.id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="同一 request_id 对应的 turn_id 不一致",
+                )
+            if (
+                payload.conversation_id is not None
+                and payload.conversation_id != existing_user_turn.conversation_id
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="同一 request_id 已属于其他会话",
+                )
+            existing_conv = await db.get(
+                Conversation, existing_user_turn.conversation_id
+            )
+            if not existing_conv or (
+                not user.is_superadmin and existing_conv.user_id != user.id
+            ):
+                raise HTTPException(status_code=404, detail="会话不存在")
+            stored_revision, stored_state_id = (
+                _stored_pending_request_identity(existing_user_turn)
+            )
+            retry_revision = (
+                payload.pending_route_revision
+                if payload.pending_route_revision is not None
+                else stored_revision
+            )
+            retry_state_id = (
+                payload.pending_state_id
+                if payload.pending_state_id is not None
+                else stored_state_id
+            )
+            retry_context = _request_context_for_payload(
+                payload,
+                conversation_id=existing_user_turn.conversation_id,
+                pending_route_revision=retry_revision,
+                pending_state_id=retry_state_id,
+            )
+            try:
+                assert_turn_request_matches(existing_user_turn, retry_context)
+            except TurnRequestConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            if turn_lease_expired(existing_user_turn):
+                # Serialize stale recovery.  Only one retry may replace the
+                # expired lease; all others observe its renewed deadline.
+                locked_turn = await find_turn_for_user(
+                    db,
+                    user.id,
+                    request_id,
+                    for_update=True,
+                )
+                if not isinstance(locked_turn, ChatTurn):
+                    raise HTTPException(status_code=409, detail="请求状态已变化，请重试")
+                if locked_turn.status in {"accepted", "generating"}:
+                    refresh = getattr(db, "refresh", None)
+                    if callable(refresh):
+                        await refresh(
+                            existing_conv,
+                            attribute_names=[
+                                "route_state_revision",
+                                "pending_route_state",
+                            ],
+                        )
+                    current_revision, current_state_id = _pending_route_identity(
+                        existing_conv
+                    )
+                    stored_revision, stored_state_id = (
+                        _stored_pending_request_identity(locked_turn)
+                    )
+                    allowed_resume_identities = {
+                        (stored_revision, stored_state_id)
+                    }
+                    stored_resume_identity = _stored_resume_identity(locked_turn)
+                    if stored_resume_identity is not None:
+                        allowed_resume_identities.add(stored_resume_identity)
+                    if (
+                        current_revision,
+                        current_state_id,
+                    ) not in allowed_resume_identities:
+                        transition_turn(
+                            locked_turn,
+                            "failed",
+                            trace_id=trace_id,
+                            error_code="stale_request_context_changed",
+                        )
+                        await db.commit()
+                        raise HTTPException(
+                            status_code=409,
+                            detail="待处理的澄清上下文已变化，请使用新的 request_id 重新发送",
+                        )
+                    if reclaim_stale_turn(locked_turn, owner=trace_id):
+                        await db.commit()
+                        durable_turn = locked_turn
+                        conv = existing_conv
+                        trace_event(
+                            "chat.turn_reclaimed",
+                            trace_id=trace_id,
+                            conversation_id=conv.id,
+                            user_id=user.id,
+                            turn_id=durable_turn.id,
+                            request_id=durable_turn.request_id,
+                            execution_attempts=durable_turn.execution_attempts,
+                        )
+                    else:
+                        await db.commit()
+                        return await _existing_turn_response(
+                            conv=existing_conv,
+                            turn=locked_turn,
+                            user=user,
+                            db=db,
+                        )
+                else:
+                    await db.commit()
+                    return await _existing_turn_response(
+                        conv=existing_conv,
+                        turn=locked_turn,
+                        user=user,
+                        db=db,
+                    )
+            else:
+                return await _existing_turn_response(
+                    conv=existing_conv,
+                    turn=existing_user_turn,
+                    user=user,
+                    db=db,
+                )
+
     # 获取或创建会话。新会话先 flush 取得 id，但不提前提交；若后续路由/校验失败，
     # 请求结束时整个未提交事务会回滚，避免留下空白会话。
-    if payload.conversation_id:
+    if conv is None and payload.conversation_id:
         conv = await db.get(Conversation, payload.conversation_id)
         # 复用已有会话时校验归属：非超管不可操作他人会话
         if conv and not user.is_superadmin and conv.user_id != user.id:
             raise HTTPException(status_code=404, detail="会话不存在")
-    else:
+    elif conv is None:
         conv = None
 
     if not conv:
         conv = Conversation(title=payload.question[:50], user_id=user.id)
         db.add(conv)
         await db.flush()
+
+    # Reserve the idempotency ledger before semantic routing.  A duplicate
+    # request therefore never re-enters retrieval/model code, including when
+    # the first attempt stopped after generation but before assistant-message
+    # persistence.  Legacy test doubles are intentionally left on the old path;
+    # real AsyncSession instances always support both methods below.
+    durable_turn_created = False
+    if durable_turn_enabled and durable_turn is None:
+        pending_route_revision, pending_state_id = _pending_route_identity(conv)
+        requested_pending_revision = (
+            payload.pending_route_revision
+            if payload.pending_route_revision is not None
+            else pending_route_revision
+        )
+        requested_pending_state_id = (
+            payload.pending_state_id
+            if payload.pending_state_id is not None
+            else pending_state_id
+        )
+        if (requested_pending_revision, requested_pending_state_id) != (
+            pending_route_revision,
+            pending_state_id,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="待处理的澄清上下文已变化，请刷新会话后重试",
+            )
+        try:
+            durable_turn, durable_turn_created = await reserve_turn(
+                db,
+                conversation_id=conv.id,
+                user_id=user.id,
+                request_id=request_id,
+                turn_id=requested_turn_id,
+                question=payload.question,
+                trace_id=trace_id,
+                knowledge_base_ids=payload.knowledge_base_ids,
+                search_config=request_search_config,
+                pending_route_revision=pending_route_revision,
+                pending_state_id=pending_state_id,
+            )
+        except TurnRequestConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not durable_turn_created:
+            # The existing row is authoritative.  Do not mutate its trace or
+            # pending state with this duplicate request.
+            if durable_turn.conversation_id != conv.id:
+                winner_conv = await db.get(
+                    Conversation, durable_turn.conversation_id
+                )
+                if not winner_conv or (
+                    not user.is_superadmin and winner_conv.user_id != user.id
+                ):
+                    raise HTTPException(status_code=404, detail="会话不存在")
+                conv = winner_conv
+            return await _existing_turn_response(
+                conv=conv,
+                turn=durable_turn,
+                user=user,
+                db=db,
+            )
+        try:
+            await db.commit()
+        except Exception as exc:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "请求已接收但暂时无法保存，请使用相同 request_id 重试",
+                    "error_code": "turn_reservation_persistence_uncertain",
+                    "same_request_recoverable": True,
+                    "retry_with_new_request_id": False,
+                },
+            ) from exc
 
     stored_pending_state = getattr(conv, "pending_route_state", None)
     pending_route_state = _active_pending_route_state(stored_pending_state)
@@ -1841,6 +3161,7 @@ async def send_message(
                 pending_state=evidence_pending_state,
                 trace_id=trace_id,
                 action="cancel",
+                turn=durable_turn,
             )
         if evidence_reply.action == "repeat":
             return await _evidence_pending_direct_response(
@@ -1852,6 +3173,7 @@ async def send_message(
                 trace_id=trace_id,
                 action="repeat",
                 repeat_reason=evidence_repeat_reason,
+                turn=durable_turn,
             )
 
     route_candidates = route_context_payloads(conversation_context)
@@ -1893,6 +3215,7 @@ async def send_message(
             selected_kb_ids=payload.knowledge_base_ids,
             task_contract=None,
             emit_clarification_event=False,
+            turn=durable_turn,
         )
         if cleared_evidence_state_id is not None:
             trace_event(
@@ -1976,6 +3299,7 @@ async def send_message(
                 trace_id=trace_id,
                 action="repeat",
                 repeat_reason="route_contract_unavailable",
+                turn=durable_turn,
             )
     else:
         try:
@@ -2010,6 +3334,14 @@ async def send_message(
                 trace_id,
                 conv.id,
                 exc=exc,
+            )
+            await _mark_turn_terminal(
+                turn=durable_turn,
+                status="failed",
+                trace_id=trace_id,
+                error_code="intent_routing_failed",
+                evidence_status="error",
+                retrieval_executed=False,
             )
             raise
     decision = routing_result.decision
@@ -2077,6 +3409,7 @@ async def send_message(
                 trace_id=trace_id,
                 selected_kb_ids=payload.knowledge_base_ids,
                 task_contract=task_contract,
+                turn=durable_turn,
             )
             if cleared_evidence_state_id is not None:
                 trace_event(
@@ -2117,6 +3450,14 @@ async def send_message(
                 error=ValueError("该问题需要查询知识库，请至少选择一个知识库"),
                 evidence_status="error",
             )
+            await _mark_turn_terminal(
+                turn=durable_turn,
+                status="failed",
+                trace_id=trace_id,
+                error_code="knowledge_base_required",
+                evidence_status="error",
+                retrieval_executed=False,
+            )
             raise HTTPException(
                 status_code=400,
                 detail="该问题需要查询知识库，请至少选择一个知识库",
@@ -2131,10 +3472,41 @@ async def send_message(
         selected_tags=search_config.get("tags") or [],
         is_followup=conversation_context.is_followup,
         carryover_sources=conversation_context.carryover_sources,
+        selected_kb_count=len(set(payload.knowledge_base_ids)),
     )
-    rag_stream_runner = (
-        run_rag_v2_stream if pipeline_version == "v2" else run_rag_stream
-    )
+    if pipeline_version == "reject":
+        trace_event(
+            "chat.error",
+            trace_id=trace_id,
+            conversation_id=conv.id,
+            user_id=user.id,
+            stage="runner_selection",
+            error=ValueError(pipeline_reason),
+            contract_present=isinstance(task_contract, RagTaskContract),
+            evidence_status="error",
+        )
+        await _mark_turn_terminal(
+            turn=durable_turn,
+            status="failed",
+            trace_id=trace_id,
+            error_code="runner_contract_rejected",
+            evidence_status="error",
+            retrieval_executed=False,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "请求执行合同校验失败，请重新发送",
+                "error_code": "runner_contract_rejected",
+                "same_request_recoverable": False,
+                "retry_with_new_request_id": True,
+            },
+        )
+    rag_stream_runner = {
+        "v1": run_rag_stream,
+        "v2": run_rag_v2_stream,
+        "direct": run_direct_response_stream,
+    }[pipeline_version]
     trace_event(
         "chat.pipeline_selected",
         trace_id=trace_id,
@@ -2144,14 +3516,117 @@ async def send_message(
         reason=pipeline_reason,
     )
 
-    # 保存用户消息
-    user_msg = Message(
-        id=uuid.uuid4(),
-        conversation_id=conv.id,
-        role="user",
-        content=payload.question,
+    if pipeline_version == "v2" and isinstance(task_contract, RagTaskContract):
+        # The semantic router can be ready while the deterministic local plan
+        # still cannot identify a safe relationship/bridge query.  Promote
+        # that uncertainty into the durable route-clarification path before
+        # saving a generating user turn or opening any retrieval/model call.
+        execution_plan = _plan_with_contract_requirements(
+            plan_query_locally(conversation_context.standalone_query),
+            task_contract,
+        )
+        if execution_plan.needs_clarification:
+            clarification_question = (
+                execution_plan.clarification_question
+                or "请补充需要查询或了解的具体问题。"
+            )
+            blocked_contract = replace(
+                task_contract,
+                readiness="needs_clarification",
+                dispatch_authorized=False,
+                decision_reason="query_plan_requires_clarification",
+                clarification=RouteClarification(
+                    question=clarification_question,
+                    unresolved=(
+                        RouteUnresolvedSlot(
+                            role="query_plan",
+                            reason="missing",
+                        ),
+                    ),
+                ),
+            )
+            trace_event(
+                "query.plan",
+                trace_id=trace_id,
+                pipeline_version="v2",
+                execution_surface="api_clarification_gate",
+                plan=(
+                    execution_plan.to_dict()
+                    if settings.rag_trace_include_content
+                    else {
+                        "schema_version": execution_plan.schema_version,
+                        "answer_shape": execution_plan.answer_shape,
+                        "query_count": len(execution_plan.retrieval_queries),
+                        "requirement_count": len(execution_plan.requirements),
+                        "confidence": execution_plan.confidence,
+                        "source": execution_plan.source,
+                        "needs_clarification": True,
+                    }
+                ),
+                **content_fields(
+                    "query",
+                    conversation_context.standalone_query,
+                ),
+            )
+            response = await _route_clarification_response(
+                db=db,
+                conv=conv,
+                user=user,
+                question=payload.question,
+                clarification_message=clarification_question,
+                decision_reason="query_plan_requires_clarification",
+                trace_id=trace_id,
+                selected_kb_ids=payload.knowledge_base_ids,
+                task_contract=blocked_contract,
+                turn=durable_turn,
+            )
+            if cleared_evidence_state_id is not None:
+                trace_event(
+                    "evidence.clarification_resolved",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    pending_state_id=cleared_evidence_state_id,
+                    resolution="new_question",
+                    route_state_revision=conv.route_state_revision,
+                )
+            return response
+
+    # 保存用户消息并把 durable turn 推进到 generating。用户消息和状态在
+    # RAG 流启动前一起提交，因此断线/进程退出后仍能判断该 request_id 已被
+    # 接受，不会误触发第二次检索。
+    if durable_turn is not None and durable_turn.status == "accepted":
+        transition_turn(durable_turn, "generating", trace_id=trace_id)
+        renew_turn_lease(durable_turn, owner=trace_id)
+    user_metadata = (
+        message_turn_metadata(durable_turn, status="generating")
+        if durable_turn is not None
+        else {}
     )
-    db.add(user_msg)
+    user_msg = None
+    if durable_turn is not None and durable_turn.user_message_id is not None:
+        loaded_user_msg = await db.get(Message, durable_turn.user_message_id)
+        if isinstance(loaded_user_msg, Message):
+            user_msg = loaded_user_msg
+            user_msg.content = payload.question
+            for key, value in user_metadata.items():
+                setattr(user_msg, key, value)
+    if user_msg is None:
+        user_msg = Message(
+            id=(
+                durable_turn.user_message_id
+                if durable_turn is not None
+                and durable_turn.user_message_id is not None
+                else uuid.uuid4()
+            ),
+            conversation_id=conv.id,
+            role="user",
+            content=payload.question,
+            **user_metadata,
+        )
+        db.add(user_msg)
+    if durable_turn is not None:
+        durable_turn.user_message_id = user_msg.id
     current_pending = getattr(conv, "pending_route_state", None)
     if (
         isinstance(current_pending, dict)
@@ -2169,6 +3644,12 @@ async def send_message(
             route_state_revision=conv.route_state_revision,
             relation=(route_decision.relation if route_decision is not None else "legacy"),
         )
+    if durable_turn is not None:
+        resume_revision, resume_state_id = _pending_route_identity(conv)
+        durable_turn.resume_context = {
+            "revision": resume_revision,
+            "state_id": resume_state_id,
+        }
     await db.commit()
     if cleared_evidence_state_id is not None:
         trace_event(
@@ -2186,6 +3667,7 @@ async def send_message(
     )
 
     async def generate():
+        nonlocal durable_turn
         full_response = []
         sources = []
         tokens = None
@@ -2210,8 +3692,27 @@ async def send_message(
         pending_done_chunk = None
         evidence_clarification_payload = None
         evidence_clarification_locked = False
+        search_snapshot: dict | None = None
         # 会话和用户消息已提交。先告知前端会话 ID，用户在首条回答完成前停止时也能继续该会话。
-        yield f"data: {json.dumps({'type': 'conversation_started', 'conversation_id': str(conv.id)})}\n\n"
+        yield "data: " + json.dumps(
+            {
+                "type": "conversation_started",
+                "conversation_id": str(conv.id),
+                **(
+                    {
+                        "turn_id": str(durable_turn.id),
+                        "request_id": durable_turn.request_id,
+                    }
+                    if durable_turn is not None
+                    else {}
+                ),
+            },
+            ensure_ascii=False,
+        ) + "\n\n"
+        if durable_turn is not None:
+            yield "data: " + json.dumps(
+                _turn_state_event(durable_turn), ensure_ascii=False
+            ) + "\n\n"
         try:
             rag_stream = rag_stream_runner(
                 question=pipeline_base_query or payload.question,
@@ -2535,6 +4036,10 @@ async def send_message(
                         evidence_scope_anchor_doc_ids
                     )
                     data["evidence_status"] = evidence_status
+                    # Keep only a bounded identity/ranking snapshot for durable
+                    # retries/history.  Message.sources remains the current
+                    # validated citation payload and is re-authorized on read.
+                    search_snapshot = _bounded_search_snapshot(data)
                     chunk = (
                         "data: "
                         + json.dumps(data, ensure_ascii=False)
@@ -2618,6 +4123,19 @@ async def send_message(
                 hit_count=hit_count or 0,
                 **content_fields("partial_answer", "".join(full_response)),
             )
+            try:
+                await asyncio.shield(
+                    _mark_turn_terminal(
+                        turn=durable_turn,
+                        status="cancelled",
+                        trace_id=trace_id,
+                        error_code="stream_cancelled",
+                        evidence_status=evidence_status,
+                        retrieval_executed=retrieval_executed,
+                    )
+                )
+            except Exception:
+                pass
             raise
         except Exception as e:
             log_exception_safely(
@@ -2652,6 +4170,14 @@ async def send_message(
                 direct_evidence_count=direct_evidence_count or 0,
                 related_reference_count=related_reference_count or 0,
                 **content_fields("partial_answer", "".join(full_response)),
+            )
+            await _mark_turn_terminal(
+                turn=durable_turn,
+                status="failed",
+                trace_id=trace_id,
+                error_code="stream_failed",
+                evidence_status=evidence_status,
+                retrieval_executed=retrieval_executed,
             )
             from database import AsyncSessionLocal
             if routing_result.route_log_id is not None:
@@ -2690,17 +4216,119 @@ async def send_message(
         created_pending_state = None
         resolved_pending_state_id = None
         persisted_route_state_revision = expected_route_state_revision
+        # Stage the generated payload first, then complete the transcript in a
+        # retryable transaction.  Any later pending-route CAS or statistics
+        # failure can no longer roll the assistant answer back.
+        if durable_turn is not None:
+            try:
+                staged_sources = [
+                    item
+                    for source in sources[:20]
+                    if (item := _bounded_source_identity_snapshot(source)) is not None
+                ]
+                durable_turn = await _stage_generated_turn(
+                    turn=durable_turn,
+                    conv=conv,
+                    answer=answer,
+                    sources=staged_sources,
+                    tokens=tokens,
+                    evidence_status=evidence_status,
+                    retrieval_executed=retrieval_executed,
+                    trace_id=trace_id,
+                    search_snapshot=search_snapshot,
+                )
+                durable_turn = await _recover_turn_answer(
+                    conv=conv,
+                    turn=durable_turn,
+                )
+            except asyncio.CancelledError:
+                await _mark_turn_terminal(
+                    turn=durable_turn,
+                    status="cancelled",
+                    trace_id=trace_id,
+                    error_code="response_persistence_cancelled",
+                    evidence_status=evidence_status,
+                    retrieval_executed=retrieval_executed,
+                )
+                raise
+            except Exception as exc:
+                payload_recoverable = await _mark_turn_persist_failed(
+                    turn=durable_turn,
+                    trace_id=trace_id,
+                )
+                trace_event(
+                    "chat.persistence_error",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    operation="stage_or_complete_turn",
+                    error=exc,
+                    **content_fields("answer", answer),
+                )
+                yield "data: " + json.dumps(
+                    {
+                        "type": "error",
+                        "message": (
+                            "回答已生成但暂时无法完成保存，请使用相同 request_id 重试"
+                            if payload_recoverable
+                            else (
+                                "回答已生成，但恢复数据未能保存。"
+                                "请重新发送问题并使用新的 request_id。"
+                            )
+                        ),
+                        "request_id": durable_turn.request_id,
+                        "turn_id": str(durable_turn.id),
+                        "status": durable_turn.status,
+                        "same_request_recoverable": payload_recoverable,
+                        "persistence_status": "failed",
+                        "retry_with_new_request_id": not payload_recoverable,
+                    },
+                    ensure_ascii=False,
+                ) + "\n\n"
+                yield "data: " + json.dumps(
+                    {
+                        "type": "done",
+                        "conversation_id": str(conv.id),
+                        "request_id": durable_turn.request_id,
+                        "turn_id": str(durable_turn.id),
+                        "status": durable_turn.status,
+                        "persistence_status": "failed",
+                        "same_request_recoverable": payload_recoverable,
+                        "retry_with_new_request_id": not payload_recoverable,
+                    },
+                    ensure_ascii=False,
+                ) + "\n\n"
+                return
         try:
             async with AsyncSessionLocal() as save_db:
-                ai_msg = Message(
-                    id=uuid.uuid4(),
-                    conversation_id=conv.id,
-                    role="assistant",
-                    content=answer,
-                    sources=sources,
-                    tokens=tokens,
-                )
-                save_db.add(ai_msg)
+                ai_msg = None
+                if durable_turn is not None and durable_turn.assistant_message_id:
+                    loaded_ai_msg = await save_db.get(
+                        Message, durable_turn.assistant_message_id
+                    )
+                    if isinstance(loaded_ai_msg, Message):
+                        ai_msg = loaded_ai_msg
+                if ai_msg is None:
+                    ai_msg = Message(
+                        id=(
+                            durable_turn.assistant_message_id
+                            if durable_turn is not None
+                            and durable_turn.assistant_message_id is not None
+                            else uuid.uuid4()
+                        ),
+                        conversation_id=conv.id,
+                        role="assistant",
+                        content=answer,
+                        sources=sources,
+                        tokens=tokens,
+                        **(
+                            message_turn_metadata(
+                                durable_turn, status="completed"
+                            )
+                            if durable_turn is not None
+                            else {}
+                        ),
+                    )
+                    save_db.add(ai_msg)
 
                 new_pending_state = None
                 if evidence_clarification_payload is not None:
@@ -2773,7 +4401,10 @@ async def send_message(
                     persisted_conv.route_state_revision = persisted_revision + 1
                     persisted_route_state_revision = persisted_conv.route_state_revision
 
-                if routing_result.route_log_id is not None:
+                if (
+                    durable_turn is None
+                    and routing_result.route_log_id is not None
+                ):
                     route_log = await save_db.get(IntentRouteLog, routing_result.route_log_id)
                     if route_log is not None:
                         route_log.retrieval_executed = (
@@ -2884,6 +4515,14 @@ async def send_message(
                 hit_count=hit_count or 0,
                 **content_fields("partial_answer", answer),
             )
+            await _mark_turn_terminal(
+                turn=durable_turn,
+                status="cancelled",
+                trace_id=trace_id,
+                error_code="response_persistence_cancelled",
+                evidence_status=evidence_status,
+                retrieval_executed=retrieval_executed,
+            )
             raise
         except Exception as exc:
             log_exception_safely(
@@ -2893,16 +4532,64 @@ async def send_message(
                 conv.id,
                 exc=exc,
             )
-            trace_event(
-                "chat.persistence_error",
-                trace_id=trace_id,
-                conversation_id=conv.id,
-                error=exc,
-                **content_fields("answer", answer),
-            )
-            yield f"data: {json.dumps({'type': 'error', 'message': '回答已生成，但保存失败，请重试'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conv.id)})}\n\n"
-            return
+            if durable_turn is not None and durable_turn.status == "completed":
+                # The transcript is already durable.  This exception can only
+                # come from the independent pending-route/statistics phase.
+                # Never emit an ACK for its rolled-back pending state.
+                created_pending_state = None
+                resolved_pending_state_id = None
+                trace_event(
+                    "chat.persistence_error",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    operation="post_answer_state_update",
+                    answer_persisted=True,
+                    error=exc,
+                )
+            else:
+                trace_event(
+                    "chat.persistence_error",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    error=exc,
+                    **content_fields("answer", answer),
+                )
+                yield f"data: {json.dumps({'type': 'error', 'message': '回答已生成，但保存失败，请重试'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conv.id)})}\n\n"
+                return
+        if durable_turn is not None and routing_result.route_log_id is not None:
+            try:
+                async with AsyncSessionLocal() as stats_db:
+                    route_log = await stats_db.get(
+                        IntentRouteLog, routing_result.route_log_id
+                    )
+                    if isinstance(route_log, IntentRouteLog):
+                        route_log.retrieval_executed = (
+                            bool(retrieval_executed)
+                            if retrieval_executed is not None
+                            else bool(decision.need_retrieval)
+                        )
+                        route_log.evidence_status = evidence_status or (
+                            "no_hit" if decision.need_retrieval else "skipped"
+                        )
+                        route_log.hit_count = int(hit_count or 0)
+                        await stats_db.commit()
+            except Exception as stats_exc:
+                log_exception_safely(
+                    logger,
+                    "[chat/route statistics best-effort] trace=%s conv=%s",
+                    trace_id,
+                    conv.id,
+                    exc=stats_exc,
+                )
+                trace_event(
+                    "chat.persistence_error",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    operation="update_route_statistics",
+                    answer_persisted=True,
+                    error=stats_exc,
+                )
         if created_pending_state is not None:
             # ``evidence_clarification`` is streamed as soon as the pipeline
             # closes generation, but choices must remain disabled until the
@@ -2919,6 +4606,10 @@ async def send_message(
                 )
                 + "\n\n"
             )
+        if durable_turn is not None:
+            yield "data: " + json.dumps(
+                _turn_state_event(durable_turn), ensure_ascii=False
+            ) + "\n\n"
         if pending_done_chunk is not None:
             yield pending_done_chunk
         else:
@@ -2927,15 +4618,11 @@ async def send_message(
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-            # 首条 SSE 数据到达前，前端也可从响应头立即绑定会话，降低刚开始就停止时丢失会话 ID 的概率。
-            "X-Conversation-ID": str(conv.id),
-            # 便于开发阶段把浏览器请求与结构化 rag.trace 日志精确关联。
-            "X-RAG-Trace-ID": trace_id,
-        },
+        headers=_turn_response_headers(
+            conversation_id=conv.id,
+            trace_id=trace_id,
+            turn=durable_turn,
+        ),
     )
 
 

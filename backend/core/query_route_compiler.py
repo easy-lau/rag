@@ -25,6 +25,7 @@ from core.query_route_contract import (
     RouteUnresolvedSlot,
     normalize_turn_candidate_keys,
 )
+from core.rag_v2.query_plan import infer_implicit_bridge
 
 
 TASK_CONTRACT_SCHEMA_VERSION = "rag_task_contract.v1"
@@ -320,6 +321,8 @@ def _compile_base_plan(
 
 def _compile_requirements(
     route: RagRouteDecision,
+    *,
+    question: str,
 ) -> tuple[CompiledAnswerRequirement, ...]:
     compiled: list[CompiledAnswerRequirement] = []
     for index, item in enumerate(route.requirements, start=1):
@@ -334,6 +337,50 @@ def _compile_requirements(
                 source="explicit" if item.origin == "user_text" else "inferred",
             )
         )
+    # The route model is semantic assistance, not the sole safety boundary.
+    # If it times out or compresses an implicit mapping question into one
+    # answer target, derive a domain-neutral bridge from the user's wording.
+    # No concrete classification value is guessed here; evidence must still
+    # prove that intermediate relationship later in the V2 pipeline.
+    if (
+        route.readiness == "ready"
+        and route.evidence_scope in {"enterprise_kb", "mixed"}
+        and not any(item.role == "bridge" for item in compiled)
+        and len(compiled) < 8
+    ):
+        # Prefer the original user question.  A route model is allowed to
+        # summarize an answer requirement (for example, reduce
+        # ``普通员工的出差标准`` to ``查询出差标准``); that summary must not erase
+        # the qualifier that makes a bridge necessary.  Requirement text is
+        # retained as a secondary source for callers that compile an already
+        # contextualized/decomposed route.
+        bridge_inputs = [
+            question,
+            *(
+                item.description
+                for item in route.requirements
+                if item.role == "answer"
+            ),
+        ]
+        inferred_bridge = next(
+            (
+                inferred
+                for value in bridge_inputs
+                for inferred in (infer_implicit_bridge(value),)
+                if inferred is not None
+            ),
+            None,
+        )
+        if inferred_bridge is not None:
+            description, _ = inferred_bridge
+            compiled.append(CompiledAnswerRequirement(
+                id=f"r{len(compiled) + 1}",
+                role="bridge",
+                origin="semantically_entailed",
+                description=description,
+                importance="helpful",
+                source="inferred",
+            ))
     return tuple(compiled)
 
 
@@ -446,7 +493,7 @@ def compile_rag_task_contract(
         dispatch_authorized=dispatch_authorized,
         decision_reason=decision_reason,
         selected_kb_count=selected_kb_count,
-        requirements=_compile_requirements(route),
+        requirements=_compile_requirements(route, question=question),
         clarification=clarification,
     )
 
@@ -569,6 +616,18 @@ def rag_task_contract_gate_reason(
         return "invalid_requirements"
     if not any(item.role == "answer" for item in contract.requirements):
         return "missing_answer_requirement"
+    if (
+        contract.need_retrieval
+        and not any(item.role == "bridge" for item in contract.requirements)
+        and any(
+            infer_implicit_bridge(item.description) is not None
+            for item in contract.requirements
+            if item.role == "answer"
+        )
+    ):
+        # A contract manually reconstructed or mutated after compilation must
+        # not downgrade an implicit mapping back to a single fact target.
+        return "implicit_mapping_missing_bridge"
     if not isinstance(contract.source, str) or not _SOURCE_RE.fullmatch(contract.source):
         return "invalid_source"
     if not isinstance(contract.decision_reason, str) or not contract.decision_reason:

@@ -56,6 +56,17 @@ class SearchConfig(BaseModel):
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=12000)
     conversation_id: uuid.UUID | None = None
+    # ``request_id`` is an opaque client idempotency key.  Older clients omit
+    # it; the API generates one before routing and returns it in the SSE
+    # headers/events.  ``turn_id`` is optional so a client can correlate a
+    # durable turn across retries without having to know the server UUID.
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    turn_id: uuid.UUID | None = None
+    # New clients echo these fields from a durable clarification ACK.  They are
+    # optional for rolling compatibility, but when present the server binds
+    # them into the request fingerprint and rejects a stale selection with 409.
+    pending_route_revision: int | None = Field(default=None, ge=0)
+    pending_state_id: str | None = Field(default=None, min_length=1, max_length=128)
     knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
     search_config: SearchConfig = Field(default_factory=SearchConfig)
 
@@ -68,6 +79,20 @@ class MessageOut(BaseModel):
     sources: list | None
     clarification: dict | None = None
     tokens: int | None = None
+    turn_id: uuid.UUID | None = None
+    request_id: str | None = None
+    # ``status`` is the durable turn status for this transcript row.  The
+    # explicit ``turn_status`` alias is retained for clients that already use
+    # the more descriptive name.
+    status: str | None = None
+    turn_status: str | None = None
+    trace_id: str | None = None
+    evidence_status: str | None = None
+    retrieval_executed: bool | None = None
+    error_code: str | None = None
+    delivery_status: str | None = None
+    persistence_status: str | None = None
+    search_snapshot: dict | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}

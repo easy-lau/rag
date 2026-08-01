@@ -188,7 +188,45 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertEqual(downgrade_kwargs["existing_type"].length, 32)
         self.assertEqual(downgrade_kwargs["type_"].length, 16)
 
-    def test_alembic_has_single_0029_head(self) -> None:
+    def test_chat_turn_migration_adds_recovery_ledger_and_history_state(self) -> None:
+        migration_30 = _load_migration("0030_add_chat_turn_persistence.py")
+        recorder = _MigrationRecorder()
+        with patch.object(migration_30, "op", recorder):
+            migration_30.upgrade()
+
+        turn_columns = {
+            item.name: item
+            for item in recorder.tables["chat_turns"]
+            if isinstance(item, Column)
+        }
+        for name in (
+            "request_id",
+            "request_fingerprint",
+            "request_context",
+            "resume_context",
+            "status",
+            "lease_owner",
+            "lease_expires_at",
+            "execution_attempts",
+            "trace_id",
+            "evidence_status",
+            "retrieval_executed",
+            "error_code",
+            "answer_content",
+            "answer_sources",
+            "search_snapshot",
+            "assistant_message_id",
+        ):
+            self.assertIn(name, turn_columns)
+        message_columns = {
+            column.name
+            for table_name, column in recorder.added_columns
+            if table_name == "messages"
+        }
+        self.assertIn("turn_status", message_columns)
+        self.assertIn("search_snapshot", message_columns)
+
+    def test_alembic_has_single_0030_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -196,8 +234,8 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0029"])
-        self.assertEqual(scripts.get_revision("0029").down_revision, "0028")
+        self.assertEqual(scripts.get_heads(), ["0030"])
+        self.assertEqual(scripts.get_revision("0030").down_revision, "0029")
 
 
 if __name__ == "__main__":  # pragma: no cover

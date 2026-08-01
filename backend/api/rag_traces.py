@@ -65,6 +65,9 @@ _TRACE_TERMINAL_EVENTS = {
 }
 _TRACE_CORE_EVENTS = {
     "chat.request",
+    "chat.pipeline_selected",
+    "chat.stream_close_error",
+    "chat.turn_reclaimed",
     "conversation.context_candidates",
     "conversation.context_resolved",
     "conversation.reference_unresolved",
@@ -75,7 +78,10 @@ _TRACE_CORE_EVENTS = {
     "intent.clarification_created",
     "intent.clarification_resolved",
     "intent.clarification_expired",
+    "direct.plan",
+    "query.plan",
     "evidence.ambiguity_assessed",
+    "evidence.explicit_comparison_resolved",
     "evidence.clarification_required",
     "evidence.clarification_created",
     "evidence.clarification_repeated",
@@ -84,14 +90,19 @@ _TRACE_CORE_EVENTS = {
     "evidence.route_contract_failed",
     "evidence.scope_filter_applied",
     "evidence.scope_filter_rejected_candidates",
+    "evidence.scope_answer_anchor_incomplete",
     "retrieval.plan",
+    "retrieval.plan_query_completed",
+    "retrieval.plan_query_error",
     "retrieval.completed",
     "retrieval.error",
+    "retrieval.expansion_error",
     "rerank.completed",
     "evidence.selection",
     "generation.context",
     "generation.skipped",
     "generation.completed",
+    "generation.error",
     *_TRACE_EXPANSION_EVENTS,
     *_TRACE_JOINT_EVENTS,
     *_TRACE_COVERAGE_EVENTS,
@@ -540,6 +551,48 @@ def _pick_trace_fields(
     return selected or None
 
 
+def _query_plan_snapshot(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a content-free V2 planning summary for trace diagnostics."""
+
+    if not isinstance(payload, dict):
+        return None
+    output = _pick_trace_fields(
+        payload,
+        "pipeline_version",
+        "execution_surface",
+    ) or {}
+    plan = payload.get("plan")
+    if not isinstance(plan, dict):
+        return output or None
+
+    plan_summary = _pick_trace_fields(
+        plan,
+        "schema_version",
+        "answer_shape",
+        "confidence",
+        "source",
+        "needs_clarification",
+    ) or {}
+    retrieval_queries = plan.get("retrieval_queries")
+    requirements = plan.get("requirements")
+    query_count = plan.get("query_count")
+    requirement_count = plan.get("requirement_count")
+    if isinstance(retrieval_queries, list):
+        query_count = len(retrieval_queries)
+    if isinstance(requirements, list):
+        requirement_count = len(requirements)
+    if isinstance(query_count, int) and not isinstance(query_count, bool):
+        plan_summary["query_count"] = max(0, query_count)
+    if isinstance(requirement_count, int) and not isinstance(
+        requirement_count,
+        bool,
+    ):
+        plan_summary["requirement_count"] = max(0, requirement_count)
+    if plan_summary:
+        output["plan"] = plan_summary
+    return output or None
+
+
 def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Extract a compact phase summary without duplicating business content."""
 
@@ -615,6 +668,24 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
     return {
+        "runner_selection": _pick_trace_fields(
+            _trace_event_payload(events, "chat.pipeline_selected"),
+            "version",
+            "reason",
+        ),
+        "direct_plan": _pick_trace_fields(
+            _trace_event_payload(events, "direct.plan"),
+            "runner_version",
+            "response_mode",
+            "retrieval_policy",
+            "history_message_count",
+            "is_followup",
+            "question_chars",
+            "question_sha256",
+        ),
+        "query_plan": _query_plan_snapshot(
+            _trace_event_payload(events, "query.plan"),
+        ),
         "conversation_context": _pick_trace_fields(
             _trace_event_payload(events, "conversation.context_resolved"),
             "is_followup",
@@ -1007,10 +1078,10 @@ def _rag_trace_export_payload(
             "recommended_checks": [
                 "检查 conversation 阶段是否正确继承或拒绝继承上一轮主题",
                 "检查 intent 阶段的模型结果、拒绝原因和安全兜底是否合理",
+                "检查 runner selection 与 query/direct plan 是否选择了正确执行器和问题结构",
                 "检查 retrieval 查询、约束、召回通道和候选分数",
                 "检查文档内扩展是否受种子文档、候选数和字符预算约束",
-                "检查联合重排的证据组合是否覆盖必要回答维度",
-                "检查 rerank 与 evidence 阶段是否保留了真正支持答案的证据",
+                "V2 检查确定性 evidence bundle 是否覆盖必要回答维度；仅 V1 检查模型重排",
                 "检查 generation 阶段的上下文、输出、耗时、重试和错误",
             ],
         },
@@ -1021,14 +1092,17 @@ def _rag_trace_export_payload(
             ),
             "suggested_prompt": (
                 "请按事件 sequence 复盘这次 RAG 调用，先判断上下文改写和意图路由是否正确，"
-                "再检查召回、文档内扩展、联合重排、证据覆盖门控与生成。"
+                "再确认选择了 v1、v2 还是 direct 执行器。V2 检查本地查询规划、召回、"
+                "文档内扩展、确定性证据覆盖门控与生成；V1 才检查模型重排；direct 应确认"
+                "没有执行知识库检索。"
                 "引用具体 sequence 和字段作为证据；"
                 "区分已由日志证明的结论与推测，最后给出可验证的优化项和回归用例。"
             ),
             "expected_sections": [
                 "结论摘要",
                 "上下文与路由",
-                "召回与重排",
+                "执行器与查询规划",
+                "召回与证据装配",
                 "证据与回答",
                 "性能与异常",
                 "优化建议及回归测试",

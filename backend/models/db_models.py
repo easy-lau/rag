@@ -99,6 +99,94 @@ class Conversation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation", cascade="all, delete-orphan")
+    turns: Mapped[list["ChatTurn"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class ChatTurn(Base):
+    """Durable state for one client chat request.
+
+    ``Message`` is the user-facing transcript, while this row is the
+    idempotency and delivery ledger.  Keeping the generated answer on the turn
+    before inserting the assistant message lets a later retry finish a
+    ``persist_failed`` turn without running retrieval/LLM again.
+    """
+
+    __tablename__ = "chat_turns"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('accepted', 'generating', 'generated', 'completed', "
+            "'persist_failed', 'failed', 'cancelled')",
+            name="ck_chat_turns_status",
+        ),
+        UniqueConstraint(
+            "conversation_id", "request_id", name="uq_chat_turn_conversation_request"
+        ),
+        UniqueConstraint("user_id", "request_id", name="uq_chat_turn_user_request"),
+        Index("ix_chat_turns_conversation_created_at", "conversation_id", "created_at"),
+        Index("ix_chat_turns_status_updated_at", "status", "updated_at"),
+        Index("ix_chat_turns_user_created_at", "user_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Client supplied idempotency key.  It is intentionally opaque; the
+    # conversation scope prevents cross-user/cross-conversation collisions.
+    request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    question_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Full canonical request envelope.  The digest is the comparison fast path;
+    # the bounded JSON is retained so old clients that omit clarification
+    # identity fields can still retry the exact original logical request.
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_context: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Route identity after this request's own pre-generation cleanup.  Stale
+    # recovery accepts input context or this checkpoint, but no unrelated
+    # conversation revision.
+    resume_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="accepted")
+    # accepted/generating are protected by a renewable execution lease.  A
+    # process crash therefore becomes reclaimable instead of a permanent 202.
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    execution_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    evidence_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    retrieval_executed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # The complete answer is staged at ``generated`` and retained through a
+    # ``persist_failed`` transition.  This field is not exposed as a separate
+    # transcript until the assistant Message commit succeeds.
+    answer_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answer_sources: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Bounded final search-panel snapshot.  It contains identities/roles and
+    # counters only; current document rows are re-authorized when history is
+    # read.
+    search_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    user_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    assistant_message_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    persistence_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=now_utc, onupdate=now_utc
+    )
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    conversation: Mapped["Conversation"] = relationship(back_populates="turns")
+    user: Mapped["User | None"] = relationship(foreign_keys=[user_id])
 
 
 class Message(Base):
@@ -110,6 +198,20 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     sources: Mapped[list | None] = mapped_column(JSONB)
     tokens: Mapped[int | None] = mapped_column(Integer)
+    # Turn metadata is duplicated on transcript rows so history can be served
+    # in one query and older messages remain backward compatible (all fields
+    # are nullable).  ``turn_id`` is deliberately unbound: cleanup/order of
+    # transcript rows must not make an already durable turn undeletable.
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    turn_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    evidence_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    retrieval_executed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    delivery_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    persistence_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    search_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")

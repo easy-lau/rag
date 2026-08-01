@@ -449,6 +449,91 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertEqual(payload["ai_analysis_guide"]["expected_sections"][-1], "优化建议及回归测试")
         self.assertIn("不可信数据", payload["ai_analysis_guide"]["untrusted_data_warning"])
 
+    def test_v2_runner_and_plans_are_core_content_free_diagnostics(self) -> None:
+        run, events, timestamp = _stored_trace(content_included=False)
+        secret = "普通员工属于D级，餐补100元"
+        events.extend([
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=3,
+                event="chat.pipeline_selected",
+                payload={
+                    "event": "chat.pipeline_selected",
+                    "version": "v2",
+                    "reason": "configured_v2",
+                },
+                created_at=timestamp,
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=4,
+                event="query.plan",
+                payload={
+                    "event": "query.plan",
+                    "pipeline_version": "rag_v2",
+                    "execution_surface": "pipeline",
+                    "query": secret,
+                    "plan": {
+                        "schema_version": "rag_query_plan.v2",
+                        "original_query": secret,
+                        "answer_shape": "multi_hop",
+                        "retrieval_queries": [secret, "职级分类"],
+                        "requirements": [
+                            {"id": "r1", "description": secret},
+                            {"id": "r2", "description": "职级映射"},
+                        ],
+                        "confidence": 0.9,
+                        "source": "local",
+                        "needs_clarification": False,
+                    },
+                },
+                created_at=timestamp,
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=5,
+                event="direct.plan",
+                payload={
+                    "event": "direct.plan",
+                    "runner_version": "direct_v1",
+                    "response_mode": "general_chat",
+                    "retrieval_policy": "skip",
+                    "history_message_count": 2,
+                    "is_followup": True,
+                    "question_chars": len(secret),
+                    "question_sha256": "d" * 64,
+                    "question": secret,
+                },
+                created_at=timestamp,
+            ),
+        ])
+        run.event_count = len(events)
+        run.observed_event_count = len(events)
+
+        payload = _rag_trace_export_payload(run, events, exported_at=timestamp)
+        snapshot = payload["diagnostic_index"]["snapshot"]
+
+        for event_name in (
+            "chat.pipeline_selected",
+            "chat.turn_reclaimed",
+            "direct.plan",
+            "query.plan",
+        ):
+            self.assertIn(event_name, _TRACE_CORE_EVENTS)
+        self.assertEqual(
+            snapshot["runner_selection"],
+            {"version": "v2", "reason": "configured_v2"},
+        )
+        self.assertEqual(snapshot["query_plan"]["plan"]["answer_shape"], "multi_hop")
+        self.assertEqual(snapshot["query_plan"]["plan"]["query_count"], 2)
+        self.assertEqual(snapshot["query_plan"]["plan"]["requirement_count"], 2)
+        self.assertEqual(snapshot["direct_plan"]["retrieval_policy"], "skip")
+        self.assertNotIn(secret, json.dumps(snapshot, ensure_ascii=False))
+        self.assertIn("v1、v2 还是 direct", payload["ai_analysis_guide"]["suggested_prompt"])
+
     def test_diagnostic_snapshot_keeps_algorithm_and_prompt_fingerprints(self) -> None:
         run, events, timestamp = _stored_trace(content_included=False)
         run.event_count = 5

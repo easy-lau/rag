@@ -142,6 +142,10 @@ export const useSearchStore = defineStore('search', () => {
   const searchMeta = ref({})
   const intentDecision = ref(null)
   const hasResultEvent = ref(false)
+  // live: the current SSE turn; history: a persisted, static snapshot.  The
+  // latter intentionally hides the animated process so a refresh never
+  // fabricates steps that were not stored by the server.
+  const contextMode = ref('live')
   const steps = ref(STEPS.map(s => ({ ...s, status: 'pending' })))
 
   function resetSteps() {
@@ -151,6 +155,7 @@ export const useSearchStore = defineStore('search', () => {
     searchMeta.value = {}
     intentDecision.value = null
     hasResultEvent.value = false
+    contextMode.value = 'live'
   }
 
   function updateStep(key, status) {
@@ -163,8 +168,9 @@ export const useSearchStore = defineStore('search', () => {
     steps.value.forEach(s => { if (s.status === 'active') s.status = 'done' })
   }
 
-  function setResults(data, fallbackMeta = {}) {
+  function setResults(data, fallbackMeta = {}, options = {}) {
     const rawResults = Array.isArray(data?.results) ? data.results : []
+    if (!options.historical) contextMode.value = 'live'
     let normalizedResults = rawResults.map(normalizeResult)
     hasResultEvent.value = true
 
@@ -353,6 +359,44 @@ export const useSearchStore = defineStore('search', () => {
     }
   }
 
+  function setTraceId(traceId) {
+    if (typeof traceId !== 'string' || !traceId.trim()) return
+    searchMeta.value = { ...searchMeta.value, trace_id: traceId.trim() }
+  }
+
+  /**
+   * Restore a persisted search result without pretending that an SSE process
+   * is still running.  The snapshot shape is intentionally additive: callers
+   * may provide `results`, `candidates`, `search_meta`, or any of the server's
+   * evidence counters.  `setResults` remains the single fail-closed normalizer.
+   */
+  function restoreSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      resetSteps()
+      return false
+    }
+    resetSteps()
+    contextMode.value = 'history'
+    const decision = snapshot.intent_decision
+      || snapshot.intentDecision
+      || snapshot.route_decision
+      || snapshot.task_contract
+    if (decision) setIntentDecision(decision)
+    const meta = snapshot.search_meta && typeof snapshot.search_meta === 'object'
+      ? snapshot.search_meta
+      : (snapshot.meta && typeof snapshot.meta === 'object' ? snapshot.meta : {})
+    const results = Array.isArray(snapshot.results)
+      ? snapshot.results
+      : (Array.isArray(snapshot.candidates) ? snapshot.candidates : [])
+    setResults(
+      { ...meta, ...snapshot, results },
+      { ...meta, historical: true },
+      { historical: true },
+    )
+    contextMode.value = 'history'
+    return true
+  }
+
   function setClarification(clarification) {
     results.value = results.value.map(item => (
       item?.evidence_role === 'direct'
@@ -377,7 +421,8 @@ export const useSearchStore = defineStore('search', () => {
   }
 
   return {
-    results, totalCount, searchMeta, intentDecision, hasResultEvent, steps,
+    results, totalCount, searchMeta, intentDecision, hasResultEvent, contextMode, steps,
     resetSteps, updateStep, finishSteps, setResults, setIntentDecision, setClarification,
+    setTraceId, restoreSnapshot,
   }
 })

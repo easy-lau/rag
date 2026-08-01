@@ -3,6 +3,7 @@ import json
 import time
 import unittest
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -12,7 +13,11 @@ from core.query_route_compiler import (
     compile_rag_task_contract,
 )
 from core.query_route_contract import parse_rag_route_decision
-from core.rag_v2.pipeline import _plan_with_contract_requirements, run_rag_v2_stream
+from core.rag_v2.pipeline import (
+    _bounded_merge_global_candidate_pools,
+    _plan_with_contract_requirements,
+    run_rag_v2_stream,
+)
 from core.rag_v2.query_plan import plan_query_locally
 
 
@@ -79,6 +84,39 @@ def _task_contract(
     )
 
 
+def _writing_task_contract(question: str):
+    route = parse_rag_route_decision(
+        {
+            "schema_version": "rag_route_decision.v1",
+            "readiness": "ready",
+            "intent_code": "writing",
+            "relation": "new",
+            "evidence_scope": "mixed",
+            "query_resolution": {"mode": "current", "context_turn_keys": []},
+            "requirements": [{
+                "role": "answer",
+                "origin": "user_text",
+                "description": question,
+            }],
+            "clarification": {"question": "", "unresolved": []},
+            "confidence": 0.98,
+            "rationale": "knowledge-grounded writing test",
+        },
+        allowed_intent_codes=["writing"],
+    )
+    return compile_rag_task_contract(
+        route,
+        RouteCategoryPolicy(
+            code="writing",
+            name="知识写作",
+            action="writing",
+        ),
+        RouteCompilerConfig(),
+        question=question,
+        selected_kb_count=1,
+        source="test",
+        knowledge_writing=True,
+    )
 def _candidate(
     *,
     kb_id: uuid.UUID,
@@ -222,6 +260,53 @@ class _HangingClient:
 
 
 class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
+    def test_global_plan_candidate_budget_reserves_novel_bridge_seed(self) -> None:
+        kb_id = uuid.uuid4()
+        primary = [
+            _candidate(
+                kb_id=kb_id,
+                doc_id=uuid.uuid4(),
+                chunk_index=index,
+                content=f"主查询候选{index}",
+            )
+            for index in range(24)
+        ]
+        bridge = _candidate(
+            kb_id=kb_id,
+            doc_id=uuid.uuid4(),
+            chunk_index=0,
+            content="跨文档桥接候选",
+        )
+
+        merged = _bounded_merge_global_candidate_pools(
+            primary,
+            [[dict(primary[0]), bridge]],
+        )
+
+        self.assertEqual(len(merged), 24)
+        self.assertIn(str(bridge["id"]), {
+            str(item["id"]) for item in merged
+        })
+
+    def test_duplicate_global_candidate_merges_all_plan_query_indexes(self) -> None:
+        kb_id = uuid.uuid4()
+        shared = _candidate(
+            kb_id=kb_id,
+            doc_id=uuid.uuid4(),
+            chunk_index=0,
+            content="同一片段支持多个明确子问题。",
+        )
+        primary = dict(shared, expansion_query_indexes=[0])
+        supplemental = dict(shared, expansion_query_indexes=[1, 2])
+
+        merged = _bounded_merge_global_candidate_pools(
+            [primary],
+            [[supplemental]],
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["expansion_query_indexes"], [0, 1, 2])
+
     def test_single_broad_contract_requirement_does_not_erase_local_multi_part(
         self,
     ) -> None:
@@ -286,6 +371,128 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             "确认两项使用同一适用范围",
         )
 
+    def test_coordinated_identity_answers_and_bridge_survive_contract_merge(
+        self,
+    ) -> None:
+        question = "普通员工出差的住宿、交通和餐补标准分别是多少？"
+        plan = plan_query_locally(question)
+        contract = _task_contract(question)
+
+        resolved = _plan_with_contract_requirements(plan, contract)
+
+        self.assertEqual(resolved.answer_shape, "multi_hop")
+        self.assertEqual(
+            [item.role for item in resolved.requirements],
+            ["answer", "answer", "answer", "bridge"],
+        )
+        self.assertEqual(
+            [item.id for item in resolved.requirements],
+            ["r1", "r2", "r3", "r4"],
+        )
+        self.assertEqual(
+            len(resolved.retrieval_queries),
+            len(resolved.requirements),
+        )
+        self.assertTrue(all(
+            item.is_required_answer for item in resolved.requirements[:3]
+        ))
+        self.assertIn(
+            "local_multi_part_requirements_preserved",
+            resolved.reason,
+        )
+
+    def test_authoritative_coordinated_plan_stays_within_requirement_budget(
+        self,
+    ) -> None:
+        question = (
+            "普通员工的交通、住宿、餐补、通讯、驻外、夜班和高温补贴"
+            "分别是多少？"
+        )
+        plan = plan_query_locally(question)
+        contract = _task_contract(
+            question,
+            requirements=[
+                {
+                    "role": "answer",
+                    "origin": "user_text",
+                    "description": question,
+                },
+                {
+                    "role": "bridge",
+                    "origin": "semantically_entailed",
+                    "description": "确认员工与制度适用范围之间的关系",
+                },
+            ],
+        )
+
+        self.assertEqual(len(plan.requirements), 8)
+        resolved = _plan_with_contract_requirements(plan, contract)
+
+        self.assertEqual(len(resolved.requirements), 8)
+        self.assertEqual(len(resolved.retrieval_queries), 8)
+        self.assertNotIn(
+            "确认员工与制度适用范围之间的关系",
+            {item.description for item in resolved.requirements},
+        )
+
+    def test_single_answer_contract_cannot_erase_local_implicit_bridge(self) -> None:
+        question = "合同工住宿标准"
+        plan = plan_query_locally(question)
+        compiled = _task_contract(question)
+        # Simulate an older/model-produced contract that compressed the route
+        # to one answer target.  The execution planner remains the final local
+        # safety boundary and must restore its deterministic bridge.
+        answer_only = replace(
+            compiled,
+            requirements=(compiled.requirements[0],),
+        )
+
+        resolved = _plan_with_contract_requirements(plan, answer_only)
+
+        self.assertEqual(resolved.answer_shape, "multi_hop")
+        self.assertEqual(
+            [item.role for item in resolved.requirements],
+            ["answer", "bridge"],
+        )
+        self.assertTrue(any(
+            "合同工" in query for query in resolved.retrieval_queries[1:]
+        ))
+
+    def test_contract_bridge_resolves_local_planning_clarification(self) -> None:
+        question = "该值取决于前一项"
+        plan = plan_query_locally(question)
+        contract = _task_contract(
+            question,
+            requirements=[
+                {
+                    "role": "answer",
+                    "origin": "user_text",
+                    "description": "查询该值",
+                },
+                {
+                    "role": "bridge",
+                    "origin": "semantically_entailed",
+                    "description": "确认前一项与该值之间的决定关系",
+                },
+            ],
+        )
+
+        self.assertTrue(plan.needs_clarification)
+
+        resolved = _plan_with_contract_requirements(plan, contract)
+
+        self.assertFalse(resolved.needs_clarification)
+        self.assertIsNone(resolved.clarification_question)
+        self.assertEqual(resolved.answer_shape, "multi_hop")
+        self.assertEqual(
+            [item.role for item in resolved.requirements],
+            ["answer", "bridge"],
+        )
+        self.assertIn(
+            "task_contract_resolved_planning_clarification",
+            resolved.reason,
+        )
+
     def test_contextualized_single_requirement_uses_standalone_query(self) -> None:
         standalone_query = "那住宿呢。普通员工的出差标准是什么"
         plan = plan_query_locally(standalone_query)
@@ -314,15 +521,19 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         carryover_sources: list[dict] | None = None,
         standalone_query: str | None = None,
         selected_tags: list[str] | None = None,
+        initial_sequence: list[list[dict] | Exception] | None = None,
         initial_delay_seconds: float = 0,
         blocking_scoped: bool = False,
         settings_override=None,
         client_override=None,
+        task_contract_override=None,
         expected_error: type[BaseException] | None = None,
     ):
         client = client_override or _FakeClient()
         search = AsyncMock()
-        if isinstance(initial, Exception):
+        if initial_sequence is not None:
+            search.side_effect = initial_sequence
+        elif isinstance(initial, Exception):
             search.side_effect = initial
         elif initial_delay_seconds > 0:
             async def delayed_search(*_args, **_kwargs):
@@ -400,9 +611,12 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
                     conversation_id="v2-test-conversation",
                     db=SimpleNamespace(),
                     intent={"intent_code": "knowledge_qa"},
-                    task_contract=_task_contract(
-                        question,
-                        requirements=requirements,
+                    task_contract=(
+                        task_contract_override
+                        or _task_contract(
+                            question,
+                            requirements=requirements,
+                        )
                     ),
                     evidence_scope_filter=evidence_scope_filter,
                     carryover_sources=carryover_sources,
@@ -418,6 +632,185 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
                     await collect_chunks()
         self._last_trace = trace
         return _payloads(chunks), client, search, fetch_full, scoped_search
+
+    async def test_cross_domain_business_matrix_reaches_grounded_generation(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "ordinary_employee_transport",
+                "普通员工的交通标准是什么",
+                (
+                    "职级分类：普通员工对应D级。",
+                    "交通标准：D级乘飞机经济舱、高铁二等座。",
+                ),
+                ("普通员工对应D级", "高铁二等座"),
+            ),
+            (
+                "contractor_lodging",
+                "合同工住宿标准是多少",
+                (
+                    "用工分类：合同工属于L2类。",
+                    "住宿标准：L2类不超过300元/天。",
+                ),
+                ("合同工属于L2类", "300元/天"),
+            ),
+            (
+                "reimbursement_deadline_receipts",
+                "报销提交时限是多久？需要提供哪些凭证？",
+                (
+                    "费用报销时限：出差结束后5个工作日内提交。",
+                    "报销凭证：必须提供正规发票、行程单及住宿发票。",
+                ),
+                ("5个工作日", "正规发票"),
+            ),
+            (
+                "leave_approval_process",
+                "员工请假审批流程是什么",
+                (
+                    "请假审批流程：员工提交申请，直属主管审批，三天以上再由部门负责人审批。",
+                ),
+                ("直属主管审批", "部门负责人审批"),
+            ),
+            (
+                "purchase_approval_limit",
+                "采购申请单笔审批额度是多少",
+                (
+                    "采购审批制度：单笔采购申请金额不超过5000元的，由部门经理审批。",
+                ),
+                ("5000元", "部门经理审批"),
+            ),
+            (
+                "login_username_enumeration",
+                "如何配置登录用户名枚举防护",
+                (
+                    "登录用户名枚举防护配置：将 error_reply_same 设置为 true，"
+                    "使账号不存在与密码错误返回相同提示。",
+                ),
+                ("error_reply_same", "相同提示"),
+            ),
+        )
+
+        for name, question, support_contents, expected_markers in cases:
+            with self.subTest(scenario=name):
+                kb_id = uuid.uuid4()
+                candidates = [
+                    _candidate(
+                        kb_id=kb_id,
+                        doc_id=uuid.uuid4(),
+                        chunk_index=0,
+                        filename=f"{name}-{index}.md",
+                        content=content,
+                    )
+                    for index, content in enumerate(support_contents, start=1)
+                ]
+                distractor = _candidate(
+                    kb_id=kb_id,
+                    doc_id=uuid.uuid4(),
+                    chunk_index=0,
+                    filename=f"{name}-unrelated.md",
+                    content="禁止纳入：访客停车区域和固定资产盘点说明。",
+                )
+                distractor.update(vector_score=0.05, vector_rank=20)
+
+                payloads, client, *_ = await self._run(
+                    question=question,
+                    kb_id=kb_id,
+                    initial=[*candidates, distractor],
+                    full_document=[],
+                )
+
+                result = next(
+                    item for item in payloads if item["type"] == "search_results"
+                )
+                self.assertIn(
+                    result["evidence_status"],
+                    {"hit", "partial", "unverified"},
+                )
+                self.assertEqual(result["missing_requirement_ids"], [])
+                self.assertGreaterEqual(len(result["answer_sources"]), 1)
+                self.assertEqual(len(client.completions.calls), 1)
+                prompt = "\n".join(
+                    message["content"]
+                    for message in client.completions.calls[0]["messages"]
+                )
+                for marker in expected_markers:
+                    self.assertIn(marker, prompt)
+                self.assertNotIn("禁止纳入", prompt)
+                self.assertEqual(
+                    "".join(
+                        item.get("content", "")
+                        for item in payloads
+                        if item.get("type") == "text_delta"
+                    ),
+                    "已根据资料回答",
+                )
+                self.assertEqual(payloads[-1]["type"], "done")
+
+    async def test_knowledge_grounded_writing_uses_v2_retrieval_and_writing_prompt(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        question = "根据制度起草一段报销通知"
+        initial = [_candidate(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            chunk_index=0,
+            content="报销通知要求：费用发生后5个工作日内提交正规发票。",
+        )]
+
+        payloads, client, *_ = await self._run(
+            question=question,
+            kb_id=kb_id,
+            initial=initial,
+            full_document=[],
+            task_contract_override=_writing_task_contract(question),
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertTrue(result["retrieval_executed"])
+        self.assertEqual(len(client.completions.calls), 1)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("用户要求执行写作任务", system_prompt)
+        self.assertIn("不得添加证据未支持的企业事实", system_prompt)
+
+    async def test_unresolved_query_plan_clarifies_before_retrieval_or_generation(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        question = "该值取决于前一项"
+
+        payloads, client, search, fetch_full, scoped = await self._run(
+            question=question,
+            kb_id=kb_id,
+            initial=[],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        clarification = next(
+            item for item in payloads if item["type"] == "evidence_clarification"
+        )
+        self.assertEqual(result["evidence_status"], "needs_clarification")
+        self.assertFalse(result["retrieval_executed"])
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(clarification["choices"], [])
+        self.assertIn("对应关系", clarification["question"])
+        self.assertIn("标准或数值", clarification["question"])
+        search.assert_not_awaited()
+        fetch_full.assert_not_awaited()
+        scoped.assert_not_awaited()
+        self.assertEqual(client.completions.calls, [])
+        trace_events = [
+            call.args[0]
+            for call in self._last_trace.call_args_list
+            if call.args
+        ]
+        self.assertNotIn("retrieval.plan", trace_events)
+        self.assertNotIn("generation.context", trace_events)
+        self.assertIn("generation.skipped", trace_events)
 
     async def test_scope_selection_hard_limits_same_kb_documents(self) -> None:
         kb_id = uuid.uuid4()
@@ -552,6 +945,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             full_document=[],
             scoped=[fresh],
             carryover_sources=[carryover],
+            task_contract_override=_task_contract(
+                "那住宿呢",
+                relation="followup",
+            ),
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
@@ -985,17 +1382,16 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             source["supports_requirement_ids"] == ["r1"]
             for source in result["answer_sources"]
         ))
-        # The exact renderer budget may consume the final display slot with an
-        # adopted source, so a downgraded truncated item need not remain in the
-        # bounded ``results`` list.  The serialized prompt itself is the source
-        # of truth and must visibly revoke its role/support claim.
-        self.assertIn("角色：background；需求：无", serialized_context)
-        self.assertGreater(len(all_context_sources), len(context_source_ids))
-        self.assertTrue(any(
-            source["evidence_contribution_role"] == "background"
-            and source["supports_requirement_ids"] == []
-            and source["renderer_truncated"]
-            and not source["included_in_answer_sources"]
+        # An oversized source is omitted completely: a truncated prefix may
+        # not contain the clause that established requirement support, and a
+        # hidden background prefix must never influence generation.
+        self.assertNotIn("角色：background", serialized_context)
+        self.assertEqual(len(all_context_sources), len(context_source_ids))
+        self.assertTrue(all(
+            source["evidence_contribution_role"]
+            in {"direct", "bridge", "complement"}
+            and source["supports_requirement_ids"]
+            and source["included_in_answer_sources"]
             for source in all_context_sources
         ))
         self.assertIn(
@@ -1099,7 +1495,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(
             item["type"] == "evidence_clarification" for item in payloads
         ))
-        search.assert_awaited_once()
+        # The unknown owner is not a valid identity/classification qualifier,
+        # so the planner performs only the original retrieval instead of a
+        # meaningless synthetic bridge lookup.
+        self.assertEqual(search.await_count, 1)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
 
@@ -1434,6 +1833,253 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("D级为100元/天", prompt)
         self.assertIn('"answer_shape": "multi_hop"', prompt)
 
+    async def test_multi_hop_global_plan_queries_join_different_documents(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        answer_doc_id = uuid.uuid4()
+        bridge_doc_id = uuid.uuid4()
+        weak_doc_id = uuid.uuid4()
+        answer = _candidate(
+            kb_id=kb_id,
+            doc_id=answer_doc_id,
+            chunk_index=0,
+            filename="差旅补贴标准.md",
+            content="D级餐补标准为100元/天。",
+        )
+        bridge = _candidate(
+            kb_id=kb_id,
+            doc_id=bridge_doc_id,
+            chunk_index=0,
+            filename="员工职级分类.md",
+            content="普通员工对应D级。",
+        )
+        unauthorized = _candidate(
+            kb_id=uuid.uuid4(),
+            doc_id=uuid.uuid4(),
+            chunk_index=0,
+            filename="未授权分类.md",
+            content="普通员工对应A级。",
+        )
+        weak = _candidate(
+            kb_id=kb_id,
+            doc_id=weak_doc_id,
+            chunk_index=0,
+            filename="无关制度.md",
+            content="访客停车区域说明。",
+        )
+        weak.update(vector_score=0.42, vector_rank=3)
+
+        payloads, client, search, *_ = await self._run(
+            question="普通员工的餐补标准是多少",
+            kb_id=kb_id,
+            initial=[],
+            initial_sequence=[
+                [answer],
+                [bridge, unauthorized, weak],
+            ],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "hit")
+        self.assertEqual(result["evidence_completeness"], "complete")
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(answer_doc_id), str(bridge_doc_id)},
+        )
+        by_doc_id = {
+            item["doc_id"]: item for item in result["answer_sources"]
+        }
+        bridge_source = by_doc_id[str(bridge_doc_id)]
+        self.assertEqual(
+            bridge_source["metadata"]["expansion_query_indexes"],
+            [1],
+        )
+        self.assertIn(
+            "global_plan_query_supplement",
+            bridge_source["candidate_origins"],
+        )
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(search.await_args_list[0].args[1], "普通员工的餐补标准是多少")
+        self.assertIn("普通员工", search.await_args_list[1].args[1])
+        self.assertEqual(
+            search.await_args_list[1].kwargs["surface"],
+            "chat_v2_plan_query",
+        )
+        self.assertIs(
+            search.await_args_list[0].args[0],
+            search.await_args_list[1].args[0],
+        )
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("D级餐补标准为100元", prompt)
+        self.assertIn("普通员工对应D级", prompt)
+        self.assertNotIn("普通员工对应A级", prompt)
+        self.assertNotIn("访客停车", prompt)
+
+    async def test_global_plan_query_timeout_keeps_primary_evidence_degraded(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        answer_doc_id = uuid.uuid4()
+        answer = _candidate(
+            kb_id=kb_id,
+            doc_id=answer_doc_id,
+            chunk_index=0,
+            filename="差旅补贴标准.md",
+            content="D级餐补标准为100元/天。",
+        )
+
+        payloads, client, search, *_ = await self._run(
+            question="普通员工的餐补标准是多少",
+            kb_id=kb_id,
+            initial=[],
+            initial_sequence=[
+                [answer],
+                TimeoutError("plan query timed out"),
+            ],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["evidence_availability"], "degraded")
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(answer_doc_id)},
+        )
+        self.assertIn(
+            "plan_query_retrieval_timeout",
+            result["evidence_state"]["reasons"],
+        )
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(len(client.completions.calls), 1)
+        answer_text = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text_delta"
+        )
+        self.assertNotIn("服务暂时不可用", answer_text)
+
+    async def test_multi_hop_selected_scope_never_runs_global_plan_query(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        selected_doc_id = uuid.uuid4()
+        outside_doc_id = uuid.uuid4()
+        selected = _candidate(
+            kb_id=kb_id,
+            doc_id=selected_doc_id,
+            chunk_index=0,
+            filename="已选择的8.6制度.md",
+            content="普通员工对应D级；D级餐补标准为100元/天。",
+        )
+        outside = _candidate(
+            kb_id=kb_id,
+            doc_id=outside_doc_id,
+            chunk_index=0,
+            filename="范围外的7.0制度.md",
+            content="普通员工对应C级；C级餐补标准为200元/天。",
+        )
+        scope_filter = {
+            "mode": "single",
+            "kb_ids": [str(kb_id)],
+            "doc_ids": [str(selected_doc_id)],
+            "choices": [{
+                "key": "c1",
+                "label": "云枢 8.6 —《已选择的8.6制度.md》",
+                "products": ["云枢"],
+                "canonical_products": ["CloudPivot"],
+                "versions": ["8.6"],
+                "projects": [],
+                "filenames": ["已选择的8.6制度.md"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(selected_doc_id)],
+                "anchor_doc_ids": [str(selected_doc_id)],
+                "companion_doc_ids": [],
+            }],
+        }
+
+        payloads, client, search, _fetch, scoped_search = await self._run(
+            question="普通员工的餐补标准是多少",
+            kb_id=kb_id,
+            initial=[],
+            scoped=[selected, outside],
+            full_document=[selected, outside],
+            evidence_scope_filter=scope_filter,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(selected_doc_id)},
+        )
+        search.assert_not_awaited()
+        scoped_search.assert_awaited()
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("100元", prompt)
+        self.assertNotIn("200元", prompt)
+
+    async def test_global_plan_query_respects_explicit_version_constraint(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        answer_doc_id = uuid.uuid4()
+        bridge_doc_id = uuid.uuid4()
+        wrong_version_doc_id = uuid.uuid4()
+        answer = _candidate(
+            kb_id=kb_id,
+            doc_id=answer_doc_id,
+            chunk_index=0,
+            filename="云枢8.6差旅标准.md",
+            content="所属产品：云枢；版本：8.6。D级餐补为100元/天。",
+        )
+        bridge = _candidate(
+            kb_id=kb_id,
+            doc_id=bridge_doc_id,
+            chunk_index=0,
+            filename="云枢8.6职级分类.md",
+            content="所属产品：云枢；版本：8.6。普通员工对应D级。",
+        )
+        wrong_version = _candidate(
+            kb_id=kb_id,
+            doc_id=wrong_version_doc_id,
+            chunk_index=0,
+            filename="云枢7职级分类.md",
+            content="所属产品：云枢；版本：7。普通员工对应C级。",
+        )
+
+        payloads, client, search, *_ = await self._run(
+            question="云枢8.6普通员工的餐补标准是多少",
+            kb_id=kb_id,
+            initial=[],
+            initial_sequence=[
+                [answer],
+                [bridge, wrong_version],
+            ],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(search.await_count, 2)
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(answer_doc_id), str(bridge_doc_id)},
+        )
+        self.assertNotIn(
+            str(wrong_version_doc_id),
+            {item["doc_id"] for item in result["results"]},
+        )
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("版本：8.6", prompt)
+        self.assertNotIn("版本：7", prompt)
+
     async def test_narrow_fact_uses_one_small_document_without_scoped_search(self) -> None:
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()
@@ -1469,7 +2115,8 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         prompt = "\n".join(
             message["content"] for message in client.completions.calls[0]["messages"]
         )
-        self.assertIn("对象与等级的映射关系", prompt)
+        self.assertNotIn("对象与等级的映射关系", prompt)
+        self.assertIn("最终数值为100", prompt)
         fetch_full.assert_awaited_once()
         scoped.assert_not_awaited()
 
@@ -1548,7 +2195,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             result["evidence_state"]["reasons"],
         )
         self.assertEqual(len(client.completions.calls), 1)
-        search.assert_awaited_once()
+        self.assertEqual(search.await_count, 2)
         scoped.assert_awaited_once()
         # The carryover phase consumed the shared remainder.  Expansion must
         # fail before starting new I/O, while the first-pass evidence survives.
