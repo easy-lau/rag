@@ -53,7 +53,7 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(constraints.product, "云枢")
         self.assertEqual(constraints.version, "8.6")
         self.assertTrue(constraints.explicit_version)
-        self.assertEqual(constraints.matched_text, "我是云枢8.6")
+        self.assertEqual(constraints.matched_text, "云枢8.6")
         self.assertIn("显式版本", constraints.extraction_reason)
 
     def test_obvious_old_versions_are_deterministic_mismatches(self) -> None:

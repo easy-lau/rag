@@ -159,6 +159,45 @@ _SOURCE_VERSION_RE = re.compile(
     rf"(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_SCOPE_NEGATION_PREFIX_RE = re.compile(
+    r"(?:不要|无需|无须|并非|不是|不(?:要|需|查|看|对比|比较|包含|包括)|"
+    r"排除|除外)[^，,。；;！!？?]{0,24}$",
+    re.IGNORECASE,
+)
+_SCOPE_NEGATION_SUFFIX_RE = re.compile(
+    r"^[^，,。；;！!？?]{0,10}(?:不要|无需|无须|不查|不看|不对比|不比较)",
+    re.IGNORECASE,
+)
+_SCOPE_EXCLUSIVE_FOCUS_RE = re.compile(
+    r"(?:只|仅)(?:需要|需|要|查|看|查询|查看|保留|使用|针对)?"
+    r"[^，,。；;！!？?]{0,10}$",
+    re.IGNORECASE,
+)
+
+
+def query_span_is_negated(text: str, start: int, end: int) -> bool:
+    """Return whether a scope phrase is governed by a local negation."""
+
+    source = str(text or "")
+    clause_start = max(
+        source.rfind(marker, 0, start)
+        for marker in ("，", ",", "。", "；", ";", "！", "!", "？", "?")
+    ) + 1
+    left = source[clause_start:start]
+    right = source[end:end + 16]
+    return bool(
+        _SCOPE_NEGATION_PREFIX_RE.search(left)
+        or _SCOPE_NEGATION_SUFFIX_RE.search(right)
+    )
+
+
+def _scope_match_has_exclusive_focus(text: str, start: int) -> bool:
+    source = str(text or "")
+    clause_start = max(
+        source.rfind(marker, 0, start)
+        for marker in ("，", ",", "。", "；", ";", "！", "!", "？", "?")
+    ) + 1
+    return bool(_SCOPE_EXCLUSIVE_FOCUS_RE.search(source[clause_start:start]))
 
 
 def _alias_search_pattern(alias: str) -> re.Pattern[str]:
@@ -185,8 +224,9 @@ def _known_enterprise_product_match(
     )
     matches: list[tuple[int, int, str, re.Match[str]]] = []
     for alias in aliases:
-        match = _alias_search_pattern(alias).search(text)
-        if match is not None:
+        for match in _alias_search_pattern(alias).finditer(text):
+            if query_span_is_negated(text, match.start(), match.end()):
+                continue
             matches.append((match.start(), -len(match.group(0)), alias, match))
     if not matches:
         return None
@@ -347,7 +387,7 @@ def extract_query_constraints(query: str) -> QueryConstraints:
     if not text:
         return QueryConstraints()
 
-    match = None
+    match: re.Match[str] | None = None
     # 先处理系统已知别名，避免通用中文分组把“登录用户名枚举云枢8.6”整段
     # 当成产品名。别名词典是确定性边界，后续可由产品配置扩展。
     known_aliases = sorted(
@@ -360,18 +400,59 @@ def extract_query_constraints(query: str) -> QueryConstraints:
         rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
         re.IGNORECASE,
     )
-    # 每个正则都可能先命中一个数量表达式；继续寻找下一个合法版本片段。
+    # Collect every positive match at the strongest available syntax tier.
+    # A comparison/mixed query containing several distinct positive scopes has
+    # no safe *global* constraint; requirement-level planning will preserve
+    # each scope independently.  An explicit ``只看/仅查`` clause may narrow a
+    # previously negated comparison to one final scope.
     for pattern in (
-        _QUERY_CUE_RE,
         known_pattern,
+        _QUERY_CUE_RE,
         _QUERY_STANDALONE_VERSION_RE,
         _QUERY_VERSION_LABEL_RE,
         _QUERY_ADJACENT_RE,
     ):
-        for candidate in pattern.finditer(text):
-            if _valid_query_match(text, candidate):
-                match = candidate
-                break
+        matches = [
+            candidate
+            for candidate in pattern.finditer(text)
+            if _valid_query_match(text, candidate)
+            and not query_span_is_negated(
+                text,
+                candidate.start(),
+                candidate.end(),
+            )
+        ]
+        if not matches:
+            continue
+        focused = [
+            candidate
+            for candidate in matches
+            if _scope_match_has_exclusive_focus(text, candidate.start())
+        ]
+        if focused:
+            match = max(focused, key=lambda candidate: candidate.start())
+            break
+        identities = {
+            (
+                _canonical_product(_clean_product(
+                    candidate.groupdict().get("product") or ""
+                )),
+                _normalize_version(
+                    candidate.groupdict().get("version")
+                    or candidate.groupdict().get("suffix_version")
+                    or ""
+                ),
+            )
+            for candidate in matches
+        }
+        if len(identities) > 1:
+            return QueryConstraints(
+                extraction_reason=(
+                    "查询包含多个独立的正向产品或版本范围，"
+                    "不生成会污染兄弟需求的全局约束"
+                ),
+            )
+        match = matches[0]
         if match is not None:
             break
     # 产品-only 约束只对明确的产品别名启用，避免把“系统 6 个节点”之类普通词
@@ -477,6 +558,9 @@ def _source_identity_texts(candidate: Mapping[str, Any]) -> tuple[str, ...]:
     for field in ("filename", "source", "heading", "title", "name", "path"):
         add(candidate.get(field))
     metadata = candidate.get("metadata")
+    if isinstance(metadata, dict):
+        metadata = dict(metadata)
+        metadata.pop("ambiguous_document_identity", None)
     for key, value in _flatten_metadata(metadata or {}):
         normalized_key = _normalize_product(key)
         if normalized_key in {
@@ -549,7 +633,16 @@ def _declared_document_identity(
     products: set[str] = set()
     versions: set[str] = set()
     projects: set[str] = set()
-    for key, value in _flatten_metadata(candidate.get("metadata") or {}):
+    raw_metadata = candidate.get("metadata") or {}
+    if isinstance(raw_metadata, dict):
+        # This marker records why a dimension was deliberately *not*
+        # inherited.  Its alternatives are diagnostics, not assertions that
+        # the current chunk belongs to every listed scope.
+        identity_metadata = dict(raw_metadata)
+        identity_metadata.pop("ambiguous_document_identity", None)
+    else:
+        identity_metadata = raw_metadata
+    for key, value in _flatten_metadata(identity_metadata):
         normalized_key = _normalize_product(key)
         if (
             normalized_key in _NORMALIZED_PRODUCT_METADATA_KEYS
@@ -630,23 +723,93 @@ def canonical_product_name(value: str) -> str:
     return _canonical_product(value)
 
 
+def candidate_section_key(candidate: Mapping[str, Any]) -> str | None:
+    """Return the ingestion-owned structural section identity for one chunk.
+
+    ``section_key`` is deliberately read only from the candidate envelope or
+    chunk metadata.  It is an opaque lineage identifier produced by ingestion,
+    not a heading guessed from body text.  Keeping this boundary centralized
+    lets applicability inheritance and later clarification filtering agree on
+    the exact same section identity.
+    """
+
+    raw_metadata = candidate.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+    value = candidate.get("section_key") or metadata.get("section_key")
+    section_key = str(value or "").strip()
+    if not section_key or len(section_key) > 500:
+        return None
+    return section_key
+
+
 def inherit_document_constraint_metadata(
     candidates: Sequence[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Copy explicit product/version identity to sibling chunks of a document.
+    """Copy only unambiguous document identity to otherwise unscoped chunks.
 
     Markdown and Word ingestion commonly put ``所属产品`` / ``产品版本`` in the
     first chunk only.  Constraint checks are nevertheless performed per chunk;
     without this propagation, the answer chunk from the same document becomes
-    ``unknown`` and is excluded.  Only explicit identity fields are inherited,
-    and grouping includes both knowledge-base and document ids so unrelated
-    documents cannot contaminate one another.
+    ``unknown`` and is excluded.
+
+    A document can also contain several independently applicable slices (for
+    example a 6.0 section and a 7.0 section).  Propagating the union of those
+    values to every chunk destroys the slice boundary: an explicit 6.0 query
+    can reject the real 6.0 chunk because that chunk now also appears to be
+    7.0, while an unscoped query can join facts across both versions.  Local
+    chunk identity is therefore authoritative.  A missing dimension is
+    inherited only when that dimension has exactly one value across the
+    document; otherwise it is marked ambiguous and deliberately left unset.
+
+    Grouping includes both knowledge-base and document ids so unrelated
+    documents cannot contaminate one another.  Existing derived inheritance
+    markers are stripped before recomputation, making this function idempotent.
     """
+
+    def local_identity(
+        candidate: dict[str, Any],
+    ) -> tuple[set[str], set[str], set[str]]:
+        item = dict(candidate)
+        raw_metadata = item.get("metadata")
+        if isinstance(raw_metadata, dict):
+            metadata = dict(raw_metadata)
+            metadata.pop("inherited_document_identity", None)
+            metadata.pop("ambiguous_document_identity", None)
+            item["metadata"] = metadata
+        return _declared_document_identity(item)
+
+    def strong_local_products(candidate: dict[str, Any]) -> set[str]:
+        """Return explicit applicability fields, excluding source-title mentions."""
+
+        products: set[str] = set()
+        raw_metadata = candidate.get("metadata")
+        metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+        metadata.pop("inherited_document_identity", None)
+        metadata.pop("ambiguous_document_identity", None)
+        for key, value in _flatten_metadata(metadata):
+            if (
+                _normalize_product(key) in _NORMALIZED_PRODUCT_METADATA_KEYS
+                and value is not None
+                and str(value).strip()
+            ):
+                products.add(str(value).strip())
+        for match in _DOCUMENT_PRODUCT_FIELD_RE.finditer(
+            str(candidate.get("content") or "")
+        ):
+            value = match.group(1).strip()
+            if value:
+                products.add(value)
+        return products
 
     identities: dict[
         tuple[str, str],
         tuple[set[str], set[str], set[str]],
     ] = {}
+    section_identities: dict[
+        tuple[str, str, str],
+        tuple[set[str], set[str], set[str]],
+    ] = {}
+    strong_document_products: dict[tuple[str, str], set[str]] = {}
     for candidate in candidates:
         doc_id = candidate.get("doc_id")
         if doc_id is None:
@@ -656,10 +819,26 @@ def inherit_document_constraint_metadata(
             key,
             (set(), set(), set()),
         )
-        products, versions, projects = _declared_document_identity(candidate)
+        products, versions, projects = local_identity(candidate)
         group_products.update(products)
         group_versions.update(versions)
         group_projects.update(projects)
+        strong_document_products.setdefault(key, set()).update(
+            strong_local_products(candidate)
+        )
+        section_key = candidate_section_key(candidate)
+        if section_key is not None:
+            (
+                section_products,
+                section_versions,
+                section_projects,
+            ) = section_identities.setdefault(
+                (*key, section_key),
+                (set(), set(), set()),
+            )
+            section_products.update(products)
+            section_versions.update(versions)
+            section_projects.update(projects)
 
     enriched: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -670,22 +849,113 @@ def inherit_document_constraint_metadata(
             if doc_id is not None
             else None
         )
+        section_key = candidate_section_key(item)
+        section_identity = (
+            section_identities.get(
+                (
+                    str(item.get("kb_id") or ""),
+                    str(doc_id),
+                    section_key,
+                )
+            )
+            if doc_id is not None and section_key is not None
+            else None
+        )
+        raw_metadata = item.get("metadata")
+        metadata = (
+            dict(raw_metadata)
+            if isinstance(raw_metadata, dict)
+            else ({"source_metadata": raw_metadata} if raw_metadata else {})
+        )
+        metadata.pop("inherited_document_identity", None)
+        metadata.pop("ambiguous_document_identity", None)
         if identity is not None and (identity[0] or identity[1] or identity[2]):
-            raw_metadata = item.get("metadata")
-            metadata = (
-                dict(raw_metadata)
-                if isinstance(raw_metadata, dict)
-                else ({"source_metadata": raw_metadata} if raw_metadata else {})
+            local_products, local_versions, local_projects = local_identity(item)
+            strong_products = strong_document_products.get(
+                (str(item.get("kb_id") or ""), str(doc_id)),
+                set(),
+            )
+            strong_product_canonicals = {
+                _canonical_product(value)
+                for value in strong_products
+                if _canonical_product(value)
+            }
+            authoritative_document_products = (
+                strong_products
+                if len(strong_product_canonicals) == 1
+                else identity[0]
             )
             inherited: dict[str, Any] = {}
-            if identity[0]:
-                inherited["product"] = sorted(identity[0], key=str.casefold)
-            if identity[1]:
-                inherited["version"] = sorted(identity[1])
-            if identity[2]:
-                inherited["project"] = sorted(identity[2], key=str.casefold)
-            metadata["inherited_document_identity"] = inherited
+            ambiguous: dict[str, Any] = {}
+            dimensions = (
+                (
+                    "product",
+                    local_products,
+                    section_identity[0] if section_identity is not None else set(),
+                    authoritative_document_products,
+                    lambda values: sorted(values, key=str.casefold),
+                ),
+                (
+                    "version",
+                    local_versions,
+                    section_identity[1] if section_identity is not None else set(),
+                    identity[1],
+                    sorted,
+                ),
+                (
+                    "project",
+                    local_projects,
+                    section_identity[2] if section_identity is not None else set(),
+                    identity[2],
+                    lambda values: sorted(values, key=str.casefold),
+                ),
+            )
+            for (
+                name,
+                local_values,
+                section_values,
+                document_values,
+                sorter,
+            ) in dimensions:
+                if local_values:
+                    if (
+                        name == "product"
+                        and len(strong_product_canonicals) == 1
+                        and not any(
+                            _canonical_product(value)
+                            in strong_product_canonicals
+                            for value in local_values
+                        )
+                    ):
+                        # A filename may name an integration target (for example
+                        # DingTalk) while an explicit ``所属产品`` header declares
+                        # the document's actual applicability (CloudPivot).  Keep
+                        # the title signal for recall, but also inherit the one
+                        # authoritative document product so constraint checking
+                        # does not misclassify the answer chunk.
+                        inherited[name] = sorter(strong_products)
+                    continue
+                # A section-local declaration is more precise than a document
+                # header.  This is what keeps a 2024 section and a 2025 section
+                # in one physical document from inheriting each other's scope.
+                if len(section_values) == 1:
+                    inherited[name] = sorter(section_values)
+                    continue
+                if len(section_values) > 1:
+                    ambiguous[name] = sorter(section_values)
+                    continue
+                if len(document_values) == 1:
+                    inherited[name] = sorter(document_values)
+                elif len(document_values) > 1:
+                    ambiguous[name] = sorter(document_values)
+            if inherited:
+                metadata["inherited_document_identity"] = inherited
+            if ambiguous:
+                metadata["ambiguous_document_identity"] = ambiguous
+        if metadata:
             item["metadata"] = metadata
+        else:
+            item.pop("metadata", None)
         enriched.append(item)
     return enriched
 
@@ -770,6 +1040,9 @@ def evaluate_candidate_constraints(
     filename = str(candidate.get("filename") or "")
     tags = candidate.get("doc_tags", candidate.get("tags")) or []
     metadata = candidate.get("metadata") or {}
+    if isinstance(metadata, dict):
+        metadata = dict(metadata)
+        metadata.pop("ambiguous_document_identity", None)
     content = str(candidate.get("content") or "")
     metadata_items = _flatten_metadata(metadata)
 

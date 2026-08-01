@@ -437,20 +437,20 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         candidates = (
             _candidate(
                 "lodging",
-                "D级住宿标准：一线城市不超过450元/天。",
+                "出差住宿标准：D级一线城市不超过450元/天。",
                 doc_id="travel-policy",
                 expansion_query_indexes=[0],
             ),
             _candidate(
                 "transport",
-                "D级交通标准：飞机经济舱、高铁二等座。",
+                "出差交通标准：D级飞机经济舱、高铁二等座。",
                 chunk_index=1,
                 doc_id="travel-policy",
                 expansion_query_indexes=[1],
             ),
             _candidate(
                 "meal",
-                "D级餐补标准：每天100元。",
+                "出差餐补标准：D级每天100元。",
                 chunk_index=2,
                 doc_id="travel-policy",
                 expansion_query_indexes=[2],
@@ -463,7 +463,11 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(plan.answer_shape, "multi_hop")
+        # Presentation shape and dependency topology are independent: this is
+        # a three-part answer whose items all depend on one bridge, not one
+        # monolithic multi-hop answer.
+        self.assertEqual(plan.answer_shape, "multi_part")
+        self.assertTrue(plan.has_bridge_dependencies)
         self.assertEqual(
             [item.role for item in plan.requirements],
             ["answer", "answer", "answer", "bridge"],
@@ -504,8 +508,11 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
             retrieval_queries=plan.retrieval_queries,
             completeness="complete",
         )
-        self.assertEqual(missing_bridge.missing_requirement_ids, ("r4",))
-        self.assertEqual(missing_bridge.state.completeness, "partial")
+        self.assertEqual(
+            missing_bridge.missing_requirement_ids,
+            ("r1", "r2", "r3", "r4"),
+        )
+        self.assertEqual(missing_bridge.state.completeness, "unknown")
 
     def test_correct_intermediate_value_joins_mapping_and_answer(self) -> None:
         for scenario in MAPPING_SCENARIOS:
@@ -704,7 +711,14 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
                     bundle.missing_requirement_ids,
                     (f"r{len(scenario.supporting_contents)}",),
                 )
-                self.assertEqual(bundle.state.completeness, "partial")
+                self.assertEqual(
+                    bundle.state.completeness,
+                    (
+                        "unknown"
+                        if len(scenario.supporting_contents) == 1
+                        else "partial"
+                    ),
+                )
 
     def test_multi_part_reimbursement_coverage_is_all_or_partial_per_item(self) -> None:
         question = (
@@ -726,7 +740,7 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
             ),
             _candidate(
                 "approval",
-                "审批流程：直属主管审批后由财务复核。",
+                "报销审批流程：直属主管审批后由财务复核。",
                 chunk_index=2,
                 expansion_query_indexes=[2],
             ),

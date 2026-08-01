@@ -18,6 +18,12 @@
 | `APP_ENV` | 宿主机 `development`，Docker `production` | 决定正文追踪的安全默认值 |
 | `APP_VERSION` / `APP_REVISION` | `dev` / 空 | 发布版本和 Git revision，由镜像构建自动注入 |
 | `LOG_LEVEL` | `INFO` | Python 日志级别 |
+| `DEVELOPMENT_LOG_DIR` | `<项目根>/logs/development` | 开发环境每个后端进程的独立日志文件目录；生产环境不写本地文件 |
+
+本地以 `uvicorn main:app --reload --port 8000` 启动时，后端会在
+`logs/development/` 自动创建 `backend-日期-pid.log`。控制台输出仍会保留；
+排查某次请求时可直接在该目录按最新文件查看，RAG Trace 的 `trace_id` 与页面响应头一致。
+该目录已被 Git 忽略，日志可能含开发环境的业务正文，不应提交或上传到外部。
 
 生产环境即使关闭正文追踪，也会保留字符数和 SHA-256，便于关联重复问题而不保存原文。生产环境也默认关闭逐候选事件，但保留阶段汇总与最终选择结果。需要在线调试正文时应显式设置 `RAG_TRACE_CONTENT_ENABLED=true` 和 `RAG_TRACE_CANDIDATE_DETAILS_ENABLED=true`，完成后及时关闭。
 关闭正文追踪时，用户名、问题/回答原文、文件名、查询命中片段、重排理由和上游异常正文不写入结构化 Trace；仅保留 ID、类型、字符数和摘要。

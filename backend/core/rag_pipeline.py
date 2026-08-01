@@ -36,6 +36,7 @@ from core.reranker import (
 )
 from core.query_constraints import (
     QueryConstraints,
+    candidate_section_key,
     evaluate_candidate_constraints,
     extract_query_constraints,
     inherit_document_constraint_metadata,
@@ -67,6 +68,15 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class _EvidenceScopeSliceFilter:
+    kb_id: uuid.UUID
+    doc_id: uuid.UUID
+    section_key: str | None
+    chunk_ids: tuple[uuid.UUID, ...]
+    is_anchor: bool
+
+
+@dataclass(frozen=True)
 class _EvidenceScopeChoiceFilter:
     key: str
     label: str
@@ -79,6 +89,7 @@ class _EvidenceScopeChoiceFilter:
     doc_ids: tuple[uuid.UUID, ...]
     anchor_doc_ids: tuple[uuid.UUID, ...]
     companion_doc_ids: tuple[uuid.UUID, ...]
+    scope_slices: tuple[_EvidenceScopeSliceFilter, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -150,6 +161,29 @@ def _bounded_uuid_values(value: object, *, limit: int) -> tuple[uuid.UUID, ...]:
         if len(result) > limit:
             raise ValueError("too many scope ids")
     return tuple(result)
+
+
+def _scope_slice_tokens(
+    scope_slice: _EvidenceScopeSliceFilter,
+) -> set[tuple[str, ...]]:
+    if scope_slice.section_key:
+        return {
+            (
+                str(scope_slice.kb_id),
+                str(scope_slice.doc_id),
+                "section",
+                scope_slice.section_key,
+            )
+        }
+    return {
+        (
+            str(scope_slice.kb_id),
+            str(scope_slice.doc_id),
+            "chunk",
+            str(chunk_id),
+        )
+        for chunk_id in scope_slice.chunk_ids
+    }
 
 
 def _invalid_evidence_scope_filter(
@@ -245,12 +279,93 @@ def _normalize_evidence_scope_filter(
             choice_companion_keys = {
                 str(item) for item in choice_companion_doc_ids
             }
+            raw_scope_slices = raw_choice.get("scope_slices")
+            scope_slices: list[_EvidenceScopeSliceFilter] = []
+            if raw_scope_slices not in (None, []):
+                if (
+                    not isinstance(raw_scope_slices, list)
+                    or not raw_scope_slices
+                    or len(raw_scope_slices) > 100
+                ):
+                    raise ValueError("choice scope slices are invalid")
+                seen_slice_tokens: set[tuple[str, ...]] = set()
+                for raw_slice in raw_scope_slices:
+                    if not isinstance(raw_slice, dict):
+                        raise ValueError("choice scope slice must be an object")
+                    slice_kb_ids = _bounded_uuid_values(
+                        [raw_slice.get("kb_id")],
+                        limit=1,
+                    )
+                    slice_doc_ids = _bounded_uuid_values(
+                        [raw_slice.get("doc_id")],
+                        limit=1,
+                    )
+                    raw_section_key = raw_slice.get("section_key")
+                    if raw_section_key is not None and not isinstance(
+                        raw_section_key,
+                        str,
+                    ):
+                        raise ValueError("choice section key is invalid")
+                    section_key = (
+                        raw_section_key.strip()
+                        if isinstance(raw_section_key, str)
+                        else None
+                    )
+                    if section_key is not None and (
+                        not section_key or len(section_key) > 500
+                    ):
+                        raise ValueError("choice section key is invalid")
+                    chunk_ids = _bounded_uuid_values(
+                        raw_slice.get("chunk_ids", []),
+                        limit=100,
+                    )
+                    is_anchor = raw_slice.get("is_anchor")
+                    if (
+                        not slice_kb_ids
+                        or not slice_doc_ids
+                        or not isinstance(is_anchor, bool)
+                        or (section_key is None and not chunk_ids)
+                    ):
+                        raise ValueError("choice scope slice is incomplete")
+                    scope_slice = _EvidenceScopeSliceFilter(
+                        kb_id=slice_kb_ids[0],
+                        doc_id=slice_doc_ids[0],
+                        section_key=section_key,
+                        chunk_ids=chunk_ids,
+                        is_anchor=is_anchor,
+                    )
+                    tokens = _scope_slice_tokens(scope_slice)
+                    if not tokens or tokens & seen_slice_tokens:
+                        raise ValueError("choice scope slice is duplicated")
+                    seen_slice_tokens.update(tokens)
+                    scope_slices.append(scope_slice)
             if (
                 choice_anchor_keys & choice_companion_keys
                 or choice_doc_keys
                 != choice_anchor_keys | choice_companion_keys
             ):
                 raise ValueError("choice anchor/companion partition is invalid")
+            if scope_slices:
+                slice_kb_keys = {
+                    str(value.kb_id) for value in scope_slices
+                }
+                slice_doc_keys = {
+                    str(value.doc_id) for value in scope_slices
+                }
+                slice_anchor_doc_keys = {
+                    str(value.doc_id)
+                    for value in scope_slices
+                    if value.is_anchor
+                }
+                if (
+                    not slice_anchor_doc_keys
+                    or not slice_kb_keys.issubset(
+                        {str(value) for value in choice_kb_ids}
+                    )
+                    or slice_doc_keys != choice_doc_keys
+                    or slice_anchor_doc_keys != choice_anchor_keys
+                ):
+                    raise ValueError("choice scope slice partition is invalid")
             choices.append(
                 _EvidenceScopeChoiceFilter(
                     key=key,
@@ -274,6 +389,7 @@ def _normalize_evidence_scope_filter(
                     doc_ids=choice_doc_ids,
                     anchor_doc_ids=choice_anchor_doc_ids,
                     companion_doc_ids=choice_companion_doc_ids,
+                    scope_slices=tuple(scope_slices),
                 )
             )
     except (TypeError, ValueError):
@@ -295,10 +411,29 @@ def _normalize_evidence_scope_filter(
             if other.key != choice.key
             for item in other.doc_ids
         }
-        if anchor_keys & other_choice_doc_keys:
+        if not choice.scope_slices and anchor_keys & other_choice_doc_keys:
             return _invalid_evidence_scope_filter(
                 mode,
                 "anchor_not_choice_exclusive",
+            )
+    for choice in choices:
+        anchor_tokens = {
+            token
+            for scope_slice in choice.scope_slices
+            if scope_slice.is_anchor
+            for token in _scope_slice_tokens(scope_slice)
+        }
+        other_tokens = {
+            token
+            for other in choices
+            if other.key != choice.key
+            for scope_slice in other.scope_slices
+            for token in _scope_slice_tokens(scope_slice)
+        }
+        if anchor_tokens & other_tokens:
+            return _invalid_evidence_scope_filter(
+                mode,
+                "anchor_slice_not_choice_exclusive",
             )
 
     choice_kb_ids = {
@@ -386,6 +521,13 @@ def _resolved_comparison_scope_filter(
                 "doc_ids": list(choice.doc_ids),
                 "anchor_doc_ids": list(choice.anchor_doc_ids),
                 "companion_doc_ids": list(choice.companion_doc_ids),
+                "scope_slices": [
+                    {
+                        **scope_slice.to_dict(),
+                        "chunk_ids": list(scope_slice.chunk_ids),
+                    }
+                    for scope_slice in choice.scope_slices
+                ],
             }
             for choice in plan.choices
         ],
@@ -463,13 +605,13 @@ def _restrict_candidates_to_scope(
         return [dict(item) for item in candidates], 0
     if not scope_filter.valid:
         return [], len(candidates)
-    allowed_kb_ids = {str(value) for value in scope_filter.kb_ids}
-    allowed_doc_ids = {str(value) for value in scope_filter.doc_ids}
     selected = [
         dict(item)
         for item in candidates
-        if str(item.get("kb_id") or "") in allowed_kb_ids
-        and str(item.get("doc_id") or "") in allowed_doc_ids
+        if any(
+            _candidate_matches_scope_choice(item, choice)
+            for choice in scope_filter.choices
+        )
     ]
     return selected, len(candidates) - len(selected)
 
@@ -488,9 +630,65 @@ def _candidate_matches_scope_choice(
     item: dict,
     choice: _EvidenceScopeChoiceFilter,
 ) -> bool:
-    return (
-        str(item.get("kb_id") or "") in {str(value) for value in choice.kb_ids}
-        and str(item.get("doc_id") or "") in {str(value) for value in choice.doc_ids}
+    kb_id = str(item.get("kb_id") or "")
+    doc_id = str(item.get("doc_id") or "")
+    if (
+        kb_id not in {str(value) for value in choice.kb_ids}
+        or doc_id not in {str(value) for value in choice.doc_ids}
+    ):
+        return False
+    if not choice.scope_slices:
+        return True
+    chunk_id = str(item.get("id") or item.get("chunk_id") or "").strip()
+    section_key = candidate_section_key(item)
+    return any(
+        kb_id == str(scope_slice.kb_id)
+        and doc_id == str(scope_slice.doc_id)
+        and (
+            (
+                scope_slice.section_key is not None
+                and section_key == scope_slice.section_key
+            )
+            or (
+                chunk_id
+                and chunk_id
+                in {str(value) for value in scope_slice.chunk_ids}
+            )
+        )
+        for scope_slice in choice.scope_slices
+    )
+
+
+def _candidate_proves_scope_choice(
+    item: dict,
+    choice: _EvidenceScopeChoiceFilter,
+) -> bool:
+    if not _candidate_matches_scope_choice(item, choice):
+        return False
+    if not choice.scope_slices:
+        return str(item.get("doc_id") or "") in {
+            str(value) for value in choice.anchor_doc_ids
+        }
+    kb_id = str(item.get("kb_id") or "")
+    doc_id = str(item.get("doc_id") or "")
+    chunk_id = str(item.get("id") or item.get("chunk_id") or "").strip()
+    section_key = candidate_section_key(item)
+    return any(
+        scope_slice.is_anchor
+        and kb_id == str(scope_slice.kb_id)
+        and doc_id == str(scope_slice.doc_id)
+        and (
+            (
+                scope_slice.section_key is not None
+                and section_key == scope_slice.section_key
+            )
+            or (
+                chunk_id
+                and chunk_id
+                in {str(value) for value in scope_slice.chunk_ids}
+            )
+        )
+        for scope_slice in choice.scope_slices
     )
 
 
@@ -504,13 +702,9 @@ def _scope_anchor_coverage(
     hit_id_set: set[str] = set()
     covered_choice_keys: set[str] = set()
     for choice in scope_filter.choices:
-        anchor_ids = {str(value) for value in choice.anchor_doc_ids}
         for item in candidates:
             doc_id = str(item.get("doc_id") or "")
-            if doc_id not in anchor_ids or not _candidate_matches_scope_choice(
-                item,
-                choice,
-            ):
+            if not _candidate_proves_scope_choice(item, choice):
                 continue
             covered_choice_keys.add(choice.key)
             if doc_id not in hit_id_set:
@@ -543,11 +737,7 @@ async def _ensure_scope_anchor_candidate_coverage(
     """
 
     def proves_choice(item: dict, choice: _EvidenceScopeChoiceFilter) -> bool:
-        return (
-            _candidate_matches_scope_choice(item, choice)
-            and str(item.get("doc_id") or "")
-            in {str(value) for value in choice.anchor_doc_ids}
-        )
+        return _candidate_proves_scope_choice(item, choice)
 
     merged = [dict(item) for item in candidates]
     seen = {_scope_candidate_identity(item) for item in merged}

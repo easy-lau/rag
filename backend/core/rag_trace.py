@@ -342,6 +342,9 @@ def trace_event(event: str, /, **payload: Any) -> None:
                 separators=(",", ":"),
                 allow_nan=False,
             ),
+            extra={
+                "conversation_id": str(payload.get("conversation_id") or ""),
+            },
         )
         # Lazy import keeps the tracing formatter usable in lightweight tests
         # and avoids making observability a startup dependency.

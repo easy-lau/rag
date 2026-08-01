@@ -21,7 +21,7 @@ from api.settings import (
     _test_config,
     apply_stored_settings,
     list_models,
-    test_model_connection,
+    test_model_connection as _test_model_connection_endpoint,
     update_settings,
 )
 from core.settings_crypto import (
@@ -582,7 +582,7 @@ class ModelConnectionTestTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch("api.settings._run_model_connection_test", new=AsyncMock(return_value=result)),
         ):
-            actual = await test_model_connection(
+            actual = await _test_model_connection_endpoint(
                 ModelConnectionTest(service="llm"),
                 db=session,
                 audit=audit,

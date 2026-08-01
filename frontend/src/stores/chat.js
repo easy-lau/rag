@@ -51,6 +51,7 @@ import {
   SSE_HANDLER_ERROR_MESSAGE,
   SSE_PARSE_ERROR_MESSAGE,
 } from '@/utils/chatStream'
+import { fetchAllConversationPages } from '@/utils/chatHistoryPagination'
 
 export const useChatStore = defineStore('chat', () => {
   const messages = ref([])
@@ -73,6 +74,9 @@ export const useChatStore = defineStore('chat', () => {
   let aborted = false
   // 用户快速切换历史对话时，只接收最后一次请求的响应，避免旧响应覆盖当前会话。
   let conversationRequestId = 0
+  // 侧栏可能由桌面/移动布局同时触发加载。只有最后一次完整分页结果可以
+  // 覆盖当前列表，避免较早请求在后返回时截断已经加载到的历史会话。
+  let historyRequestId = 0
   // 停止生成后使旧 SSE 事件失效，避免其 done 事件把已新建的空会话切回旧会话。
   let streamRunId = 0
   // Only one stream can be active.  Keeping its source outside the async
@@ -321,10 +325,13 @@ export const useChatStore = defineStore('chat', () => {
     // the same message does after a history reload.
     aiMsg = reactive(aiMsg)
 
+    const requestKnowledgeBaseIds = Array.isArray(options.knowledgeBaseIds)
+      ? options.knowledgeBaseIds
+      : selectedKbIds.value
     const { promise, abort } = createChatStream({
       question: normalizedQuestion,
       conversation_id: currentConvId.value,
-      knowledge_base_ids: selectedKbIds.value,
+      knowledge_base_ids: requestKnowledgeBaseIds,
       search_config: searchConfig.value,
       request_id: requestId,
       turn_id: turnId || undefined,
@@ -709,6 +716,10 @@ export const useChatStore = defineStore('chat', () => {
       clarificationSource: target,
       allowFreeText: false,
       displayContent,
+      // A picker is a continuation of its originating evidence scope, rather
+      // than a new query under a possibly changed global KB filter.  Backend
+      // authorization remains authoritative and rechecks this snapshot.
+      knowledgeBaseIds: clarification.selected_kb_ids_snapshot,
       requestId: clarification.retryable
         ? clarification.last_submission_request_id
         : null,
@@ -748,7 +759,12 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function loadHistory() {
-    conversations.value = await getChatHistory()
+    const requestId = ++historyRequestId
+    const rows = await fetchAllConversationPages(getChatHistory, {
+      pageSize: 100,
+      isCurrent: () => requestId === historyRequestId,
+    })
+    if (rows !== null && requestId === historyRequestId) conversations.value = rows
   }
 
   function restoreMessageSearch(message) {

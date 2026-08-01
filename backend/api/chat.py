@@ -64,7 +64,9 @@ from core.query_route_compiler import (
     rag_task_contract_gate_reason,
 )
 from core.query_route_contract import RouteClarification, RouteUnresolvedSlot
+from core.query_constraints import candidate_section_key
 from core.rag_trace import content_fields, log_exception_safely, trace_event
+from core.logging_config import stream_in_conversation_log
 from config import get_settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -304,6 +306,78 @@ def _strict_string_list(
     return tuple(normalized)
 
 
+def _validated_choice_scope_slices(value: object) -> tuple[dict, ...] | None:
+    """Validate exact section/chunk allow-lists carried by one choice.
+
+    ``None`` preserves rolling compatibility with document-level v2 states.
+    A present list is strict: every row binds one authorized KB/document pair
+    to an ingestion section key or exact chunk ids and declares whether that
+    slice proves the choice.  Missing selectors never fall back to a document.
+    """
+
+    if value is None or value == []:
+        return ()
+    if not isinstance(value, list) or not (1 <= len(value) <= 100):
+        return None
+    slices: list[dict] = []
+    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
+    for raw_slice in value:
+        if not isinstance(raw_slice, dict):
+            return None
+        try:
+            kb_id = str(uuid.UUID(str(raw_slice.get("kb_id") or "")))
+            doc_id = str(uuid.UUID(str(raw_slice.get("doc_id") or "")))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        raw_section_key = raw_slice.get("section_key")
+        if raw_section_key is None:
+            section_key = None
+        elif (
+            not isinstance(raw_section_key, str)
+            or not raw_section_key.strip()
+            or len(raw_section_key.strip()) > 500
+        ):
+            return None
+        else:
+            section_key = raw_section_key.strip()
+        chunk_ids = _strict_string_list(
+            raw_slice.get("chunk_ids", []),
+            max_items=100,
+            uuid_values=True,
+        )
+        is_anchor = raw_slice.get("is_anchor")
+        if chunk_ids is None or not isinstance(is_anchor, bool):
+            return None
+        if section_key is None and not chunk_ids:
+            return None
+        identity = (kb_id, doc_id, section_key or "", tuple(chunk_ids))
+        if identity in seen:
+            return None
+        seen.add(identity)
+        slices.append({
+            "kb_id": kb_id,
+            "doc_id": doc_id,
+            "section_key": section_key,
+            "chunk_ids": list(chunk_ids),
+            "is_anchor": is_anchor,
+        })
+    return tuple(slices)
+
+
+def _scope_slice_identity_tokens(scope_slice: dict) -> set[tuple[str, ...]]:
+    """Return non-cartesian identities used for cross-choice exclusivity."""
+
+    kb_id = str(scope_slice.get("kb_id") or "")
+    doc_id = str(scope_slice.get("doc_id") or "")
+    section_key = str(scope_slice.get("section_key") or "").strip()
+    if section_key:
+        return {(kb_id, doc_id, "section", section_key)}
+    return {
+        (kb_id, doc_id, "chunk", str(chunk_id))
+        for chunk_id in scope_slice.get("chunk_ids", [])
+    }
+
+
 def _validated_evidence_choices(
     value: object,
     *,
@@ -312,6 +386,7 @@ def _validated_evidence_choices(
     if not isinstance(value, list) or not (2 <= len(value) <= 6):
         return None
     prevalidated_doc_ids: list[tuple[str, ...]] = []
+    prevalidated_scope_slices: list[tuple[dict, ...]] = []
     doc_occurrences: dict[str, int] = {}
     for raw_choice in value:
         if not isinstance(raw_choice, dict):
@@ -324,7 +399,13 @@ def _validated_evidence_choices(
         )
         if doc_ids is None:
             return None
+        scope_slices = _validated_choice_scope_slices(
+            raw_choice.get("scope_slices")
+        )
+        if scope_slices is None:
+            return None
         prevalidated_doc_ids.append(doc_ids)
+        prevalidated_scope_slices.append(scope_slices)
         for doc_id in doc_ids:
             doc_occurrences[doc_id] = doc_occurrences.get(doc_id, 0) + 1
     selected_kb_set = set(selected_kb_ids)
@@ -371,6 +452,7 @@ def _validated_evidence_choices(
             if items is None:
                 return None
             normalized[field] = list(items)
+        scope_slices = prevalidated_scope_slices[choice_index]
         raw_anchor_doc_ids = raw_choice.get("anchor_doc_ids")
         raw_companion_doc_ids = raw_choice.get("companion_doc_ids")
         if raw_anchor_doc_ids is None and raw_companion_doc_ids is None:
@@ -405,22 +487,66 @@ def _validated_evidence_choices(
         doc_id_set = set(prevalidated_doc_ids[choice_index])
         anchor_set = set(anchor_doc_ids)
         companion_set = set(companion_doc_ids)
+        if scope_slices:
+            slice_kb_ids = {str(item["kb_id"]) for item in scope_slices}
+            slice_doc_ids = {str(item["doc_id"]) for item in scope_slices}
+            slice_anchor_doc_ids = {
+                str(item["doc_id"])
+                for item in scope_slices
+                if item["is_anchor"] is True
+            }
+            if (
+                not slice_anchor_doc_ids
+                or not slice_kb_ids.issubset(set(normalized["kb_ids"]))
+                or slice_doc_ids != doc_id_set
+                or slice_anchor_doc_ids != anchor_set
+            ):
+                return None
         if (
             not anchor_set
             or anchor_set & companion_set
             or anchor_set | companion_set != doc_id_set
-            or any(doc_occurrences.get(doc_id) != 1 for doc_id in anchor_set)
-            or any(doc_occurrences.get(doc_id, 0) < 2 for doc_id in companion_set)
+            or (
+                not scope_slices
+                and any(doc_occurrences.get(doc_id) != 1 for doc_id in anchor_set)
+            )
         ):
             return None
         normalized["anchor_doc_ids"] = list(anchor_doc_ids)
         normalized["companion_doc_ids"] = list(companion_doc_ids)
+        if scope_slices:
+            normalized["scope_slices"] = [dict(item) for item in scope_slices]
         if not set(normalized["kb_ids"]).issubset(selected_kb_set):
             return None
         all_doc_ids.update(normalized["doc_ids"])
         if len(all_doc_ids) > 30:
             return None
         choices.append(normalized)
+    # A shared generic slice may accompany several choices, but a slice that
+    # proves one choice must be exclusive at section/chunk granularity.
+    choice_slice_tokens = [
+        {
+            token
+            for scope_slice in choice.get("scope_slices", [])
+            for token in _scope_slice_identity_tokens(scope_slice)
+        }
+        for choice in choices
+    ]
+    for choice_index, choice in enumerate(choices):
+        anchor_tokens = {
+            token
+            for scope_slice in choice.get("scope_slices", [])
+            if scope_slice.get("is_anchor") is True
+            for token in _scope_slice_identity_tokens(scope_slice)
+        }
+        other_tokens = {
+            token
+            for index, tokens in enumerate(choice_slice_tokens)
+            if index != choice_index
+            for token in tokens
+        }
+        if anchor_tokens & other_tokens:
+            return None
     return tuple(choices)
 
 
@@ -727,6 +853,12 @@ def _evidence_scope_filter(
             "anchor_doc_ids": list(raw_choice.get("anchor_doc_ids", [])),
             "companion_doc_ids": list(raw_choice.get("companion_doc_ids", [])),
         }
+        if raw_choice.get("scope_slices"):
+            choice["scope_slices"] = [
+                dict(value)
+                for value in raw_choice.get("scope_slices", [])
+                if isinstance(value, dict)
+            ]
         choices.append(choice)
         kb_ids.update(choice_kb_ids)
         doc_ids.update(choice["doc_ids"])
@@ -832,6 +964,14 @@ def _evidence_clarification_ack(
         "clarification_message_id": pending_state["clarification_message_id"],
         "route_state_revision": route_state_revision,
         "conversation_id": str(conversation_id),
+        # The choice belongs to the retrieval scope that created it.  The
+        # client reuses this snapshot for the selection request; the server
+        # still re-authorizes every KB/document before execution.  Do not make
+        # a click depend on whichever global KB filters happen to be selected
+        # later in the UI.
+        "selected_kb_ids_snapshot": list(
+            pending_state["selected_kb_ids_snapshot"]
+        ),
     }
 
 
@@ -1104,7 +1244,9 @@ async def _route_clarification_response(
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
-        generate_clarification(),
+        stream_in_conversation_log(
+            generate_clarification(), conversation_id=conv.id
+        ),
         media_type="text/event-stream",
         headers=_turn_response_headers(
             conversation_id=conv.id, trace_id=trace_id, turn=turn
@@ -1397,7 +1539,7 @@ async def _evidence_pending_direct_response(
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
-        generate_direct(),
+        stream_in_conversation_log(generate_direct(), conversation_id=conv.id),
         media_type="text/event-stream",
         headers=_turn_response_headers(
             conversation_id=conv.id, trace_id=trace_id, turn=turn
@@ -1750,6 +1892,7 @@ def _parse_uuid(value: object) -> uuid.UUID | None:
 def _scope_anchor_coverage_from_sources(
     scope_filter: dict | None,
     answer_pairs: set[tuple[uuid.UUID, uuid.UUID]],
+    answer_sources: object = None,
 ) -> tuple[bool | None, list[str]]:
     """Recompute selected-scope anchors from refreshed answer sources.
 
@@ -1761,6 +1904,40 @@ def _scope_anchor_coverage_from_sources(
 
     if not isinstance(scope_filter, dict):
         return None, []
+    choices = [
+        value
+        for value in scope_filter.get("choices", [])
+        if isinstance(value, dict)
+    ]
+    if any(choice.get("scope_slices") for choice in choices):
+        sources = [
+            value for value in (answer_sources or []) if isinstance(value, dict)
+        ]
+        covered_doc_ids: set[str] = set()
+        for choice in choices:
+            anchor_slices = [
+                value
+                for value in choice.get("scope_slices", [])
+                if isinstance(value, dict) and value.get("is_anchor") is True
+            ]
+            if not anchor_slices:
+                return False, []
+            matched_source = next(
+                (
+                    source
+                    for source in sources
+                    if any(
+                        _source_matches_scope_slice(source, scope_slice)
+                        for scope_slice in anchor_slices
+                    )
+                ),
+                None,
+            )
+            if matched_source is None:
+                return False, sorted(covered_doc_ids)
+            covered_doc_ids.add(str(matched_source.get("doc_id") or ""))
+        return True, sorted(value for value in covered_doc_ids if value)
+
     anchor_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
     for raw_choice in scope_filter.get("choices", []):
         if not isinstance(raw_choice, dict):
@@ -1785,6 +1962,59 @@ def _scope_anchor_coverage_from_sources(
     covered = anchor_pairs & answer_pairs
     covered_doc_ids = sorted({str(doc_id) for _, doc_id in covered})
     return covered == anchor_pairs, covered_doc_ids
+
+
+def _source_matches_scope_slice(source: dict, scope_slice: dict) -> bool:
+    if (
+        str(source.get("kb_id") or "") != str(scope_slice.get("kb_id") or "")
+        or str(source.get("doc_id") or "")
+        != str(scope_slice.get("doc_id") or "")
+    ):
+        return False
+    source_chunk_id = str(
+        source.get("id") or source.get("chunk_id") or ""
+    ).strip()
+    section_key = candidate_section_key(source)
+    allowed_section_key = str(scope_slice.get("section_key") or "").strip()
+    allowed_chunk_ids = {
+        str(value).strip()
+        for value in scope_slice.get("chunk_ids", [])
+        if str(value).strip()
+    }
+    return bool(
+        (allowed_section_key and section_key == allowed_section_key)
+        or (source_chunk_id and source_chunk_id in allowed_chunk_ids)
+    )
+
+
+def _source_matches_scope_filter(source: dict, scope_filter: dict | None) -> bool:
+    if not isinstance(scope_filter, dict):
+        return False
+    choices = [
+        value
+        for value in scope_filter.get("choices", [])
+        if isinstance(value, dict)
+    ]
+    scope_slices = [
+        scope_slice
+        for choice in choices
+        for scope_slice in choice.get("scope_slices", [])
+        if isinstance(scope_slice, dict)
+    ]
+    if scope_slices:
+        return any(
+            _source_matches_scope_slice(source, scope_slice)
+            for scope_slice in scope_slices
+        )
+    allowed_pairs = _scope_document_pairs(scope_filter)
+    try:
+        pair = (
+            uuid.UUID(str(source.get("kb_id") or "")),
+            uuid.UUID(str(source.get("doc_id") or "")),
+        )
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return pair in allowed_pairs
 
 
 def _scope_document_pairs(
@@ -2410,7 +2640,7 @@ def _turn_replay_response(
         ) + "\n\n"
 
     return StreamingResponse(
-        stream(),
+        stream_in_conversation_log(stream(), conversation_id=conv.id),
         status_code=status_code,
         media_type="text/event-stream",
         headers=_turn_response_headers(
@@ -3710,6 +3940,7 @@ async def send_message(
         evidence_source_validation_ok: bool | None = None
         evidence_source_validation_error: str | None = None
         evidence_answer_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+        evidence_answer_sources: list[dict] = []
         evidence_source_validation_locked = False
         evidence_source_validation_failure_emitted = False
         pending_done_chunk = None
@@ -3854,6 +4085,7 @@ async def send_message(
                     raw_answer_sources = data.get("answer_sources")
                     has_answer_source_list = isinstance(raw_answer_sources, list)
                     evidence_answer_pairs = set()
+                    evidence_answer_sources = []
                     answer_source_required = (
                         normalized_evidence_status
                         in _ANSWER_SOURCE_REQUIRED_STATUSES
@@ -3922,6 +4154,16 @@ async def send_message(
                                 evidence_source_validation_error = (
                                     "answer_source_scope_forbidden"
                                 )
+                            elif any(
+                                not _source_matches_scope_filter(
+                                    source,
+                                    evidence_filter,
+                                )
+                                for source in answer_source_items
+                            ):
+                                evidence_source_validation_error = (
+                                    "answer_source_scope_slice_forbidden"
+                                )
                         evidence_source_validation_ok = (
                             evidence_source_validation_error is None
                         )
@@ -3930,9 +4172,11 @@ async def send_message(
                         # lock below replaces the model stream with one
                         # deterministic retry message and keeps pending scope.
                         raw_answer_sources = answer_source_items
+                        evidence_answer_sources = list(answer_source_items)
                         if evidence_source_validation_error is not None:
                             raw_answer_sources = []
                             answer_source_items = []
+                            evidence_answer_sources = []
                             evidence_answer_pairs = set()
                             if normalized_evidence_status not in {
                                 "error",
@@ -3946,6 +4190,7 @@ async def send_message(
                         _scope_anchor_coverage_from_sources(
                             evidence_filter,
                             evidence_answer_pairs,
+                            evidence_answer_sources,
                         )
                     )
                     if evidence_filter is not None:
@@ -4639,7 +4884,7 @@ async def send_message(
             yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conv.id)})}\n\n"
 
     return StreamingResponse(
-        generate(),
+        stream_in_conversation_log(generate(), conversation_id=conv.id),
         media_type="text/event-stream",
         headers=_turn_response_headers(
             conversation_id=conv.id,

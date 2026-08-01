@@ -23,13 +23,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
 from core.evidence_ambiguity import (
+    DocumentEvidenceAssessment,
     EvidenceAmbiguityDecision,
+    EvidenceScopeSlice,
     detect_evidence_scope_ambiguity,
+    detect_post_evidence_document_ambiguity,
 )
 from core.llm_stream import stream_with_retry_before_first_delta
 from core.openai_client import get_client
 from core.query_constraints import (
     QueryConstraints,
+    candidate_section_key,
+    canonical_product_name,
+    evaluate_candidate_constraints,
+    extract_document_constraint_identity,
     extract_query_constraints,
     inherit_document_constraint_metadata,
 )
@@ -45,6 +52,12 @@ from core.rag_pipeline import (
 )
 from core.rag_trace import content_fields, json_safe, trace_event
 from core.rag_v2.context import build_evidence_context
+from core.rag_v2.bridge_resolution import (
+    bridge_dependency_ids_for_answer,
+    build_bridge_expansion_queries,
+    content_contains_positive_subject,
+    extract_bridge_subject,
+)
 from core.rag_v2.contracts import (
     AnswerRequirementV2,
     EvidenceBundle,
@@ -68,6 +81,7 @@ logger = logging.getLogger(__name__)
 PIPELINE_VERSION = "v2"
 MAX_GLOBAL_CANDIDATES = 24
 MAX_GLOBAL_PLAN_QUERY_CANDIDATES = 6
+MAX_BRIDGE_EXPANSION_QUERIES = 4
 MAX_EXPANSION_DOCUMENTS = 3
 MAX_DISPLAY_RESULTS = 20
 MAX_CONTEXT_CHUNKS = 16
@@ -328,6 +342,53 @@ def _mark_global_plan_query_candidates(
             item["global_plan_query_supplement"] = True
         marked.append(item)
     return marked
+
+
+def _mark_bridge_expansion_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    query_index: int,
+) -> list[dict]:
+    """Label source-resolved second-hop hits without claiming requirement support."""
+
+    marked: list[dict] = []
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        item = dict(candidate)
+        item["candidate_origin"] = "resolved_bridge_query"
+        item["candidate_origins"] = _merge_origins(
+            item,
+            {"candidate_origin": "resolved_bridge_query"},
+        )
+        item["bridge_expansion_query_index"] = max(0, int(query_index))
+        marked.append(item)
+    return marked
+
+
+def _filter_candidates_by_constraints(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    constraints: QueryConstraints,
+) -> list[dict]:
+    """Apply the same explicit product/version boundary before ambiguity checks."""
+
+    enriched = inherit_document_constraint_metadata(candidates)
+    if not constraints.has_scope_constraint:
+        return enriched
+    filtered: list[dict] = []
+    for candidate in enriched:
+        evaluation = evaluate_candidate_constraints(
+            constraints,
+            dict(candidate),
+        )
+        if evaluation.status in {"mismatch", "unknown"}:
+            continue
+        filtered.append({
+            **dict(candidate),
+            "constraint_status": evaluation.status,
+        })
+    return filtered
 
 
 def _has_retrieval_quality_signal(candidate: Mapping[str, Any]) -> bool:
@@ -636,7 +697,101 @@ def _plan_with_contract_requirements(
             for item in plan.requirements
         )
     )
-    if local_explicit_split_is_authoritative:
+    local_plan_is_authoritative = bool(
+        task_contract.relation == "new"
+        and not plan.needs_clarification
+        and plan.answer_shape != "unknown"
+        and any(item.is_required_answer for item in plan.requirements)
+        and not (
+            len(required_answer_indexes) > 1
+            and sum(item.is_required_answer for item in plan.requirements) == 1
+        )
+        and all(
+            item.source == "explicit"
+            for item in plan.requirements
+            if item.role == "answer"
+        )
+    )
+
+    def attach_dependency_edges(
+        values: Sequence[AnswerRequirementV2],
+    ) -> tuple[AnswerRequirementV2, ...]:
+        answers = tuple(item for item in values if item.role == "answer")
+        bridges = tuple(
+            item
+            for item in values
+            if item.role == "bridge" and item.bridge_subject
+        )
+        if not bridges:
+            return tuple(
+                replace(item, depends_on_requirement_ids=())
+                if item.role == "answer"
+                else item
+                for item in values
+                if item.role != "bridge"
+            )
+        attached: list[AnswerRequirementV2] = []
+
+        def scope_compatible(
+            answer: AnswerRequirementV2,
+            bridge: AnswerRequirementV2,
+        ) -> bool:
+            if answer.scope_version and bridge.scope_version:
+                if answer.scope_version != bridge.scope_version:
+                    return False
+            elif answer.scope_version or bridge.scope_version:
+                return False
+            if answer.scope_product and bridge.scope_product:
+                if canonical_product_name(
+                    answer.scope_product
+                ) != canonical_product_name(bridge.scope_product):
+                    return False
+            elif answer.scope_product or bridge.scope_product:
+                return False
+            return True
+
+        for item in values:
+            if item.role != "answer":
+                attached.append(item)
+                continue
+            matched = tuple(
+                bridge.id
+                for bridge in bridges
+                if bridge.bridge_subject
+                and scope_compatible(item, bridge)
+                and content_contains_positive_subject(
+                    item.description,
+                    bridge.bridge_subject,
+                )
+            )
+            existing = tuple(item.depends_on_requirement_ids or ())
+            # With exactly one answer target, every canonical bridge emitted by
+            # the compiled contract is topologically unambiguous.  For multiple
+            # answers only an exact positive subject match may add an edge.
+            inferred = (
+                tuple(bridge.id for bridge in bridges)
+                if len(answers) == 1
+                else matched
+            )
+            attached.append(replace(
+                item,
+                depends_on_requirement_ids=tuple(dict.fromkeys(
+                    (*existing, *inferred)
+                )),
+            ))
+        referenced_bridge_ids = {
+            dependency_id
+            for item in attached
+            if item.role == "answer"
+            for dependency_id in (item.depends_on_requirement_ids or ())
+        }
+        return tuple(
+            item
+            for item in attached
+            if item.role != "bridge" or item.id in referenced_bridge_ids
+        )
+
+    if local_plan_is_authoritative:
         # The route model may summarize an explicitly enumerated question into
         # one broad answer requirement.  That semantic summary must not erase a
         # deterministic split derived from punctuation/numbering in the user's
@@ -644,6 +799,15 @@ def _plan_with_contract_requirements(
         # genuinely additional helpful contract requirements (for example a
         # bridge), assigning fresh stable ids for this execution plan.
         merged = list(plan.requirements)
+        local_bridge_subjects = tuple(
+            subject.casefold()
+            for requirement in plan.requirements
+            if requirement.role == "bridge"
+            if (
+                subject := requirement.bridge_subject
+                or extract_bridge_subject(requirement.description)
+            )
+        )
         seen_descriptions = {
             re.sub(r"\s+", " ", item.description).strip().casefold()
             for item in merged
@@ -658,15 +822,38 @@ def _plan_with_contract_requirements(
             ).strip().casefold()
             if not normalized_description or normalized_description in seen_descriptions:
                 continue
+            bridge_subject = (
+                extract_bridge_subject(item.description)
+                if item.role == "bridge"
+                else None
+            )
+            if item.role == "bridge" and local_bridge_subjects:
+                normalized_subject = str(bridge_subject or "").casefold()
+                if not normalized_subject or any(
+                    local_subject in normalized_subject
+                    or normalized_subject in local_subject
+                    for local_subject in local_bridge_subjects
+                ):
+                    # The deterministic bridge came from the user's exact
+                    # wording and is the canonical edge.  A free-text model
+                    # paraphrase may improve retrieval only when it describes
+                    # a genuinely distinct, answer-bound subject.
+                    continue
             merged.append(AnswerRequirementV2(
                 id=f"r{len(merged) + 1}",
                 description=item.description,
                 role=item.role,
                 importance=item.importance,
                 source=item.source,
+                bridge_subject=bridge_subject,
+                scope_product=getattr(item, "scope_product", None),
+                scope_version=getattr(item, "scope_version", None),
+                scope_explicit_version=bool(
+                    getattr(item, "scope_explicit_version", False)
+                ),
             ))
             seen_descriptions.add(normalized_description)
-        requirements = tuple(merged)
+        requirements = attach_dependency_edges(merged)
     else:
         merged_requirements = [
             AnswerRequirementV2(
@@ -686,6 +873,26 @@ def _plan_with_contract_requirements(
                 role=item.role,
                 importance=item.importance,
                 source=item.source,
+                coverage_mode=(
+                    plan.requirements[index].coverage_mode
+                    if item.role == "answer"
+                    and index < len(plan.requirements)
+                    and plan.requirements[index].role == "answer"
+                    else "single"
+                ),
+                bridge_subject=(
+                    extract_bridge_subject(item.description)
+                    if item.role == "bridge"
+                    else None
+                ),
+                depends_on_requirement_ids=(
+                    () if item.role == "answer" else None
+                ),
+                scope_product=getattr(item, "scope_product", None),
+                scope_version=getattr(item, "scope_version", None),
+                scope_explicit_version=bool(
+                    getattr(item, "scope_explicit_version", False)
+                ),
             )
             for index, item in enumerate(contract_requirements)
         ]
@@ -729,14 +936,24 @@ def _plan_with_contract_requirements(
                     role="bridge",
                     importance="helpful",
                     source="inferred",
+                    bridge_subject=local_bridge.bridge_subject,
+                    scope_product=local_bridge.scope_product,
+                    scope_version=local_bridge.scope_version,
+                    scope_explicit_version=(
+                        local_bridge.scope_explicit_version
+                    ),
                 ))
                 seen_descriptions.add(normalized_description)
-        requirements = tuple(merged_requirements)
+        requirements = attach_dependency_edges(merged_requirements)
     has_bridge = any(item.role == "bridge" for item in requirements)
+    has_bridge_dependencies = any(
+        item.role == "answer" and bool(item.depends_on_requirement_ids)
+        for item in requirements
+    )
     required_answers = sum(item.is_required_answer for item in requirements)
     planning_clarification_resolved = bool(
         plan.needs_clarification
-        and has_bridge
+        and has_bridge_dependencies
         and required_answers >= 1
     )
     answer_shape = plan.answer_shape
@@ -750,14 +967,13 @@ def _plan_with_contract_requirements(
         reason = f"{reason}; task_contract_bridge_requirement".strip("; ")
     elif (
         answer_shape == "multi_hop"
-        and not has_bridge
-        and contextualized_single_requirement
+        and not has_bridge_dependencies
     ):
         # The previous-turn text was only used to resolve the target phrase;
         # without a bridge in the current route contract this cannot remain a
         # multi-hop plan.  Downgrade to a broad fact lookup so evidence status
         # stays partial/insufficient instead of manufacturing a complete join.
-        answer_shape = "fact"
+        answer_shape = "unknown" if plan.needs_clarification else "fact"
         source = "model"
         confidence = min(confidence, 0.7)
         reason = f"{reason}; contextual_bridge_unresolved".strip("; ")
@@ -806,7 +1022,7 @@ def _plan_with_contract_requirements(
         answer_shape=answer_shape,
         retrieval_queries=tuple(retrieval_queries),
         requirements=requirements,
-        source=("local" if local_explicit_split_is_authoritative else source),
+        source=("local" if local_plan_is_authoritative else source),
         confidence=confidence,
         needs_clarification=(
             False if planning_clarification_resolved else plan.needs_clarification
@@ -983,6 +1199,218 @@ async def _expand_candidates(
     )
 
 
+async def _retrieve_bridge_expansion_candidates(
+    *,
+    db: AsyncSession,
+    queries: Sequence[str],
+    kb_ids: list[uuid.UUID],
+    document_ids: Sequence[uuid.UUID] | None,
+    constraints: QueryConstraints,
+    method: str,
+    trace_id: str,
+    deadline: float,
+    stage_timeout_seconds: float,
+    candidate_k: int,
+) -> tuple[list[dict], int, int, tuple[str, ...]]:
+    """Run bounded source-resolved second-hop searches inside current scope."""
+
+    normalized_queries: list[str] = []
+    seen_queries: set[str] = set()
+    for value in queries:
+        query = re.sub(r"\s+", " ", str(value or "")).strip()
+        key = query.casefold()
+        if not query or key in seen_queries:
+            continue
+        seen_queries.add(key)
+        normalized_queries.append(query)
+        if len(normalized_queries) >= MAX_BRIDGE_EXPANSION_QUERIES:
+            break
+    if not normalized_queries:
+        return [], 0, 0, ()
+
+    scoped_doc_ids = list(dict.fromkeys(document_ids or ()))
+    scoped_doc_keys = {str(value) for value in scoped_doc_ids}
+    candidate_pools: list[list[dict]] = []
+    errors: list[str] = []
+    attempted_count = 0
+    succeeded_count = 0
+    for query_index, query in enumerate(normalized_queries):
+        attempted_count += 1
+        diagnostics: dict[str, Any] = {}
+        try:
+            timeout = _remaining_stage_timeout(
+                deadline=deadline,
+                stage_timeout_seconds=stage_timeout_seconds,
+            )
+            if scoped_doc_ids:
+                raw_candidates = await asyncio.wait_for(
+                    search_within_documents(
+                        db,
+                        queries=[query],
+                        kb_ids=kb_ids,
+                        doc_ids=scoped_doc_ids,
+                        method=method,
+                        per_document_limit=4,
+                        total_limit=MAX_GLOBAL_PLAN_QUERY_CANDIDATES,
+                        max_document_count=min(
+                            max(len(scoped_doc_ids), 1),
+                            30,
+                        ),
+                        trace_id=trace_id,
+                        surface="chat_v2_bridge_query_scope",
+                    ),
+                    timeout=timeout,
+                )
+            else:
+                raw_candidates = await asyncio.wait_for(
+                    hybrid_search(
+                        db,
+                        query,
+                        kb_ids,
+                        min(candidate_k, MAX_GLOBAL_PLAN_QUERY_CANDIDATES),
+                        method,
+                        trace_id=trace_id,
+                        surface="chat_v2_bridge_query",
+                        diagnostics=diagnostics,
+                    ),
+                    timeout=timeout,
+                )
+            authorized = _authorized_candidates(
+                raw_candidates,
+                kb_ids=kb_ids,
+            )
+            if scoped_doc_ids:
+                authorized = _filter_candidates_to_documents(
+                    authorized,
+                    scoped_doc_keys,
+                )
+            constrained = _filter_candidates_by_constraints(
+                authorized,
+                constraints=constraints,
+            )
+            admitted, admitted_doc_ids, relevance_reason, rejected_doc_ids = (
+                _admit_initial_candidates(
+                    constrained,
+                    forced_doc_ids=(scoped_doc_keys if scoped_doc_ids else None),
+                    query=query,
+                    allow_uncalibrated_forced_scope=bool(scoped_doc_ids),
+                )
+            )
+            marked = _mark_bridge_expansion_candidates(
+                admitted,
+                query_index=query_index,
+            )
+            fallback_to_global = False
+            # Prefer the evidence-anchor document, but do not assume every
+            # organization stores the mapping and its policy row together.
+            # If that local closure has no admissible answer candidate, perform
+            # exactly one bounded global pass.  The latter remains subject to
+            # normal authorization, explicit scope constraints and graph-join
+            # validation; it is a discovery fallback, never a broad context
+            # merge alongside a successful local closure.
+            if not marked and scoped_doc_ids:
+                fallback_to_global = True
+                global_candidates = await asyncio.wait_for(
+                    hybrid_search(
+                        db,
+                        query,
+                        kb_ids,
+                        min(candidate_k, MAX_GLOBAL_PLAN_QUERY_CANDIDATES),
+                        method,
+                        trace_id=trace_id,
+                        surface="chat_v2_bridge_query",
+                        diagnostics=diagnostics,
+                    ),
+                    timeout=_remaining_stage_timeout(
+                        deadline=deadline,
+                        stage_timeout_seconds=stage_timeout_seconds,
+                    ),
+                )
+                global_authorized = _authorized_candidates(
+                    global_candidates,
+                    kb_ids=kb_ids,
+                )
+                global_constrained = _filter_candidates_by_constraints(
+                    global_authorized,
+                    constraints=constraints,
+                )
+                global_admitted, global_doc_ids, global_reason, global_rejected = (
+                    _admit_initial_candidates(
+                        global_constrained,
+                        query=query,
+                    )
+                )
+                raw_candidates = [*raw_candidates, *global_candidates]
+                admitted_doc_ids = set(admitted_doc_ids) | set(global_doc_ids)
+                rejected_doc_ids = tuple(dict.fromkeys([
+                    *rejected_doc_ids,
+                    *global_rejected,
+                ]))
+                relevance_reason = f"{relevance_reason}; fallback={global_reason}"
+                marked = _mark_bridge_expansion_candidates(
+                    global_admitted,
+                    query_index=query_index,
+                )
+            if marked:
+                candidate_pools.append(marked)
+            succeeded_count += 1
+            if diagnostics.get("vector_channel_failed"):
+                errors.append("bridge_query_vector_channel_degraded")
+            trace_event(
+                "retrieval.bridge_query_completed",
+                trace_id=trace_id,
+                pipeline_version=PIPELINE_VERSION,
+                query_index=query_index,
+                candidate_count=len(raw_candidates),
+                admitted_candidate_count=len(marked),
+                admitted_document_count=len(admitted_doc_ids),
+                rejected_document_count=len(rejected_doc_ids),
+                relevance_reason=relevance_reason,
+                scoped=bool(scoped_doc_ids),
+                fallback_to_global=fallback_to_global,
+                **content_fields("query", query),
+            )
+        except Exception as exc:
+            reason = (
+                "bridge_query_retrieval_timeout"
+                if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                or time.perf_counter() >= deadline
+                else "bridge_query_retrieval_failed"
+            )
+            errors.append(reason)
+            trace_event(
+                "retrieval.bridge_query_error",
+                trace_id=trace_id,
+                pipeline_version=PIPELINE_VERSION,
+                query_index=query_index,
+                stage="resolved_bridge_query",
+                reason=reason,
+                error=exc,
+                **content_fields("query", query),
+            )
+            logger.warning(
+                "[RAG v2] 动态二跳检索失败，保留已有候选 "
+                "query_index=%d error=%s",
+                query_index,
+                type(exc).__name__,
+            )
+            # A timed-out statement on the shared AsyncSession must settle before
+            # reuse.  Stop this optional phase and retain all earlier evidence.
+            break
+
+    merged = _bounded_merge_global_candidate_pools(
+        [],
+        candidate_pools,
+        limit=MAX_GLOBAL_CANDIDATES,
+    )
+    return (
+        merged,
+        attempted_count,
+        succeeded_count,
+        tuple(dict.fromkeys(errors)),
+    )
+
+
 def _full_document_ids(candidates: Sequence[Mapping[str, Any]]) -> set[str]:
     grouped: dict[str, list[Mapping[str, Any]]] = {}
     for candidate in candidates:
@@ -1019,7 +1447,7 @@ def _estimated_completeness(
         if str(candidate.get("doc_id") or "").strip()
     }
     full_doc_ids = _full_document_ids(full_document_candidates)
-    if plan.answer_shape == "multi_hop" and plan.retrieval_queries:
+    if plan.has_bridge_dependencies and plan.retrieval_queries:
         observed_query_indexes = {
             index
             for candidate in initial_candidates
@@ -1122,11 +1550,310 @@ def _coverage_requirement_ids(plan: QueryPlanV2) -> tuple[str, ...]:
     explicit user answer target.
     """
 
+    dependency_ids = {
+        dependency_id
+        for requirement in plan.requirements
+        if requirement.role == "answer"
+        for dependency_id in (requirement.depends_on_requirement_ids or ())
+    }
     return tuple(
         requirement.id
         for requirement in plan.requirements
         if requirement.importance == "required"
-        or (plan.answer_shape == "multi_hop" and requirement.role == "bridge")
+        or requirement.id in dependency_ids
+    )
+
+
+def _has_unresolved_legacy_intradocument_scope(
+    decision: EvidenceAmbiguityDecision,
+) -> bool:
+    """Return whether choices share one document without section lineage.
+
+    Post-evidence ambiguity is normally preferable because raw retrieval scope
+    labels do not prove that every alternative can answer the question.  One
+    legacy shape cannot be deferred safely, however: several mutually
+    exclusive choices anchored by exact chunks inside the same physical
+    document.  Unscoped sibling chunks in that document have no trustworthy
+    lineage and are deliberately omitted from the choices.  If the pipeline
+    continued to evidence assembly, those orphan chunks could lose their scope
+    identity and collapse into one generic answer graph.  Preserve the earlier
+    clarification instead; after selection the exact chunk allow-list remains
+    authoritative and missing evidence fails closed.
+    """
+
+    anchor_occurrences: dict[tuple[str, str], int] = {}
+    for choice in decision.choices:
+        legacy_anchor_documents = {
+            (str(value.kb_id), str(value.doc_id))
+            for value in choice.scope_slices
+            if value.is_anchor and value.section_key is None and value.chunk_ids
+        }
+        for key in legacy_anchor_documents:
+            anchor_occurrences[key] = anchor_occurrences.get(key, 0) + 1
+    return any(count >= 2 for count in anchor_occurrences.values())
+
+
+def _post_evidence_document_assessments(
+    *,
+    bundle: EvidenceBundle,
+    requirements: Sequence[AnswerRequirementV2],
+) -> tuple[DocumentEvidenceAssessment, ...]:
+    """Build document-level answer graphs from final rendered evidence.
+
+    V2 does not run a model reranker, so raw ``topic_relevance`` and
+    ``answer_support`` fields are normally absent.  The evidence assembler has
+    already performed the stronger deterministic check: visible requirement
+    support, resolved bridge joins, scope compatibility and the final context
+    budget.  Convert only documents that independently retain a required answer
+    graph; bridge/background chunks and cross-document companion mappings never
+    become standalone user choices.
+    """
+
+    required_answers = {
+        requirement.id: requirement
+        for requirement in requirements
+        if requirement.role == "answer" and requirement.importance == "required"
+    }
+    if not required_answers:
+        return ()
+    bridge_dependencies = {
+        answer_id: set(bridge_dependency_ids_for_answer(answer, requirements))
+        for answer_id, answer in required_answers.items()
+    }
+    rendered_answer_source_ids = set(bundle.answer_source_ids) & set(
+        bundle.context_item_ids
+    )
+    visible_source_ids = set(bundle.answer_source_ids) & set(
+        bundle.context_item_ids
+    )
+    visible_items_by_id = {
+        item.chunk_id: item
+        for item in bundle.items
+        if item.chunk_id in visible_source_ids
+    }
+    grouped: dict[
+        tuple[str, str, tuple[str, ...], tuple[str, ...]],
+        dict[str, Any],
+    ] = {}
+    for position, item in enumerate(bundle.items):
+        if item.chunk_id not in rendered_answer_source_ids:
+            continue
+        answer_ids = set(item.supports_requirement_ids) & set(required_answers)
+        if not answer_ids or item.role not in {"direct", "complement"}:
+            continue
+        joins = [
+            value
+            for value in item.metadata.get("resolved_bridge_joins", [])
+            if isinstance(value, Mapping)
+        ]
+        direct_answer_ids = {
+            str(value)
+            for field in (
+                "direct_subject_answer_requirement_ids",
+                "direct_subject_bridge_bypass_requirement_ids",
+            )
+            for value in item.metadata.get(field, [])
+            if isinstance(value, str)
+        }
+        independently_supported: list[
+            tuple[str, tuple[str, ...], tuple[str, ...]]
+        ] = []
+        for answer_id in answer_ids:
+            dependencies = bridge_dependencies.get(answer_id, set())
+            if not dependencies or answer_id in direct_answer_ids:
+                independently_supported.append((answer_id, (), ()))
+                continue
+            answer_joins = [
+                value
+                for value in joins
+                if str(value.get("answer_requirement_id") or "") == answer_id
+                and str(value.get("bridge_requirement_id") or "") in dependencies
+                and str(value.get("bridge_source_kb_id") or "") == item.kb_id
+            ]
+            joined_by_requirement = {
+                str(value.get("bridge_requirement_id") or ""): value
+                for value in answer_joins
+            }
+            if not dependencies <= set(joined_by_requirement):
+                continue
+            companion_doc_ids: set[str] = set()
+            companion_chunk_ids: set[str] = set()
+            graph_is_visible = True
+            for dependency_id in dependencies:
+                join = joined_by_requirement[dependency_id]
+                source_chunk_id = str(
+                    join.get("bridge_source_chunk_id") or ""
+                ).strip()
+                source_doc_id = str(
+                    join.get("bridge_source_doc_id") or ""
+                ).strip()
+                source_item = visible_items_by_id.get(source_chunk_id)
+                if (
+                    source_item is None
+                    or dependency_id not in source_item.supports_requirement_ids
+                    or source_item.role not in {"direct", "bridge", "complement"}
+                    or not source_doc_id
+                    or source_item.doc_id != source_doc_id
+                    or source_item.kb_id != item.kb_id
+                ):
+                    graph_is_visible = False
+                    break
+                if source_doc_id != item.doc_id:
+                    companion_doc_ids.add(source_doc_id)
+                companion_chunk_ids.add(source_chunk_id)
+            if graph_is_visible:
+                independently_supported.append((
+                    answer_id,
+                    tuple(sorted(companion_doc_ids)),
+                    tuple(sorted(companion_chunk_ids)),
+                ))
+        if not independently_supported:
+            continue
+        filename = str(item.metadata.get("filename") or "").strip()
+        if not filename:
+            continue
+        for (
+            answer_id,
+            companion_doc_ids,
+            companion_chunk_ids,
+        ) in independently_supported:
+            graph_chunk_ids = {item.chunk_id, *companion_chunk_ids}
+            graph_items = [
+                source_item
+                for source_item in visible_items_by_id.values()
+                if source_item.kb_id == item.kb_id
+                and source_item.chunk_id in graph_chunk_ids
+            ]
+            products: set[str] = set()
+            canonical_products: set[str] = set()
+            versions: set[str] = set()
+            projects: set[str] = set()
+            for graph_item in graph_items:
+                identity = extract_document_constraint_identity(
+                    graph_item.to_dict()
+                )
+                products.update(identity.products)
+                canonical_products.update(identity.canonical_products)
+                versions.update(identity.versions)
+                projects.update(identity.projects)
+            item_dict = item.to_dict()
+            anchor_section_key = candidate_section_key(item_dict)
+            anchor_identity = extract_document_constraint_identity(item_dict)
+            anchor_slice_key = (
+                ("section", anchor_section_key)
+                if anchor_section_key is not None
+                else (
+                    "local",
+                    "\x1e".join(anchor_identity.canonical_products),
+                    "\x1e".join(anchor_identity.versions),
+                    "\x1e".join(anchor_identity.projects),
+                    *(
+                        ()
+                        if (
+                            anchor_identity.canonical_products
+                            or anchor_identity.versions
+                            or anchor_identity.projects
+                        )
+                        # Legacy chunks without section lineage or a local
+                        # applicability identity remain one document answer
+                        # graph.  Their exact chunk ids are accumulated in the
+                        # row below for fail-closed selection, but must not turn
+                        # every paragraph into an independent document choice.
+                        else ("document",)
+                    ),
+                )
+            )
+            row = grouped.setdefault(
+                (
+                    item.kb_id,
+                    item.doc_id,
+                    companion_doc_ids,
+                    anchor_slice_key,
+                ),
+                {
+                    "kb_id": item.kb_id,
+                    "doc_id": item.doc_id,
+                    "filename": filename,
+                    "companion_doc_ids": companion_doc_ids,
+                    "position": position,
+                    "answer_ids": set(),
+                    "products": set(),
+                    "canonical_products": set(),
+                    "versions": set(),
+                    "projects": set(),
+                    "chunk_ids": set(),
+                    "section_keys": set(),
+                    "companion_scope_slices": {},
+                },
+            )
+            row["position"] = min(int(row["position"]), position)
+            row["answer_ids"].add(answer_id)
+            row["products"].update(products)
+            row["canonical_products"].update(canonical_products)
+            row["versions"].update(versions)
+            row["projects"].update(projects)
+            row["chunk_ids"].add(item.chunk_id)
+            if anchor_section_key is not None:
+                row["section_keys"].add(anchor_section_key)
+            for source_item in graph_items:
+                if source_item.chunk_id == item.chunk_id:
+                    continue
+                source_dict = source_item.to_dict()
+                source_section_key = candidate_section_key(source_dict)
+                source_slice = EvidenceScopeSlice(
+                    kb_id=source_item.kb_id,
+                    doc_id=source_item.doc_id,
+                    section_key=source_section_key,
+                    chunk_ids=(source_item.chunk_id,),
+                    is_anchor=False,
+                )
+                source_slice_key = (
+                    source_item.kb_id,
+                    source_item.doc_id,
+                    "section" if source_section_key else "chunk",
+                    source_section_key or source_item.chunk_id,
+                )
+                row["companion_scope_slices"][source_slice_key] = source_slice
+
+    return tuple(
+        DocumentEvidenceAssessment(
+            kb_id=str(row["kb_id"]),
+            doc_id=str(row["doc_id"]),
+            filename=str(row["filename"]),
+            evidence_role="standalone_answer",
+            supports_requirement_ids=tuple(
+                requirement_id
+                for requirement_id in required_answers
+                if requirement_id in row["answer_ids"]
+            ),
+            # These are deterministic binary evidence-graph scores, not model
+            # reranker probabilities.  ``assessment_valid`` records the source
+            # of their authority for the detector.
+            topic_relevance=1.0,
+            answer_support=1.0,
+            assessment_valid=True,
+            companion_doc_ids=tuple(row["companion_doc_ids"]),
+            products=tuple(sorted(row["products"], key=str.casefold)),
+            canonical_products=tuple(sorted(
+                row["canonical_products"],
+                key=str.casefold,
+            )),
+            versions=tuple(sorted(row["versions"])),
+            projects=tuple(sorted(row["projects"], key=str.casefold)),
+            chunk_ids=tuple(sorted(row["chunk_ids"])),
+            section_keys=tuple(sorted(row["section_keys"])),
+            companion_scope_slices=tuple(
+                row["companion_scope_slices"][key]
+                for key in sorted(row["companion_scope_slices"])
+            ),
+        )
+        for row in sorted(
+            grouped.values(),
+            key=lambda value: (
+                int(value["position"]),
+                str(value["filename"]).casefold(),
+            ),
+        )
     )
 
 
@@ -1546,6 +2273,16 @@ async def run_rag_v2_stream(
         kb_ids=retrieval_kb_ids,
         doc_ids=scope_doc_ids,
     )
+    if normalized_scope_filter is not None and normalized_scope_filter.valid:
+        carryover_candidates, _ = _restrict_candidates_to_scope(
+            carryover_candidates,
+            normalized_scope_filter,
+        )
+        carryover_doc_ids = {
+            str(item.get("doc_id") or "").strip()
+            for item in carryover_candidates
+            if str(item.get("doc_id") or "").strip()
+        }
 
     yield _step_event("analyze", "active")
     if intent:
@@ -1569,7 +2306,7 @@ async def run_rag_v2_stream(
         (index, value)
         for index, value in plan_query_specs
         if re.sub(r"\s+", " ", value).strip().casefold() != retrieval_query_key
-    ) if plan.answer_shape in {"multi_hop", "multi_part", "comparison"} else ()
+    ) if len(plan.retrieval_queries) > 1 else ()
     trace_include_content = bool(
         getattr(settings, "rag_trace_include_content", True)
     )
@@ -1779,6 +2516,10 @@ async def run_rag_v2_stream(
     supplemental_rejected_doc_ids: set[str] = set()
     supplemental_query_attempted_count = 0
     supplemental_query_succeeded_count = 0
+    bridge_query_planned_count = 0
+    bridge_query_attempted_count = 0
+    bridge_query_succeeded_count = 0
+    bridge_query_candidate_count = 0
     carryover_anchor_attempted = False
     carryover_anchor_succeeded: bool | None = None
     carryover_anchor_error: str | None = None
@@ -2075,6 +2816,7 @@ async def run_rag_v2_stream(
                 ),
                 candidates=early_enriched,
                 requirements=plan.requirements,
+                mode="applicability_only",
             )
             # A clarification decision is itself an evidence-scope allow-list.
             # Do not let the later vector-gap gate drop a weaker but mutually
@@ -2270,6 +3012,18 @@ async def run_rag_v2_stream(
                     expansion_errors,
                 ) = expansion_result
                 expansion_attempted = bool(_expansion_attempted)
+                if (
+                    normalized_scope_filter is not None
+                    and normalized_scope_filter.valid
+                ):
+                    expanded_candidates, _ = _restrict_candidates_to_scope(
+                        expanded_candidates,
+                        normalized_scope_filter,
+                    )
+                    full_document_candidates, _ = _restrict_candidates_to_scope(
+                        full_document_candidates,
+                        normalized_scope_filter,
+                    )
             except Exception as exc:
                 # Expansion is an optional evidence-quality pass.  A timeout
                 # or malformed adapter result must never erase the authorized
@@ -2300,6 +3054,129 @@ async def run_rag_v2_stream(
             full_document_candidates = []
             expansion_attempted = False
             expansion_succeeded = None
+        if (
+            plan.has_bridge_dependencies
+            and expanded_candidates
+        ):
+            try:
+                bridge_seed_candidates = _filter_candidates_by_constraints(
+                    expanded_candidates,
+                    constraints=constraints,
+                )
+                bridge_queries = build_bridge_expansion_queries(
+                    plan.requirements,
+                    bridge_seed_candidates,
+                )[:MAX_BRIDGE_EXPANSION_QUERIES]
+            except Exception as exc:
+                # Dynamic bridge resolution is an optional recall-improvement
+                # phase.  A parser or resolver defect must never be promoted to
+                # a primary retrieval outage that erases already verified
+                # first-hop evidence.
+                retrieval_degraded = True
+                retrieval_soft_errors.append("bridge_query_resolution_failed")
+                bridge_queries = ()
+                trace_event(
+                    "retrieval.bridge_query_error",
+                    trace_id=trace_id,
+                    pipeline_version=PIPELINE_VERSION,
+                    stage="resolved_bridge_query_planning",
+                    reason="bridge_query_resolution_failed",
+                    error=exc,
+                )
+                logger.warning(
+                    "[RAG v2] 动态二跳规划失败，保留已有候选 error=%s",
+                    type(exc).__name__,
+                )
+            else:
+                bridge_query_planned_count = len(bridge_queries)
+                trace_event(
+                    "retrieval.bridge_expansion_planned",
+                    trace_id=trace_id,
+                    pipeline_version=PIPELINE_VERSION,
+                    query_count=bridge_query_planned_count,
+                    candidate_count=len(bridge_seed_candidates),
+                    scoped=bool(scope_doc_ids),
+                    queries=(
+                        list(bridge_queries)
+                        if trace_include_content
+                        else []
+                    ),
+                )
+            if bridge_queries:
+                # A bridge is first resolved from evidence that already passed
+                # the current-query admission gate.  Its dependent answer must
+                # therefore first be sought inside those anchored documents.
+                # Re-running a global document gate for ``A级住宿标准`` loses
+                # valid cross-section evidence whenever no single chunk happens
+                # to contain both the class and the target phrase.  This is a
+                # locality rule, not a business exception: the final claim
+                # adjudicator still verifies the bridge join and answer clause.
+                bridge_anchor_document_ids = _document_ids(
+                    initial_candidates,
+                    limit=expansion_max_documents,
+                )
+                if (
+                    normalized_scope_filter is not None
+                    and normalized_scope_filter.valid
+                ):
+                    bridge_anchor_document_ids = list(dict.fromkeys([
+                        *bridge_anchor_document_ids,
+                        *normalized_scope_filter.doc_ids,
+                    ]))[:expansion_max_documents]
+                try:
+                    (
+                        bridge_candidates,
+                        bridge_query_attempted_count,
+                        bridge_query_succeeded_count,
+                        bridge_query_errors,
+                    ) = await _retrieve_bridge_expansion_candidates(
+                        db=db,
+                        queries=bridge_queries,
+                        kb_ids=retrieval_kb_ids,
+                        document_ids=bridge_anchor_document_ids or None,
+                        constraints=constraints,
+                        method=method,
+                        trace_id=trace_id,
+                        deadline=retrieval_deadline,
+                        stage_timeout_seconds=expansion_stage_timeout_seconds,
+                        candidate_k=candidate_k,
+                    )
+                except Exception as exc:
+                    # Individual adapter failures are handled inside the helper;
+                    # this guard covers unexpected orchestration defects without
+                    # converting the whole retrieval into "unavailable".
+                    retrieval_degraded = True
+                    retrieval_soft_errors.append("bridge_query_retrieval_failed")
+                    trace_event(
+                        "retrieval.bridge_query_error",
+                        trace_id=trace_id,
+                        pipeline_version=PIPELINE_VERSION,
+                        stage="resolved_bridge_query_wrapper",
+                        reason="bridge_query_retrieval_failed",
+                        error=exc,
+                    )
+                    logger.warning(
+                        "[RAG v2] 动态二跳执行异常，保留已有候选 error=%s",
+                        type(exc).__name__,
+                    )
+                else:
+                    if (
+                        normalized_scope_filter is not None
+                        and normalized_scope_filter.valid
+                    ):
+                        bridge_candidates, _ = _restrict_candidates_to_scope(
+                            bridge_candidates,
+                            normalized_scope_filter,
+                        )
+                    bridge_query_candidate_count = len(bridge_candidates)
+                    if bridge_candidates:
+                        expanded_candidates = _bounded_merge_global_candidate_pools(
+                            expanded_candidates,
+                            [bridge_candidates],
+                        )
+                    if bridge_query_errors:
+                        retrieval_degraded = True
+                        retrieval_soft_errors.extend(bridge_query_errors)
         if retrieval_soft_errors:
             expansion_errors = tuple(dict.fromkeys([
                 *retrieval_soft_errors,
@@ -2355,6 +3232,10 @@ async def run_rag_v2_stream(
             supplemental_query_succeeded_count=(
                 supplemental_query_succeeded_count
             ),
+            bridge_query_planned_count=bridge_query_planned_count,
+            bridge_query_attempted_count=bridge_query_attempted_count,
+            bridge_query_succeeded_count=bridge_query_succeeded_count,
+            bridge_query_candidate_count=bridge_query_candidate_count,
             workflow_timeout_seconds=retrieval_workflow_timeout_seconds,
             workflow_deadline_exhausted=(
                 time.perf_counter() >= retrieval_deadline
@@ -2421,6 +3302,15 @@ async def run_rag_v2_stream(
             expanded_candidates or initial_candidates
         )
         if normalized_scope_filter is not None and normalized_scope_filter.valid:
+            enriched_candidates, _ = _restrict_candidates_to_scope(
+                enriched_candidates,
+                normalized_scope_filter,
+            )
+            full_document_candidates, _ = _restrict_candidates_to_scope(
+                full_document_candidates,
+                normalized_scope_filter,
+            )
+        if normalized_scope_filter is not None and normalized_scope_filter.valid:
             # A validated pending selection is already an explicit scope
             # decision.  Do not ask the user to select the same range again.
             ambiguity = EvidenceAmbiguityDecision(
@@ -2429,12 +3319,45 @@ async def run_rag_v2_stream(
                 allowed_doc_ids=tuple(sorted(scope_doc_ids or ())),
             )
         else:
-            ambiguity = detect_evidence_scope_ambiguity(
+            pre_evidence_scope = detect_evidence_scope_ambiguity(
                 query=query,
                 constraints=constraints,
                 candidates=enriched_candidates,
                 requirements=plan.requirements,
+                mode="applicability_only",
             )
+            if pre_evidence_scope.needs_clarification:
+                if _has_unresolved_legacy_intradocument_scope(
+                    pre_evidence_scope
+                ):
+                    # Exact legacy chunk anchors are the last trustworthy scope
+                    # boundary available for this physical document.  Preserve
+                    # the clarification now; unscoped orphan chunks were not
+                    # added to any choice and may not be reconsidered as a
+                    # generic post-evidence answer graph.
+                    ambiguity = pre_evidence_scope
+                else:
+                    # Raw candidates may keep a weak alternative alive for
+                    # recall, but they cannot prove that the alternative
+                    # contains a usable answer.  Defer ordinary user-facing
+                    # scope decisions until the final, budget-reconciled
+                    # evidence graphs are available.
+                    ambiguity = EvidenceAmbiguityDecision(
+                        needs_clarification=False,
+                        reason=(
+                            "implicit_applicability_deferred_to_post_evidence"
+                        ),
+                        relevant_document_count=(
+                            pre_evidence_scope.relevant_document_count
+                        ),
+                    )
+            else:
+                # Explicit single-scope and compare-all requests may provide a
+                # safe execution allow-list even though they do not require a
+                # clarification.  Preserve only that execution decision; the
+                # final scope/document assessment still runs on surviving
+                # evidence below.
+                ambiguity = pre_evidence_scope
 
         effective_scope_doc_ids = (
             set(ambiguity.allowed_doc_ids)
@@ -2461,6 +3384,13 @@ async def run_rag_v2_stream(
             initial_candidates=initial_candidates,
             full_document_candidates=full_document_candidates,
         )
+        if bridge_query_candidate_count > 0:
+            # A resolved-value pass is an independently gated retrieval path.
+            # This raises only the structural ceiling; evidence assembly still
+            # has to prove the exact bridge join and every required answer, and
+            # will deterministically downgrade any missing or mismatched item.
+            completeness = "complete"
+            missing_requirement_ids = ()
         if plan.allows_narrow_fact_path:
             bundle_candidates = (
                 enriched_candidates
@@ -2529,21 +3459,6 @@ async def run_rag_v2_stream(
     )
     yield _step_event("rerank", "done")
 
-    trace_event(
-        "evidence.ambiguity_assessed",
-        trace_id=trace_id,
-        pipeline_version=PIPELINE_VERSION,
-        needs_clarification=ambiguity.needs_clarification,
-        dimension=ambiguity.dimension,
-        reason=ambiguity.reason,
-        choice_count=len(ambiguity.choices),
-        relevant_document_count=ambiguity.relevant_document_count,
-        choices=(
-            [choice.to_dict() for choice in ambiguity.choices]
-            if trace_include_content
-            else []
-        ),
-    )
     context = build_evidence_context(
         bundle,
         max_chunks=MAX_CONTEXT_CHUNKS,
@@ -2607,6 +3522,42 @@ async def run_rag_v2_stream(
                 ]))[:12],
             ),
         )
+    if (
+        not retrieval_failed
+        and not ambiguity.needs_clarification
+        and ambiguity.reason not in {
+            "explicit_enumerated_scopes",
+            "explicit_all_scopes",
+            "query_requests_all_scopes",
+        }
+        and not (
+            normalized_scope_filter is not None
+            and normalized_scope_filter.valid
+        )
+    ):
+        ambiguity = detect_post_evidence_document_ambiguity(
+            query=query,
+            requirements=plan.requirements,
+            assessments=_post_evidence_document_assessments(
+                bundle=bundle,
+                requirements=plan.requirements,
+            ),
+        )
+    trace_event(
+        "evidence.ambiguity_assessed",
+        trace_id=trace_id,
+        pipeline_version=PIPELINE_VERSION,
+        needs_clarification=ambiguity.needs_clarification,
+        dimension=ambiguity.dimension,
+        reason=ambiguity.reason,
+        choice_count=len(ambiguity.choices),
+        relevant_document_count=ambiguity.relevant_document_count,
+        choices=(
+            [choice.to_dict() for choice in ambiguity.choices]
+            if trace_include_content
+            else []
+        ),
+    )
     coverage = _coverage_status(bundle)
     trace_event(
         "evidence.coverage_assessed",
@@ -2667,6 +3618,9 @@ async def run_rag_v2_stream(
             {
                 "kb_id": item.kb_id,
                 "doc_id": item.doc_id,
+                "id": item.chunk_id,
+                "chunk_id": item.chunk_id,
+                "metadata": dict(item.metadata),
             }
             for item in bundle.items
             if item.chunk_id in effective_source_id_set

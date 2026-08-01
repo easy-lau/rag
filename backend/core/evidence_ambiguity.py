@@ -9,16 +9,20 @@ scope would silently guess on the user's behalf.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from core.query_constraints import (
     QueryConstraints,
+    candidate_section_key,
     canonical_product_name,
     evaluate_candidate_constraints,
     extract_document_constraint_identity,
+    extract_query_constraints,
     inherit_document_constraint_metadata,
+    query_span_is_negated,
 )
 
 
@@ -35,6 +39,10 @@ MAX_CHOICE_TEXT_CHARS = 500
 # not contain a business-topic allow-list.  The limits keep a broad query from
 # turning a large knowledge base into an unusable choice list.
 MAX_TOPIC_DOCUMENT_CHOICES = 6
+
+AmbiguityDetectionMode = Literal["combined", "applicability_only"]
+_AMBIGUITY_DETECTION_MODES = frozenset({"combined", "applicability_only"})
+_DOCUMENT_ANSWER_ANCHOR_ROLES = frozenset({"direct", "standalone_answer"})
 
 _ALL_SCOPES_REQUEST_RE = re.compile(
     r"(?:所有|全部|各个?|不同|多个)\s*(?:产品|版本|项目|范围)|"
@@ -89,6 +97,18 @@ _TOPIC_ALL_DOCUMENTS_RE = re.compile(
     r"分别(?:说明|回答|列出|介绍)|都(?:要|查|看|了解|列出))",
     re.IGNORECASE,
 )
+
+
+def _positive_pattern_match(
+    pattern: re.Pattern[str],
+    text: str,
+) -> re.Match[str] | None:
+    source = str(text or "")
+    return next((
+        match
+        for match in pattern.finditer(source)
+        if not query_span_is_negated(source, match.start(), match.end())
+    ), None)
 
 
 def _safe_score(value: Any) -> float:
@@ -146,7 +166,28 @@ def query_requests_all_scopes(query: str) -> bool:
     comparison unless it names an applicability dimension.
     """
 
-    return bool(_ALL_SCOPES_REQUEST_RE.search(str(query or "").strip()))
+    text = str(query or "").strip()
+    return _positive_pattern_match(_ALL_SCOPES_REQUEST_RE, text) is not None
+
+
+@dataclass(frozen=True)
+class EvidenceScopeSlice:
+    """One fail-closed applicability slice inside a physical document.
+
+    New ingestions identify a slice by ``kb_id + doc_id + section_key``.  Old
+    chunks without structural lineage fall back to the exact observed chunk
+    ids.  At least one selector is therefore always present; a slice can never
+    silently degrade to a whole-document grant.
+    """
+
+    kb_id: str
+    doc_id: str
+    section_key: str | None = None
+    chunk_ids: tuple[str, ...] = ()
+    is_anchor: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -164,6 +205,45 @@ class EvidenceScopeChoice:
     filenames: tuple[str, ...]
     max_topic_relevance: float
     max_answer_support: float
+    scope_slices: tuple[EvidenceScopeSlice, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class DocumentEvidenceAssessment:
+    """Post-evidence assessment contract for one document chunk.
+
+    Document choices are intentionally built from assessed answer evidence,
+    not raw retrieval candidates.  ``assessment_valid`` must be asserted by
+    the evidence adjudication stage; score presence alone is not verification.
+    ``evidence_role`` is the contribution role (for example ``direct`` or
+    ``bridge``), not the UI's direct/related display classification.
+    """
+
+    kb_id: str
+    doc_id: str
+    filename: str
+    evidence_role: str
+    supports_requirement_ids: tuple[str, ...]
+    topic_relevance: float | None
+    answer_support: float | None
+    assessment_valid: bool
+    # A standalone answer graph is anchored by the document that contains the
+    # answer clause.  Cross-document mappings/prerequisites travel with that
+    # anchor as companions so selecting a clarification option retains the
+    # complete graph rather than only its final clause.
+    companion_doc_ids: tuple[str, ...] = ()
+    products: tuple[str, ...] = ()
+    canonical_products: tuple[str, ...] = ()
+    versions: tuple[str, ...] = ()
+    projects: tuple[str, ...] = ()
+    # Exact answer/bridge chunk lineage for same-document applicability slices.
+    # Legacy callers may omit these fields and retain document-level behavior.
+    chunk_ids: tuple[str, ...] = ()
+    section_keys: tuple[str, ...] = ()
+    companion_scope_slices: tuple[EvidenceScopeSlice, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -233,6 +313,9 @@ class _DocumentScope:
     projects: set[str]
     max_topic_relevance: float
     max_answer_support: float
+    slice_key: tuple[str, ...]
+    section_key: str | None
+    chunk_ids: set[str]
 
 
 @dataclass
@@ -246,6 +329,7 @@ class _ScopeGroup:
     filenames: set[str]
     max_topic_relevance: float
     max_answer_support: float
+    slices: dict[tuple[str, ...], _DocumentScope]
 
 
 def _display_product(
@@ -305,6 +389,7 @@ def _merge_document_into_group(group: _ScopeGroup, document: _DocumentScope) -> 
         group.max_answer_support,
         document.max_answer_support,
     )
+    group.slices.setdefault(document.slice_key, document)
 
 
 def _new_group(document: _DocumentScope) -> _ScopeGroup:
@@ -318,6 +403,7 @@ def _new_group(document: _DocumentScope) -> _ScopeGroup:
         filenames=set(document.filenames),
         max_topic_relevance=document.max_topic_relevance,
         max_answer_support=document.max_answer_support,
+        slices={document.slice_key: document},
     )
 
 
@@ -379,17 +465,56 @@ def _document_scopes(
     constraints: QueryConstraints,
 ) -> list[_DocumentScope]:
     enriched = inherit_document_constraint_metadata(candidates)
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     for candidate in enriched:
         kb_id = str(candidate.get("kb_id") or "").strip()
         doc_id = str(candidate.get("doc_id") or "").strip()
         if not kb_id or not doc_id:
             continue
-        grouped.setdefault((kb_id, doc_id), []).append(candidate)
+        section_key = candidate_section_key(candidate)
+        identity = extract_document_constraint_identity(candidate)
+        raw_metadata = candidate.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+        unresolved_identity = metadata.get("ambiguous_document_identity")
+        if (
+            section_key is None
+            and isinstance(unresolved_identity, Mapping)
+            and bool(unresolved_identity)
+        ):
+            # Legacy chunks have no ingestion-owned section lineage.  When the
+            # same physical document declares several mutually exclusive
+            # identities, an unscoped chunk cannot be attributed to any one of
+            # them safely.  Treating it as a generic companion would copy that
+            # chunk into every clarification choice and leak a sibling version
+            # back into generation after the user selects one.  Keep the chunk
+            # in the broad retrieval snapshot, but never place it in an
+            # executable scope choice; a selected legacy scope therefore fails
+            # closed unless an exact identity-bearing chunk can answer it.
+            continue
+        if section_key is not None:
+            local_key = ("section", section_key)
+        elif (
+            identity.canonical_products
+            or identity.versions
+            or identity.projects
+        ):
+            # Legacy chunks have no structural lineage.  Keep locally declared
+            # identities separate and use the exact observed chunk ids later as
+            # their request-local allow-list.
+            local_key = (
+                "local",
+                "\x1e".join(identity.canonical_products),
+                "\x1e".join(identity.versions),
+                "\x1e".join(identity.projects),
+            )
+        else:
+            local_key = ("generic",)
+        grouped.setdefault((kb_id, doc_id, *local_key), []).append(candidate)
 
     documents: list[_DocumentScope] = []
     query_product = canonical_product_name(constraints.product or "")
-    for (kb_id, doc_id), items in grouped.items():
+    for slice_key, items in grouped.items():
+        kb_id, doc_id = slice_key[:2]
         eligible: list[dict[str, Any]] = []
         for item in items:
             if str(item.get("evidence_role") or "") == "irrelevant":
@@ -426,6 +551,7 @@ def _document_scopes(
         versions: set[str] = set()
         projects: set[str] = set()
         filenames: set[str] = set()
+        chunk_ids: set[str] = set()
         for item in items:
             identity = extract_document_constraint_identity(item)
             products.update(identity.products)
@@ -439,9 +565,24 @@ def _document_scopes(
             filename = str(item.get("filename") or "").strip()
             if filename:
                 filenames.add(filename)
+            chunk_id = str(item.get("id") or item.get("chunk_id") or "").strip()
+            if chunk_id:
+                chunk_ids.add(chunk_id)
         if query_product and not canonical_products:
             canonical_products.add(query_product)
             products.add(str(constraints.product or "").strip())
+
+        section_keys = {
+            value
+            for item in items
+            if (value := candidate_section_key(item)) is not None
+        }
+        section_key = next(iter(section_keys)) if len(section_keys) == 1 else None
+        # Without either ingestion lineage or an exact chunk id this physical
+        # slice cannot be selected safely.  It may not create a clarification
+        # option that later broadens to its whole document.
+        if section_key is None and not chunk_ids:
+            continue
 
         documents.append(
             _DocumentScope(
@@ -458,6 +599,9 @@ def _document_scopes(
                 max_answer_support=max(
                     _safe_score(item.get("answer_support")) for item in eligible
                 ),
+                slice_key=tuple(slice_key),
+                section_key=section_key,
+                chunk_ids=chunk_ids,
             )
         )
     return documents
@@ -675,25 +819,41 @@ def _scope_groups_to_choices(
     """Convert mutually exclusive groups to the shared public choice shape."""
 
     ordered_groups = _ordered_scope_groups(groups)
-    document_scope_counts: dict[str, int] = {}
+    slice_scope_counts: dict[tuple[str, ...], int] = {}
     for group in ordered_groups:
-        for doc_id in group.doc_ids:
-            document_scope_counts[doc_id] = document_scope_counts.get(doc_id, 0) + 1
+        for slice_key in group.slices:
+            slice_scope_counts[slice_key] = slice_scope_counts.get(slice_key, 0) + 1
 
     choices: list[EvidenceScopeChoice] = []
     for index, group in enumerate(ordered_groups, start=1):
+        anchor_slice_keys = {
+            slice_key
+            for slice_key in group.slices
+            if slice_scope_counts.get(slice_key, 0) == 1
+        }
+        if not anchor_slice_keys:
+            # Distinct groups should own at least one source slice.  Retaining
+            # this defensive fallback prevents a companion-only result from
+            # being mistaken for proof that the selected scope was covered.
+            anchor_slice_keys = set(group.slices)
         anchor_doc_ids = {
-            doc_id
-            for doc_id in group.doc_ids
-            if document_scope_counts.get(doc_id, 0) == 1
+            group.slices[slice_key].doc_id
+            for slice_key in anchor_slice_keys
         }
         companion_doc_ids = set(group.doc_ids) - anchor_doc_ids
-        if not anchor_doc_ids:
-            # Distinct groups should own at least one document.  Retaining this
-            # defensive fallback prevents a companion-only result from being
-            # mistaken for proof that the selected scope was covered.
-            anchor_doc_ids = set(group.doc_ids)
-            companion_doc_ids = set()
+        scope_slices = tuple(
+            EvidenceScopeSlice(
+                kb_id=value.kb_id,
+                doc_id=value.doc_id,
+                section_key=value.section_key,
+                chunk_ids=tuple(sorted(value.chunk_ids)),
+                is_anchor=slice_key in anchor_slice_keys,
+            )
+            for slice_key, value in sorted(
+                group.slices.items(),
+                key=lambda pair: pair[0],
+            )
+        )
         choices.append(
             EvidenceScopeChoice(
                 key=f"c{index}",
@@ -727,6 +887,7 @@ def _scope_groups_to_choices(
                 ),
                 max_topic_relevance=round(group.max_topic_relevance, 4),
                 max_answer_support=round(group.max_answer_support, 4),
+                scope_slices=scope_slices,
             )
         )
     return tuple(choices)
@@ -1027,6 +1188,805 @@ def _topic_groups_to_choices(rows: list[dict[str, Any]]) -> tuple[EvidenceScopeC
     return tuple(choices)
 
 
+def _required_answer_requirement_ids(
+    requirements: Iterable[Any] | None,
+) -> tuple[str, ...]:
+    """Return explicitly required answer requirement ids in source order.
+
+    Post-evidence document ambiguity must never guess which planner
+    requirements are answer-bearing.  Callers therefore need to provide the
+    typed/mapping requirement contract, including ``id``, ``role`` and
+    ``importance``.  Missing fields fail closed and cannot create choices.
+    """
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in requirements or ():
+        if isinstance(raw, Mapping):
+            requirement_id = raw.get("id")
+            role = raw.get("role")
+            importance = raw.get("importance")
+        else:
+            requirement_id = getattr(raw, "id", None)
+            role = getattr(raw, "role", None)
+            importance = getattr(raw, "importance", None)
+        normalized_id = str(requirement_id or "").strip()
+        if (
+            not normalized_id
+            or normalized_id in seen
+            or str(role or "").strip().casefold() != "answer"
+            or str(importance or "").strip().casefold() != "required"
+        ):
+            continue
+        seen.add(normalized_id)
+        result.append(normalized_id)
+        if len(result) >= 8:
+            break
+    return tuple(result)
+
+
+def _positive_assessment_score(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(score) or score <= 0:
+        return None
+    return min(score, 1.0)
+
+
+def _eligible_document_assessment(
+    assessment: DocumentEvidenceAssessment,
+    *,
+    required_answer_ids: set[str],
+) -> tuple[set[str], float, float] | None:
+    """Validate one post-evidence row as a document-choice anchor.
+
+    Only a positively assessed standalone answer can introduce a document
+    option.  Bridge, complement, background and display-only ``direct`` labels
+    are not interchangeable: callers must pass the contribution role through
+    ``evidence_role``.  This keeps supporting material attached to an answer
+    without presenting it as a competing source.
+    """
+
+    if not isinstance(assessment, DocumentEvidenceAssessment):
+        return None
+    if assessment.assessment_valid is not True:
+        return None
+    if (
+        str(assessment.evidence_role or "").strip().casefold()
+        not in _DOCUMENT_ANSWER_ANCHOR_ROLES
+    ):
+        return None
+    topic_relevance = _positive_assessment_score(assessment.topic_relevance)
+    answer_support = _positive_assessment_score(assessment.answer_support)
+    if topic_relevance is None or answer_support is None:
+        return None
+    supported_ids = {
+        str(value or "").strip()
+        for value in assessment.supports_requirement_ids or ()
+        if str(value or "").strip() in required_answer_ids
+    }
+    if not supported_ids:
+        return None
+    return supported_ids, topic_relevance, answer_support
+
+
+def _assessment_scope_slices(
+    assessment: DocumentEvidenceAssessment,
+) -> tuple[EvidenceScopeSlice, ...]:
+    """Normalize one assessed answer graph into exact selectable slices."""
+
+    kb_id = str(assessment.kb_id or "").strip()
+    doc_id = str(assessment.doc_id or "").strip()
+    chunk_ids = _bounded_unique(assessment.chunk_ids or (), limit=100)
+    section_keys = _bounded_unique(assessment.section_keys or (), limit=20)
+    anchors: list[EvidenceScopeSlice] = []
+    if section_keys:
+        anchors.extend(
+            EvidenceScopeSlice(
+                kb_id=kb_id,
+                doc_id=doc_id,
+                section_key=section_key,
+                chunk_ids=chunk_ids,
+                is_anchor=True,
+            )
+            for section_key in section_keys
+        )
+    elif chunk_ids:
+        anchors.append(EvidenceScopeSlice(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            section_key=None,
+            chunk_ids=chunk_ids,
+            is_anchor=True,
+        ))
+
+    output: list[EvidenceScopeSlice] = []
+    seen: set[tuple[str, str, str, tuple[str, ...], bool]] = set()
+    for value in (*anchors, *assessment.companion_scope_slices):
+        if not isinstance(value, EvidenceScopeSlice):
+            continue
+        identity = (
+            str(value.kb_id),
+            str(value.doc_id),
+            str(value.section_key or ""),
+            tuple(value.chunk_ids),
+            bool(value.is_anchor),
+        )
+        if identity in seen:
+            continue
+        if not value.section_key and not value.chunk_ids:
+            continue
+        seen.add(identity)
+        output.append(value)
+    return tuple(output)
+
+
+def _scope_slice_tokens(
+    values: Iterable[EvidenceScopeSlice],
+    *,
+    anchors_only: bool = False,
+) -> tuple[tuple[str, ...], ...]:
+    tokens: set[tuple[str, ...]] = set()
+    for value in values:
+        if anchors_only and not value.is_anchor:
+            continue
+        if value.section_key:
+            tokens.add((
+                str(value.kb_id),
+                str(value.doc_id),
+                "section",
+                str(value.section_key),
+            ))
+        else:
+            tokens.update(
+                (
+                    str(value.kb_id),
+                    str(value.doc_id),
+                    "chunk",
+                    str(chunk_id),
+                )
+                for chunk_id in value.chunk_ids
+            )
+    return tuple(sorted(tokens))
+
+
+def _merge_interdependent_answer_graph_rows(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse answer graphs which use another graph's anchor as evidence.
+
+    Clarification choices must be independent alternatives.  If graph A uses
+    graph B's answer anchor as a companion, advertising A and B as separate
+    choices is both misleading and structurally invalid: B would be a shared
+    document and an exclusive anchor at the same time.  Collapse every such
+    connected component before choices are built.
+
+    The representative prefers a complete graph that is not itself dependent
+    on another member (a dependency sink).  All documents from the component
+    remain in its bounded allow-list as companions, so graph normalization can
+    neither invent access nor discard evidence needed by a selected answer.
+    Rows are linked only inside the same knowledge base and when they support
+    at least one common required answer.
+    """
+
+    if len(rows) < 2:
+        return rows
+
+    anchor_indexes: dict[tuple[str, str, tuple[tuple[str, ...], ...]], list[int]] = {}
+    for index, row in enumerate(rows):
+        anchor_indexes.setdefault(
+            (
+                str(row["kb_id"]),
+                str(row["doc_id"]),
+                tuple(row.get("anchor_scope_tokens") or ()),
+            ),
+            [],
+        ).append(index)
+
+    adjacency = [set() for _ in rows]
+    dependency_targets = [set() for _ in rows]
+
+    # Multiple assessments of the same document are one answer anchor even
+    # when their bridge sets differ.
+    for indexes in anchor_indexes.values():
+        for offset, left in enumerate(indexes):
+            for right in indexes[offset + 1:]:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+
+    for index, row in enumerate(rows):
+        supported_ids = set(row["supported_required_answer_ids"])
+        kb_id = str(row["kb_id"])
+        for companion_doc_id in row["companion_doc_ids"]:
+            matching_targets = [
+                target
+                for (target_kb, target_doc, _), indexes in anchor_indexes.items()
+                if target_kb == kb_id and target_doc == str(companion_doc_id)
+                for target in indexes
+            ]
+            for target in matching_targets:
+                if target == index:
+                    continue
+                if not supported_ids.intersection(
+                    rows[target]["supported_required_answer_ids"]
+                ):
+                    continue
+                dependency_targets[index].add(target)
+                adjacency[index].add(target)
+                adjacency[target].add(index)
+
+    components: list[set[int]] = []
+    unseen = set(range(len(rows)))
+    while unseen:
+        start = min(unseen)
+        component: set[int] = set()
+        pending = [start]
+        while pending:
+            current = pending.pop()
+            if current in component:
+                continue
+            component.add(current)
+            unseen.discard(current)
+            pending.extend(adjacency[current] - component)
+        components.append(component)
+
+    merged_rows: list[dict[str, Any]] = []
+    for component in components:
+        if len(component) == 1:
+            merged_rows.append(rows[next(iter(component))])
+            continue
+
+        incoming_counts = {
+            index: sum(
+                index in dependency_targets[source]
+                for source in component
+            )
+            for index in component
+        }
+        representative_index = min(
+            component,
+            key=lambda index: (
+                len(dependency_targets[index].intersection(component)),
+                -incoming_counts[index],
+                int(rows[index]["position"]),
+                str(rows[index]["filename"]).casefold(),
+                str(rows[index]["doc_id"]),
+            ),
+        )
+        representative = rows[representative_index]
+        merged = dict(representative)
+        component_doc_ids = {
+            str(doc_id)
+            for index in component
+            for doc_id in (
+                rows[index]["doc_id"],
+                *rows[index]["companion_doc_ids"],
+            )
+            if str(doc_id)
+        }
+        representative_doc_id = str(representative["doc_id"])
+        merged["companion_doc_ids"] = (
+            component_doc_ids - {representative_doc_id}
+        )
+        for field in (
+            "filenames",
+            "products",
+            "canonical_products",
+            "versions",
+            "projects",
+            "supported_required_answer_ids",
+            "chunk_ids",
+            "section_keys",
+        ):
+            merged[field] = {
+                value
+                for index in component
+                for value in rows[index][field]
+            }
+        merged_scope_slices: dict[tuple[str, ...], EvidenceScopeSlice] = {}
+        for index in component:
+            for value in rows[index].get("scope_slices", ()):
+                for token in _scope_slice_tokens((value,)):
+                    merged_scope_slices[token] = value
+        merged["scope_slices"] = tuple(merged_scope_slices.values())
+        merged["anchor_scope_tokens"] = _scope_slice_tokens(
+            merged["scope_slices"],
+            anchors_only=True,
+        )
+        merged["position"] = min(
+            int(rows[index]["position"]) for index in component
+        )
+        merged["max_topic_relevance"] = max(
+            float(rows[index]["max_topic_relevance"])
+            for index in component
+        )
+        merged["max_answer_support"] = max(
+            float(rows[index]["max_answer_support"])
+            for index in component
+        )
+        merged_rows.append(merged)
+
+    merged_rows.sort(
+        key=lambda row: (
+            int(row["position"]),
+            str(row["filename"]).casefold(),
+            str(row["doc_id"]),
+        )
+    )
+    return merged_rows
+
+
+def _post_evidence_graph_choices(
+    rows: list[dict[str, Any]],
+) -> tuple[EvidenceScopeChoice, ...]:
+    choices: list[EvidenceScopeChoice] = []
+    label_counts: dict[str, int] = {}
+    for row in rows:
+        key = _topic_label_key(str(row.get("filename") or ""))
+        label_counts[key] = label_counts.get(key, 0) + 1
+    for index, row in enumerate(rows, start=1):
+        anchor_doc_id = str(row["doc_id"])
+        companion_doc_ids = tuple(sorted(
+            {
+                str(value).strip()
+                for value in row["companion_doc_ids"]
+                if str(value).strip() and str(value).strip() != anchor_doc_id
+            }
+        ))
+        filename = str(row["filename"] or "未命名文档")[:MAX_CHOICE_TEXT_CHARS]
+        label = f"《{filename}》"
+        if label_counts.get(_topic_label_key(filename), 0) > 1:
+            versions = sorted(row["versions"], key=_version_key)
+            projects = sorted(row["projects"], key=str.casefold)
+            qualifier = (
+                f"版本 {' / '.join(versions[:2])}"
+                if versions
+                else (
+                    f"项目 {' / '.join(projects[:2])}"
+                    if projects
+                    else f"文档ID {anchor_doc_id[:8]}"
+                )
+            )
+            label = f"{label}（{qualifier}）"
+        choices.append(EvidenceScopeChoice(
+            key=f"c{index}",
+            label=label[:MAX_CHOICE_TEXT_CHARS],
+            products=_bounded_unique(
+                sorted(row["products"], key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            canonical_products=_bounded_unique(
+                sorted(row["canonical_products"], key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            versions=_bounded_unique(
+                sorted(row["versions"], key=_version_key),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            projects=_bounded_unique(
+                sorted(row["projects"], key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            kb_ids=(str(row["kb_id"]),),
+            doc_ids=(anchor_doc_id, *companion_doc_ids),
+            anchor_doc_ids=(anchor_doc_id,),
+            companion_doc_ids=companion_doc_ids,
+            filenames=(filename,),
+            max_topic_relevance=round(float(row["max_topic_relevance"]), 4),
+            max_answer_support=round(float(row["max_answer_support"]), 4),
+            scope_slices=tuple(row.get("scope_slices", ())),
+        ))
+    return tuple(choices)
+
+
+def _post_evidence_scope_choices(
+    *,
+    query: str,
+    rows: list[dict[str, Any]],
+) -> tuple[str | None, tuple[EvidenceScopeChoice, ...]]:
+    """Group complete answer graphs by their verified applicability scope.
+
+    Raw retrieval candidates are deliberately absent here.  Every synthetic
+    document below represents one graph that survived evidence adjudication
+    and the final prompt budget; its scope is the union of its answer anchor
+    and bridge companions.
+    """
+
+    constraints = extract_query_constraints(query)
+    graph_rows: dict[str, dict[str, Any]] = {}
+    documents: list[_DocumentScope] = []
+    for index, row in enumerate(rows):
+        graph_id = f"__assessed_graph_{index}"
+        graph_rows[graph_id] = row
+        documents.append(_DocumentScope(
+            kb_id=str(row["kb_id"]),
+            doc_id=graph_id,
+            filenames={str(row["filename"])},
+            products=set(row["products"]),
+            canonical_products=set(row["canonical_products"]),
+            versions=set(row["versions"]),
+            projects=set(row["projects"]),
+            max_topic_relevance=float(row["max_topic_relevance"]),
+            max_answer_support=float(row["max_answer_support"]),
+            slice_key=(str(row["kb_id"]), graph_id, "assessed_graph"),
+            section_key=None,
+            chunk_ids=set(),
+        ))
+    documents = _filter_explicit_query_project(
+        query,
+        _filter_explicit_query_version(query, documents, constraints),
+    )
+    groups, dimension = _scope_groups(documents, constraints)
+    if dimension is None or len(groups) < 2:
+        return None, ()
+
+    # Generic graphs are copied into each scope by ``_scope_groups``.  That is
+    # correct for ordinary supporting documents, but an answer graph cannot be
+    # advertised as the exclusive anchor of two choices.  Fall back to a
+    # document question rather than publishing an invalid allow-list.
+    graph_occurrences: dict[str, int] = {}
+    for group in groups:
+        for graph_id in group.doc_ids:
+            graph_occurrences[graph_id] = graph_occurrences.get(graph_id, 0) + 1
+    if any(count != 1 for count in graph_occurrences.values()):
+        return None, ()
+
+    choices: list[EvidenceScopeChoice] = []
+    for index, group in enumerate(_ordered_scope_groups(groups), start=1):
+        member_rows = [graph_rows[graph_id] for graph_id in group.doc_ids]
+        merged_scope_slices: dict[tuple[str, ...], EvidenceScopeSlice] = {}
+        for row in member_rows:
+            for value in row.get("scope_slices", ()):
+                for token in _scope_slice_tokens((value,)):
+                    merged_scope_slices[token] = value
+        scope_slices = tuple(merged_scope_slices.values())
+        if scope_slices:
+            anchor_doc_ids = {
+                str(value.doc_id) for value in scope_slices if value.is_anchor
+            }
+            all_doc_ids = {str(value.doc_id) for value in scope_slices}
+        else:
+            anchor_doc_ids = {
+                str(row["doc_id"]) for row in member_rows if str(row["doc_id"])
+            }
+            all_doc_ids = set(anchor_doc_ids)
+            all_doc_ids.update(
+                str(doc_id)
+                for row in member_rows
+                for doc_id in row["companion_doc_ids"]
+                if str(doc_id)
+            )
+        companion_doc_ids = all_doc_ids - anchor_doc_ids
+        choices.append(EvidenceScopeChoice(
+            key=f"c{index}",
+            label=_choice_label(group, constraints)[:MAX_CHOICE_TEXT_CHARS],
+            products=_bounded_unique(
+                sorted(group.products, key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            canonical_products=_bounded_unique(
+                sorted(group.canonical_products, key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            versions=_bounded_unique(
+                sorted(group.versions, key=_version_key),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            projects=_bounded_unique(
+                sorted(group.projects, key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            kb_ids=tuple(sorted({str(row["kb_id"]) for row in member_rows})),
+            doc_ids=tuple(sorted(all_doc_ids)),
+            anchor_doc_ids=tuple(sorted(anchor_doc_ids)),
+            companion_doc_ids=tuple(sorted(companion_doc_ids)),
+            filenames=_bounded_unique(
+                sorted(group.filenames, key=str.casefold),
+                max_chars=MAX_CHOICE_TEXT_CHARS,
+            ),
+            max_topic_relevance=round(group.max_topic_relevance, 4),
+            max_answer_support=round(group.max_answer_support, 4),
+            scope_slices=scope_slices,
+        ))
+    return dimension, tuple(choices)
+
+
+def detect_post_evidence_document_ambiguity(
+    *,
+    query: str,
+    requirements: Iterable[Any] | None,
+    assessments: Iterable[DocumentEvidenceAssessment],
+) -> EvidenceAmbiguityDecision:
+    """Detect document alternatives from adjudicated answer evidence only.
+
+    This is the document/topic phase for a two-stage pipeline.  Applicability
+    scopes are resolved before evidence assembly; this function runs after the
+    evidence stage has assigned contribution roles and requirement support.
+
+    Documents supporting different required answers are complementary and do
+    not compete.  A choice is created only when at least two distinct document
+    anchors independently support the *same* required answer.  Supporting
+    bridge/complement/background rows can remain in the evidence bundle, but
+    can never become user-facing options here.
+    """
+
+    text = str(query or "").strip()
+    if not text:
+        return EvidenceAmbiguityDecision(
+            needs_clarification=False,
+            reason="empty_query",
+        )
+    if _positive_pattern_match(_TOPIC_ALL_DOCUMENTS_RE, text) is not None:
+        return EvidenceAmbiguityDecision(
+            needs_clarification=False,
+            reason="query_requests_all_documents",
+        )
+    if query_requests_all_scopes(text):
+        return EvidenceAmbiguityDecision(
+            needs_clarification=False,
+            reason="query_requests_all_scopes",
+        )
+
+    required_answer_ids = _required_answer_requirement_ids(requirements)
+    if not required_answer_ids:
+        return EvidenceAmbiguityDecision(
+            needs_clarification=False,
+            reason="no_required_answer_requirements",
+        )
+    required_answer_id_set = set(required_answer_ids)
+
+    def applicability_slice_identity(
+        assessment: DocumentEvidenceAssessment,
+        scope_slices: tuple[EvidenceScopeSlice, ...],
+    ) -> tuple[tuple[str, ...], ...]:
+        """Return a slice identity only when it carries applicability data.
+
+        A section boundary is evidence lineage, not an alternative answer
+        scope.  Treating every ``section_key`` as a document identity turns a
+        single policy's table of contents into many competing documents.  The
+        boundary matters only after ingestion has associated the section with
+        a product, version or project; then it prevents a selected scope from
+        leaking a sibling section back into the answer graph.
+        """
+
+        has_applicability_identity = bool(
+            assessment.products
+            or assessment.canonical_products
+            or assessment.versions
+            or assessment.projects
+        )
+        if not has_applicability_identity:
+            return ()
+        return _scope_slice_tokens(scope_slices, anchors_only=True)
+
+    grouped: dict[
+        tuple[
+            str,
+            str,
+            tuple[str, ...],
+            tuple[tuple[str, ...], ...],
+        ],
+        dict[str, Any],
+    ] = {}
+    for position, assessment in enumerate(assessments):
+        eligible = _eligible_document_assessment(
+            assessment,
+            required_answer_ids=required_answer_id_set,
+        )
+        if eligible is None:
+            continue
+        kb_id = str(assessment.kb_id or "").strip()
+        doc_id = str(assessment.doc_id or "").strip()
+        filename = str(assessment.filename or "").strip()
+        if not kb_id or not doc_id or not filename:
+            continue
+        companion_doc_ids = tuple(sorted({
+            str(value or "").strip()
+            for value in assessment.companion_doc_ids or ()
+            if str(value or "").strip()
+            and str(value or "").strip() != doc_id
+        }))
+        scope_slices = _assessment_scope_slices(assessment)
+        anchor_scope_tokens = applicability_slice_identity(
+            assessment,
+            scope_slices,
+        )
+        supported_ids, topic_relevance, answer_support = eligible
+        row = grouped.setdefault(
+            (kb_id, doc_id, companion_doc_ids, anchor_scope_tokens),
+            {
+                "kb_id": kb_id,
+                "doc_id": doc_id,
+                "companion_doc_ids": set(companion_doc_ids),
+                "filenames": set(),
+                "products": set(),
+                "canonical_products": set(),
+                "versions": set(),
+                "projects": set(),
+                "position": position,
+                "supported_required_answer_ids": set(),
+                "max_topic_relevance": 0.0,
+                "max_answer_support": 0.0,
+                "chunk_ids": set(),
+                "section_keys": set(),
+                "scope_slices": (),
+                "anchor_scope_tokens": anchor_scope_tokens,
+            },
+        )
+        row["filenames"].add(filename)
+        row["products"].update(
+            str(value).strip()
+            for value in assessment.products or ()
+            if str(value).strip()
+        )
+        row["canonical_products"].update(
+            str(value).strip()
+            for value in assessment.canonical_products or ()
+            if str(value).strip()
+        )
+        row["versions"].update(
+            str(value).strip()
+            for value in assessment.versions or ()
+            if str(value).strip()
+        )
+        row["projects"].update(
+            project
+            for value in assessment.projects or ()
+            if (project := _meaningful_project(value)) is not None
+        )
+        row["position"] = min(int(row["position"]), position)
+        row["supported_required_answer_ids"].update(supported_ids)
+        row["max_topic_relevance"] = max(
+            float(row["max_topic_relevance"]),
+            topic_relevance,
+        )
+        row["max_answer_support"] = max(
+            float(row["max_answer_support"]),
+            answer_support,
+        )
+        row["chunk_ids"].update(assessment.chunk_ids or ())
+        row["section_keys"].update(assessment.section_keys or ())
+        merged_scope_slices = {
+            token: value
+            for value in row.get("scope_slices", ())
+            for token in _scope_slice_tokens((value,))
+        }
+        for value in scope_slices:
+            for token in _scope_slice_tokens((value,)):
+                merged_scope_slices[token] = value
+        row["scope_slices"] = tuple(merged_scope_slices.values())
+
+    rows = list(grouped.values())
+    for row in rows:
+        row["filename"] = sorted(row["filenames"], key=str.casefold)[0]
+    rows.sort(key=lambda row: (row["position"], row["filename"].casefold()))
+    rows = _merge_interdependent_answer_graph_rows(rows)
+    if len(rows) < 2:
+        return EvidenceAmbiguityDecision(
+            needs_clarification=False,
+            reason="single_assessed_answer_document",
+            relevant_document_count=len(rows),
+        )
+
+    competing_groups: list[
+        tuple[
+            tuple[
+                str,
+                str,
+                tuple[str, ...],
+                tuple[tuple[str, ...], ...],
+            ],
+            ...,
+        ]
+    ] = []
+    for requirement_id in required_answer_ids:
+        group = tuple(
+            (
+                str(row["kb_id"]),
+                str(row["doc_id"]),
+                tuple(sorted(row["companion_doc_ids"])),
+                tuple(row.get("anchor_scope_tokens") or ()),
+            )
+            for row in rows
+            if requirement_id in row["supported_required_answer_ids"]
+        )
+        if len(group) >= 2 and group not in competing_groups:
+            competing_groups.append(group)
+    if not competing_groups:
+        # The assessed documents cover different required answers and are
+        # therefore complementary parts of one response.
+        return EvidenceAmbiguityDecision(
+            needs_clarification=False,
+            reason="complementary_assessed_answer_documents",
+            relevant_document_count=len(rows),
+        )
+
+    if len(competing_groups) > 1 and any(
+        group != competing_groups[0] for group in competing_groups[1:]
+    ):
+        competing_document_count = len({
+            key for group in competing_groups for key in group
+        })
+        return EvidenceAmbiguityDecision(
+            needs_clarification=True,
+            dimension="document",
+            question=(
+                "检索到多个问题部分分别存在不同的有效答案来源。"
+                "请补充需要核对的具体问题部分或适用范围。"
+            ),
+            reason="multiple_assessed_document_ambiguity_groups",
+            relevant_document_count=competing_document_count,
+        )
+
+    competing_keys = set(competing_groups[0])
+    choice_rows = [
+        row
+        for row in rows
+        if (
+            str(row["kb_id"]),
+            str(row["doc_id"]),
+            tuple(sorted(row["companion_doc_ids"])),
+            tuple(row.get("anchor_scope_tokens") or ()),
+        ) in competing_keys
+    ]
+    scope_dimension, scope_choices = _post_evidence_scope_choices(
+        query=text,
+        rows=choice_rows,
+    )
+    if scope_dimension is not None and len(scope_choices) >= 2:
+        lines = [
+            "检索到与当前问题相关、但适用范围不同的资料：",
+            *(
+                f"{index}. {choice.label}"
+                for index, choice in enumerate(scope_choices, start=1)
+            ),
+            "请问需要查询哪一项？也可以回复“都对比”。",
+        ]
+        return EvidenceAmbiguityDecision(
+            needs_clarification=True,
+            dimension=scope_dimension,
+            question="\n".join(lines),
+            reason="multiple_mutually_exclusive_assessed_scopes",
+            choices=scope_choices,
+            relevant_document_count=len({
+                doc_id for choice in scope_choices for doc_id in choice.doc_ids
+            }),
+        )
+    if len(choice_rows) > MAX_TOPIC_DOCUMENT_CHOICES:
+        return EvidenceAmbiguityDecision(
+            needs_clarification=True,
+            dimension="document",
+            question=(
+                "检索到超过 6 篇经过评估且能回答当前问题的资料。"
+                "请补充具体主题、适用范围或文档名称。"
+            ),
+            reason="too_many_assessed_answer_documents",
+            relevant_document_count=len(choice_rows),
+        )
+
+    choices = _post_evidence_graph_choices(choice_rows)
+    question = (
+        "检索到多篇均能支持当前问题、但答案来源不同的资料：\n"
+        + "\n".join(
+            f"{index}. {choice.label}"
+            for index, choice in enumerate(choices, start=1)
+        )
+        + "\n请问需要查询哪一篇？也可以回复“都要”。"
+    )
+    return EvidenceAmbiguityDecision(
+        needs_clarification=True,
+        dimension="document",
+        question=question,
+        reason="multiple_assessed_answer_documents",
+        choices=choices,
+        relevant_document_count=len(choice_rows),
+    )
+
+
 def _requirement_descriptions(requirements: Iterable[Any] | None) -> tuple[str, ...]:
     """Read bounded requirement prose without depending on a planner class.
 
@@ -1107,7 +2067,10 @@ def _detect_topic_document_ambiguity(
     """
 
     text = str(query or "").strip()
-    if not text or _TOPIC_ALL_DOCUMENTS_RE.search(text):
+    if (
+        not text
+        or _positive_pattern_match(_TOPIC_ALL_DOCUMENTS_RE, text) is not None
+    ):
         return None
     # If source metadata already declares an applicability scope, the product/
     # version/project grouping above is the authoritative decision—even when a
@@ -1317,7 +2280,7 @@ def _matched_scope_aliases(
 
 def _explicit_all_scope_dimension(query: str) -> tuple[bool, str | None]:
     text = str(query or "").strip()
-    match = _EXPLICIT_ALL_DIMENSION_RE.search(text)
+    match = _positive_pattern_match(_EXPLICIT_ALL_DIMENSION_RE, text)
     if match is not None:
         raw_dimension = (
             match.group("dimension")
@@ -1403,8 +2366,8 @@ def resolve_explicit_scope_comparison(
     text = str(query or "").strip()
     all_requested, all_dimension = _explicit_all_scope_dimension(text)
     enumerated_requested = bool(
-        _COMPARISON_REQUEST_RE.search(text)
-        or _NAMED_MULTI_SCOPE_REQUEST_RE.search(text)
+        _positive_pattern_match(_COMPARISON_REQUEST_RE, text)
+        or _positive_pattern_match(_NAMED_MULTI_SCOPE_REQUEST_RE, text)
     )
     if not candidates:
         return ExplicitScopeComparisonPlan(matched=False, reason="no_candidates")
@@ -1509,8 +2472,20 @@ def detect_evidence_scope_ambiguity(
     constraints: QueryConstraints,
     candidates: list[dict[str, Any]],
     requirements: Iterable[Any] | None = None,
+    mode: AmbiguityDetectionMode = "combined",
 ) -> EvidenceAmbiguityDecision:
-    """Return a clarification decision for mutually exclusive relevant scopes."""
+    """Return a clarification decision for mutually exclusive scopes.
+
+    ``combined`` preserves the compatibility behavior for existing callers.
+    Retrieval pre-gates must pass ``applicability_only``: that mode evaluates
+    only source-anchored product/version/project scopes and can never emit a
+    document/topic choice or use one as a retrieval rescue set.  New pipelines
+    should run :func:`detect_post_evidence_document_ambiguity` after evidence
+    adjudication for the document phase.
+    """
+
+    if mode not in _AMBIGUITY_DETECTION_MODES:
+        raise ValueError(f"unsupported ambiguity detection mode: {mode}")
 
     if not candidates:
         return EvidenceAmbiguityDecision(
@@ -1615,7 +2590,11 @@ def detect_evidence_scope_ambiguity(
     # not already explain the result set, inspect independent document topics.
     # This catches broad requests such as ``员工标准是什么`` without turning a
     # scoped multi-document answer into a filename picker.
-    if dimension is None and not constraints.has_scope_constraint:
+    if (
+        mode == "combined"
+        and dimension is None
+        and not constraints.has_scope_constraint
+    ):
         topic_decision = _detect_topic_document_ambiguity(
             query=query,
             candidates=candidates,

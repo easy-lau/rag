@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping
 
+from core.query_constraints import extract_query_constraints
+
 
 QUERY_PLAN_V2_SCHEMA_VERSION = "query_plan.v2"
 
@@ -43,6 +45,7 @@ ANSWER_SHAPES = frozenset(
 RequirementRole = Literal["answer", "bridge"]
 RequirementImportance = Literal["required", "helpful"]
 RequirementSource = Literal["explicit", "inferred"]
+RequirementCoverageMode = Literal["single", "collection"]
 PlanSource = Literal["local", "model", "fallback"]
 
 EvidenceAvailability = Literal["ok", "degraded", "unavailable"]
@@ -142,6 +145,27 @@ class AnswerRequirementV2:
     role: RequirementRole = "answer"
     importance: RequirementImportance = "required"
     source: RequirementSource = "explicit"
+    # ``single`` means one active claim can satisfy the requirement.
+    # ``collection`` means the user asked for an exhaustive set (for example
+    # all applicable rules in a policy).  Evidence assembly then keeps every
+    # discovered active claim in the bounded, authorized snapshot and refuses
+    # to call the answer complete when the renderer drops one of them.
+    coverage_mode: RequirementCoverageMode = "single"
+    # Machine-readable bridge semantics.  ``description`` is presentation and
+    # retrieval text; it must never be parsed as the only source of dependency
+    # truth because route models are free to paraphrase it.
+    bridge_subject: str | None = None
+    # ``None`` is reserved for legacy/unbound requirements.  An empty tuple is
+    # an explicit statement that this answer has no bridge dependency.  Keeping
+    # those states distinct prevents an independent answer in a multi-part query
+    # from being silently attached to every bridge in the plan.
+    depends_on_requirement_ids: tuple[str, ...] | None = None
+    # Applicability is requirement-local.  A multi-part turn may ask one
+    # question about 8.2 and another about 8.6; compiling only one global query
+    # constraint would necessarily contaminate a sibling requirement.
+    scope_product: str | None = None
+    scope_version: str | None = None
+    scope_explicit_version: bool = False
 
     def __post_init__(self) -> None:
         requirement_id = str(self.id or "").strip()
@@ -153,26 +177,137 @@ class AnswerRequirementV2:
             raise ValueError("requirement importance must be required or helpful")
         if self.source not in {"explicit", "inferred"}:
             raise ValueError("requirement source must be explicit or inferred")
+        if self.coverage_mode not in {"single", "collection"}:
+            raise ValueError("requirement coverage mode must be single or collection")
+        if self.role == "bridge" and self.coverage_mode != "single":
+            raise ValueError("bridge requirements must use single coverage")
         description = _normalized_text(
             self.description,
             field_name="requirement description",
             max_chars=_MAX_REQUIREMENT_CHARS,
         )
+        bridge_subject = self.bridge_subject
+        if bridge_subject is not None:
+            bridge_subject = _normalized_text(
+                bridge_subject,
+                field_name="bridge subject",
+                max_chars=_MAX_REQUIREMENT_CHARS,
+            )
+        dependency_ids = (
+            None
+            if self.depends_on_requirement_ids is None
+            else _normalized_requirement_ids(
+                self.depends_on_requirement_ids,
+                field_name="requirement dependency ids",
+            )
+        )
+        if self.role == "answer" and bridge_subject is not None:
+            raise ValueError("answer requirements cannot define a bridge subject")
+        if self.role == "bridge" and dependency_ids is not None:
+            raise ValueError("bridge requirements cannot define dependencies")
+        scope_product = (
+            re.sub(r"\s+", " ", str(self.scope_product or "")).strip()
+            or None
+        )
+        scope_version = (
+            re.sub(r"\s+", " ", str(self.scope_version or "")).strip()
+            or None
+        )
+        scope_explicit_version = bool(self.scope_explicit_version)
+        if scope_product is None and scope_version is None:
+            inferred_scope = extract_query_constraints(description)
+            scope_product = inferred_scope.product
+            scope_version = inferred_scope.version
+            scope_explicit_version = inferred_scope.explicit_version
+        elif scope_version is not None:
+            scope_explicit_version = True
         object.__setattr__(self, "id", requirement_id)
         object.__setattr__(self, "description", description)
+        object.__setattr__(self, "bridge_subject", bridge_subject)
+        object.__setattr__(self, "depends_on_requirement_ids", dependency_ids)
+        object.__setattr__(self, "scope_product", scope_product)
+        object.__setattr__(self, "scope_version", scope_version)
+        object.__setattr__(
+            self,
+            "scope_explicit_version",
+            scope_explicit_version,
+        )
 
     @property
     def is_required_answer(self) -> bool:
         return self.role == "answer" and self.importance == "required"
 
-    def to_dict(self) -> dict[str, str]:
-        return {
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "id": self.id,
             "description": self.description,
             "role": self.role,
             "importance": self.importance,
             "source": self.source,
+            "coverage_mode": self.coverage_mode,
         }
+        if self.bridge_subject is not None:
+            result["bridge_subject"] = self.bridge_subject
+        if self.depends_on_requirement_ids is not None:
+            result["depends_on_requirement_ids"] = list(
+                self.depends_on_requirement_ids
+            )
+        if self.scope_product is not None or self.scope_version is not None:
+            result["scope"] = {
+                "product": self.scope_product,
+                "version": self.scope_version,
+                "explicit_version": self.scope_explicit_version,
+            }
+        return result
+
+
+def validate_answer_requirement_graph(
+    requirements: tuple[AnswerRequirementV2, ...],
+    *,
+    require_explicit_answer_dependencies: bool = False,
+    require_referenced_bridges: bool = False,
+) -> None:
+    """Validate answer-to-bridge edges without deriving semantic relations.
+
+    This is intentionally a graph validator, not a natural-language fallback.
+    Callers that compile executable plans must bind every answer explicitly and
+    must remove dangling bridge hints before this boundary.
+    """
+
+    requirement_by_id = {item.id: item for item in requirements}
+    referenced_bridge_ids: set[str] = set()
+    for requirement in requirements:
+        if requirement.role == "answer":
+            dependency_ids = requirement.depends_on_requirement_ids
+            if dependency_ids is None:
+                if require_explicit_answer_dependencies:
+                    raise ValueError(
+                        "answer requirements must explicitly declare bridge dependencies"
+                    )
+                continue
+            for dependency_id in dependency_ids:
+                dependency = requirement_by_id.get(dependency_id)
+                if dependency is None:
+                    raise ValueError(
+                        "query plan requirement dependency does not exist"
+                    )
+                if dependency.role != "bridge":
+                    raise ValueError(
+                        "answer requirements may depend only on bridge requirements"
+                    )
+                referenced_bridge_ids.add(dependency_id)
+
+    if require_referenced_bridges:
+        bridge_ids = {
+            requirement.id
+            for requirement in requirements
+            if requirement.role == "bridge"
+        }
+        if dangling := bridge_ids - referenced_bridge_ids:
+            raise ValueError(
+                "query plan contains unreferenced bridge requirements: "
+                + ", ".join(sorted(dangling))
+            )
 
 
 @dataclass(frozen=True)
@@ -226,15 +361,12 @@ class QueryPlanV2:
         requirement_ids = [item.id for item in requirements]
         if len(set(requirement_ids)) != len(requirement_ids):
             raise ValueError("query plan contains duplicate requirement ids")
-
-        # A multi-hop plan is a claim about a relationship, not merely a
-        # differently named fact lookup.  Without an explicit bridge target
-        # the evidence layer cannot prove the intermediate mapping and must
-        # not be allowed to mark the answer complete.
-        if self.answer_shape == "multi_hop" and not any(
-            item.role == "bridge" for item in requirements
-        ):
-            raise ValueError("multi_hop query plans require a bridge requirement")
+        validate_answer_requirement_graph(requirements)
+        for requirement in requirements:
+            if requirement.role == "bridge" and not requirement.bridge_subject:
+                raise ValueError(
+                    "query plan bridge requirements require a canonical subject"
+                )
 
         reason = re.sub(r"\s+", " ", str(self.reason or "")).strip()
         if len(reason) > _MAX_REASON_CHARS:
@@ -258,6 +390,19 @@ class QueryPlanV2:
             raise ValueError("a ready query plan requires a retrieval query")
         if ready_shape and not requirements:
             raise ValueError("a ready query plan requires an answer requirement")
+        if ready_shape:
+            validate_answer_requirement_graph(
+                requirements,
+                require_explicit_answer_dependencies=True,
+                require_referenced_bridges=True,
+            )
+        if self.answer_shape == "multi_hop" and not any(
+            item.role == "answer" and item.depends_on_requirement_ids
+            for item in requirements
+        ):
+            raise ValueError(
+                "multi_hop query plans require an answer-to-bridge dependency"
+            )
 
         object.__setattr__(self, "original_query", original_query)
         object.__setattr__(self, "retrieval_queries", retrieval_queries)
@@ -279,6 +424,15 @@ class QueryPlanV2:
             and any(item.is_required_answer for item in self.requirements)
         )
 
+    @property
+    def has_bridge_dependencies(self) -> bool:
+        """Whether execution must resolve at least one answer dependency edge."""
+
+        return any(
+            item.role == "answer" and bool(item.depends_on_requirement_ids)
+            for item in self.requirements
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -291,6 +445,7 @@ class QueryPlanV2:
             "reason": self.reason,
             "needs_clarification": self.needs_clarification,
             "clarification_question": self.clarification_question,
+            "has_bridge_dependencies": self.has_bridge_dependencies,
         }
 
 

@@ -1,13 +1,19 @@
 import unittest
 
 from core.evidence_ambiguity import (
+    DocumentEvidenceAssessment,
     _topic_document_rows,
     _version_key,
     detect_evidence_scope_ambiguity,
+    detect_post_evidence_document_ambiguity,
     query_requests_all_scopes,
     resolve_explicit_scope_comparison,
 )
-from core.query_constraints import extract_query_constraints
+from core.query_constraints import (
+    extract_document_constraint_identity,
+    extract_query_constraints,
+    inherit_document_constraint_metadata,
+)
 from core.rag_v2.query_plan import plan_query_locally
 
 
@@ -99,6 +105,426 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         )
         self.assertIn("员工请假管理办法.docx", decision.question)
         self.assertIn("公司出差管理标准.docx", decision.question)
+
+    def test_applicability_only_mode_never_emits_document_topic_choices(
+        self,
+    ) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="leave-pre-gate",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                content="员工请假制度、审批流程和休假要求。",
+                topic=0.90,
+                support=0.80,
+            ),
+            _candidate(
+                chunk_id="travel-pre-gate",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                content="员工出差交通、住宿和餐饮标准。",
+                topic=0.88,
+                support=0.78,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="员工标准是什么",
+            constraints=extract_query_constraints("员工标准是什么"),
+            candidates=candidates,
+            mode="applicability_only",
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertIsNone(decision.dimension)
+        self.assertEqual(decision.choices, ())
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+
+    def test_applicability_only_mode_still_clarifies_source_versions(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"travel-{version}",
+                doc_id=f"doc-travel-{version}",
+                filename=f"差旅制度{version}版.docx",
+                content="员工出差交通、住宿和餐饮标准。",
+                metadata={"version": version},
+                topic=0.90,
+                support=0.85,
+            )
+            for version in ("2024", "2025")
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="员工出差标准是什么",
+            constraints=extract_query_constraints("员工出差标准是什么"),
+            candidates=candidates,
+            mode="applicability_only",
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(len(decision.choices), 2)
+
+    def test_post_evidence_document_ambiguity_requires_competing_answer_support(
+        self,
+    ) -> None:
+        query = "员工标准是什么"
+        plan = plan_query_locally(query)
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.91,
+                answer_support=0.84,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.90,
+                answer_support=0.86,
+                assessment_valid=True,
+            ),
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query=query,
+            requirements=plan.requirements,
+            assessments=assessments,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "document")
+        self.assertEqual(decision.reason, "multiple_assessed_answer_documents")
+        self.assertEqual(
+            {choice.doc_ids for choice in decision.choices},
+            {("doc-leave",), ("doc-travel",)},
+        )
+        self.assertTrue(all(
+            choice.max_topic_relevance > 0
+            and choice.max_answer_support > 0
+            for choice in decision.choices
+        ))
+
+    def test_post_evidence_document_ambiguity_ignores_entity_only_noise(
+        self,
+    ) -> None:
+        query = "总经理的住宿标准"
+        plan = plan_query_locally(query)
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                evidence_role="background",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.75,
+                answer_support=0.20,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                evidence_role="bridge",
+                supports_requirement_ids=("r2",),
+                topic_relevance=0.80,
+                answer_support=0.40,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.94,
+                answer_support=0.91,
+                assessment_valid=True,
+            ),
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query=query,
+            requirements=plan.requirements,
+            assessments=assessments,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+        self.assertEqual(decision.relevant_document_count, 1)
+        self.assertEqual(decision.choices, ())
+
+    def test_post_evidence_document_ambiguity_rejects_zero_and_unassessed_rows(
+        self,
+    ) -> None:
+        query = "员工标准是什么"
+        plan = plan_query_locally(query)
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-zero",
+                filename="零分资料.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.0,
+                answer_support=0.0,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-unassessed",
+                filename="未评估资料.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.95,
+                answer_support=0.90,
+                assessment_valid=False,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-valid",
+                filename="有效资料.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.92,
+                answer_support=0.88,
+                assessment_valid=True,
+            ),
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query=query,
+            requirements=plan.requirements,
+            assessments=assessments,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+        self.assertEqual(decision.relevant_document_count, 1)
+
+    def test_post_evidence_document_ambiguity_keeps_complements_together(
+        self,
+    ) -> None:
+        requirements = [
+            {
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+                "description": "报销提交时限",
+            },
+            {
+                "id": "r2",
+                "role": "answer",
+                "importance": "required",
+                "description": "报销所需凭证",
+            },
+            {
+                "id": "r3",
+                "role": "bridge",
+                "importance": "helpful",
+                "description": "确认适用报销制度",
+            },
+        ]
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-deadline",
+                filename="报销时限.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.91,
+                answer_support=0.87,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-receipts",
+                filename="报销凭证.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r2",),
+                topic_relevance=0.90,
+                answer_support=0.89,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-scope",
+                filename="制度适用范围.docx",
+                evidence_role="bridge",
+                supports_requirement_ids=("r3",),
+                topic_relevance=0.82,
+                answer_support=0.70,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-exception",
+                filename="报销例外说明.docx",
+                evidence_role="complement",
+                supports_requirement_ids=("r1",),
+                topic_relevance=0.80,
+                answer_support=0.72,
+                assessment_valid=True,
+            ),
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="报销提交时限是多久，需要哪些凭证",
+            requirements=requirements,
+            assessments=assessments,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(
+            decision.reason,
+            "complementary_assessed_answer_documents",
+        )
+        self.assertEqual(decision.choices, ())
+
+    def test_post_evidence_single_cross_document_graph_is_not_ambiguous(self) -> None:
+        query = "普通员工的餐补标准是多少"
+        plan = plan_query_locally(query)
+        decision = detect_post_evidence_document_ambiguity(
+            query=query,
+            requirements=plan.requirements,
+            assessments=[DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-policy",
+                filename="差旅补贴标准.md",
+                evidence_role="standalone_answer",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+                companion_doc_ids=("doc-grade",),
+            )],
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+        self.assertEqual(decision.relevant_document_count, 1)
+
+    def test_post_evidence_version_choices_keep_graph_companions(self) -> None:
+        query = "普通员工的餐补标准是多少"
+        plan = plan_query_locally(query)
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id=f"doc-policy-{version}",
+                filename="差旅补贴标准.md",
+                evidence_role="standalone_answer",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+                companion_doc_ids=(f"doc-grade-{version}",),
+                products=("CloudPivot",),
+                canonical_products=("云枢",),
+                versions=(version,),
+            )
+            for version in ("6", "7")
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query=query,
+            requirements=plan.requirements,
+            assessments=assessments,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(len(decision.choices), 2)
+        by_version = {
+            choice.versions[0]: choice for choice in decision.choices
+        }
+        for version in ("6", "7"):
+            choice = by_version[version]
+            self.assertEqual(choice.anchor_doc_ids, (f"doc-policy-{version}",))
+            self.assertEqual(choice.companion_doc_ids, (f"doc-grade-{version}",))
+            self.assertEqual(
+                set(choice.doc_ids),
+                {f"doc-policy-{version}", f"doc-grade-{version}"},
+            )
+            self.assertIn(version, choice.label)
+
+    def test_post_evidence_merges_graph_whose_companion_is_another_anchor(
+        self,
+    ) -> None:
+        requirements = ({
+            "id": "r1",
+            "role": "answer",
+            "importance": "required",
+            "description": "查询当前规则",
+        },)
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-dependent",
+                filename="规则明细.md",
+                evidence_role="standalone_answer",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+                companion_doc_ids=("doc-dominant",),
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-dominant",
+                filename="规则总表.md",
+                evidence_role="standalone_answer",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+            ),
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-independent",
+                filename="另一套规则.md",
+                evidence_role="standalone_answer",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+            ),
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="当前规则是什么",
+            requirements=requirements,
+            assessments=assessments,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.reason, "multiple_assessed_answer_documents")
+        self.assertEqual(len(decision.choices), 2)
+        merged = next(
+            choice
+            for choice in decision.choices
+            if "doc-dependent" in choice.doc_ids
+        )
+        self.assertEqual(merged.anchor_doc_ids, ("doc-dominant",))
+        self.assertEqual(merged.companion_doc_ids, ("doc-dependent",))
+        self.assertEqual(
+            set(merged.doc_ids),
+            {"doc-dependent", "doc-dominant"},
+        )
+        for choice in decision.choices:
+            other_doc_ids = {
+                doc_id
+                for other in decision.choices
+                if other.key != choice.key
+                for doc_id in other.doc_ids
+            }
+            self.assertTrue(set(choice.anchor_doc_ids).isdisjoint(other_doc_ids))
 
     def test_document_topic_gate_keeps_specific_query_answerable(self) -> None:
         candidates = [
@@ -1606,6 +2032,291 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         self.assertFalse(decision.needs_clarification)
         self.assertEqual(decision.relevant_document_count, 1)
         self.assertEqual(decision.allowed_doc_ids, ("doc-year-2025",))
+
+    def test_same_document_section_versions_are_distinct_selectable_slices(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="same-doc-2024",
+                doc_id="doc-shared-policy",
+                filename="公司差旅制度.docx",
+                content="2024版普通员工出差餐补为80元。",
+                metadata={"section_key": "section-2024", "version": "2024"},
+                topic=0.96,
+                support=0.92,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="same-doc-2025",
+                doc_id="doc-shared-policy",
+                filename="公司差旅制度.docx",
+                content="2025版普通员工出差餐补为100元。",
+                metadata={"section_key": "section-2025", "version": "2025"},
+                topic=0.95,
+                support=0.91,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="same-doc-common",
+                doc_id="doc-shared-policy",
+                filename="公司差旅制度.docx",
+                content="报销须提供正规发票。",
+                metadata={"section_key": "section-common"},
+                topic=0.7,
+                support=0.35,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="普通员工的出差餐补标准是什么",
+            constraints=extract_query_constraints("普通员工的出差餐补标准是什么"),
+            candidates=candidates,
+            mode="applicability_only",
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(len(decision.choices), 2)
+        self.assertEqual(
+            {choice.doc_ids for choice in decision.choices},
+            {("doc-shared-policy",)},
+        )
+        anchors_by_version = {
+            choice.versions[0]: {
+                value.section_key
+                for value in choice.scope_slices
+                if value.is_anchor
+            }
+            for choice in decision.choices
+        }
+        self.assertEqual(
+            anchors_by_version,
+            {"2024": {"section-2024"}, "2025": {"section-2025"}},
+        )
+        self.assertTrue(all(
+            any(
+                value.section_key == "section-common" and not value.is_anchor
+                for value in choice.scope_slices
+            )
+            for choice in decision.choices
+        ))
+
+    def test_legacy_same_document_orphan_chunks_are_not_shared_across_scopes(
+        self,
+    ) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="legacy-header-a",
+                doc_id="legacy-multi-scope-doc",
+                filename="多范围配置.md",
+                content="所属产品：CloudPivot；适用项目：项目A。",
+                topic=0.96,
+                support=0.9,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="legacy-answer-a",
+                doc_id="legacy-multi-scope-doc",
+                filename="多范围配置.md",
+                content="安全配置：项目A必须启用兼容模式。",
+                topic=0.95,
+                support=0.9,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="legacy-header-b",
+                doc_id="legacy-multi-scope-doc",
+                filename="多范围配置.md",
+                content="所属产品：CloudPivot；适用项目：项目B。",
+                topic=0.94,
+                support=0.89,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="legacy-answer-b",
+                doc_id="legacy-multi-scope-doc",
+                filename="多范围配置.md",
+                content="安全配置：项目B必须启用严格模式。",
+                topic=0.93,
+                support=0.88,
+                role="direct",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="安全配置是什么",
+            constraints=extract_query_constraints("安全配置是什么"),
+            candidates=candidates,
+            mode="applicability_only",
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "project")
+        self.assertEqual(len(decision.choices), 2)
+        selected_chunk_ids = {
+            chunk_id
+            for choice in decision.choices
+            for scope_slice in choice.scope_slices
+            for chunk_id in scope_slice.chunk_ids
+        }
+        self.assertEqual(
+            selected_chunk_ids,
+            {"legacy-header-a", "legacy-header-b"},
+        )
+        self.assertFalse(any(
+            not scope_slice.is_anchor
+            for choice in decision.choices
+            for scope_slice in choice.scope_slices
+        ))
+
+    def test_section_identity_inherits_locally_not_across_same_document(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="header-2024",
+                doc_id="doc-local-inheritance",
+                filename="公司差旅制度.docx",
+                content="产品版本：2024",
+                metadata={"section_key": "section-2024"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="answer-2024",
+                doc_id="doc-local-inheritance",
+                filename="公司差旅制度.docx",
+                content="普通员工餐补80元。",
+                metadata={"section_key": "section-2024"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="header-2025",
+                doc_id="doc-local-inheritance",
+                filename="公司差旅制度.docx",
+                content="产品版本：2025",
+                metadata={"section_key": "section-2025"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="answer-2025",
+                doc_id="doc-local-inheritance",
+                filename="公司差旅制度.docx",
+                content="普通员工餐补100元。",
+                metadata={"section_key": "section-2025"},
+                topic=0.9,
+                support=0.8,
+            ),
+            _candidate(
+                chunk_id="generic",
+                doc_id="doc-local-inheritance",
+                filename="公司差旅制度.docx",
+                content="报销说明。",
+                metadata={"section_key": "section-generic"},
+                topic=0.9,
+                support=0.8,
+            ),
+        ]
+
+        enriched = {
+            item["id"]: item
+            for item in inherit_document_constraint_metadata(candidates)
+        }
+        self.assertEqual(
+            extract_document_constraint_identity(enriched["answer-2024"]).versions,
+            ("2024",),
+        )
+        self.assertEqual(
+            extract_document_constraint_identity(enriched["answer-2025"]).versions,
+            ("2025",),
+        )
+        self.assertEqual(
+            extract_document_constraint_identity(enriched["generic"]).versions,
+            (),
+        )
+        self.assertEqual(
+            enriched["generic"]["metadata"]["ambiguous_document_identity"][
+                "version"
+            ],
+            ["2024", "2025"],
+        )
+
+    def test_post_evidence_same_document_versions_remain_independent(self) -> None:
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-shared",
+                filename="公司差旅制度.docx",
+                evidence_role="standalone_answer",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+                versions=(version,),
+                chunk_ids=(f"chunk-{version}",),
+                section_keys=(f"section-{version}",),
+            )
+            for version in ("2024", "2025")
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="普通员工的出差餐补标准是什么",
+            requirements=[{
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            }],
+            assessments=assessments,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(len(decision.choices), 2)
+        self.assertEqual(
+            {
+                next(
+                    value.section_key
+                    for value in choice.scope_slices
+                    if value.is_anchor
+                )
+                for choice in decision.choices
+            },
+            {"section-2024", "section-2025"},
+        )
+
+    def test_post_evidence_same_document_sections_are_complementary_without_scope_identity(
+        self,
+    ) -> None:
+        """A policy's chapters are evidence composition, not a document picker."""
+
+        assessments = [
+            DocumentEvidenceAssessment(
+                kb_id="kb-1",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                evidence_role="direct",
+                supports_requirement_ids=("r1",),
+                topic_relevance=1.0,
+                answer_support=1.0,
+                assessment_valid=True,
+                chunk_ids=(f"chunk-{section}",),
+                section_keys=(section,),
+            )
+            for section in ("general", "transport", "lodging", "meals")
+        ]
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="公司的出差标准是什么",
+            requirements=[{
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            }],
+            assessments=assessments,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+        self.assertEqual(decision.relevant_document_count, 1)
 
 
 if __name__ == "__main__":

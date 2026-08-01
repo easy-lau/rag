@@ -17,16 +17,25 @@ from api.chat import (
     _refined_evidence_query,
     _scope_anchor_coverage_from_sources,
     _validate_stream_answer_sources,
+    _validated_evidence_choices,
     _scoped_evidence_query,
     send_message,
 )
 from core.conversation_context import ConversationContext
+from core.evidence_ambiguity import detect_post_evidence_document_ambiguity
 from core.query_route_compiler import (
     RouteCategoryPolicy,
     RouteCompilerConfig,
     compile_rag_task_contract,
 )
 from core.query_route_contract import parse_rag_route_decision
+from core.rag_v2.contracts import (
+    AnswerRequirementV2,
+    EvidenceBundle,
+    EvidenceItem,
+    EvidenceState,
+)
+from core.rag_v2.pipeline import _post_evidence_document_assessments
 from models.db_models import Document, DocumentChunk, IntentRouteLog
 from models.schemas import ChatRequest, IntentEvidenceStatus
 
@@ -404,6 +413,121 @@ class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
+    def test_same_document_slice_choice_survives_pending_validation_and_selection(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_2024 = uuid.uuid4()
+        chunk_2025 = uuid.uuid4()
+        choices = [
+            {
+                "key": f"c{index}",
+                "label": f"公司差旅制度 {version}版",
+                "products": [],
+                "canonical_products": [],
+                "versions": [version],
+                "projects": [],
+                "filenames": ["公司差旅制度.docx"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(doc_id)],
+                "anchor_doc_ids": [str(doc_id)],
+                "companion_doc_ids": [],
+                "scope_slices": [{
+                    "kb_id": str(kb_id),
+                    "doc_id": str(doc_id),
+                    "section_key": f"section-{version}",
+                    "chunk_ids": [str(chunk_id)],
+                    "is_anchor": True,
+                }],
+            }
+            for index, (version, chunk_id) in enumerate(
+                (("2024", chunk_2024), ("2025", chunk_2025)),
+                start=1,
+            )
+        ]
+
+        normalized = _validated_evidence_choices(
+            choices,
+            selected_kb_ids=(str(kb_id),),
+        )
+        self.assertIsNotNone(normalized)
+        pending = {
+            "selection_mode": "choice",
+            "choices": list(normalized or ()),
+        }
+        reply = _parse_evidence_scope_reply("第二个", pending)
+        scope_filter = _evidence_scope_filter(
+            reply,
+            current_kb_ids=[kb_id],
+        )
+
+        self.assertIsNotNone(scope_filter)
+        self.assertEqual(scope_filter["doc_ids"], [str(doc_id)])
+        self.assertEqual(
+            scope_filter["choices"][0]["scope_slices"][0]["section_key"],
+            "section-2025",
+        )
+        selected_source = {
+            "id": str(chunk_2025),
+            "chunk_id": str(chunk_2025),
+            "kb_id": str(kb_id),
+            "doc_id": str(doc_id),
+            "metadata": {"section_key": "section-2025"},
+        }
+        wrong_source = {
+            "id": str(chunk_2024),
+            "chunk_id": str(chunk_2024),
+            "kb_id": str(kb_id),
+            "doc_id": str(doc_id),
+            "metadata": {"section_key": "section-2024"},
+        }
+        self.assertEqual(
+            _scope_anchor_coverage_from_sources(
+                scope_filter,
+                {(kb_id, doc_id)},
+                [selected_source],
+            ),
+            (True, [str(doc_id)]),
+        )
+        self.assertEqual(
+            _scope_anchor_coverage_from_sources(
+                scope_filter,
+                {(kb_id, doc_id)},
+                [wrong_source],
+            ),
+            (False, []),
+        )
+
+    def test_same_anchor_section_cannot_be_relabelled_as_two_choices(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        base_choice = {
+            "label": "公司差旅制度",
+            "products": [],
+            "canonical_products": [],
+            "versions": [],
+            "projects": [],
+            "filenames": ["公司差旅制度.docx"],
+            "kb_ids": [str(kb_id)],
+            "doc_ids": [str(doc_id)],
+            "anchor_doc_ids": [str(doc_id)],
+            "companion_doc_ids": [],
+            "scope_slices": [{
+                "kb_id": str(kb_id),
+                "doc_id": str(doc_id),
+                "section_key": "same-section",
+                "chunk_ids": [str(chunk_id)],
+                "is_anchor": True,
+            }],
+        }
+        self.assertIsNone(_validated_evidence_choices(
+            [
+                {**base_choice, "key": "c1"},
+                {**base_choice, "key": "c2"},
+            ],
+            selected_kb_ids=(str(kb_id),),
+        ))
+
     def test_all_public_evidence_statuses_fit_route_log_column(self) -> None:
         statuses = get_args(IntentEvidenceStatus)
         self.assertIn("needs_clarification", statuses)
@@ -582,6 +706,210 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         malformed["choices"][0]["anchor_doc_ids"] = [str(shared_companion)]
         malformed["choices"][0]["companion_doc_ids"] = [str(first_anchor)]
         self.assertIsNone(_active_pending_route_state(malformed))
+
+    def test_choice_specific_companion_stays_inside_authorized_scope(self) -> None:
+        kb_id = uuid.uuid4()
+        companion_doc_id = uuid.uuid4()
+        pending = _evidence_pending_state(kb_id=kb_id)
+        first_choice = pending["choices"][0]
+        first_choice["doc_ids"].append(str(companion_doc_id))
+        first_choice["companion_doc_ids"] = [str(companion_doc_id)]
+
+        normalized = _active_pending_route_state(pending)
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(
+            normalized["choices"][0]["companion_doc_ids"],
+            [str(companion_doc_id)],
+        )
+        reply = _parse_evidence_scope_reply("1", normalized)
+        scope_filter = _evidence_scope_filter(reply, current_kb_ids=[kb_id])
+        self.assertEqual(
+            set(scope_filter["doc_ids"]),
+            {
+                *normalized["choices"][0]["anchor_doc_ids"],
+                str(companion_doc_id),
+            },
+        )
+        # A companion remains part of the server-created document allow-list;
+        # omitting it from doc_ids or changing the current KB authorization
+        # invalidates the state/filter instead of broadening retrieval.
+        malformed = json.loads(json.dumps(normalized, ensure_ascii=False))
+        malformed["choices"][0]["doc_ids"].remove(str(companion_doc_id))
+        self.assertIsNone(_active_pending_route_state(malformed))
+        self.assertIsNone(
+            _evidence_scope_filter(reply, current_kb_ids=[uuid.uuid4()])
+        )
+
+    def test_pipeline_choice_graph_merge_satisfies_chat_fail_closed_contract(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        dependent_doc_id = uuid.uuid4()
+        dominant_doc_id = uuid.uuid4()
+        independent_doc_id = uuid.uuid4()
+        dependent_chunk_id = uuid.uuid4()
+        dominant_chunk_id = uuid.uuid4()
+        independent_chunk_id = uuid.uuid4()
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="查询普通员工的当前规则",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="确认普通员工对应的职级",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+                bridge_subject="普通员工",
+            ),
+        )
+        bundle = EvidenceBundle(
+            state=EvidenceState(
+                availability="ok",
+                confidence="verified",
+                completeness="complete",
+            ),
+            items=(
+                EvidenceItem(
+                    chunk_id=str(dependent_chunk_id),
+                    doc_id=str(dependent_doc_id),
+                    kb_id=str(kb_id),
+                    content="规则明细需要结合职级总表。",
+                    role="direct",
+                    supports_requirement_ids=("r1",),
+                    metadata={
+                        "filename": "规则明细.md",
+                        "product": "云枢",
+                        "version": "6.0.1",
+                        "resolved_bridge_joins": [{
+                            "answer_requirement_id": "r1",
+                            "bridge_requirement_id": "r2",
+                            "bridge_source_chunk_id": str(dominant_chunk_id),
+                            "bridge_source_doc_id": str(dominant_doc_id),
+                            "bridge_source_kb_id": str(kb_id),
+                        }],
+                    },
+                ),
+                EvidenceItem(
+                    chunk_id=str(dominant_chunk_id),
+                    doc_id=str(dominant_doc_id),
+                    kb_id=str(kb_id),
+                    content="职级总表也直接列出了当前规则。",
+                    role="direct",
+                    supports_requirement_ids=("r1", "r2"),
+                    metadata={
+                        "filename": "规则总表.md",
+                        "product": "云枢",
+                        "version": "6.0.1",
+                        "direct_subject_answer_requirement_ids": ["r1"],
+                    },
+                ),
+                EvidenceItem(
+                    chunk_id=str(independent_chunk_id),
+                    doc_id=str(independent_doc_id),
+                    kb_id=str(kb_id),
+                    content="另一套规则独立回答当前问题。",
+                    role="direct",
+                    supports_requirement_ids=("r1",),
+                    metadata={
+                        "filename": "另一套规则.md",
+                        "product": "云枢",
+                        "version": "7.1.0",
+                        "direct_subject_answer_requirement_ids": ["r1"],
+                    },
+                ),
+            ),
+            context_item_ids=(
+                str(dependent_chunk_id),
+                str(dominant_chunk_id),
+                str(independent_chunk_id),
+            ),
+            answer_source_ids=(
+                str(dependent_chunk_id),
+                str(dominant_chunk_id),
+                str(independent_chunk_id),
+            ),
+        )
+        decision = detect_post_evidence_document_ambiguity(
+            query="当前规则是什么",
+            requirements=requirements,
+            assessments=_post_evidence_document_assessments(
+                bundle=bundle,
+                requirements=requirements,
+            ),
+        )
+        event = json.loads(json.dumps(decision.to_dict(), ensure_ascii=False))
+        self.assertEqual(event["dimension"], "version")
+
+        # This is the pre-fix producer shape.  Chat must keep rejecting it:
+        # dominant_doc_id cannot be both c1's companion and c2's anchor.
+        old_overlapping_choices = [
+            {
+                "key": "c1",
+                "label": "《规则明细.md》",
+                "products": [],
+                "canonical_products": [],
+                "versions": [],
+                "projects": [],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(dependent_doc_id), str(dominant_doc_id)],
+                "anchor_doc_ids": [str(dependent_doc_id)],
+                "companion_doc_ids": [str(dominant_doc_id)],
+                "filenames": ["规则明细.md"],
+            },
+            {
+                "key": "c2",
+                "label": "《规则总表.md》",
+                "products": [],
+                "canonical_products": [],
+                "versions": [],
+                "projects": [],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(dominant_doc_id)],
+                "anchor_doc_ids": [str(dominant_doc_id)],
+                "companion_doc_ids": [],
+                "filenames": ["规则总表.md"],
+            },
+        ]
+        self.assertIsNone(_validated_evidence_choices(
+            old_overlapping_choices,
+            selected_kb_ids=(str(kb_id),),
+        ))
+
+        validated = _validated_evidence_choices(
+            event["choices"],
+            selected_kb_ids=(str(kb_id),),
+        )
+        self.assertIsNotNone(validated)
+        state = _evidence_event_pending_state(
+            event,
+            original_query="当前规则是什么",
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
+        self.assertIsNotNone(state)
+        self.assertEqual(
+            {value for choice in state["choices"] for value in choice["kb_ids"]},
+            {str(kb_id)},
+        )
+        self.assertEqual(
+            {value for choice in state["choices"] for value in choice["doc_ids"]},
+            {
+                str(dependent_doc_id),
+                str(dominant_doc_id),
+                str(independent_doc_id),
+            },
+        )
+        reply = _parse_evidence_scope_reply("1", state)
+        self.assertIsNotNone(
+            _evidence_scope_filter(reply, current_kb_ids=[kb_id])
+        )
+        self.assertIsNone(
+            _evidence_scope_filter(reply, current_kb_ids=[uuid.uuid4()])
+        )
 
     def test_evidence_scope_reply_parser_supports_generic_choice_forms(self) -> None:
         pending = _evidence_pending_state()
@@ -1269,6 +1597,10 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ack["clarification_message_id"], str(assistant.id))
         self.assertEqual(ack["route_state_revision"], 1)
         self.assertEqual(ack["conversation_id"], str(conversation_id))
+        self.assertEqual(
+            ack["selected_kb_ids_snapshot"],
+            state["selected_kb_ids_snapshot"],
+        )
         events = [call.args[0] for call in trace.call_args_list]
         self.assertIn("evidence.clarification_created", events)
         self.assertNotIn("evidence.clarification_resolved", events)

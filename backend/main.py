@@ -22,6 +22,7 @@ from api import (
     users,
 )
 from config import get_settings
+from core.logging_config import configure_application_logging
 from core.settings_crypto import SettingsEncryptionError
 from core.login_security import login_log_cleanup_loop
 from core.rag_trace_store import start_rag_trace_store, stop_rag_trace_store
@@ -29,10 +30,13 @@ from database import engine
 
 _settings = get_settings()
 _log_level = getattr(logging, _settings.log_level.strip().upper(), logging.INFO)
-logging.basicConfig(
-    level=_log_level,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+_development_log_path = configure_application_logging(
+    app_env=_settings.app_env,
+    log_level=_log_level,
+    development_log_dir=_settings.development_log_dir,
 )
+if _development_log_path is not None:
+    logging.getLogger(__name__).info("[startup] 开发日志文件: %s", _development_log_path)
 
 
 @asynccontextmanager

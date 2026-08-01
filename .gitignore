@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .DS_Store
 *.log
+logs/
 
 # 用户上传的文件（运行时数据，非代码）
 uploads/

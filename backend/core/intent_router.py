@@ -327,6 +327,16 @@ _NORMATIVE_TERMS = (
     "上限",
     "下限",
 )
+_STRUCTURAL_NORMATIVE_TERMS = (
+    # These nouns can also occur in general-world requests (for example a
+    # travel plan).  They enter the enterprise fast path only when the query
+    # planner independently proves a concrete entity -> derived attribute
+    # shape, such as ``供应商甲 -> 风险处置措施``.
+    "措施",
+    "策略",
+    "方案",
+    "处置",
+)
 _NORMATIVE_QUERY_MARKERS = (
     "是什么",
     "是多少",
@@ -356,7 +366,8 @@ _NORMATIVE_CONCEPT_MARKERS = (
     "是什么意思",
 )
 _NORMATIVE_LOOKUP_PREFIX_RE = re.compile(
-    r"(?:请问|查询|查看|了解|说明|告诉我|想知道|我想了解|我想知道)",
+    r"^(?:(?:请问|请|麻烦|帮我)\s*)?"
+    r"(?:查询|查看|了解|说明|告诉我|想知道|我想了解|我想知道)\s*",
     re.IGNORECASE,
 )
 
@@ -434,18 +445,33 @@ def _is_normative_query(question: str) -> bool:
     if any(marker in text for marker in _NORMATIVE_CONCEPT_MARKERS):
         return False
 
-    for term in _NORMATIVE_TERMS:
+    # A predicate is optional only when the query planner can independently
+    # prove a concrete entity/condition -> policy-attribute shape, for example
+    # ``总经理的住宿标准`` or ``供应商A风险处置要求``.  This lets a selected
+    # enterprise KB take the deterministic route even when the user omits
+    # ``是什么`` without turning bare noun phrases such as ``住宿标准`` into
+    # enterprise lookups.
+    structural_lookup = infer_implicit_bridge(text) is not None
+
+    for term in (*_NORMATIVE_TERMS, *_STRUCTURAL_NORMATIVE_TERMS):
+        if term in _STRUCTURAL_NORMATIVE_TERMS and not structural_lookup:
+            continue
         start = text.find(term)
         while start >= 0:
             prefix = text[:start].strip()
             suffix = text[start + len(term):].strip()
             # A bare “标准是什么” has no resolvable subject and should remain
             # with the semantic router; “某对象的标准是什么” is concrete.
-            subject = re.sub(r"^[请问查询查看了解\s]+|[的之\s]+$", "", prefix)
+            subject = _NORMATIVE_LOOKUP_PREFIX_RE.sub("", prefix, count=1)
+            subject = re.sub(r"^(?:请问|请)\s*|[的之\s]+$", "", subject)
             if len(subject) >= 2:
                 if (
                     any(marker in suffix for marker in _NORMATIVE_QUERY_MARKERS)
-                    or (not suffix and _NORMATIVE_LOOKUP_PREFIX_RE.search(prefix))
+                    or (
+                        not suffix
+                        and _NORMATIVE_LOOKUP_PREFIX_RE.search(prefix)
+                    )
+                    or (not suffix and structural_lookup)
                     or (suffix in {"?", "？", "。", "！", "!"})
                 ):
                     return True
@@ -1603,11 +1629,10 @@ def _rule_route_requirements(question: str) -> tuple[RouteRequirement, ...]:
     ]
     inferred_bridge = infer_implicit_bridge(question)
     if inferred_bridge is not None:
-        description, _ = inferred_bridge
         requirements.append(RouteRequirement(
             role="bridge",
             origin="semantically_entailed",
-            description=description[:240],
+            description=inferred_bridge.description[:240],
         ))
     return tuple(requirements)
 

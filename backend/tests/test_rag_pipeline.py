@@ -14,6 +14,9 @@ from core.rag_pipeline import (
     _fallback_to_initial_verified_evidence,
     _knowledge_context_message,
     _merge_retrieval_candidates,
+    _normalize_evidence_scope_filter,
+    _restrict_candidates_to_scope,
+    _scope_anchor_coverage,
     _resolve_document_expansion_plan,
     _rescue_missing_joint_evidence,
     _select_unverified_evidence,
@@ -57,6 +60,75 @@ def _settings(**overrides):
 async def _empty_stream():
     if False:  # pragma: no cover - 保持该函数为异步生成器
         yield None
+
+
+class EvidenceScopeSliceFilterTests(unittest.TestCase):
+    def test_selected_section_drops_sibling_section_in_same_document(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        selected_chunk_id = uuid.uuid4()
+        sibling_chunk_id = uuid.uuid4()
+        payload = {
+            "mode": "single",
+            "kb_ids": [str(kb_id)],
+            "doc_ids": [str(doc_id)],
+            "choices": [{
+                "key": "c2",
+                "label": "公司差旅制度 2025版",
+                "products": [],
+                "canonical_products": [],
+                "versions": ["2025"],
+                "projects": [],
+                "filenames": ["公司差旅制度.docx"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(doc_id)],
+                "anchor_doc_ids": [str(doc_id)],
+                "companion_doc_ids": [],
+                "scope_slices": [{
+                    "kb_id": str(kb_id),
+                    "doc_id": str(doc_id),
+                    "section_key": "section-2025",
+                    "chunk_ids": [str(selected_chunk_id)],
+                    "is_anchor": True,
+                }],
+            }],
+        }
+        normalized = _normalize_evidence_scope_filter(
+            payload,
+            authorized_kb_ids=[kb_id],
+        )
+        self.assertIsNotNone(normalized)
+        self.assertTrue(normalized.valid)
+        candidates = [
+            {
+                "id": str(selected_chunk_id),
+                "kb_id": str(kb_id),
+                "doc_id": str(doc_id),
+                "metadata": {"section_key": "section-2025"},
+            },
+            {
+                "id": str(sibling_chunk_id),
+                "kb_id": str(kb_id),
+                "doc_id": str(doc_id),
+                "metadata": {"section_key": "section-2024"},
+            },
+        ]
+
+        selected, dropped = _restrict_candidates_to_scope(
+            candidates,
+            normalized,
+        )
+
+        self.assertEqual([item["id"] for item in selected], [str(selected_chunk_id)])
+        self.assertEqual(dropped, 1)
+        self.assertEqual(
+            _scope_anchor_coverage(selected, normalized),
+            (True, (str(doc_id),)),
+        )
+        self.assertEqual(
+            _scope_anchor_coverage(candidates[1:], normalized),
+            (False, ()),
+        )
 
 
 class _FakeCompletions:

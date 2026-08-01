@@ -372,12 +372,11 @@ def _compile_requirements(
             None,
         )
         if inferred_bridge is not None:
-            description, _ = inferred_bridge
             compiled.append(CompiledAnswerRequirement(
                 id=f"r{len(compiled) + 1}",
                 role="bridge",
                 origin="semantically_entailed",
-                description=description,
+                description=inferred_bridge.description,
                 importance="helpful",
                 source="inferred",
             ))

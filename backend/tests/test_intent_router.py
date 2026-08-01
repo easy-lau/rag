@@ -640,6 +640,126 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         )
         create.assert_not_awaited()
 
+    async def test_subject_normative_suffix_with_history_uses_preflight(
+        self,
+    ) -> None:
+        questions = (
+            "总经理的住宿标准",
+            "普通员工住宿标准",
+            "供应商A风险处置要求",
+            "供应商甲的风险处置措施是什么",
+            "客户A的服务策略是什么",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                self.assertTrue(_is_normative_query(question))
+                self.assertTrue(_requires_knowledge_retrieval(question))
+                create = AsyncMock(
+                    side_effect=AssertionError(
+                        "自包含规范查询不应因存在历史而调用路由模型"
+                    )
+                )
+                with (
+                    patch(
+                        "core.intent_router.get_intent_router_config",
+                        new=AsyncMock(return_value=_default_config()),
+                    ),
+                    patch(
+                        "core.intent_router.list_intent_categories",
+                        new=AsyncMock(return_value=_categories()),
+                    ),
+                    patch(
+                        "core.intent_router.get_client",
+                        return_value=_model_client(create),
+                    ),
+                    patch(
+                        "core.intent_router.get_settings",
+                        return_value=_model_settings(),
+                    ),
+                    patch("core.intent_router.trace_event"),
+                ):
+                    result = await classify_intent_result(
+                        object(),
+                        question,
+                        selected_kb_count_override=1,
+                        route_context=({
+                            "candidate_key": "t1",
+                            "user_input": "普通员工的餐补是多少？",
+                            "assistant_answer": "普通员工对应 D 级。",
+                            "reusable_source_count": 1,
+                        },),
+                        fallback_relation="new",
+                        fallback_query_mode="current",
+                        record_log=False,
+                    )
+
+                self.assertEqual(result.route_decision.relation, "new")
+                self.assertEqual(result.task_contract.query_mode, "current")
+                self.assertEqual(result.task_contract.context_turn_keys, ())
+                self.assertEqual(
+                    result.diagnostics["deterministic_preflight"],
+                    "enterprise_question",
+                )
+                create.assert_not_awaited()
+
+    async def test_bare_normative_term_with_history_still_uses_semantic_router(
+        self,
+    ) -> None:
+        question = "标准是什么"
+        self.assertFalse(_is_normative_query(question))
+        self.assertFalse(_requires_knowledge_retrieval(question))
+        route_payload = {
+            "schema_version": "rag_route_decision.v1",
+            "readiness": "ready",
+            "intent_code": "general_chat",
+            "relation": "new",
+            "evidence_scope": "general_world",
+            "query_resolution": {"mode": "current", "context_turn_keys": []},
+            "requirements": [{
+                "role": "answer",
+                "origin": "user_text",
+                "description": question,
+            }],
+            "clarification": {"question": "", "unresolved": []},
+            "confidence": 0.93,
+            "rationale": "缺少具体规范对象",
+        }
+        create = AsyncMock(return_value=_model_response(json.dumps(route_payload)))
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_count_override=1,
+                route_context=({
+                    "candidate_key": "t1",
+                    "user_input": "普通员工的餐补是多少？",
+                    "assistant_answer": "普通员工对应 D 级。",
+                    "reusable_source_count": 1,
+                },),
+                fallback_relation="new",
+                fallback_query_mode="current",
+                record_log=False,
+            )
+
+        self.assertNotIn("deterministic_preflight", result.diagnostics)
+        self.assertEqual(result.task_contract.response_mode, "general_chat")
+        create.assert_awaited_once()
+
     async def test_knowledge_dependent_writing_keeps_writing_route(self) -> None:
         route_payload = {
             "schema_version": "rag_route_decision.v1",
@@ -1068,6 +1188,8 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             "查询任意对象的资格条件有哪些？",
             "某项目的执行规则如何适用",
             "公司制度对报销有什么要求？",
+            "总经理的住宿标准",
+            "客户A的审批额度",
         )
         for question in lookup_questions:
             with self.subTest(question=question):
@@ -1085,6 +1207,8 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(decision.decision_reason, "knowledge_scope_guard")
 
         non_lookup_questions = (
+            "标准是什么",
+            "住宿标准",
             "介绍技术规范含义",
             "什么是政策",
             "今天上海天气怎么样？",

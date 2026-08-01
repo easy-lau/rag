@@ -43,6 +43,7 @@ class QueryPlanV2ContractTests(unittest.TestCase):
                 AnswerRequirementV2(
                     id="r1",
                     description="Which value applies?",
+                    depends_on_requirement_ids=(),
                 ),
             ),
             confidence=0.9,
@@ -60,7 +61,11 @@ class QueryPlanV2ContractTests(unittest.TestCase):
             answer_shape="fact",
             retrieval_queries=("ambiguous input",),
             requirements=(
-                AnswerRequirementV2(id="r1", description="ambiguous input"),
+                AnswerRequirementV2(
+                    id="r1",
+                    description="ambiguous input",
+                    depends_on_requirement_ids=(),
+                ),
             ),
             confidence=1.0,
             source="fallback",
@@ -81,7 +86,7 @@ class QueryPlanV2ContractTests(unittest.TestCase):
             )
 
     def test_multi_hop_plan_requires_an_explicit_bridge(self) -> None:
-        with self.assertRaisesRegex(ValueError, "bridge requirement"):
+        with self.assertRaisesRegex(ValueError, "answer-to-bridge dependency"):
             QueryPlanV2(
                 original_query="实体对应的额度是多少",
                 answer_shape="multi_hop",
@@ -90,11 +95,137 @@ class QueryPlanV2ContractTests(unittest.TestCase):
                     AnswerRequirementV2(
                         id="r1",
                         description="实体对应的额度是多少",
+                        depends_on_requirement_ids=(),
                     ),
                 ),
                 confidence=0.9,
                 source="local",
             )
+
+    def test_structured_bridge_fields_are_serialized(self) -> None:
+        plan = QueryPlanV2(
+            original_query="普通员工餐补是多少",
+            answer_shape="multi_hop",
+            retrieval_queries=("普通员工餐补是多少", "普通员工对应职级"),
+            requirements=(
+                AnswerRequirementV2(
+                    id="r1",
+                    description="普通员工餐补是多少",
+                    depends_on_requirement_ids=("r2",),
+                ),
+                AnswerRequirementV2(
+                    id="r2",
+                    description="确认普通员工对应的职级",
+                    role="bridge",
+                    importance="helpful",
+                    source="inferred",
+                    bridge_subject="普通员工",
+                ),
+            ),
+            confidence=0.9,
+            source="local",
+        )
+
+        payload = plan.to_dict()
+        self.assertTrue(payload["has_bridge_dependencies"])
+        self.assertEqual(
+            payload["requirements"][0]["depends_on_requirement_ids"],
+            ["r2"],
+        )
+        self.assertEqual(
+            payload["requirements"][1]["bridge_subject"],
+            "普通员工",
+        )
+
+    def test_requirement_role_specific_fields_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot define a bridge subject"):
+            AnswerRequirementV2(
+                id="r1",
+                description="answer",
+                bridge_subject="entity",
+            )
+        with self.assertRaisesRegex(ValueError, "cannot define dependencies"):
+            AnswerRequirementV2(
+                id="r2",
+                description="bridge",
+                role="bridge",
+                bridge_subject="entity",
+                depends_on_requirement_ids=(),
+            )
+
+    def test_collection_coverage_is_serialized_and_answer_only(self) -> None:
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="列出全部适用规则",
+            coverage_mode="collection",
+            depends_on_requirement_ids=(),
+        )
+
+        self.assertEqual(requirement.to_dict()["coverage_mode"], "collection")
+        with self.assertRaisesRegex(ValueError, "bridge requirements"):
+            AnswerRequirementV2(
+                id="r2",
+                description="确认对象分类",
+                role="bridge",
+                bridge_subject="对象",
+                coverage_mode="collection",
+            )
+
+    def test_query_plan_rejects_dangling_wrong_role_and_orphan_edges(self) -> None:
+        cases = (
+            (
+                (
+                    AnswerRequirementV2(
+                        id="r1",
+                        description="answer",
+                        depends_on_requirement_ids=("r9",),
+                    ),
+                ),
+                "does not exist",
+            ),
+            (
+                (
+                    AnswerRequirementV2(
+                        id="r1",
+                        description="answer one",
+                        depends_on_requirement_ids=("r2",),
+                    ),
+                    AnswerRequirementV2(
+                        id="r2",
+                        description="answer two",
+                        depends_on_requirement_ids=(),
+                    ),
+                ),
+                "only on bridge",
+            ),
+            (
+                (
+                    AnswerRequirementV2(
+                        id="r1",
+                        description="answer",
+                        depends_on_requirement_ids=(),
+                    ),
+                    AnswerRequirementV2(
+                        id="r2",
+                        description="bridge",
+                        role="bridge",
+                        bridge_subject="entity",
+                    ),
+                ),
+                "unreferenced bridge",
+            ),
+        )
+        for requirements, message in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    QueryPlanV2(
+                        original_query="query",
+                        answer_shape="fact",
+                        retrieval_queries=("query",),
+                        requirements=requirements,
+                        confidence=0.9,
+                        source="local",
+                    )
 
 
 class EvidenceContractTests(unittest.TestCase):

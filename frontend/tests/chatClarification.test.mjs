@@ -27,6 +27,7 @@ function persistedAck(overrides = {}) {
     clarification_message_id: 'assistant-1',
     route_state_revision: 3,
     conversation_id: 'conversation-1',
+    selected_kb_ids_snapshot: ['kb-1'],
     ...overrides,
   }
 }
@@ -95,6 +96,7 @@ test('实时澄清在持久化 ack 前不可提交，收到合法 ack 后才解�
   assert.equal(markClarificationSubmitted(message, 'c1'), false)
   assert.equal(message.clarification.submitted, true)
   assert.equal(message.clarification.submitted_reply, 'c1')
+  assert.deepEqual(message.clarification.selected_kb_ids_snapshot, ['kb-1'])
 })
 
 test('search_results 内嵌澄清也必须使用精确协议版本', () => {
@@ -202,6 +204,7 @@ test('ack 必须使用精确协议和完整持久化标识，畸形事件不会�
     persistedAck({ persisted: false }),
     persistedAck({ pending_state_id: '' }),
     persistedAck({ route_state_revision: null }),
+    persistedAck({ selected_kb_ids_snapshot: [] }),
   ]) {
     const message = { role: 'assistant' }
     attachEvidenceClarification(message, {

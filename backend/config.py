@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     app_version: str = "dev"
     app_revision: str = ""
     log_level: str = "INFO"
+    # 仅开发环境启用。聊天链路按 conversation_id 追加到独立日志文件；没有
+    # 会话归属的启动/系统日志保留在 worker 系统文件。生产保持 stdout，由容器
+    # 日志驱动、Loki 或 ELK 等集中收集系统接管。
+    development_log_dir: str = str(
+        Path(__file__).resolve().parent.parent / "logs" / "development"
+    )
     rag_trace_enabled: bool = True
     rag_trace_content_enabled: bool | None = None
     rag_trace_candidate_details_enabled: bool | None = None

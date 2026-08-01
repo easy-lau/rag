@@ -4,6 +4,7 @@ const MAX_LABEL_CHARS = 240
 const MAX_REPLY_CHARS = 32
 const MAX_IDENTIFIER_CHARS = 160
 const MAX_CHOICE_METADATA_ITEMS = 12
+const MAX_KB_SNAPSHOT_ITEMS = 100
 
 const CLARIFICATION_DIMENSIONS = new Set([
   'version',
@@ -33,6 +34,15 @@ function boundedMetadataList(value) {
     .slice(0, MAX_CHOICE_METADATA_ITEMS)
     .map(item => boundedText(item, MAX_LABEL_CHARS))
     .filter(Boolean)
+}
+
+function boundedIdentifierList(value, limit = MAX_KB_SNAPSHOT_ITEMS) {
+  if (!Array.isArray(value)) return []
+  return [...new Set(value
+    .filter(item => typeof item === 'string')
+    .map(item => boundedIdentifier(item))
+    .filter(Boolean))]
+    .slice(0, limit)
 }
 
 function routeStateRevision(value) {
@@ -112,6 +122,7 @@ export function normalizeEvidenceClarification(value) {
   const lastSubmissionRequestId = boundedIdentifier(payload.last_submission_request_id)
   const lastSubmittedReply = boundedText(payload.last_submitted_reply, MAX_REPLY_CHARS)
   const revision = routeStateRevision(payload.route_state_revision)
+  const selectedKbIdsSnapshot = boundedIdentifierList(payload.selected_kb_ids_snapshot)
   const persisted = payload.persisted === true
   // An acknowledgement is only actionable when it identifies a concrete,
   // persisted route-state revision. Merely receiving choices must never make
@@ -140,6 +151,7 @@ export function normalizeEvidenceClarification(value) {
     clarification_message_id: clarificationMessageId || null,
     route_state_revision: revision,
     conversation_id: boundedIdentifier(payload.conversation_id) || null,
+    selected_kb_ids_snapshot: selectedKbIdsSnapshot,
     ack_schema_version: boundedText(payload.ack_schema_version, 80) || null,
     submission_pending: payload.submission_pending === true && payload.submitted === true,
     submission_request_id: submissionRequestId || null,
@@ -225,6 +237,7 @@ export function acknowledgeEvidenceClarification(message, payload) {
   const clarificationMessageId = boundedIdentifier(ack.clarification_message_id)
   const conversationId = boundedIdentifier(ack.conversation_id)
   const revision = routeStateRevision(ack.route_state_revision)
+  const selectedKbIdsSnapshot = boundedIdentifierList(ack.selected_kb_ids_snapshot)
   if (
     ack.type !== 'evidence_clarification_ack'
     || ack.schema_version !== 'rag_evidence_clarification_ack.v1'
@@ -233,6 +246,7 @@ export function acknowledgeEvidenceClarification(message, payload) {
     || !clarificationMessageId
     || !conversationId
     || revision === null
+    || selectedKbIdsSnapshot.length === 0
   ) return null
 
   // If the original event already identified a state, a different ack must
@@ -260,6 +274,7 @@ export function acknowledgeEvidenceClarification(message, payload) {
     clarification_message_id: clarificationMessageId,
     route_state_revision: revision,
     conversation_id: conversationId,
+    selected_kb_ids_snapshot: selectedKbIdsSnapshot,
     ack_schema_version: boundedText(ack.schema_version, 80) || null,
   }
   return target.clarification
