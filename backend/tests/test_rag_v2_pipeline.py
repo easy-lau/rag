@@ -101,6 +101,15 @@ def _candidate(
         "metadata": {},
         "score": score,
         "retrieval_score": score,
+        # Mirror the production retriever contract.  Individual relevance tests
+        # override these raw observations when exercising score thresholds.
+        "vector_score": 0.86,
+        "vector_rank": 1,
+        "keyword_score": None,
+        "keyword_rank": None,
+        "trigram_score": None,
+        "trigram_rank": None,
+        "active_channels": ["vector"],
         "candidate_origin": "current_retrieval",
         "candidate_origins": ["current_retrieval"],
     }
@@ -127,6 +136,9 @@ def _full_document(
         item.update(
             score=None,
             retrieval_score=None,
+            vector_score=None,
+            vector_rank=None,
+            active_channels=[],
             candidate_origin="small_document_full",
             candidate_origins=["small_document_full"],
             full_document_chunk_count=len(contents),
@@ -210,6 +222,70 @@ class _HangingClient:
 
 
 class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
+    def test_single_broad_contract_requirement_does_not_erase_local_multi_part(
+        self,
+    ) -> None:
+        question = "第一项是什么？第二项如何处理？"
+        plan = plan_query_locally(question)
+        contract = _task_contract(
+            question,
+            requirements=[{
+                "role": "answer",
+                "origin": "user_text",
+                "description": "回答用户提出的问题",
+            }],
+        )
+
+        resolved = _plan_with_contract_requirements(plan, contract)
+
+        self.assertEqual(resolved.answer_shape, "multi_part")
+        self.assertEqual(
+            [(item.id, item.description) for item in resolved.requirements],
+            [
+                ("r1", "第一项是什么"),
+                ("r2", "第二项如何处理"),
+            ],
+        )
+        self.assertEqual(resolved.retrieval_queries, (
+            "第一项是什么",
+            "第二项如何处理",
+        ))
+        self.assertIn("local_multi_part_requirements_preserved", resolved.reason)
+
+    def test_local_multi_part_keeps_additional_contract_bridge(self) -> None:
+        question = "第一项是什么？第二项如何处理？"
+        plan = plan_query_locally(question)
+        contract = _task_contract(
+            question,
+            requirements=[
+                {
+                    "role": "answer",
+                    "origin": "user_text",
+                    "description": "回答用户提出的问题",
+                },
+                {
+                    "role": "bridge",
+                    "origin": "semantically_entailed",
+                    "description": "确认两项使用同一适用范围",
+                },
+            ],
+        )
+
+        resolved = _plan_with_contract_requirements(plan, contract)
+
+        self.assertEqual(
+            [(item.id, item.role, item.importance) for item in resolved.requirements],
+            [
+                ("r1", "answer", "required"),
+                ("r2", "answer", "required"),
+                ("r3", "bridge", "helpful"),
+            ],
+        )
+        self.assertEqual(
+            resolved.requirements[2].description,
+            "确认两项使用同一适用范围",
+        )
+
     def test_contextualized_single_requirement_uses_standalone_query(self) -> None:
         standalone_query = "那住宿呢。普通员工的出差标准是什么"
         plan = plan_query_locally(standalone_query)
@@ -500,7 +576,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(anchor_call.kwargs["doc_ids"], [doc_id])
 
-    async def test_followup_carryover_anchor_failure_keeps_authorized_seed_degraded(
+    async def test_followup_carryover_anchor_failure_rejects_previous_seed(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -533,24 +609,152 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "partial")
-        self.assertEqual(result["evidence_availability"], "degraded")
-        self.assertEqual(result["answer_source_count"], 1)
+        self.assertEqual(result["evidence_status"], "error")
+        self.assertEqual(result["evidence_availability"], "unavailable")
+        self.assertEqual(result["answer_source_count"], 0)
+        self.assertEqual(result["answer_sources"], [])
         self.assertFalse(result["carryover_anchor_succeeded"])
-        self.assertTrue(result["carryover_seed_used"])
-        self.assertEqual(result["carryover_candidate_count"], 1)
-        self.assertIn(
-            "carryover_anchor_failed",
-            result["evidence_state"]["reasons"],
+        self.assertFalse(result["carryover_seed_used"])
+        self.assertEqual(result["carryover_candidate_count"], 0)
+        self.assertEqual(client.completions.calls, [])
+        answer = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text_delta"
         )
-        self.assertEqual(result["answer_sources"][0]["score"], 0.0)
-        self.assertEqual(result["answer_sources"][0]["retrieval_score"], 0.0)
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertIn("服务暂时不可用", answer)
+        self.assertNotIn("一线城市450元", answer)
+        self.assertNotIn("未授权知识库", answer)
+
+    async def test_unmatched_carryover_document_cannot_reenter_via_expansion(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        old_doc_id = uuid.uuid4()
+        current_doc_id = uuid.uuid4()
+        carryover = _candidate(
+            kb_id=kb_id,
+            doc_id=old_doc_id,
+            chunk_index=0,
+            content="上一轮旧文档只说明旧指标。",
+            filename="旧制度.docx",
+            score=0.99,
+        )
+        current = _candidate(
+            kb_id=kb_id,
+            doc_id=current_doc_id,
+            chunk_index=0,
+            content="目标指标当前值为20。",
+            filename="当前制度.docx",
+        )
+        current.update(vector_score=0.91, vector_rank=1)
+        old_full = _full_document(
+            kb_id=kb_id,
+            doc_id=old_doc_id,
+            contents=["目标指标旧值为10，已废止。"],
+            filename="旧制度.docx",
+        )
+        current_full = _full_document(
+            kb_id=kb_id,
+            doc_id=current_doc_id,
+            contents=["目标指标当前值为20。"],
+            filename="当前制度.docx",
+        )
+
+        payloads, client, _search, fetch_full, _scoped = await self._run(
+            question="目标指标是多少",
+            standalone_query="目标指标是多少",
+            kb_id=kb_id,
+            initial=[current],
+            full_document=[*old_full, *current_full],
+            scoped=[],
+            carryover_sources=[carryover],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(
+            {item["doc_id"] for item in result["results"]},
+            {str(current_doc_id)},
+        )
+        self.assertEqual(
+            fetch_full.await_args.kwargs["doc_ids"],
+            [current_doc_id],
+        )
         prompt = "\n".join(
             message["content"] for message in client.completions.calls[0]["messages"]
         )
-        self.assertIn("一线城市450元", prompt)
-        self.assertNotIn("未授权知识库", prompt)
+        self.assertIn("当前值为20", prompt)
+        self.assertNotIn("旧值为10", prompt)
+        self.assertNotIn("上一轮旧文档", prompt)
+
+    async def test_rejected_fresh_carryover_hit_cannot_reenter_via_expansion(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        old_doc_id = uuid.uuid4()
+        current_doc_id = uuid.uuid4()
+        carryover = _candidate(
+            kb_id=kb_id,
+            doc_id=old_doc_id,
+            chunk_index=0,
+            content="上一轮旧标准。",
+            filename="旧制度.docx",
+            score=0.99,
+        )
+        low_fresh = _candidate(
+            kb_id=kb_id,
+            doc_id=old_doc_id,
+            chunk_index=1,
+            content="旧制度的弱相关说明。",
+            filename="旧制度.docx",
+        )
+        low_fresh.update(vector_score=0.55, vector_rank=2)
+        current = _candidate(
+            kb_id=kb_id,
+            doc_id=current_doc_id,
+            chunk_index=0,
+            content="目标指标当前值为20。",
+            filename="当前制度.docx",
+        )
+        current.update(vector_score=0.92, vector_rank=1)
+        old_full = _full_document(
+            kb_id=kb_id,
+            doc_id=old_doc_id,
+            contents=["目标指标旧值为10，已废止。"],
+            filename="旧制度.docx",
+        )
+        current_full = _full_document(
+            kb_id=kb_id,
+            doc_id=current_doc_id,
+            contents=["目标指标当前值为20。"],
+            filename="当前制度.docx",
+        )
+
+        payloads, client, _search, fetch_full, _scoped = await self._run(
+            question="目标指标是多少",
+            standalone_query="目标指标是多少",
+            kb_id=kb_id,
+            initial=[current],
+            full_document=[*old_full, *current_full],
+            scoped=[low_fresh],
+            carryover_sources=[carryover],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertFalse(result["carryover_anchor_succeeded"])
+        self.assertEqual(
+            {item["doc_id"] for item in result["results"]},
+            {str(current_doc_id)},
+        )
+        self.assertEqual(
+            fetch_full.await_args.kwargs["doc_ids"],
+            [current_doc_id],
+        )
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("旧值为10", prompt)
+        self.assertNotIn("上一轮旧标准", prompt)
 
     async def test_selected_tags_soft_boost_v2_without_admitting_noise(self) -> None:
         kb_id = uuid.uuid4()
@@ -592,7 +796,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             {str(tagged_doc_id), str(other_doc_id)},
         )
 
-    async def test_followup_low_score_fresh_anchor_falls_back_per_document(
+    async def test_followup_low_score_fresh_anchor_does_not_reuse_previous_seed(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -630,17 +834,18 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "partial")
-        self.assertTrue(result["carryover_seed_used"])
+        self.assertEqual(result["evidence_status"], "no_hit")
+        self.assertFalse(result["carryover_seed_used"])
         self.assertFalse(result["carryover_anchor_succeeded"])
-        self.assertIn(
-            "carryover_anchor_below_relevance_gate",
-            result["evidence_state"]["reasons"],
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(client.completions.calls, [])
+        answer = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text_delta"
         )
-        prompt = "\n".join(
-            message["content"] for message in client.completions.calls[0]["messages"]
-        )
-        self.assertIn("一线城市450元", prompt)
+        self.assertIn("未找到", answer)
+        self.assertNotIn("一线城市450元", answer)
 
     async def test_document_relevance_gate_excludes_lower_vector_noise(self) -> None:
         kb_id = uuid.uuid4()
@@ -757,6 +962,9 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             str(item["chunk_id"])
             for item in generation_context.kwargs["context_sources"]
         }
+        all_context_sources = generation_context.kwargs[
+            "all_context_sources"
+        ]
         answer_source_ids = {
             str(item["id"])
             for item in result["answer_sources"]
@@ -773,6 +981,23 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             result["answer_source_count"],
             len(generation_context.kwargs["context_sources"]),
         )
+        self.assertTrue(all(
+            source["supports_requirement_ids"] == ["r1"]
+            for source in result["answer_sources"]
+        ))
+        # The exact renderer budget may consume the final display slot with an
+        # adopted source, so a downgraded truncated item need not remain in the
+        # bounded ``results`` list.  The serialized prompt itself is the source
+        # of truth and must visibly revoke its role/support claim.
+        self.assertIn("角色：background；需求：无", serialized_context)
+        self.assertGreater(len(all_context_sources), len(context_source_ids))
+        self.assertTrue(any(
+            source["evidence_contribution_role"] == "background"
+            and source["supports_requirement_ids"] == []
+            and source["renderer_truncated"]
+            and not source["included_in_answer_sources"]
+            for source in all_context_sources
+        ))
         self.assertIn(
             "generation_context_budget_limited",
             result["evidence_state"]["reasons"],
@@ -838,6 +1063,8 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             content="员工出差交通、住宿和餐饮补贴标准。",
         )
         travel.update(
+            vector_score=None,
+            vector_rank=None,
             keyword_score=0.02,
             keyword_rank=1,
             active_channels=["keyword"],
@@ -850,6 +1077,8 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             content="员工请假审批、休假天数和销假要求。",
         )
         leave.update(
+            vector_score=None,
+            vector_rank=None,
             trigram_score=0.18,
             trigram_rank=1,
             active_channels=["trigram"],
@@ -987,7 +1216,12 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         payloads, client, *_ = await self._run(
             question="请分别回答第一项和第二项",
             kb_id=kb_id,
-            initial=[dict(full[0])],
+            initial=[{
+                **full[0],
+                "vector_score": 0.86,
+                "vector_rank": 1,
+                "active_channels": ["vector"],
+            }],
             full_document=full,
             requirements=[
                 {
@@ -1006,7 +1240,13 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "partial")
         self.assertEqual(result["coverage_status"], "partial")
+        self.assertEqual(result["covered_requirement_ids"], ["r1"])
+        self.assertEqual(result["missing_requirement_ids"], ["r2"])
         self.assertEqual(result["missing_requirement_count"], 1)
+        self.assertEqual(
+            result["answer_sources"][0]["supports_requirement_ids"],
+            ["r1"],
+        )
 
     async def test_expansion_deadline_retains_first_pass_evidence(self) -> None:
         kb_id = uuid.uuid4()
@@ -1095,8 +1335,20 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             filename="公司管理标准.docx",
         )
         initial = [dict(full[0]), dict(full[2])]
-        initial[0].update(score=0.09, retrieval_score=0.09)
-        initial[1].update(score=0.08, retrieval_score=0.08)
+        initial[0].update(
+            score=0.09,
+            retrieval_score=0.09,
+            vector_score=0.86,
+            vector_rank=1,
+            active_channels=["vector"],
+        )
+        initial[1].update(
+            score=0.08,
+            retrieval_score=0.08,
+            vector_score=0.84,
+            vector_rank=2,
+            active_channels=["vector"],
+        )
 
         payloads, client, _search, _fetch, scoped = await self._run(
             question="普通岗位的管理标准是什么",
@@ -1134,7 +1386,13 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         initial = [dict(full[1])]
-        initial[0].update(score=0.09, retrieval_score=0.09)
+        initial[0].update(
+            score=0.09,
+            retrieval_score=0.09,
+            vector_score=0.86,
+            vector_rank=1,
+            active_channels=["vector"],
+        )
 
         payloads, client, *_ = await self._run(
             question="普通岗位的餐饮补贴是多少",
@@ -1158,6 +1416,17 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "hit")
         self.assertEqual(len(result["answer_sources"]), 2)
+        by_role = {
+            source["evidence_contribution_role"]: source
+            for source in result["answer_sources"]
+        }
+        self.assertEqual(by_role["bridge"]["supports_requirement_ids"], ["r2"])
+        self.assertEqual(
+            by_role["complement"]["supports_requirement_ids"],
+            ["r1"],
+        )
+        self.assertEqual(result["covered_requirement_ids"], ["r2", "r1"])
+        self.assertEqual(result["missing_requirement_ids"], [])
         prompt = "\n".join(
             message["content"] for message in client.completions.calls[0]["messages"]
         )
@@ -1177,7 +1446,13 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         initial = [dict(full[1])]
-        initial[0].update(score=0.09, retrieval_score=0.09)
+        initial[0].update(
+            score=0.09,
+            retrieval_score=0.09,
+            vector_score=0.86,
+            vector_rank=1,
+            active_channels=["vector"],
+        )
 
         payloads, client, _search, fetch_full, scoped = await self._run(
             question="最终数值是多少",
@@ -1188,8 +1463,13 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "hit")
-        self.assertEqual(len(result["answer_sources"]), 2)
+        self.assertEqual(len(result["answer_sources"]), 1)
+        self.assertIn("最终数值为100", result["answer_sources"][0]["content"])
         self.assertEqual(len(client.completions.calls), 1)
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("对象与等级的映射关系", prompt)
         fetch_full.assert_awaited_once()
         scoped.assert_not_awaited()
 
@@ -1375,7 +1655,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
 
-    async def test_primary_retrieval_failure_keeps_authorized_followup_seed(self) -> None:
+    async def test_primary_retrieval_failure_rejects_authorized_followup_seed(self) -> None:
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()
         seed = _candidate(
@@ -1395,19 +1675,127 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "partial")
-        self.assertEqual(result["evidence_availability"], "degraded")
-        self.assertEqual(result["answer_source_count"], 1)
-        self.assertTrue(result["carryover_seed_used"])
+        self.assertEqual(result["evidence_status"], "error")
+        self.assertEqual(result["evidence_availability"], "unavailable")
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(result["answer_source_count"], 0)
+        self.assertFalse(result["carryover_seed_used"])
         self.assertEqual(result["carryover_anchor_succeeded"], False)
-        self.assertEqual(len(client.completions.calls), 1)
-        self.assertIn(
-            "住宿标准",
-            client.completions.calls[0]["messages"][1]["content"],
+        self.assertEqual(result["carryover_candidate_count"], 0)
+        self.assertEqual(client.completions.calls, [])
+        answer = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text_delta"
         )
+        self.assertIn("服务暂时不可用", answer)
+        self.assertNotIn("450元", answer)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
         search.assert_awaited_once()
+
+    async def test_candidate_without_raw_quality_signal_is_no_hit(self) -> None:
+        kb_id = uuid.uuid4()
+        candidate = _candidate(
+            kb_id=kb_id,
+            doc_id=uuid.uuid4(),
+            chunk_index=0,
+            content="缺少召回质量观测的候选正文。",
+        )
+        for field in (
+            "vector_score",
+            "vector_rank",
+            "keyword_score",
+            "keyword_rank",
+            "trigram_score",
+            "trigram_rank",
+            "active_channels",
+        ):
+            candidate.pop(field, None)
+
+        payloads, client, _search, fetch_full, scoped = await self._run(
+            question="查询当前制度",
+            kb_id=kb_id,
+            initial=[candidate],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "no_hit")
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(client.completions.calls, [])
+        fetch_full.assert_not_awaited()
+        scoped.assert_not_awaited()
+        completed = next(
+            call
+            for call in self._last_trace.call_args_list
+            if call.args and call.args[0] == "retrieval.completed"
+        )
+        self.assertEqual(
+            completed.kwargs["relevance_reason"],
+            "adapter_quality_signal_missing",
+        )
+
+    async def test_verified_scope_bounds_uncalibrated_candidate(self) -> None:
+        kb_id = uuid.uuid4()
+        selected_doc_id = uuid.uuid4()
+        candidate = _candidate(
+            kb_id=kb_id,
+            doc_id=selected_doc_id,
+            chunk_index=0,
+            content="用户已选择范围内的受限正文。",
+            filename="已选择范围.md",
+        )
+        for field in (
+            "vector_score",
+            "vector_rank",
+            "keyword_score",
+            "keyword_rank",
+            "trigram_score",
+            "trigram_rank",
+            "active_channels",
+        ):
+            candidate.pop(field, None)
+        scope_filter = {
+            "mode": "single",
+            "kb_ids": [str(kb_id)],
+            "doc_ids": [str(selected_doc_id)],
+            "choices": [{
+                "key": "c1",
+                "label": "已选择范围 —《已选择范围.md》",
+                "products": [],
+                "canonical_products": [],
+                "versions": [],
+                "projects": [],
+                "filenames": ["已选择范围.md"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(selected_doc_id)],
+                "anchor_doc_ids": [str(selected_doc_id)],
+                "companion_doc_ids": [],
+            }],
+        }
+
+        payloads, client, search, _fetch, scoped = await self._run(
+            question="配置是什么",
+            kb_id=kb_id,
+            initial=[],
+            scoped=[candidate],
+            full_document=[],
+            evidence_scope_filter=scope_filter,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["answer_source_count"], 1)
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(selected_doc_id)},
+        )
+        self.assertTrue(result["evidence_scope_anchor_hit"])
+        self.assertEqual(len(client.completions.calls), 1)
+        search.assert_not_awaited()
+        scoped.assert_awaited()
 
     async def test_explicit_version_mismatch_never_enters_context(self) -> None:
         kb_id = uuid.uuid4()
@@ -1612,6 +2000,61 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             {str(first_doc), str(second_doc)},
         )
         self.assertEqual(client.completions.calls, [])
+
+    async def test_uncalibrated_ambiguity_candidate_cannot_bypass_gate(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        calibrated_doc_id = uuid.uuid4()
+        uncalibrated_doc_id = uuid.uuid4()
+        calibrated = _candidate(
+            kb_id=kb_id,
+            doc_id=calibrated_doc_id,
+            chunk_index=0,
+            filename="CloudPivot 6 安全配置.md",
+            content="所属产品：CloudPivot；产品版本：6。可信配置方法A。",
+        )
+        uncalibrated = _candidate(
+            kb_id=kb_id,
+            doc_id=uncalibrated_doc_id,
+            chunk_index=0,
+            filename="CloudPivot 7 安全配置.md",
+            content="所属产品：CloudPivot；产品版本：7。无质量观测配置方法B。",
+        )
+        for field in (
+            "vector_score",
+            "vector_rank",
+            "keyword_score",
+            "keyword_rank",
+            "trigram_score",
+            "trigram_rank",
+            "active_channels",
+        ):
+            uncalibrated.pop(field, None)
+
+        payloads, client, *_ = await self._run(
+            question="如何设置安全配置",
+            kb_id=kb_id,
+            initial=[calibrated, uncalibrated],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertNotEqual(result["evidence_status"], "needs_clarification")
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(calibrated_doc_id)},
+        )
+        self.assertFalse(any(
+            item["type"] == "evidence_clarification" for item in payloads
+        ))
+        self.assertEqual(len(client.completions.calls), 1)
+        prompt = "\n".join(
+            message["content"]
+            for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("可信配置方法A", prompt)
+        self.assertNotIn("无质量观测配置方法B", prompt)
 
 
 if __name__ == "__main__":

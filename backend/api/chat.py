@@ -67,6 +67,7 @@ _SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = {
 _EVIDENCE_PENDING_SCHEMA = "rag_pending_clarification.v2"
 _EVIDENCE_PENDING_KIND = "evidence_scope"
 _EVIDENCE_EVENT_SCHEMA = "rag_evidence_clarification.v1"
+_EVIDENCE_ACK_SCHEMA = "rag_evidence_clarification_ack.v1"
 _EVIDENCE_DIMENSIONS = {
     "version",
     "product",
@@ -83,6 +84,14 @@ _CHOICE_TEXT_FIELDS = (
     "filenames",
 )
 _CHOICE_UUID_FIELDS = ("kb_ids", "doc_ids")
+_PUBLIC_CHOICE_FIELDS = (
+    "key",
+    "label",
+    "products",
+    "versions",
+    "projects",
+    "filenames",
+)
 _ALL_EVIDENCE_SCOPES_RE = re.compile(
     r"^(?:全部|全都|都要|都查|都看|都对比|全部对比|全部都要|分别对比|"
     r"所有版本|全部版本|两个都要|两个都看|两个都对比)(?:一下|吧|。|！|!)?$",
@@ -736,6 +745,25 @@ def _evidence_event_pending_state(
     return _validated_evidence_pending_state(state)
 
 
+def _evidence_clarification_ack(
+    *,
+    conversation_id: uuid.UUID,
+    pending_state: dict,
+    route_state_revision: int,
+) -> dict:
+    """Acknowledge only a clarification state that is already durable."""
+
+    return {
+        "type": "evidence_clarification_ack",
+        "schema_version": _EVIDENCE_ACK_SCHEMA,
+        "persisted": True,
+        "pending_state_id": pending_state["state_id"],
+        "clarification_message_id": pending_state["clarification_message_id"],
+        "route_state_revision": route_state_revision,
+        "conversation_id": str(conversation_id),
+    }
+
+
 async def _route_clarification_response(
     *,
     db: AsyncSession,
@@ -1031,6 +1059,19 @@ async def _evidence_pending_direct_response(
                     "reason": "selection_not_recognized",
                     "choices": pending_state["choices"],
                 }
+            )
+            # This branch commits the repeated assistant message before the
+            # stream starts, and ``pending_state`` was validated as active by
+            # the caller.  The client may therefore enable the choices only
+            # after receiving this durable-state acknowledgement.
+            events.append(
+                _evidence_clarification_ack(
+                    conversation_id=conv.id,
+                    pending_state=pending_state,
+                    route_state_revision=int(
+                        getattr(conv, "route_state_revision", 0) or 0
+                    ),
+                )
             )
         events.extend(
             [
@@ -1389,11 +1430,98 @@ def _source_snapshot_is_answer_evidence(source: object) -> bool:
     return status not in _NON_ANSWER_SOURCE_STATUSES
 
 
+async def _historical_evidence_clarification(
+    pending_route_state: object,
+    *,
+    route_state_revision: object,
+    assistant_message_ids: set[str],
+    accessible_set: set[uuid.UUID] | None,
+    db: AsyncSession,
+) -> dict | None:
+    """Build a public picker only from the currently valid server state.
+
+    Pending-state UUID allow-lists are routing internals, not client
+    authorization.  Historical restoration therefore rechecks the user's
+    current KB scope and every referenced document before exposing a reduced
+    choice projection.
+    """
+
+    state = _active_pending_route_state(pending_route_state)
+    if (
+        state is None
+        or state.get("schema_version") != _EVIDENCE_PENDING_SCHEMA
+        or state.get("clarification_message_id") not in assistant_message_ids
+    ):
+        return None
+    try:
+        revision = int(route_state_revision or 0)
+        selected_kb_ids = {
+            uuid.UUID(value) for value in state["selected_kb_ids_snapshot"]
+        }
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if revision < 0:
+        return None
+    if accessible_set is not None and not selected_kb_ids.issubset(accessible_set):
+        return None
+
+    choices = state["choices"]
+    referenced_doc_ids = {
+        uuid.UUID(value)
+        for choice in choices
+        for value in choice["doc_ids"]
+    }
+    if referenced_doc_ids:
+        statement = select(Document.id, Document.kb_id).where(
+            Document.id.in_(referenced_doc_ids),
+            Document.kb_id.in_(selected_kb_ids),
+            Document.is_active.is_(True),
+            Document.status == "ready",
+        )
+        if accessible_set is not None:
+            statement = statement.where(Document.kb_id.in_(accessible_set))
+        current_doc_kbs = {
+            doc_id: kb_id
+            for doc_id, kb_id in (await db.execute(statement)).all()
+        }
+        if set(current_doc_kbs) != referenced_doc_ids:
+            return None
+        for choice in choices:
+            choice_kb_ids = {uuid.UUID(value) for value in choice["kb_ids"]}
+            if any(
+                current_doc_kbs[uuid.UUID(value)] not in choice_kb_ids
+                for value in choice["doc_ids"]
+            ):
+                return None
+
+    public_choices = []
+    for choice in choices:
+        public_choice = {}
+        for field in _PUBLIC_CHOICE_FIELDS:
+            value = choice[field]
+            public_choice[field] = list(value) if isinstance(value, list) else value
+        public_choices.append(public_choice)
+    return {
+        "schema_version": _EVIDENCE_EVENT_SCHEMA,
+        "needs_clarification": True,
+        "dimension": state["dimension"],
+        "question": state["clarification_message"],
+        "choices": public_choices,
+        "acknowledged": True,
+        "persisted": True,
+        "pending_state_id": state["state_id"],
+        "clarification_message_id": state["clarification_message_id"],
+        "route_state_revision": revision,
+    }
+
+
 async def _messages_with_current_source_scope(
     rows: list[Message],
     *,
     user: User,
     db: AsyncSession,
+    pending_route_state: object = None,
+    route_state_revision: object = 0,
 ) -> list[MessageOut]:
     """按当前角色范围和文档状态过滤历史 ``sources`` 快照。
 
@@ -1404,6 +1532,15 @@ async def _messages_with_current_source_scope(
 
     accessible = await get_accessible_kb_ids(user, db)
     accessible_set = set(accessible) if accessible is not None else None
+    historical_clarification = await _historical_evidence_clarification(
+        pending_route_state,
+        route_state_revision=route_state_revision,
+        assistant_message_ids={
+            str(row.id) for row in rows if row.role == "assistant"
+        },
+        accessible_set=accessible_set,
+        db=db,
+    )
     referenced_sources: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = set()
     for row in rows:
         for source in (row.sources if isinstance(row.sources, list) else ()):
@@ -1472,6 +1609,13 @@ async def _messages_with_current_source_scope(
             role=row.role,
             content=row.content,
             sources=visible_sources if isinstance(row.sources, list) else None,
+            clarification=(
+                historical_clarification
+                if historical_clarification is not None
+                and historical_clarification["clarification_message_id"]
+                == str(row.id)
+                else None
+            ),
             tokens=row.tokens,
             created_at=row.created_at,
         )
@@ -2759,6 +2903,22 @@ async def send_message(
             yield f"data: {json.dumps({'type': 'error', 'message': '回答已生成，但保存失败，请重试'})}\n\n"
             yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conv.id)})}\n\n"
             return
+        if created_pending_state is not None:
+            # ``evidence_clarification`` is streamed as soon as the pipeline
+            # closes generation, but choices must remain disabled until the
+            # assistant message and pending state have committed together.
+            yield (
+                "data: "
+                + json.dumps(
+                    _evidence_clarification_ack(
+                        conversation_id=conv.id,
+                        pending_state=created_pending_state,
+                        route_state_revision=persisted_route_state_revision,
+                    ),
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
         if pending_done_chunk is not None:
             yield pending_done_chunk
         else:
@@ -2811,7 +2971,13 @@ async def get_messages(
         .where(Message.conversation_id == conv_id)
         .order_by(Message.created_at)
     )).scalars().all()
-    return await _messages_with_current_source_scope(rows, user=user, db=db)
+    return await _messages_with_current_source_scope(
+        rows,
+        user=user,
+        db=db,
+        pending_route_state=getattr(conv, "pending_route_state", None),
+        route_state_revision=getattr(conv, "route_state_revision", 0),
+    )
 
 
 @router.patch("/{conv_id}", response_model=ConversationOut)

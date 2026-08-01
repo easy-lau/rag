@@ -66,6 +66,7 @@ class MessageOut(BaseModel):
     role: str
     content: str
     sources: list | None
+    clarification: dict | None = None
     tokens: int | None = None
     created_at: datetime
 

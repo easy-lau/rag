@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -59,6 +59,59 @@ class _SaveDB:
 
     async def commit(self):
         self.commits += 1
+
+
+def _history_pending_state(
+    *,
+    clarification_message_id: uuid.UUID,
+    kb_id: uuid.UUID,
+    first_doc_id: uuid.UUID,
+    second_doc_id: uuid.UUID,
+) -> dict:
+    now = datetime.now(UTC)
+    return {
+        "schema_version": "rag_pending_clarification.v2",
+        "kind": "evidence_scope",
+        "state_id": str(uuid.uuid4()),
+        "base_user_message_id": str(uuid.uuid4()),
+        "clarification_message_id": str(clarification_message_id),
+        "original_query": "普通员工的出差标准是什么",
+        "dimension": "version",
+        "selection_mode": "choice",
+        "choices": [
+            {
+                "key": "c1",
+                "label": "2025 版差旅标准",
+                "products": ["差旅制度"],
+                "canonical_products": ["差旅制度"],
+                "versions": ["2025"],
+                "projects": [],
+                "filenames": ["差旅标准-2025.md"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(first_doc_id)],
+                "anchor_doc_ids": [str(first_doc_id)],
+                "companion_doc_ids": [],
+            },
+            {
+                "key": "c2",
+                "label": "2026 版差旅标准",
+                "products": ["差旅制度"],
+                "canonical_products": ["差旅制度"],
+                "versions": ["2026"],
+                "projects": [],
+                "filenames": ["差旅标准-2026.md"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(second_doc_id)],
+                "anchor_doc_ids": [str(second_doc_id)],
+                "companion_doc_ids": [],
+            },
+        ],
+        "clarification_message": "检索到两个版本，请选择 2025 版或 2026 版。",
+        "selected_kb_ids_snapshot": [str(kb_id)],
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=1)).isoformat(),
+        "dispatch_authorized": False,
+    }
 
 
 class ChatStreamParsingTests(unittest.TestCase):
@@ -237,6 +290,150 @@ class ChatHistoricalSourceScopeTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(messages[0].sources, [])
                 db.execute.assert_not_awaited()
+
+
+class ChatHistoricalClarificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_pending_clarification_is_restored_with_public_choices(self) -> None:
+        conversation_id = uuid.uuid4()
+        message_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        first_doc_id = uuid.uuid4()
+        second_doc_id = uuid.uuid4()
+        row = Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="检索到两个版本，请选择 2025 版或 2026 版。",
+            sources=[],
+            created_at=datetime.now(UTC),
+        )
+        pending = _history_pending_state(
+            clarification_message_id=message_id,
+            kb_id=kb_id,
+            first_doc_id=first_doc_id,
+            second_doc_id=second_doc_id,
+        )
+        db = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    all=lambda: [
+                        (first_doc_id, kb_id),
+                        (second_doc_id, kb_id),
+                    ]
+                )
+            )
+        )
+
+        with patch(
+            "api.chat.get_accessible_kb_ids",
+            new=AsyncMock(return_value=[kb_id]),
+        ):
+            messages = await _messages_with_current_source_scope(
+                [row],
+                user=SimpleNamespace(id=uuid.uuid4()),
+                db=db,
+                pending_route_state=pending,
+                route_state_revision=7,
+            )
+
+        clarification = messages[0].clarification
+        self.assertIsNotNone(clarification)
+        self.assertTrue(clarification["acknowledged"])
+        self.assertTrue(clarification["persisted"])
+        self.assertEqual(clarification["pending_state_id"], pending["state_id"])
+        self.assertEqual(clarification["clarification_message_id"], str(message_id))
+        self.assertEqual(clarification["route_state_revision"], 7)
+        self.assertEqual(
+            set(clarification["choices"][0]),
+            {
+                "key",
+                "label",
+                "products",
+                "versions",
+                "projects",
+                "filenames",
+            },
+        )
+        public_payload = json.dumps(clarification, ensure_ascii=False)
+        self.assertNotIn("doc_ids", public_payload)
+        self.assertNotIn("kb_ids", public_payload)
+        self.assertNotIn("anchor_doc_ids", public_payload)
+        self.assertNotIn("canonical_products", public_payload)
+
+    async def test_history_does_not_restore_invalid_or_unauthorized_clarification(self) -> None:
+        conversation_id = uuid.uuid4()
+        message_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        first_doc_id = uuid.uuid4()
+        second_doc_id = uuid.uuid4()
+        base_pending = _history_pending_state(
+            clarification_message_id=message_id,
+            kb_id=kb_id,
+            first_doc_id=first_doc_id,
+            second_doc_id=second_doc_id,
+        )
+        expired = dict(base_pending)
+        expired["created_at"] = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+        expired["expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        mismatched = dict(base_pending)
+        mismatched["clarification_message_id"] = str(uuid.uuid4())
+        cases = (
+            (
+                "expired",
+                expired,
+                [kb_id],
+                [(first_doc_id, kb_id), (second_doc_id, kb_id)],
+            ),
+            (
+                "message_mismatch",
+                mismatched,
+                [kb_id],
+                [(first_doc_id, kb_id), (second_doc_id, kb_id)],
+            ),
+            (
+                "kb_scope_revoked",
+                base_pending,
+                [],
+                [(first_doc_id, kb_id), (second_doc_id, kb_id)],
+            ),
+            (
+                "document_inactive_or_unready",
+                base_pending,
+                [kb_id],
+                [(first_doc_id, kb_id)],
+            ),
+        )
+
+        for case_name, pending, accessible, document_rows in cases:
+            with self.subTest(case=case_name):
+                row = Message(
+                    id=message_id,
+                    conversation_id=conversation_id,
+                    role="assistant",
+                    content="请选择版本",
+                    sources=[],
+                    created_at=datetime.now(UTC),
+                )
+                db = SimpleNamespace(
+                    execute=AsyncMock(
+                        return_value=SimpleNamespace(
+                            all=lambda rows=document_rows: rows
+                        )
+                    )
+                )
+                with patch(
+                    "api.chat.get_accessible_kb_ids",
+                    new=AsyncMock(return_value=accessible),
+                ):
+                    messages = await _messages_with_current_source_scope(
+                        [row],
+                        user=SimpleNamespace(id=uuid.uuid4()),
+                        db=db,
+                        pending_route_state=pending,
+                        route_state_revision=3,
+                    )
+
+                self.assertIsNone(messages[0].clarification)
 
 
 class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -874,8 +1071,17 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
         routing_result = SimpleNamespace(decision=decision, route_log_id=None)
 
         async def cancelled_stream(**_kwargs):
-            if False:  # pragma: no cover - makes this an async generator
-                yield ""
+            yield "data: " + json.dumps(
+                {
+                    "type": "evidence_clarification",
+                    "schema_version": "rag_evidence_clarification.v1",
+                    "needs_clarification": True,
+                    "dimension": "document",
+                    "question": "请选择需要查询的资料。",
+                    "choices": [],
+                },
+                ensure_ascii=False,
+            ) + "\n\n"
             raise asyncio.CancelledError
 
         with (
@@ -900,9 +1106,18 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                 db=db,
                 user=user,
             )
+            chunks = []
             with self.assertRaises(asyncio.CancelledError):
-                [chunk async for chunk in response.body_iterator]
+                async for chunk in response.body_iterator:
+                    chunks.append(chunk)
 
+        payloads = [
+            _parse_sse_payload(chunk.decode() if isinstance(chunk, bytes) else chunk)
+            for chunk in chunks
+        ]
+        event_types = [item["type"] for item in payloads if item]
+        self.assertIn("evidence_clarification", event_types)
+        self.assertNotIn("evidence_clarification_ack", event_types)
         self.assertEqual(trace.call_args_list[-1].args[0], "chat.cancelled")
         self.assertEqual(trace.call_args_list[-1].kwargs["stage"], "streaming")
 

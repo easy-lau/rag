@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -279,19 +280,27 @@ def _mark_initial_retrieval_candidates(
 
 
 def _has_retrieval_quality_signal(candidate: Mapping[str, Any]) -> bool:
-    """Whether an adapter supplied fields required by the relevance gate."""
+    """Whether an adapter supplied a usable raw retrieval observation.
 
-    return any(
-        key in candidate
-        for key in (
-            "vector_score",
-            "keyword_score",
-            "keyword_rank",
-            "trigram_score",
-            "trigram_rank",
-            "active_channels",
-        )
-    )
+    Rank fields and ``active_channels`` describe ordering only.  Likewise,
+    merely including score keys with ``None`` values does not prove that a
+    retrieval channel actually assessed the candidate.  The relevance gate
+    therefore accepts only a finite vector/keyword/trigram score as a quality
+    signal; the channel-specific thresholds are applied later by
+    ``assess_document_relevance``.
+    """
+
+    for field in ("vector_score", "keyword_score", "trigram_score"):
+        value = candidate.get(field)
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            return True
+    return False
 
 
 def _admit_initial_candidates(
@@ -299,51 +308,73 @@ def _admit_initial_candidates(
     *,
     forced_doc_ids: set[str] | None = None,
     query: str | None = None,
+    allow_uncalibrated_forced_scope: bool = False,
 ) -> tuple[list[dict], set[str], str, tuple[str, ...]]:
     """Apply a deterministic document gate before any evidence expansion.
 
-    Production retrievers always expose raw channel fields.  Test/custom
-    adapters that omit them are kept compatible by admitting their bounded
-    pool; they are still marked as uncalibrated in the reason and cannot make
-    a real vector no-hit pass the gate.
+    Production retrievers expose raw channel observations.  A custom/rolling
+    adapter that omits them cannot bypass the relevance gate merely by
+    returning a bounded list.  The only exception is a document allow-list
+    rebuilt from a server-validated evidence-scope choice: those documents are
+    already explicitly selected by the user and remain bounded by the current
+    authorization and scope checks.
     """
 
     valid = [item for item in candidates if isinstance(item, Mapping)]
     if not valid:
         return [], set(), "no_candidates", ()
-    has_signal = any(_has_retrieval_quality_signal(item) for item in valid)
-    if not has_signal:
-        doc_ids = {
-            str(item.get("doc_id") or "").strip()
-            for item in valid
-            if str(item.get("doc_id") or "").strip()
-        }
-        if forced_doc_ids is not None:
-            doc_ids &= forced_doc_ids
-        selected = _filter_candidates_to_documents(valid, doc_ids)
-        return selected, doc_ids, "adapter_quality_signal_missing", ()
-
-    decision = assess_document_relevance(valid, query=query)
-    admitted_doc_ids = set(decision.admitted_doc_ids)
-    if forced_doc_ids is not None:
-        present_doc_ids = {
-            str(item.get("doc_id") or "").strip()
-            for item in valid
-            if str(item.get("doc_id") or "").strip()
-        }
-        # A source-resolved explicit scope is both a rescue set and an
-        # allow-list: named comparison documents survive a score gap, while an
-        # unmentioned third version can never remain merely because it also
-        # had a lexical hit.
-        admitted_doc_ids = (
-            admitted_doc_ids | (forced_doc_ids & present_doc_ids)
-        ) & forced_doc_ids
-    selected = _filter_candidates_to_documents(valid, admitted_doc_ids)
     document_order = tuple(dict.fromkeys(
         str(item.get("doc_id") or "").strip()
         for item in valid
         if str(item.get("doc_id") or "").strip()
     ))
+    calibrated = [
+        item for item in valid if _has_retrieval_quality_signal(item)
+    ]
+    calibrated_doc_ids = {
+        str(item.get("doc_id") or "").strip()
+        for item in calibrated
+        if str(item.get("doc_id") or "").strip()
+    }
+    if not calibrated:
+        admitted_doc_ids = (
+            set(document_order) & forced_doc_ids
+            if allow_uncalibrated_forced_scope and forced_doc_ids is not None
+            else set()
+        )
+        selected = _filter_candidates_to_documents(valid, admitted_doc_ids)
+        rejected = tuple(
+            doc_id for doc_id in document_order if doc_id not in admitted_doc_ids
+        )
+        reason = (
+            "adapter_quality_signal_missing_forced_scope"
+            if admitted_doc_ids
+            else "adapter_quality_signal_missing"
+        )
+        return selected, admitted_doc_ids, reason, rejected
+
+    # Evaluate only candidates carrying an actual retrieval observation.  A
+    # single calibrated row elsewhere in the pool must not make unrelated
+    # scoreless rows look assessed or let an early model-derived ambiguity
+    # choice promote them into evidence.
+    decision = assess_document_relevance(calibrated, query=query)
+    admitted_doc_ids = set(decision.admitted_doc_ids)
+    if forced_doc_ids is not None:
+        present_doc_ids = set(document_order)
+        # A source-resolved explicit scope is both a rescue set and an
+        # allow-list: named comparison documents survive a score gap, while an
+        # unmentioned third version can never remain merely because it also
+        # had a lexical hit.  Only a server-validated scope may rescue a
+        # scoreless document; early ambiguity detection may rescue weak scored
+        # candidates, but cannot manufacture retrieval quality.
+        forced_rescue_doc_ids = forced_doc_ids & present_doc_ids
+        if not allow_uncalibrated_forced_scope:
+            forced_rescue_doc_ids &= calibrated_doc_ids
+        admitted_doc_ids = (
+            admitted_doc_ids | forced_rescue_doc_ids
+        ) & forced_doc_ids
+    selected_pool = valid if allow_uncalibrated_forced_scope else calibrated
+    selected = _filter_candidates_to_documents(selected_pool, admitted_doc_ids)
     rejected = tuple(
         doc_id for doc_id in document_order if doc_id not in admitted_doc_ids
     )
@@ -456,27 +487,66 @@ def _plan_with_contract_requirements(
         and len(required_answer_indexes) == 1
         and plan.original_query
     )
-    requirements = tuple(
-        AnswerRequirementV2(
-            id=item.id,
-            # A deterministic follow-up contract is compiled from the raw
-            # utterance (for example "那住宿呢"), while ``plan`` is built from
-            # the already resolved standalone query.  With one explicit answer
-            # target, use that resolved wording for evidence coverage; keep
-            # multi-part/model requirements unchanged because their individual
-            # decomposition remains authoritative.
-            description=(
-                plan.original_query[:500]
-                if contextualized_single_requirement
-                and index == required_answer_indexes[0]
-                else item.description
-            ),
-            role=item.role,
-            importance=item.importance,
-            source=item.source,
-        )
-        for index, item in enumerate(contract_requirements)
+    local_multi_part_is_authoritative = bool(
+        task_contract.relation == "new"
+        and plan.answer_shape == "multi_part"
+        and len(plan.requirements) > 1
+        and len(plan.retrieval_queries) == len(plan.requirements)
+        and len(required_answer_indexes) == 1
+        and all(item.is_required_answer for item in plan.requirements)
+        and all(item.source == "explicit" for item in plan.requirements)
     )
+    if local_multi_part_is_authoritative:
+        # The route model may summarize an explicitly enumerated question into
+        # one broad answer requirement.  That semantic summary must not erase a
+        # deterministic split derived from punctuation/numbering in the user's
+        # own text.  Keep every explicit local sub-question and append only
+        # genuinely additional helpful contract requirements (for example a
+        # bridge), assigning fresh stable ids for this execution plan.
+        merged = list(plan.requirements)
+        seen_descriptions = {
+            re.sub(r"\s+", " ", item.description).strip().casefold()
+            for item in merged
+        }
+        for item in contract_requirements:
+            if item.importance == "required":
+                continue
+            normalized_description = re.sub(
+                r"\s+", " ", item.description
+            ).strip().casefold()
+            if not normalized_description or normalized_description in seen_descriptions:
+                continue
+            merged.append(AnswerRequirementV2(
+                id=f"r{len(merged) + 1}",
+                description=item.description,
+                role=item.role,
+                importance=item.importance,
+                source=item.source,
+            ))
+            seen_descriptions.add(normalized_description)
+        requirements = tuple(merged)
+    else:
+        requirements = tuple(
+            AnswerRequirementV2(
+                id=item.id,
+                # A deterministic follow-up contract is compiled from the raw
+                # utterance (for example "那住宿呢"), while ``plan`` is built from
+                # the already resolved standalone query.  With one explicit answer
+                # target, use that resolved wording for evidence coverage; keep
+                # multi-part/model requirements unchanged because their individual
+                # decomposition remains authoritative.
+                description=(
+                    plan.original_query[:500]
+                    if contextualized_single_requirement
+                    and index == required_answer_indexes[0]
+                    else item.description
+                ),
+                role=item.role,
+                importance=item.importance,
+                source=item.source,
+            )
+            for index, item in enumerate(contract_requirements)
+        )
     has_bridge = any(item.role == "bridge" for item in requirements)
     required_answers = sum(item.is_required_answer for item in requirements)
     answer_shape = plan.answer_shape
@@ -497,9 +567,13 @@ def _plan_with_contract_requirements(
         plan,
         answer_shape=answer_shape,
         requirements=requirements,
-        source=source,
+        source=("local" if local_multi_part_is_authoritative else source),
         confidence=confidence,
-        reason=reason,
+        reason=(
+            f"{reason}; local_multi_part_requirements_preserved".strip("; ")
+            if local_multi_part_is_authoritative
+            else reason
+        ),
     )
 
 
@@ -680,64 +754,6 @@ def _full_document_ids(candidates: Sequence[Mapping[str, Any]]) -> set[str]:
     return complete
 
 
-_COVERAGE_TEXT_RE = re.compile(r"[A-Za-z0-9_.+/-]{2,}|[\u3400-\u9fff]{2,}")
-_GENERIC_COVERAGE_TERMS = {
-    "什么",
-    "多少",
-    "查询",
-    "确认",
-    "标准",
-    "信息",
-    "内容",
-    "对应",
-    "需要",
-    "如何",
-    "怎么",
-}
-_COVERAGE_STOP_CHARS = frozenset("的是和与及为请查询需")
-
-
-def _coverage_terms(value: str) -> set[str]:
-    terms: set[str] = set()
-    for match in _COVERAGE_TEXT_RE.finditer(str(value or "").casefold()):
-        token = match.group(0)
-        terms.add(token)
-        if re.fullmatch(r"[\u3400-\u9fff]+", token) and len(token) > 2:
-            for index in range(len(token) - 1):
-                pair = token[index:index + 2]
-                if not (_COVERAGE_STOP_CHARS & set(pair)):
-                    terms.add(pair)
-    return terms - _GENERIC_COVERAGE_TERMS
-
-
-def _missing_requirement_ids(
-    plan: QueryPlanV2,
-    candidates: Sequence[Mapping[str, Any]],
-) -> tuple[str, ...]:
-    required = [
-        item
-        for item in plan.requirements
-        if item.importance == "required"
-    ]
-    if not required:
-        return ()
-    corpus = "\n".join(str(item.get("content") or "") for item in candidates)
-    corpus_terms = _coverage_terms(corpus)
-    if not corpus_terms:
-        return tuple(item.id for item in required)
-    missing: list[str] = []
-    for item in required:
-        requirement_terms = _coverage_terms(item.description)
-        overlap = requirement_terms & corpus_terms
-        supported = bool(
-            any(len(term) >= 3 for term in overlap)
-            or len(overlap) >= 2
-        )
-        if requirement_terms and not supported:
-            missing.append(item.id)
-    return tuple(missing)
-
-
 def _estimated_completeness(
     *,
     plan: QueryPlanV2,
@@ -756,29 +772,20 @@ def _estimated_completeness(
         if str(candidate.get("doc_id") or "").strip()
     }
     full_doc_ids = _full_document_ids(full_document_candidates)
-    evidence_candidates = (
-        full_document_candidates or initial_candidates
-    )
-    missing_ids = _missing_requirement_ids(plan, evidence_candidates)
     # Complete is intentionally narrow: only one retrieved document and a
-    # database-verified complete small-document snapshot can establish it.
+    # database-verified complete small-document snapshot can establish the
+    # structural ceiling.  Requirement coverage is deliberately not estimated
+    # here from a concatenated corpus; ``assemble_evidence_bundle`` maps each
+    # requirement to each admitted chunk and may downgrade this ceiling.
     complete_snapshot = (
         len(initial_doc_ids) == 1
         and initial_doc_ids.issubset(full_doc_ids)
     )
-    required_count = sum(
-        item.importance == "required" for item in plan.requirements
-    )
-    # One strongly admitted query requirement backed by a complete document
-    # snapshot does not need a brittle lexical entailment guess.  Multiple
-    # explicit requirements still require independent local support signals.
-    if complete_snapshot and required_count <= 1:
-        missing_ids = ()
-    if complete_snapshot and not missing_ids:
+    if complete_snapshot:
         return "complete", ()
     if not plan.allows_narrow_fact_path:
-        return "partial", missing_ids
-    return "unknown", missing_ids
+        return "partial", ()
+    return "unknown", ()
 
 
 def _unavailable_bundle(reason: str) -> EvidenceBundle:
@@ -801,7 +808,7 @@ def _legacy_evidence_status(
 ) -> str:
     if retrieval_failed or bundle.state.availability == "unavailable":
         return "error"
-    if not bundle.context_item_ids:
+    if not bundle.answer_source_ids:
         if (
             constraints.has_scope_constraint
             and had_retrieval_candidates
@@ -818,11 +825,52 @@ def _legacy_evidence_status(
 
 
 def _coverage_status(bundle: EvidenceBundle) -> str:
-    if bundle.state.completeness == "complete" and bundle.context_item_ids:
+    if not bundle.answer_source_ids:
+        return "insufficient"
+    if (
+        bundle.state.completeness == "complete"
+        and not bundle.missing_requirement_ids
+    ):
         return "complete"
-    if bundle.context_item_ids:
-        return "partial"
-    return "insufficient"
+    return "partial"
+
+
+def _coverage_requirement_ids(plan: QueryPlanV2) -> tuple[str, ...]:
+    """Return requirements that must survive into the final prompt.
+
+    Explicit answer targets are always coverage-critical.  A multi-hop answer
+    additionally cannot be complete without its bridge, even though the route
+    contract records inferred bridge facts as ``helpful`` rather than as an
+    explicit user answer target.
+    """
+
+    return tuple(
+        requirement.id
+        for requirement in plan.requirements
+        if requirement.importance == "required"
+        or (plan.answer_shape == "multi_hop" and requirement.role == "bridge")
+    )
+
+
+def _missing_requirements_for_context(
+    *,
+    plan: QueryPlanV2,
+    bundle: EvidenceBundle,
+    safe_context_ids: Sequence[str],
+) -> tuple[str, ...]:
+    safe_ids = set(safe_context_ids)
+    covered_ids = {
+        requirement_id
+        for item in bundle.items
+        if item.chunk_id in safe_ids
+        and item.role in {"direct", "bridge", "complement"}
+        for requirement_id in item.supports_requirement_ids
+    }
+    return tuple(
+        requirement_id
+        for requirement_id in _coverage_requirement_ids(plan)
+        if requirement_id not in covered_ids
+    )
 
 
 def _source_from_item(item: EvidenceItem, *, direct: bool) -> dict[str, Any]:
@@ -844,6 +892,13 @@ def _source_from_item(item: EvidenceItem, *, direct: bool) -> dict[str, Any]:
         "score": score,
         "retrieval_score": retrieval_score,
         "evidence_role": "direct" if direct else "related",
+        # ``evidence_role`` remains the UI-facing direct/related classification.
+        # The V2 contribution role and explicit coverage mapping are separate so
+        # a bridge/complement can be shown as used evidence without being
+        # misrepresented as standalone entailment.
+        "evidence_contribution_role": item.role,
+        "contribution_role": item.role,
+        "supports_requirement_ids": list(item.supports_requirement_ids),
         "constraint_status": item.constraint_status,
         "answer_support": metadata.get("answer_support"),
         "rerank_status": "retrieved_v2",
@@ -962,7 +1017,10 @@ def _result_payload(
         "carryover_seed_used": carryover_seed_used,
         "carryover_anchor_succeeded": carryover_anchor_succeeded,
         "coverage_status": coverage,
+        "covered_requirement_ids": list(bundle.covered_requirement_ids),
+        "covered_requirement_count": len(bundle.covered_requirement_ids),
         "expansion_attempted": expansion_attempted,
+        "missing_requirement_ids": list(bundle.missing_requirement_ids),
         "missing_requirement_count": len(bundle.missing_requirement_ids),
         "joint_support_score": None,
         "clarification": clarification,
@@ -1453,7 +1511,7 @@ async def run_rag_v2_stream(
                             error=exc,
                         )
                         logger.warning(
-                            "[RAG v2] 上一轮来源限定补检失败，保留已授权来源 error=%s",
+                            "[RAG v2] 上一轮来源限定补检失败，拒绝复用上一轮片段 error=%s",
                             type(exc).__name__,
                         )
                 else:
@@ -1529,6 +1587,10 @@ async def run_rag_v2_stream(
             raw_initial_candidates,
             forced_doc_ids=forced_doc_ids,
             query=query,
+            allow_uncalibrated_forced_scope=bool(
+                normalized_scope_filter is not None
+                and normalized_scope_filter.valid
+            ),
         )
         # Expansion may add a complete small document or many structural/table
         # siblings.  Preserve which chunks were admitted by the current query so
@@ -1537,11 +1599,10 @@ async def run_rag_v2_stream(
         initial_candidates = _mark_initial_retrieval_candidates(
             initial_candidates
         )
-        # Fill each carryover document that did not survive the current-query
-        # relevance gate.  This includes a fresh hit whose calibrated score is
-        # below the document threshold: the old score is still ignored, but
-        # the currently authorized chunk can anchor a degraded same-document
-        # expansion instead of disappearing silently.
+        # A previous-turn source is never a substitute for current-query
+        # evidence.  Record why its document did not survive, but do not merge
+        # the old chunk back into the current candidate pool: authorization
+        # proves readability, not support for this turn.
         if carryover_candidates:
             eligible_carryover_doc_ids = set(carryover_doc_ids)
             if early_ambiguity.allowed_doc_ids:
@@ -1563,35 +1624,9 @@ async def run_rag_v2_stream(
                 carryover_anchor_error = (
                     "carryover_anchor_below_relevance_gate"
                 )
+                carryover_anchor_succeeded = False
             elif missing_carryover_doc_ids and carryover_anchor_error is None:
                 carryover_anchor_error = "carryover_anchor_no_match"
-            fallback_candidates = _filter_candidates_to_documents(
-                carryover_candidates,
-                missing_carryover_doc_ids,
-            )
-            if fallback_candidates:
-                initial_candidates = _merge_candidate_pools(
-                    initial_candidates,
-                    fallback_candidates,
-                )
-                rescued_doc_ids = {
-                    str(item.get("doc_id") or "").strip()
-                    for item in fallback_candidates
-                }
-                admitted_doc_ids.update(rescued_doc_ids)
-                rejected_doc_ids = tuple(
-                    doc_id
-                    for doc_id in rejected_doc_ids
-                    if doc_id not in rescued_doc_ids
-                )
-                carryover_seed_used = True
-                carryover_anchor_succeeded = False
-                retrieval_degraded = True
-                relevance_reason = (
-                    "carryover_seed_rescue"
-                    if relevance_reason == "no_candidates"
-                    else f"{relevance_reason};carryover_seed_rescue"
-                )
         retrieval_degraded = bool(
             retrieval_degraded
             or retrieval_diagnostics.get("vector_channel_failed")
@@ -1608,20 +1643,27 @@ async def run_rag_v2_stream(
                 if scope_doc_ids is not None
                 else (1 if plan.allows_narrow_fact_path else MAX_EXPANSION_DOCUMENTS)
             )
-            expansion_document_ids: list[uuid.UUID] | None = None
-            if carryover_doc_ids:
-                # Put the previous-turn anchors first so a narrow fact path
-                # cannot spend its single-document expansion budget on an
-                # unrelated global hit.  All ids were intersected with the
-                # current KB/scope boundary above.
-                expansion_document_ids = list(dict.fromkeys(
-                    [
-                        *_uuid_document_ids(carryover_doc_ids),
-                        *_uuid_document_ids(forced_doc_ids),
-                    ]
-                ))
-            elif forced_doc_ids:
-                expansion_document_ids = _uuid_document_ids(forced_doc_ids)
+            # Expansion is downstream of the current-query relevance gate.
+            # Previous-turn document ids and early ambiguity choices are not
+            # evidence and must never be able to load a document that did not
+            # survive that gate.  Fresh carryover hits were merged ahead of the
+            # global pool above, so deriving ids from ``initial_candidates``
+            # keeps their priority without reintroducing stale documents.
+            expansion_document_ids = _document_ids(
+                initial_candidates,
+                limit=expansion_max_documents,
+            )
+            if (
+                normalized_scope_filter is not None
+                and normalized_scope_filter.valid
+            ):
+                # A server-validated user selection is the only bounded
+                # exception: all selected documents may be expanded even when
+                # one returned no calibrated row in the first scoped pass.
+                expansion_document_ids = list(dict.fromkeys([
+                    *expansion_document_ids,
+                    *normalized_scope_filter.doc_ids,
+                ]))[:expansion_max_documents]
             expansion_attempted = True
             try:
                 stage_timeout = _remaining_stage_timeout(
@@ -1640,7 +1682,7 @@ async def run_rag_v2_stream(
                         # A narrow fact skips only the expensive second embedding;
                         # structural neighbors remain enabled inside the helper.
                         allow_scoped_expansion=not plan.allows_narrow_fact_path,
-                        document_ids=expansion_document_ids or None,
+                        document_ids=expansion_document_ids,
                     ),
                     timeout=stage_timeout,
                 )
@@ -1729,75 +1771,29 @@ async def run_rag_v2_stream(
         )
     except Exception as exc:
         retrieval_error = exc
-        if carryover_candidates:
-            # The current query may fail before the carryover anchor search is
-            # reached (for example, a database/vector timeout).  The previous
-            # chunks were reloaded and authorized under the current KB scope
-            # before entering this block, so they are a safe degraded seed.
-            # Keeping them is materially better than converting a contextual
-            # follow-up into an infrastructure-only error, and it preserves
-            # the explicit boundary that no old ranking score is reused.
-            retrieval_failed = False
-            retrieval_degraded = True
-            initial_candidates = list(carryover_candidates)
-            expanded_candidates = list(carryover_candidates)
-            full_document_candidates = []
-            expansion_attempted = False
-            expansion_succeeded = False
-            expansion_errors = (
-                "primary_retrieval_failed_carryover_seed",
-            )
-            carryover_anchor_attempted = True
-            carryover_anchor_succeeded = False
-            carryover_anchor_error = "primary_retrieval_failed"
-            carryover_seed_used = True
-            admitted_doc_ids = {
-                str(item.get("doc_id") or "").strip()
-                for item in carryover_candidates
-                if str(item.get("doc_id") or "").strip()
-            }
-            rejected_doc_ids = ()
-            relevance_reason = "carryover_seed_rescue_after_retrieval_error"
-            trace_event(
-                "retrieval.carryover_anchor",
-                trace_id=trace_id,
-                pipeline_version=PIPELINE_VERSION,
-                attempted=True,
-                succeeded=False,
-                source_count=len(carryover_sources),
-                authorized_candidate_count=len(carryover_candidates),
-                fresh_candidate_count=0,
-                fallback_seed_used=True,
-                fallback_seed_count=len(carryover_candidates),
-                scoped_document_count=len(carryover_doc_ids),
-                degraded=True,
-                reason=carryover_anchor_error,
-            )
-            trace_event(
-                "retrieval.completed",
-                trace_id=trace_id,
-                pipeline_version=PIPELINE_VERSION,
-                method=method,
-                candidate_count=len(initial_candidates),
-                raw_candidate_count=0,
-                rejected_document_count=0,
-                relevance_reason=relevance_reason,
-                expanded_candidate_count=len(expanded_candidates),
-                full_document_candidate_count=0,
-                expansion_attempted=False,
-                expansion_succeeded=False,
-                retrieval_degraded=True,
-                carryover_anchor_attempted=True,
-                carryover_anchor_succeeded=False,
-                carryover_seed_used=True,
-                workflow_timeout_seconds=retrieval_workflow_timeout_seconds,
-                workflow_deadline_exhausted=(
-                    time.perf_counter() >= retrieval_deadline
-                ),
-                elapsed_ms=round((time.perf_counter() - retrieval_started) * 1000),
-            )
-        else:
-            retrieval_failed = True
+        # Authorization only proves that a previous-turn chunk may be read; it
+        # does not prove that the chunk supports the current question.  When the
+        # current retrieval workflow fails, fail closed instead of converting
+        # stale carryover text into answer evidence.
+        retrieval_failed = True
+        initial_candidates = []
+        raw_initial_candidates = []
+        expanded_candidates = []
+        full_document_candidates = []
+        expansion_attempted = False
+        expansion_succeeded = False
+        expansion_errors = ()
+        admitted_doc_ids = set()
+        rejected_doc_ids = ()
+        relevance_reason = "primary_retrieval_failed"
+        carryover_anchor_attempted = bool(carryover_candidates)
+        carryover_anchor_succeeded = (
+            False if carryover_candidates else None
+        )
+        carryover_anchor_error = (
+            "primary_retrieval_failed" if carryover_candidates else None
+        )
+        carryover_seed_used = False
         trace_event(
             "retrieval.error",
             trace_id=trace_id,
@@ -1808,6 +1804,9 @@ async def run_rag_v2_stream(
             workflow_deadline_exhausted=(
                 time.perf_counter() >= retrieval_deadline
             ),
+            carryover_source_count=len(carryover_sources),
+            authorized_carryover_candidate_count=len(carryover_candidates),
+            carryover_seed_used=False,
             elapsed_ms=round((time.perf_counter() - retrieval_started) * 1000),
         )
         logger.warning(
@@ -1894,6 +1893,8 @@ async def run_rag_v2_stream(
         bundle = assemble_evidence_bundle(
             query=query,
             candidates=bundle_candidates,
+            requirements=plan.requirements,
+            retrieval_queries=plan.retrieval_queries,
             constraints=bundle_constraints,
             overview_candidates=overview_candidates,
             answer_shape=plan.answer_shape,
@@ -1959,16 +1960,52 @@ async def run_rag_v2_stream(
         # The evidence assembler's body budget does not include serialized
         # source headers. Reconcile the exact prompt budget before publishing
         # status/sources; truncated context cannot claim complete coverage.
+        truncated_context_ids = set(context.truncated_item_ids)
+        safe_context_ids = tuple(
+            chunk_id
+            for chunk_id in context.item_ids
+            if chunk_id not in truncated_context_ids
+        )
+        safe_context_id_set = set(safe_context_ids)
+        safe_answer_source_ids = tuple(
+            chunk_id
+            for chunk_id in bundle.answer_source_ids
+            if chunk_id in safe_context_id_set
+        )
+        final_missing_requirement_ids = _missing_requirements_for_context(
+            plan=plan,
+            bundle=bundle,
+            safe_context_ids=safe_context_ids,
+        )
+        reconciled_items = tuple(
+            replace(
+                item,
+                role="background",
+                supports_requirement_ids=(),
+                metadata={
+                    **dict(item.metadata),
+                    "evidence_role_v2": "background",
+                    "supports_requirement_ids": [],
+                    "renderer_truncated": True,
+                },
+            )
+            if item.chunk_id in truncated_context_ids
+            else item
+            for item in bundle.items
+        )
         bundle = replace(
             bundle,
+            items=reconciled_items,
             context_item_ids=context.item_ids,
-            answer_source_ids=context.item_ids,
+            answer_source_ids=safe_answer_source_ids,
+            missing_requirement_ids=final_missing_requirement_ids,
             state=EvidenceState(
                 availability=bundle.state.availability,
                 confidence=bundle.state.confidence,
                 completeness=(
                     "partial"
                     if bundle.state.completeness == "complete"
+                    or final_missing_requirement_ids
                     else bundle.state.completeness
                 ),
                 reasons=tuple(dict.fromkeys([
@@ -1985,9 +2022,10 @@ async def run_rag_v2_stream(
         pass_name="final",
         coverage_status=coverage,
         requirement_count=len(plan.requirements),
-        required_requirement_count=sum(
-            requirement.is_required_answer for requirement in plan.requirements
-        ),
+        required_requirement_count=len(_coverage_requirement_ids(plan)),
+        covered_requirement_count=len(bundle.covered_requirement_ids),
+        covered_requirement_ids=list(bundle.covered_requirement_ids),
+        missing_requirement_ids=list(bundle.missing_requirement_ids),
         missing_requirement_count=len(bundle.missing_requirement_ids),
         selected_candidate_count=len(bundle.context_item_ids),
         expansion_attempted=expansion_attempted,
@@ -2013,8 +2051,15 @@ async def run_rag_v2_stream(
         "needs_clarification": "rag_v2_mutually_exclusive_scopes",
     }[evidence_status]
 
+    rendered_context_ids = set(context.item_ids)
     effective_source_ids = (
-        () if ambiguity.needs_clarification else context.item_ids
+        ()
+        if ambiguity.needs_clarification
+        else tuple(
+            chunk_id
+            for chunk_id in bundle.answer_source_ids
+            if chunk_id in rendered_context_ids
+        )
     )
     scope_anchor_hit: bool | None = None
     scope_anchor_doc_ids: tuple[str, ...] = ()
@@ -2075,6 +2120,9 @@ async def run_rag_v2_stream(
         direct_evidence_count=result_payload["direct_evidence_count"],
         related_reference_count=result_payload["related_reference_count"],
         coverage_status=coverage,
+        covered_requirement_count=len(bundle.covered_requirement_ids),
+        covered_requirement_ids=list(bundle.covered_requirement_ids),
+        missing_requirement_ids=list(bundle.missing_requirement_ids),
         evidence_availability=bundle.state.availability,
         evidence_confidence=bundle.state.confidence,
         evidence_completeness=bundle.state.completeness,
@@ -2095,6 +2143,12 @@ async def run_rag_v2_stream(
                 "chunk_id": source.get("id"),
                 "chunk_index": source.get("chunk_index"),
                 "evidence_role": source.get("evidence_role"),
+                "evidence_contribution_role": source.get(
+                    "evidence_contribution_role"
+                ),
+                "supports_requirement_ids": source.get(
+                    "supports_requirement_ids"
+                ),
                 "constraint_status": source.get("constraint_status"),
                 "retrieval_score": source.get("retrieval_score"),
                 **content_fields("filename", str(source.get("filename") or "")),
@@ -2106,6 +2160,12 @@ async def run_rag_v2_stream(
                 "doc_id": source.get("doc_id"),
                 "chunk_id": source.get("id"),
                 "chunk_index": source.get("chunk_index"),
+                "evidence_contribution_role": source.get(
+                    "evidence_contribution_role"
+                ),
+                "supports_requirement_ids": source.get(
+                    "supports_requirement_ids"
+                ),
                 "constraint_status": source.get("constraint_status"),
                 **content_fields("filename", str(source.get("filename") or "")),
             }
@@ -2158,6 +2218,9 @@ async def run_rag_v2_stream(
             history_message_count=len(history),
             coverage_status=coverage,
             requirement_count=len(plan.requirements),
+            covered_requirement_count=len(bundle.covered_requirement_ids),
+            covered_requirement_ids=list(bundle.covered_requirement_ids),
+            missing_requirement_ids=list(bundle.missing_requirement_ids),
             missing_requirement_count=len(bundle.missing_requirement_ids),
             expansion_attempted=expansion_attempted,
             expansion_succeeded=expansion_succeeded,
@@ -2224,6 +2287,7 @@ async def run_rag_v2_stream(
             ),
         })
     messages.append({"role": "user", "content": question})
+    context_item_by_id = {item.chunk_id: item for item in bundle.items}
     trace_event(
         "generation.context",
         trace_id=trace_id,
@@ -2246,6 +2310,9 @@ async def run_rag_v2_stream(
         history_message_count=len(history),
         coverage_status=coverage,
         requirement_count=len(plan.requirements),
+        covered_requirement_count=len(bundle.covered_requirement_ids),
+        covered_requirement_ids=list(bundle.covered_requirement_ids),
+        missing_requirement_ids=list(bundle.missing_requirement_ids),
         missing_requirement_count=len(bundle.missing_requirement_ids),
         expansion_attempted=expansion_attempted,
         expansion_succeeded=expansion_succeeded,
@@ -2255,8 +2322,43 @@ async def run_rag_v2_stream(
                 "doc_id": source.get("doc_id"),
                 "chunk_id": source.get("id"),
                 "chunk_index": source.get("chunk_index"),
+                "evidence_contribution_role": source.get(
+                    "evidence_contribution_role"
+                ),
+                "supports_requirement_ids": source.get(
+                    "supports_requirement_ids"
+                ),
             }
             for source in result_payload["answer_sources"]
+        ],
+        # ``context_sources`` remains the positive answer-source contract used
+        # by existing trace consumers.  The prompt can also contain bounded
+        # background context, so expose the exact rendered item set separately
+        # instead of making incident analysis infer it from answer sources.
+        all_context_sources=[
+            {
+                "kb_id": context_item_by_id[chunk_id].kb_id,
+                "doc_id": context_item_by_id[chunk_id].doc_id,
+                "chunk_id": chunk_id,
+                "chunk_index": context_item_by_id[chunk_id].chunk_index,
+                "evidence_contribution_role": context_item_by_id[chunk_id].role,
+                "supports_requirement_ids": list(
+                    context_item_by_id[chunk_id].supports_requirement_ids
+                ),
+                "included_in_answer_sources": (
+                    chunk_id in set(effective_source_ids)
+                ),
+                "renderer_truncated": bool(
+                    context_item_by_id[chunk_id].metadata.get(
+                        "renderer_truncated"
+                    )
+                ),
+                "candidate_origins": list(
+                    context_item_by_id[chunk_id].origins
+                ),
+            }
+            for chunk_id in context.item_ids
+            if chunk_id in context_item_by_id
         ],
         **content_fields("context", context.text),
     )

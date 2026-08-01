@@ -30,6 +30,83 @@
           <n-spin size="small" /><span>思考中...</span>
         </div>
 
+        <section
+          v-if="clarification"
+          class="message-clarification"
+          aria-label="选择知识库适用范围"
+        >
+          <div class="message-clarification__heading">
+            <span class="message-clarification__eyebrow">{{ clarificationEyebrow }}</span>
+            <strong>{{ clarification.question || '请选择本次查询的适用范围' }}</strong>
+          </div>
+
+          <p
+            v-if="clarification.acknowledged && !clarification.invalidated && !clarification.submitted"
+            class="message-clarification__hint"
+          >
+            选择后会沿用当前问题重新检索；系统不会把未选择的资料混入答案。
+          </p>
+          <p
+            v-if="clarification.submitted"
+            class="message-clarification__submitted"
+            aria-live="polite"
+          >
+            {{ clarificationSubmittedText }}
+          </p>
+          <p
+            v-else-if="clarificationStatusText"
+            :id="clarificationStatusId"
+            class="message-clarification__status"
+            :class="{ 'message-clarification__status--invalid': clarification.invalidated }"
+            aria-live="polite"
+          >
+            {{ clarificationStatusText }}
+          </p>
+
+          <template v-if="clarification.choices.length">
+            <div
+              v-if="!clarification.submitted"
+              class="message-clarification__choices"
+              role="group"
+              aria-label="可选适用范围"
+              :aria-describedby="clarificationStatusText ? clarificationStatusId : undefined"
+            >
+              <button
+                v-for="choice in clarification.choices"
+                :key="choice.id"
+                type="button"
+                class="message-clarification__choice"
+                :disabled="!clarificationCanSubmit"
+                :aria-label="`选择第 ${choice.index} 项：${choice.label}`"
+                :title="clarificationDisabledReason"
+                @click="selectClarification(choice.reply)"
+              >
+                <span class="message-clarification__index" aria-hidden="true">{{ choice.index }}</span>
+                <span>{{ choice.label }}</span>
+              </button>
+              <button
+                v-if="clarification.choices.length > 1"
+                type="button"
+                class="message-clarification__choice message-clarification__choice--compare"
+                :disabled="!clarificationCanSubmit"
+                aria-label="对比全部适用范围"
+                :title="clarificationDisabledReason"
+                @click="selectClarification('都对比')"
+              >
+                都对比
+              </button>
+            </div>
+          </template>
+
+          <p
+            v-else-if="clarification.acknowledged && !clarification.invalidated && !clarification.submitted"
+            class="message-clarification__refinement"
+            aria-live="polite"
+          >
+            当前候选范围较多，无法安全列成有限选项。请在输入框补充具体产品、版本、项目或制度名称。
+          </p>
+        </section>
+
         <!-- 历史消息直接使用自身持久化的 sources，不依赖右侧“本次检索”状态。 -->
         <div v-if="hasPersistedEvidence" class="message-evidence">
           <button
@@ -146,9 +223,10 @@ import { useAuthStore } from '@/stores/auth'
 import DocumentEvidenceGroup from '@/components/search/DocumentEvidenceGroup.vue'
 import { persistedAnswerSources } from '@/utils/chatEvidence'
 import { groupEvidenceByDocument, safeExternalSourceUrl } from '@/utils/evidenceDocuments'
+import { isClarificationSubmittable, normalizeEvidenceClarification } from '@/utils/chatClarification'
 
 const props = defineProps({ message: Object })
-const emit = defineEmits(['retry', 'preview'])
+const emit = defineEmits(['retry', 'preview', 'clarify'])
 
 const msg = useMessage()
 const { copy: copyText } = useClipboard()
@@ -158,6 +236,48 @@ const authStore = useAuthStore()
 const evidenceExpanded = ref(false)
 
 const isUser = computed(() => props.message.role === 'user')
+const clarification = computed(() => (
+  isUser.value ? null : normalizeEvidenceClarification(props.message.clarification)
+))
+const clarificationCanSubmit = computed(() => (
+  !chatStore.isStreaming && isClarificationSubmittable(clarification.value)
+))
+const clarificationStatusId = computed(() => {
+  const messageId = String(props.message.id || 'streaming').replace(/[^a-zA-Z0-9_-]/g, '-')
+  return `message-clarification-status-${messageId}`
+})
+const clarificationEyebrow = computed(() => {
+  if (clarification.value?.submitted) return '已确认'
+  if (clarification.value?.invalidated) return '选择已失效'
+  if (!clarification.value?.acknowledged) return '正在保存'
+  return '需要你确认'
+})
+const clarificationStatusText = computed(() => {
+  const value = clarification.value
+  if (!value || value.submitted) return ''
+  if (value.invalidated) {
+    if (value.invalid_reason === 'stream_aborted') {
+      return '生成已停止，本次范围选择没有生效。请重新提问。'
+    }
+    return '本次澄清未能完成保存，以下选项已失效。请重新提问。'
+  }
+  if (!value.acknowledged) return '正在确认本次澄清是否已保存，确认前不能选择。'
+  if (chatStore.isStreaming) return '范围选择已安全保存，当前处理结束后即可选择。'
+  return ''
+})
+const clarificationDisabledReason = computed(() => (
+  clarificationCanSubmit.value ? undefined : (clarificationStatusText.value || '该范围选择当前不可用')
+))
+const clarificationSubmittedText = computed(() => {
+  if (!clarification.value?.submitted) return ''
+  if (clarification.value.submitted_reply === '都对比') return '已提交“都对比”，查询结果会显示在下方。'
+  const selected = clarification.value.choices.find(choice => (
+    choice.reply === clarification.value.submitted_reply
+  ))
+  return selected
+    ? `已提交第 ${selected.index} 项：${selected.label}`
+    : '已提交补充范围，查询结果会显示在下方。'
+})
 // 系统设置「显示参考来源」总开关：关闭则隐藏所有来源行（默认显示）
 const showSources = computed(() => settingsStore.data.show_sources !== false)
 // 普通问答角色可查看本轮命中片段，但不能因此获得整篇文档读取能力。
@@ -320,6 +440,11 @@ function openSource(src) {
   emit('preview', src)
 }
 
+function selectClarification(reply) {
+  if (!clarificationCanSubmit.value) return
+  emit('clarify', { message: props.message, reply })
+}
+
 function copy() {
   copyText(props.message.content)
   msg.success('已复制')
@@ -367,6 +492,138 @@ function formatTime(t) {
 </script>
 
 <style scoped>
+.message-clarification {
+  margin-top: 12px;
+  border: 1px solid color-mix(in srgb, var(--ui-warning) 34%, var(--ui-border));
+  border-radius: var(--ui-radius-popover);
+  background: color-mix(in srgb, var(--ui-warning) 7%, var(--ui-surface));
+  padding: 12px;
+}
+
+.message-clarification__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 9px;
+  color: var(--ui-text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.message-clarification__heading strong {
+  min-width: 0;
+  flex: 1 1 240px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.message-clarification__eyebrow {
+  border-radius: var(--ui-radius-pill);
+  background: color-mix(in srgb, var(--ui-warning) 15%, var(--ui-surface));
+  padding: 2px 7px;
+  color: var(--ui-warning);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.message-clarification__hint,
+.message-clarification__refinement,
+.message-clarification__submitted,
+.message-clarification__status {
+  margin-top: 7px;
+  color: var(--ui-text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.message-clarification__refinement {
+  color: var(--ui-warning);
+}
+
+.message-clarification__submitted {
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface-muted);
+  padding: 8px 10px;
+  color: var(--ui-text-secondary);
+}
+
+.message-clarification__status {
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface-muted);
+  padding: 8px 10px;
+  color: var(--ui-warning);
+}
+
+.message-clarification__status--invalid {
+  background: var(--ui-danger-subtle);
+  color: var(--ui-danger);
+}
+
+.message-clarification__choices {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.message-clarification__choice {
+  display: flex;
+  min-height: var(--ui-control-height);
+  width: 100%;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid var(--ui-border-strong);
+  border-radius: var(--ui-radius-control);
+  background: var(--ui-surface);
+  padding: 8px 10px;
+  color: var(--ui-text);
+  font-size: 12px;
+  line-height: 1.45;
+  text-align: left;
+  overflow-wrap: anywhere;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease;
+}
+
+.message-clarification__choice:hover:not(:disabled) {
+  border-color: var(--ui-border-focus);
+  background: var(--ui-surface-hover);
+}
+
+.message-clarification__choice:focus-visible {
+  outline: 2px solid var(--ui-focus-outline);
+  outline-offset: 2px;
+  box-shadow: var(--ui-focus-ring);
+}
+
+.message-clarification__choice:disabled {
+  cursor: not-allowed;
+  border-color: var(--ui-border);
+  background: var(--ui-surface-disabled);
+  color: var(--ui-text-disabled);
+}
+
+.message-clarification__choice--compare {
+  justify-content: center;
+  border-color: color-mix(in srgb, var(--ui-primary) 42%, var(--ui-border));
+  background: var(--ui-primary-subtle);
+  color: var(--ui-primary);
+  font-weight: 650;
+  text-align: center;
+}
+
+.message-clarification__index {
+  display: inline-grid;
+  flex: 0 0 22px;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: var(--ui-radius-pill);
+  background: var(--ui-surface-muted);
+  color: var(--ui-primary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .message-evidence {
   margin-top: 12px;
 }
@@ -532,6 +789,10 @@ function formatTime(t) {
 }
 
 @media (max-width: 639px) {
+  .message-clarification__choice {
+    min-height: 40px;
+  }
+
   .message-evidence__toggle {
     width: 100%;
     min-height: 40px;
@@ -558,6 +819,7 @@ function formatTime(t) {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .message-clarification__choice,
   .message-evidence__toggle,
   .message-evidence__chevron {
     transition: none;

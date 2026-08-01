@@ -57,12 +57,119 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
             plan.retrieval_queries,
             ("第一项是什么", "第二项如何处理"),
         )
+        self.assertEqual(
+            [(item.id, item.description) for item in plan.requirements],
+            [
+                ("r1", "第一项是什么"),
+                ("r2", "第二项如何处理"),
+            ],
+        )
+        self.assertTrue(all(item.is_required_answer for item in plan.requirements))
+        self.assertTrue(all(item.source == "explicit" for item in plan.requirements))
 
         newline_plan = plan_query_locally("检查第一项\n处理第二项")
         self.assertEqual(newline_plan.answer_shape, "multi_part")
         self.assertEqual(
             newline_plan.retrieval_queries,
             ("检查第一项", "处理第二项"),
+        )
+        self.assertEqual(
+            [item.description for item in newline_plan.requirements],
+            ["检查第一项", "处理第二项"],
+        )
+
+    def test_chinese_semicolon_and_numbered_queries_have_matching_requirements(
+        self,
+    ) -> None:
+        semicolon_plan = plan_query_locally("查询甲项；查询乙项；查询丙项")
+
+        self.assertEqual(
+            semicolon_plan.retrieval_queries,
+            ("查询甲项", "查询乙项", "查询丙项"),
+        )
+        self.assertEqual(
+            [item.description for item in semicolon_plan.requirements],
+            ["查询甲项", "查询乙项", "查询丙项"],
+        )
+
+        numbered_plan = plan_query_locally(
+            "1. 查询第一项 2. 查询第二项 3. 查询第三项"
+        )
+        self.assertEqual(
+            numbered_plan.retrieval_queries,
+            ("查询第一项", "查询第二项", "查询第三项"),
+        )
+        self.assertEqual(
+            [(item.id, item.description) for item in numbered_plan.requirements],
+            [
+                ("r1", "查询第一项"),
+                ("r2", "查询第二项"),
+                ("r3", "查询第三项"),
+            ],
+        )
+
+    def test_english_multi_part_query_has_one_requirement_per_question(self) -> None:
+        plan = plan_query_locally(
+            "What is the first setting? How do I configure the second setting?"
+        )
+
+        self.assertEqual(plan.answer_shape, "multi_part")
+        self.assertEqual(
+            plan.retrieval_queries,
+            (
+                "What is the first setting",
+                "How do I configure the second setting",
+            ),
+        )
+        self.assertEqual(
+            [item.description for item in plan.requirements],
+            list(plan.retrieval_queries),
+        )
+
+    def test_duplicate_multi_part_queries_are_deduplicated_in_requirements(
+        self,
+    ) -> None:
+        plan = plan_query_locally("第一项是什么？第一项是什么？第二项是什么？")
+
+        self.assertEqual(
+            plan.retrieval_queries,
+            ("第一项是什么", "第二项是什么"),
+        )
+        self.assertEqual(
+            [(item.id, item.description) for item in plan.requirements],
+            [("r1", "第一项是什么"), ("r2", "第二项是什么")],
+        )
+
+    def test_multi_part_queries_and_requirements_are_limited_to_eight(self) -> None:
+        question = " ".join(
+            f"{index}. 子问题{index}" for index in range(1, 11)
+        )
+
+        plan = plan_query_locally(question)
+
+        self.assertEqual(
+            plan.retrieval_queries,
+            tuple(f"子问题{index}" for index in range(1, 9)),
+        )
+        self.assertEqual(
+            [item.id for item in plan.requirements],
+            [f"r{index}" for index in range(1, 9)],
+        )
+        self.assertEqual(
+            [item.description for item in plan.requirements],
+            list(plan.retrieval_queries),
+        )
+
+    def test_non_multi_part_plan_keeps_single_original_query_requirement(self) -> None:
+        question = "某项制度是什么"
+
+        plan = plan_query_locally(question)
+
+        self.assertEqual(plan.answer_shape, "overview")
+        self.assertEqual(plan.retrieval_queries, (question,))
+        self.assertEqual(
+            [(item.id, item.description) for item in plan.requirements],
+            [("r1", question)],
         )
 
     def test_single_trailing_question_mark_is_not_multi_part(self) -> None:

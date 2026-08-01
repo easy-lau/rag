@@ -3,6 +3,10 @@ import assert from 'node:assert/strict'
 import { createPinia, setActivePinia } from 'pinia'
 
 import { useSearchStore } from '../src/stores/search.js'
+import {
+  applyClarificationLifecycleEvent,
+  lockMessageClarificationEvidence,
+} from '../src/utils/chatClarification.js'
 
 function freshStore() {
   setActivePinia(createPinia())
@@ -109,6 +113,99 @@ test('needs_clarification 表示检索已执行但选择前没有回答依据', 
   assert.equal(store.searchMeta.answer_source_count, 0)
   assert.deepEqual(store.searchMeta.clarification, clarification)
   assert.deepEqual(store.results.map(item => item.evidence_role), ['related', 'related'])
+})
+
+test('独立澄清事件可补写 search meta，等待后续 search_results 合并', () => {
+  const store = freshStore()
+  const clarification = {
+    dimension: 'document',
+    choices: [{ key: 'c1', label: '公司出差管理标准.docx' }],
+  }
+
+  store.setClarification(clarification)
+
+  assert.equal(store.searchMeta.evidence_status, 'needs_clarification')
+  assert.deepEqual(store.searchMeta.clarification, clarification)
+})
+
+test('独立澄清事件立即降级 direct 并清空全部回答依据统计', () => {
+  const store = freshStore()
+  store.setResults({
+    evidence_status: 'hit',
+    retrieval_executed: true,
+    displayed_result_count: 2,
+    hit_count: 2,
+    direct_evidence_count: 2,
+    context_evidence_count: 2,
+    answer_source_count: 2,
+    coverage_status: 'complete',
+    results: [
+      { id: 'direct-1', evidence_role: 'direct' },
+      { id: 'direct-2', evidence_role: 'direct' },
+    ],
+  })
+
+  store.setClarification({
+    dimension: 'document',
+    choices: [{ key: 'c1', label: '公司出差管理标准.docx' }],
+  })
+
+  assert.deepEqual(store.results.map(item => item.evidence_role), ['related', 'related'])
+  assert.equal(store.searchMeta.evidence_status, 'needs_clarification')
+  assert.equal(store.searchMeta.hit_count, 0)
+  assert.equal(store.searchMeta.direct_evidence_count, 0)
+  assert.equal(store.searchMeta.context_evidence_count, 0)
+  assert.equal(store.searchMeta.answer_source_count, 0)
+  assert.equal(store.searchMeta.related_reference_count, 2)
+  assert.equal(store.searchMeta.coverage_status, 'insufficient')
+})
+
+test('clarification 锁定后乱序 hit search_results 仍保持 fail closed', () => {
+  const store = freshStore()
+  const message = {
+    role: 'assistant',
+    sources: [],
+  }
+  const clarification = applyClarificationLifecycleEvent(message, {
+    type: 'evidence_clarification',
+    schema_version: 'rag_evidence_clarification.v1',
+    dimension: 'version',
+    choices: [
+      { key: 'c1', label: '云枢 6' },
+      { key: 'c2', label: '云枢 8.6' },
+    ],
+  })
+  lockMessageClarificationEvidence(message, clarification)
+  store.setClarification(clarification)
+
+  const contradictoryHit = {
+    evidence_status: 'hit',
+    retrieval_executed: true,
+    hit_count: 1,
+    direct_evidence_count: 1,
+    context_evidence_count: 1,
+    answer_source_count: 1,
+    coverage_status: 'complete',
+    answer_sources: [{ id: 'late-direct', evidence_role: 'direct' }],
+    results: [{ id: 'late-direct', evidence_role: 'direct' }],
+  }
+  store.setResults(contradictoryHit)
+  // This is the same final lock applied by the chat event path after it sees
+  // an existing picker; even a contradictory answer_sources payload is gone.
+  message.sources = contradictoryHit.answer_sources
+  lockMessageClarificationEvidence(message, message.clarification)
+
+  assert.deepEqual(message.sources, [])
+  assert.equal(message.evidence_status, 'needs_clarification')
+  assert.equal(message.search_meta.hit_count, 0)
+  assert.equal(store.searchMeta.evidence_status, 'needs_clarification')
+  assert.equal(store.searchMeta.hit_count, 0)
+  assert.equal(store.searchMeta.direct_evidence_count, 0)
+  assert.equal(store.searchMeta.context_evidence_count, 0)
+  assert.equal(store.searchMeta.answer_source_count, 0)
+  assert.equal(store.searchMeta.coverage_status, 'insufficient')
+  assert.deepEqual(store.results.map(item => item.evidence_role), ['related'])
+  assert.deepEqual(store.searchMeta.clarification, clarification)
 })
 
 test('旧协议明确未执行检索时优先判定为 skipped', () => {

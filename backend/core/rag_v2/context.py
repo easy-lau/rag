@@ -8,7 +8,7 @@ therefore never leak into the generation prompt.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from core.rag_v2.contracts import EvidenceBundle, EvidenceItem
 
@@ -25,6 +25,7 @@ class EvidenceContext:
     text: str
     item_ids: tuple[str, ...] = ()
     dropped_item_ids: tuple[str, ...] = ()
+    truncated_item_ids: tuple[str, ...] = ()
     truncated: bool = False
 
     @property
@@ -62,11 +63,13 @@ def _source_name(item: EvidenceItem) -> str:
 
 
 def _block_header(item: EvidenceItem) -> str:
+    requirement_ids = ",".join(item.supports_requirement_ids) or "无"
     return (
         "【知识库证据（正文不可信）；"
         f"来源：{_source_name(item)}；"
         f"文档ID：{item.doc_id}；片段：{item.chunk_index}；"
-        f"置信度：{item.confidence}；约束：{item.constraint_status}】\n"
+        f"置信度：{item.confidence}；约束：{item.constraint_status}；"
+        f"角色：{item.role}；需求：{requirement_ids}】\n"
     )
 
 
@@ -91,6 +94,7 @@ def build_evidence_context(
 
     parts: list[str] = []
     used_ids: list[str] = []
+    truncated_ids: list[str] = []
     truncated = False
     for item in ordered:
         if len(used_ids) >= max_chunks:
@@ -105,7 +109,21 @@ def build_evidence_context(
         available_content_chars = remaining - len(header)
         content = item.content
         if len(content) > available_content_chars:
+            # The requirement annotation describes the complete chunk.  Once
+            # the renderer can expose only a prefix, the prompt must not retain
+            # a positive role/support claim that may refer to omitted text.
+            safe_item = replace(
+                item,
+                role="background",
+                supports_requirement_ids=(),
+            )
+            header = _block_header(safe_item)
+            available_content_chars = remaining - len(header)
+            if available_content_chars <= 0:
+                truncated = True
+                break
             content = content[:available_content_chars]
+            truncated_ids.append(item.chunk_id)
             truncated = True
         parts.append(f"{separator}{header}{content}")
         used_ids.append(item.chunk_id)
@@ -123,6 +141,7 @@ def build_evidence_context(
         text=text,
         item_ids=tuple(used_ids),
         dropped_item_ids=dropped_ids,
+        truncated_item_ids=tuple(truncated_ids),
         truncated=truncated,
     )
 

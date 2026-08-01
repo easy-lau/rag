@@ -1141,10 +1141,120 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(locked_payload["context_evidence_count"], 0)
         self.assertEqual(locked_payload["hit_count"], 0)
         self.assertEqual(locked_payload["results"][0]["evidence_role"], "related")
-        self.assertIn("done", [item["type"] for item in payloads if item])
+        event_types = [item["type"] for item in payloads if item]
+        self.assertLess(
+            event_types.index("evidence_clarification"),
+            event_types.index("evidence_clarification_ack"),
+        )
+        self.assertLess(
+            event_types.index("evidence_clarification_ack"),
+            event_types.index("done"),
+        )
+        ack = next(
+            item
+            for item in payloads
+            if item and item["type"] == "evidence_clarification_ack"
+        )
+        self.assertEqual(
+            ack["schema_version"],
+            "rag_evidence_clarification_ack.v1",
+        )
+        self.assertTrue(ack["persisted"])
+        self.assertEqual(ack["pending_state_id"], state["state_id"])
+        self.assertEqual(ack["clarification_message_id"], str(assistant.id))
+        self.assertEqual(ack["route_state_revision"], 1)
+        self.assertEqual(ack["conversation_id"], str(conversation_id))
         events = [call.args[0] for call in trace.call_args_list]
         self.assertIn("evidence.clarification_created", events)
         self.assertNotIn("evidence.clarification_resolved", events)
+
+    async def test_pipeline_evidence_clarification_save_failure_has_no_ack(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        pending_template = _evidence_pending_state(kb_id=kb_id)
+        conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RouteStateDB(conv)
+        save_db = _FailingSaveStateDB(conv)
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=pending_template["original_query"],
+            history_messages=(),
+            carryover_sources=(),
+        )
+        decision = SimpleNamespace(
+            need_retrieval=True,
+            decision_reason="classified_retrieval",
+            to_dict=lambda: {
+                "intent_code": "knowledge_qa",
+                "need_retrieval": True,
+                "decision_reason": "classified_retrieval",
+            },
+        )
+        routing_result = SimpleNamespace(decision=decision, route_log_id=None)
+
+        async def clarification_stream(**_kwargs):
+            yield "data: " + json.dumps(
+                {
+                    "type": "evidence_clarification",
+                    "schema_version": "rag_evidence_clarification.v1",
+                    "needs_clarification": True,
+                    "dimension": pending_template["dimension"],
+                    "question": pending_template["clarification_message"],
+                    "choices": pending_template["choices"],
+                },
+                ensure_ascii=False,
+            ) + "\n\n"
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch("api.chat.run_rag_stream", new=clarification_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question="解决登录用户名枚举要配置什么",
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            payloads = [
+                _parse_sse_payload(
+                    chunk.decode() if isinstance(chunk, bytes) else chunk
+                )
+                async for chunk in response.body_iterator
+            ]
+
+        event_types = [item["type"] for item in payloads if item]
+        self.assertIn("evidence_clarification", event_types)
+        self.assertNotIn("evidence_clarification_ack", event_types)
+        self.assertEqual(event_types[-2:], ["error", "done"])
+        self.assertIsNone(conv.pending_route_state)
+        self.assertEqual(conv.route_state_revision, 0)
+        events = [call.args[0] for call in trace.call_args_list]
+        self.assertIn("chat.persistence_error", events)
+        self.assertNotIn("evidence.clarification_created", events)
 
     async def test_v2_selection_keeps_pending_when_answer_context_is_empty(self) -> None:
         conversation_id = uuid.uuid4()
@@ -1852,10 +1962,27 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         rag_stream.assert_not_called()
         self.assertIs(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 2)
-        self.assertIn(
-            "evidence_clarification",
-            [item["type"] for item in payloads if item],
+        event_types = [item["type"] for item in payloads if item]
+        self.assertLess(
+            event_types.index("evidence_clarification"),
+            event_types.index("evidence_clarification_ack"),
         )
+        self.assertLess(
+            event_types.index("evidence_clarification_ack"),
+            event_types.index("done"),
+        )
+        ack = next(
+            item
+            for item in payloads
+            if item and item["type"] == "evidence_clarification_ack"
+        )
+        self.assertTrue(ack["persisted"])
+        self.assertEqual(ack["pending_state_id"], pending["state_id"])
+        self.assertEqual(
+            ack["clarification_message_id"],
+            pending["clarification_message_id"],
+        )
+        self.assertEqual(ack["route_state_revision"], 2)
         self.assertIn(
             "evidence.clarification_repeated",
             [call.args[0] for call in trace.call_args_list],

@@ -43,6 +43,7 @@
             :key="msg.id"
             :message="msg"
             @retry="handleRetry"
+            @clarify="handleClarification"
             @preview="openSourcePreview"
           />
         </div>
@@ -507,6 +508,14 @@ function handleRetry(answerMessage) {
   }
   autoFollowLatest.value = true
   chatStore.sendMessage(targetUser.content)
+}
+
+function handleClarification({ message, reply } = {}) {
+  if (chatStore.isStreaming) return
+  autoFollowLatest.value = true
+  if (!chatStore.submitClarification(message, reply)) {
+    msg.warning('该范围选择已失效，请在输入框重新说明需要查询的范围')
+  }
 }
 
 function setWelcomeQuestion(question) {

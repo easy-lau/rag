@@ -123,15 +123,23 @@ def _ready_plan(
     reason: str,
     retrieval_queries: tuple[str, ...] | None = None,
 ) -> QueryPlanV2:
+    planned_queries = retrieval_queries or (question,)
+    requirement_descriptions = (
+        planned_queries if answer_shape == "multi_part" else (question,)
+    )
     return QueryPlanV2(
         original_query=question,
         answer_shape=answer_shape,
-        retrieval_queries=retrieval_queries or (question,),
-        requirements=(
+        retrieval_queries=planned_queries,
+        requirements=tuple(
             AnswerRequirementV2(
-                id="r1",
-                description=question,
-            ),
+                id=f"r{index}",
+                description=description,
+            )
+            for index, description in enumerate(
+                requirement_descriptions,
+                start=1,
+            )
         ),
         confidence=confidence,
         source="local",

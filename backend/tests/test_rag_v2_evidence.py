@@ -1,6 +1,7 @@
 import unittest
 
 from core.query_constraints import extract_query_constraints
+from core.rag_v2.contracts import AnswerRequirementV2
 from core.rag_v2.evidence import assemble_evidence_bundle
 
 
@@ -24,6 +25,415 @@ def _candidate(
 
 
 class EvidenceBundleAssemblyTests(unittest.TestCase):
+    def test_single_requirement_uses_current_retrieval_seed_as_complement(self) -> None:
+        requirement = AnswerRequirementV2(id="r1", description="某项标准")
+        bundle = assemble_evidence_bundle(
+            query="某项标准",
+            candidates=[
+                _candidate(
+                    "seed",
+                    content="明确条款：上限为450元/天。",
+                    candidate_origins=["initial_retrieval"],
+                )
+            ],
+            requirements=(requirement,),
+            retrieval_queries=("某项标准",),
+        )
+
+        self.assertEqual(bundle.items[0].role, "complement")
+        self.assertEqual(bundle.items[0].supports_requirement_ids, ("r1",))
+        self.assertEqual(bundle.answer_source_ids, ("seed",))
+
+    def test_overview_maps_all_bounded_anchored_document_chunks(self) -> None:
+        requirement = AnswerRequirementV2(id="r1", description="制度概览")
+        bundle = assemble_evidence_bundle(
+            query="制度概览",
+            answer_shape="overview",
+            candidates=[
+                _candidate(
+                    "seed",
+                    content="制度标题",
+                    candidate_origins=["initial_retrieval"],
+                )
+            ],
+            overview_candidates=[
+                _candidate("section", chunk_index=1, content="具体章节内容")
+            ],
+            requirements=(requirement,),
+            retrieval_queries=("制度概览",),
+        )
+
+        self.assertEqual(set(bundle.answer_source_ids), {"seed", "section"})
+        self.assertTrue(all(
+            item.supports_requirement_ids == ("r1",)
+            for item in bundle.answer_sources
+        ))
+
+    def test_query_indexes_map_each_chunk_to_the_aligned_requirement(self) -> None:
+        requirements = (
+            AnswerRequirementV2(id="r1", description="交通要求"),
+            AnswerRequirementV2(id="r2", description="住宿要求"),
+        )
+        bundle = assemble_evidence_bundle(
+            query="请分别查询交通和住宿要求",
+            candidates=[
+                _candidate(
+                    "lodging",
+                    content="第二个召回片段",
+                    expansion_query_indexes=[1],
+                ),
+                _candidate(
+                    "transport",
+                    chunk_index=1,
+                    content="第一个召回片段",
+                    expansion_query_indexes=[0],
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=("交通要求", "住宿要求"),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["transport"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["lodging"].supports_requirement_ids, ("r2",))
+        self.assertEqual(by_id["transport"].role, "complement")
+        self.assertEqual(bundle.missing_requirement_ids, ())
+        self.assertEqual(set(bundle.answer_source_ids), {"transport", "lodging"})
+        self.assertEqual(bundle.state.completeness, "complete")
+
+    def test_explicit_support_ids_are_filtered_to_known_requirements(self) -> None:
+        requirements = (
+            AnswerRequirementV2(id="r1", description="目标一"),
+            AnswerRequirementV2(id="r2", description="目标二"),
+        )
+        bundle = assemble_evidence_bundle(
+            query="查询目标",
+            candidates=[
+                _candidate(
+                    "explicit",
+                    content="无词面重叠的正文",
+                    role="direct",
+                    supports_requirement_ids=["r1", "unknown", "INVALID"],
+                )
+            ],
+            requirements=requirements,
+            retrieval_queries=("其他查询",),
+            rerank_succeeded=True,
+            completeness="complete",
+        )
+
+        item = bundle.items[0]
+        self.assertEqual(item.supports_requirement_ids, ("r1",))
+        self.assertEqual(item.metadata["supports_requirement_ids"], ["r1"])
+        self.assertEqual(item.role, "direct")
+        self.assertEqual(bundle.answer_source_ids, ("explicit",))
+        self.assertEqual(bundle.missing_requirement_ids, ("r2",))
+        self.assertEqual(bundle.state.completeness, "partial")
+
+    def test_lexical_coverage_is_assessed_per_chunk_not_concatenated(self) -> None:
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="alpha beta",
+        )
+        bundle = assemble_evidence_bundle(
+            query="alpha beta",
+            candidates=[
+                _candidate("alpha", content="alpha"),
+                _candidate("beta", chunk_index=1, content="beta"),
+            ],
+            requirements=(requirement,),
+            retrieval_queries=(),
+            completeness="complete",
+        )
+
+        self.assertTrue(all(not item.supports_requirement_ids for item in bundle.items))
+        self.assertEqual(bundle.answer_source_ids, ())
+        self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+        self.assertEqual(bundle.state.completeness, "partial")
+
+    def test_entity_overlap_alone_cannot_satisfy_compound_requirement(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="查询普通岗位的餐饮补贴金额",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="确认普通岗位对应的职级",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通岗位的餐饮补贴是多少",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "bridge",
+                    content="职级分类：普通岗位对应D级。",
+                )
+            ],
+            requirements=requirements,
+            retrieval_queries=("普通岗位的餐饮补贴是多少",),
+            completeness="complete",
+        )
+
+        item = bundle.items[0]
+        self.assertEqual(item.supports_requirement_ids, ("r2",))
+        self.assertEqual(item.role, "bridge")
+        self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+
+    def test_answer_query_index_cannot_promote_bridge_only_chunk(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="查询普通岗位的餐饮补贴金额",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="确认普通岗位对应的职级",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通岗位的餐饮补贴是多少",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "bridge",
+                    content="职级分类：普通岗位对应D级。",
+                    expansion_query_indexes=[0],
+                )
+            ],
+            requirements=requirements,
+            retrieval_queries=("普通岗位的餐饮补贴是多少",),
+            completeness="complete",
+        )
+
+        item = bundle.items[0]
+        self.assertEqual(item.supports_requirement_ids, ("r2",))
+        self.assertEqual(item.role, "bridge")
+        self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+
+    def test_multi_hop_joins_answer_seed_to_resolved_bridge_value(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="查询普通岗位的餐饮补贴金额",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="确认普通岗位对应的职级",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通岗位的餐饮补贴是多少",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "answer",
+                    content="餐饮补贴：D级为100元/天。",
+                    candidate_origins=["initial_retrieval"],
+                ),
+                _candidate(
+                    "bridge",
+                    chunk_index=1,
+                    content="职级分类：普通岗位对应D级。",
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=("普通岗位的餐饮补贴是多少",),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["answer"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["answer"].role, "complement")
+        self.assertEqual(by_id["bridge"].supports_requirement_ids, ("r2",))
+        self.assertEqual(by_id["bridge"].role, "bridge")
+        self.assertEqual(bundle.missing_requirement_ids, ())
+        self.assertEqual(set(bundle.answer_source_ids), {"answer", "bridge"})
+
+    def test_multi_hop_rejects_unjoined_answer_value(self) -> None:
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="查询普通岗位的餐饮补贴金额",
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="确认普通岗位对应的职级",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通岗位的餐饮补贴是多少",
+            answer_shape="multi_hop",
+            candidates=[
+                _candidate(
+                    "wrong-answer",
+                    content="餐饮补贴：A级为200元/天。",
+                    candidate_origins=["initial_retrieval"],
+                ),
+                _candidate(
+                    "bridge",
+                    chunk_index=1,
+                    content="职级分类：普通岗位对应D级。",
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=("普通岗位的餐饮补贴是多少",),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["wrong-answer"].supports_requirement_ids, ())
+        self.assertEqual(by_id["wrong-answer"].role, "background")
+        self.assertEqual(bundle.answer_source_ids, ("bridge",))
+        self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+
+    def test_required_coverage_precedes_higher_scored_background_under_budget(self) -> None:
+        requirements = (
+            AnswerRequirementV2(id="r1", description="alpha target"),
+            AnswerRequirementV2(id="r2", description="beta target"),
+        )
+        bundle = assemble_evidence_bundle(
+            query="two targets",
+            candidates=[
+                _candidate("background", content="generic notes", score=100),
+                _candidate(
+                    "r1",
+                    chunk_index=1,
+                    content="first mapped result",
+                    score=0.1,
+                    role="direct",
+                    supports_requirement_ids=["r1"],
+                ),
+                _candidate(
+                    "r2",
+                    chunk_index=2,
+                    content="second mapped result",
+                    score=0.1,
+                    role="direct",
+                    supports_requirement_ids=["r2"],
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=("alpha target", "beta target"),
+            rerank_succeeded=True,
+            completeness="complete",
+            max_context_chunks=2,
+        )
+
+        self.assertEqual(bundle.context_item_ids, ("r1", "r2"))
+        self.assertEqual(bundle.answer_source_ids, ("r1", "r2"))
+        self.assertEqual(bundle.missing_requirement_ids, ())
+        self.assertEqual(bundle.state.completeness, "complete")
+
+    def test_invalid_query_indexes_cannot_manufacture_requirement_support(self) -> None:
+        requirement = AnswerRequirementV2(id="r1", description="目标要求")
+        bundle = assemble_evidence_bundle(
+            query="目标要求",
+            candidates=[
+                _candidate(
+                    "invalid-indexes",
+                    content="完全无关正文",
+                    expansion_query_indexes=[True, -1, 9, "bad"],
+                )
+            ],
+            requirements=(requirement,),
+            retrieval_queries=("目标要求",),
+            completeness="complete",
+        )
+
+        self.assertEqual(bundle.items[0].supports_requirement_ids, ())
+        self.assertEqual(bundle.items[0].role, "background")
+        self.assertEqual(bundle.answer_source_ids, ())
+        self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+
+    def test_unexecuted_reranker_cannot_mark_candidate_verified_or_direct(self) -> None:
+        bundle = assemble_evidence_bundle(
+            query="配置",
+            candidates=[
+                _candidate(
+                    "legacy",
+                    content="配置说明",
+                    rerank_status="verified",
+                    evidence_role="direct",
+                )
+            ],
+            rerank_succeeded=None,
+        )
+
+        self.assertEqual(bundle.items[0].confidence, "retrieved")
+        self.assertEqual(bundle.items[0].role, "background")
+
+    def test_stale_support_annotations_are_ignored_without_verification(self) -> None:
+        requirement = AnswerRequirementV2(id="r1", description="fresh target")
+        bundle = assemble_evidence_bundle(
+            query="fresh target",
+            candidates=[
+                _candidate(
+                    "stale",
+                    content="old unrelated context",
+                    role="direct",
+                    supports_requirement_ids=["r1"],
+                    rerank_status="verified",
+                )
+            ],
+            requirements=(requirement,),
+            retrieval_queries=("fresh target",),
+            rerank_succeeded=None,
+            completeness="complete",
+        )
+
+        self.assertEqual(bundle.items[0].supports_requirement_ids, ())
+        self.assertEqual(bundle.items[0].role, "background")
+        self.assertEqual(bundle.answer_source_ids, ())
+        self.assertEqual(bundle.missing_requirement_ids, ("r1",))
+
+    def test_multi_hop_helpful_bridge_is_coverage_critical(self) -> None:
+        requirements = (
+            AnswerRequirementV2(id="r1", description="answer target"),
+            AnswerRequirementV2(
+                id="r2",
+                description="bridge target",
+                role="bridge",
+                importance="helpful",
+                source="inferred",
+            ),
+        )
+        values = dict(
+            query="resolve target",
+            candidates=[
+                _candidate(
+                    "answer",
+                    content="mapped by current retrieval",
+                    expansion_query_indexes=[0],
+                )
+            ],
+            requirements=requirements,
+            retrieval_queries=("answer target", "bridge target"),
+            completeness="complete",
+        )
+
+        multi_hop = assemble_evidence_bundle(answer_shape="multi_hop", **values)
+        ordinary = assemble_evidence_bundle(answer_shape="fact", **values)
+
+        self.assertEqual(multi_hop.missing_requirement_ids, ("r2",))
+        self.assertEqual(multi_hop.state.completeness, "partial")
+        self.assertEqual(ordinary.missing_requirement_ids, ())
+        self.assertEqual(ordinary.state.completeness, "complete")
+
     def test_hard_mismatch_and_unauthorized_candidates_are_excluded(self) -> None:
         constraints = extract_query_constraints("云枢8.2.75消息接口怎么配置")
         candidates = [

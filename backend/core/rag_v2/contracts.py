@@ -55,6 +55,22 @@ EvidenceConstraintStatus = Literal[
     "unknown",
     "mismatch",
 ]
+EvidenceRole = Literal[
+    "direct",
+    "bridge",
+    "complement",
+    "background",
+    "conflicting",
+]
+EVIDENCE_ROLES = frozenset(
+    {
+        "direct",
+        "bridge",
+        "complement",
+        "background",
+        "conflicting",
+    }
+)
 
 _REQUIREMENT_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_QUERY_CHARS = 1000
@@ -98,6 +114,25 @@ def _normalized_unique_texts(
         if len(normalized) > max_items:
             raise ValueError(f"{field_name} has too many items")
     return tuple(normalized)
+
+
+def _normalized_requirement_ids(
+    values: object,
+    *,
+    field_name: str,
+    max_items: int = 8,
+) -> tuple[str, ...]:
+    normalized = _normalized_unique_texts(
+        values,
+        field_name=field_name,
+        max_items=max_items,
+        max_chars=64,
+    )
+    if any(not _REQUIREMENT_ID_RE.fullmatch(value) for value in normalized):
+        raise ValueError(
+            f"{field_name} must contain stable lowercase requirement ids"
+        )
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -305,6 +340,8 @@ class EvidenceItem:
     constraint_status: EvidenceConstraintStatus = "unknown"
     authorized: bool = True
     origins: tuple[str, ...] = ()
+    role: EvidenceRole = "background"
+    supports_requirement_ids: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -341,11 +378,17 @@ class EvidenceItem:
             raise ValueError("unsupported evidence constraint status")
         if not isinstance(self.authorized, bool):
             raise ValueError("authorized must be a boolean")
+        if self.role not in EVIDENCE_ROLES:
+            raise ValueError("unsupported evidence role")
         origins = _normalized_unique_texts(
             self.origins,
             field_name="evidence origin",
             max_items=12,
             max_chars=100,
+        )
+        supports_requirement_ids = _normalized_requirement_ids(
+            self.supports_requirement_ids,
+            field_name="supported requirement id",
         )
         if not isinstance(self.metadata, Mapping):
             raise ValueError("evidence metadata must be a mapping")
@@ -356,6 +399,11 @@ class EvidenceItem:
         object.__setattr__(self, "content", self.content.strip())
         object.__setattr__(self, "score", score)
         object.__setattr__(self, "origins", origins)
+        object.__setattr__(
+            self,
+            "supports_requirement_ids",
+            supports_requirement_ids,
+        )
         object.__setattr__(self, "metadata", dict(self.metadata))
 
     def to_dict(self) -> dict[str, Any]:
@@ -370,6 +418,8 @@ class EvidenceItem:
             "constraint_status": self.constraint_status,
             "authorized": self.authorized,
             "origins": list(self.origins),
+            "role": self.role,
+            "supports_requirement_ids": list(self.supports_requirement_ids),
             "metadata": dict(self.metadata),
         }
 
@@ -406,11 +456,10 @@ class EvidenceBundle:
             max_items=100,
             max_chars=200,
         )
-        missing_ids = _normalized_unique_texts(
+        missing_ids = _normalized_requirement_ids(
             self.missing_requirement_ids,
             field_name="missing requirement id",
             max_items=8,
-            max_chars=64,
         )
         if any(value not in item_by_id for value in context_ids):
             raise ValueError("context item ids must reference bundle items")
@@ -441,11 +490,32 @@ class EvidenceBundle:
         item_by_id = {item.chunk_id: item for item in self.items}
         return tuple(item_by_id[value] for value in self.answer_source_ids)
 
+    @property
+    def covered_requirement_ids(self) -> tuple[str, ...]:
+        """Requirement ids supported by evidence admitted to generation.
+
+        Background material and contradictory evidence remain visible for
+        diagnostics, but neither can establish positive requirement coverage.
+        """
+
+        covered: list[str] = []
+        seen: set[str] = set()
+        for item in self.context_items:
+            if item.role not in {"direct", "bridge", "complement"}:
+                continue
+            for requirement_id in item.supports_requirement_ids:
+                if requirement_id in seen:
+                    continue
+                seen.add(requirement_id)
+                covered.append(requirement_id)
+        return tuple(covered)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.to_dict(),
             "items": [item.to_dict() for item in self.items],
             "context_item_ids": list(self.context_item_ids),
             "answer_source_ids": list(self.answer_source_ids),
+            "covered_requirement_ids": list(self.covered_requirement_ids),
             "missing_requirement_ids": list(self.missing_requirement_ids),
         }

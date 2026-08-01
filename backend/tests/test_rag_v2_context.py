@@ -11,6 +11,8 @@ def _item(
     doc_id: str = "doc-a",
     chunk_index: int = 0,
     content: str = "证据正文",
+    role: str = "background",
+    supports_requirement_ids: tuple[str, ...] = (),
 ) -> EvidenceItem:
     return EvidenceItem(
         chunk_id=chunk_id,
@@ -20,11 +22,31 @@ def _item(
         chunk_index=chunk_index,
         confidence="retrieved",
         constraint_status="neutral",
+        role=role,
+        supports_requirement_ids=supports_requirement_ids,
         metadata={"filename": f"{doc_id}.md"},
     )
 
 
 class EvidenceContextTests(unittest.TestCase):
+    def test_header_exposes_role_and_requirement_mapping(self) -> None:
+        item = _item(
+            "mapped",
+            role="bridge",
+            supports_requirement_ids=("r1", "r2"),
+        )
+        bundle = EvidenceBundle(
+            state=EvidenceState("ok", "retrieved", "partial"),
+            items=(item,),
+            context_item_ids=("mapped",),
+            answer_source_ids=("mapped",),
+        )
+
+        text = render_evidence_context(bundle)
+
+        self.assertIn("角色：bridge", text)
+        self.assertIn("需求：r1,r2", text)
+
     def test_renderer_uses_only_admitted_context_items(self) -> None:
         included = _item("included")
         diagnostic_only = _item("diagnostic", chunk_index=1)
@@ -96,6 +118,7 @@ class EvidenceContextTests(unittest.TestCase):
         self.assertTrue(context.truncated)
         self.assertEqual(context.item_ids, ("one",))
         self.assertEqual(context.dropped_item_ids, ("two",))
+        self.assertEqual(context.truncated_item_ids, ("one",))
 
     def test_render_chunk_budget_is_enforced(self) -> None:
         bundle = EvidenceBundle(
@@ -110,6 +133,28 @@ class EvidenceContextTests(unittest.TestCase):
         self.assertEqual(context.item_ids, ("one",))
         self.assertEqual(context.dropped_item_ids, ("two",))
         self.assertTrue(context.truncated)
+
+    def test_truncated_prefix_drops_positive_mapping_from_prompt_header(self) -> None:
+        item = _item(
+            "mapped",
+            content="证" * 200,
+            role="direct",
+            supports_requirement_ids=("r1",),
+        )
+        bundle = EvidenceBundle(
+            state=EvidenceState("ok", "retrieved", "partial"),
+            items=(item,),
+            context_item_ids=("mapped",),
+            answer_source_ids=("mapped",),
+        )
+
+        context = build_evidence_context(bundle, max_chars=120)
+
+        self.assertEqual(context.truncated_item_ids, ("mapped",))
+        self.assertIn("角色：background", context.text)
+        self.assertIn("需求：无", context.text)
+        self.assertNotIn("角色：direct", context.text)
+        self.assertNotIn("需求：r1", context.text)
 
     def test_unavailable_bundle_never_builds_context(self) -> None:
         bundle = EvidenceBundle(

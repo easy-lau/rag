@@ -14,6 +14,8 @@ def _item(
     *,
     authorized=True,
     constraint_status="neutral",
+    role="background",
+    supports_requirement_ids=(),
 ):
     return EvidenceItem(
         chunk_id=chunk_id,
@@ -25,6 +27,8 @@ def _item(
         constraint_status=constraint_status,
         authorized=authorized,
         origins=("hybrid",),
+        role=role,
+        supports_requirement_ids=supports_requirement_ids,
         metadata={"section_key": "s1"},
     )
 
@@ -78,6 +82,57 @@ class QueryPlanV2ContractTests(unittest.TestCase):
 
 
 class EvidenceContractTests(unittest.TestCase):
+    def test_evidence_role_and_requirement_ids_are_first_class(self) -> None:
+        item = _item(
+            role="direct",
+            supports_requirement_ids=("r1", "r1", "bridge_2"),
+        )
+
+        self.assertEqual(item.role, "direct")
+        self.assertEqual(item.supports_requirement_ids, ("r1", "bridge_2"))
+        self.assertEqual(item.to_dict()["role"], "direct")
+        self.assertEqual(
+            item.to_dict()["supports_requirement_ids"],
+            ["r1", "bridge_2"],
+        )
+
+    def test_invalid_evidence_role_or_requirement_id_is_rejected(self) -> None:
+        for values in (
+            {"role": "related"},
+            {"supports_requirement_ids": ("R1",)},
+            {"supports_requirement_ids": "r1"},
+        ):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    _item(**values)
+
+    def test_bundle_derives_positive_coverage_from_context_roles(self) -> None:
+        direct = _item(
+            "direct",
+            role="direct",
+            supports_requirement_ids=("r1",),
+        )
+        conflicting = _item(
+            "conflict",
+            role="conflicting",
+            supports_requirement_ids=("r2",),
+        )
+        background = _item(
+            "background",
+            role="background",
+            supports_requirement_ids=("r3",),
+        )
+        bundle = EvidenceBundle(
+            state=EvidenceState("ok", "retrieved", "partial"),
+            items=(direct, conflicting, background),
+            context_item_ids=("direct", "conflict", "background"),
+            answer_source_ids=("direct",),
+            missing_requirement_ids=("r2", "r3"),
+        )
+
+        self.assertEqual(bundle.covered_requirement_ids, ("r1",))
+        self.assertEqual(bundle.to_dict()["covered_requirement_ids"], ["r1"])
+
     def test_soft_degradation_keeps_authorized_context(self) -> None:
         state = EvidenceState(
             availability="degraded",

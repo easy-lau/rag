@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { normalizeEvidenceClarification } from '../utils/chatClarification.js'
 
 const STEPS = [
   { key: 'analyze',  label: '问题分析' },
@@ -168,6 +169,15 @@ export const useSearchStore = defineStore('search', () => {
     hasResultEvent.value = true
 
     const eventMeta = data?.search_meta || data?.meta || {}
+    const previousClarification = normalizeEvidenceClarification(searchMeta.value.clarification)
+      ? searchMeta.value.clarification
+      : null
+    const incomingClarification = firstDefined(data.clarification, eventMeta.clarification, null)
+    const effectiveClarification = previousClarification
+      || (normalizeEvidenceClarification(incomingClarification) ? incomingClarification : null)
+    // Once a stream has entered clarification, later/out-of-order result
+    // events cannot promote candidates back into answer evidence.
+    const clarificationLocked = Boolean(effectiveClarification)
     const rawExplicitStatus = firstDefined(data.evidence_status, eventMeta.evidence_status)
     const explicitStatus = typeof rawExplicitStatus === 'string'
       ? rawExplicitStatus.trim().toLowerCase()
@@ -193,6 +203,7 @@ export const useSearchStore = defineStore('search', () => {
       else if (retrievalExecuted === true) evidenceStatus = 'no_hit'
       else evidenceStatus = 'unverified'
     }
+    if (clarificationLocked) evidenceStatus = 'needs_clarification'
 
     const hasNoAnswerEvidence = NON_ANSWER_EVIDENCE_STATUSES.has(evidenceStatus)
     if (evidenceStatus === 'no_hit' || evidenceStatus === 'needs_clarification') {
@@ -272,9 +283,11 @@ export const useSearchStore = defineStore('search', () => {
       data.coverage_status,
       eventMeta.coverage_status,
     )
-    const coverageStatus = ['complete', 'partial', 'insufficient'].includes(rawCoverageStatus)
-      ? rawCoverageStatus
-      : ''
+    const coverageStatus = clarificationLocked
+      ? 'insufficient'
+      : (['complete', 'partial', 'insufficient'].includes(rawCoverageStatus)
+          ? rawCoverageStatus
+          : '')
     const missingRequirementCount = nonNegativeCount(firstDefined(
       data.missing_requirement_count,
       eventMeta.missing_requirement_count,
@@ -295,9 +308,7 @@ export const useSearchStore = defineStore('search', () => {
         {},
       ),
       clarification: firstDefined(
-        data.clarification,
-        eventMeta.clarification,
-        searchMeta.value.clarification,
+        effectiveClarification,
         null,
       ),
       retrieval_executed: retrievalExecuted,
@@ -342,8 +353,31 @@ export const useSearchStore = defineStore('search', () => {
     }
   }
 
+  function setClarification(clarification) {
+    results.value = results.value.map(item => (
+      item?.evidence_role === 'direct'
+        ? { ...item, evidence_role: 'related' }
+        : item
+    ))
+    const relatedReferenceCount = results.value.filter(item => item?.evidence_role === 'related').length
+    searchMeta.value = {
+      ...searchMeta.value,
+      evidence_status: 'needs_clarification',
+      hit_count: 0,
+      direct_evidence_count: 0,
+      related_reference_count: Math.max(
+        nonNegativeCount(searchMeta.value.related_reference_count) ?? 0,
+        relatedReferenceCount,
+      ),
+      context_evidence_count: 0,
+      answer_source_count: 0,
+      coverage_status: 'insufficient',
+      clarification,
+    }
+  }
+
   return {
     results, totalCount, searchMeta, intentDecision, hasResultEvent, steps,
-    resetSteps, updateStep, finishSteps, setResults, setIntentDecision,
+    resetSteps, updateStep, finishSteps, setResults, setIntentDecision, setClarification,
   }
 })
