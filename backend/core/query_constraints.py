@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 
 ConstraintStatus = Literal["exact", "compatible", "unknown", "mismatch", "neutral"]
@@ -35,6 +35,14 @@ _QUERY_ADJACENT_RE = re.compile(
 _QUERY_VERSION_LABEL_RE = re.compile(
     rf"(?P<product>[A-Za-z][A-Za-z0-9_.\-]{{1,30}}|[\u3400-\u9fff]{{2,16}})"
     rf"\s*版本\s*(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
+    re.IGNORECASE,
+)
+_QUERY_STANDALONE_VERSION_RE = re.compile(
+    rf"(?<![A-Za-z0-9_])(?:版本\s*|[vV]\s*)"
+    rf"(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}|"
+    rf"(?<![A-Za-z0-9_.])(?P<suffix_version>{_VERSION_PATTERN})\s*"
+    rf"(?:版|版本|年度(?:制度)?)"
+    rf"(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 _LEADING_QUERY_WORDS = (
@@ -128,6 +136,29 @@ _DOCUMENT_PROJECT_FIELD_RE = re.compile(
     r"(?:所属项目|项目名称|项目(?!版本))\s*[：:]\s*([^\n\r>,，;；]+)",
     re.IGNORECASE,
 )
+# File names and ingestion headings are often the only source-anchored
+# applicability signal available for a chunk (for example ``云枢7配置`` or
+# ``差旅制度2025版``).  They are useful for scope grouping, but only when a
+# registered product alias is adjacent to a version, or when a number is
+# explicitly marked as a version/edition.  Do not treat arbitrary numbers in
+# paths, dates, or document names as versions.
+_SOURCE_IDENTITY_METADATA_KEYS = {
+    "source",
+    "heading",
+    "title",
+    "filename",
+    "file_name",
+    "name",
+    "path",
+}
+_SOURCE_VERSION_RE = re.compile(
+    rf"(?<![\d.])(?:版本\s*|[vV]\s*)"
+    rf"(?P<prefix_version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}|"
+    rf"(?<![\d.])(?P<suffix_version>{_VERSION_PATTERN})\s*"
+    rf"(?:版|版本|年度(?:制度)?)"
+    rf"(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 
 
 def _alias_search_pattern(alias: str) -> re.Pattern[str]:
@@ -193,6 +224,23 @@ class QueryConstraints:
         """
 
         return bool(self.product)
+
+    @property
+    def has_version_constraint(self) -> bool:
+        """查询明确指定了版本，即使没有绑定到产品。
+
+        ``has_hard_constraint`` intentionally keeps its historical meaning of
+        product *and* version.  A standalone label such as ``版本8.6`` still
+        needs a separate scope gate so a 7.x document cannot answer it.
+        """
+
+        return bool(self.version and self.explicit_version)
+
+    @property
+    def has_scope_constraint(self) -> bool:
+        """查询包含必须由文档身份确认的产品或版本适用范围。"""
+
+        return self.has_product_constraint or self.has_version_constraint
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -279,7 +327,8 @@ def _clean_product(value: str) -> str:
 def _valid_query_match(text: str, match: re.Match[str]) -> bool:
     """避免把“云枢 8 个节点”这类数量误识别为版本。"""
 
-    version = match.groupdict().get("version") or ""
+    groups = match.groupdict()
+    version = groups.get("version") or groups.get("suffix_version") or ""
     if "." not in version:
         tail = text[match.end():]
         if _VERSION_UNIT_WORDS.match(tail):
@@ -312,7 +361,13 @@ def extract_query_constraints(query: str) -> QueryConstraints:
         re.IGNORECASE,
     )
     # 每个正则都可能先命中一个数量表达式；继续寻找下一个合法版本片段。
-    for pattern in (_QUERY_CUE_RE, known_pattern, _QUERY_VERSION_LABEL_RE, _QUERY_ADJACENT_RE):
+    for pattern in (
+        _QUERY_CUE_RE,
+        known_pattern,
+        _QUERY_STANDALONE_VERSION_RE,
+        _QUERY_VERSION_LABEL_RE,
+        _QUERY_ADJACENT_RE,
+    ):
         for candidate in pattern.finditer(text):
             if _valid_query_match(text, candidate):
                 match = candidate
@@ -333,12 +388,29 @@ def extract_query_constraints(query: str) -> QueryConstraints:
             )
         return QueryConstraints()
 
-    product = _clean_product(match.group("product"))
-    version = _normalize_version(match.group("version"))
-    if not product or not version:
+    raw_product = match.groupdict().get("product") or ""
+    raw_version = (
+        match.groupdict().get("version")
+        or match.groupdict().get("suffix_version")
+        or ""
+    )
+    product = _clean_product(raw_product) if raw_product else ""
+    version = _normalize_version(raw_version)
+    if not version:
         return QueryConstraints()
 
     matched_text = match.group(0).strip()
+    if not product:
+        return QueryConstraints(
+            product=None,
+            version=version,
+            explicit_version=True,
+            matched_text=matched_text,
+            extraction_reason=(
+                f"由查询片段“{matched_text}”识别出显式版本“{version}”，"
+                "未指定产品"
+            ),
+        )
     return QueryConstraints(
         product=product,
         version=version,
@@ -383,10 +455,96 @@ def _versions_from_value(value: Any) -> set[str]:
     }
 
 
+def _source_identity_texts(candidate: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return bounded, source-authored identity labels for one candidate.
+
+    Retrieval adapters use slightly different names for the original source
+    label.  Restricting this helper to the filename and a small allow-list of
+    ingestion metadata fields prevents arbitrary metadata values (or chunk
+    bodies) from becoming an applicability identity.
+    """
+
+    texts: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        texts.append(text[:1000])
+
+    for field in ("filename", "source", "heading", "title", "name", "path"):
+        add(candidate.get(field))
+    metadata = candidate.get("metadata")
+    for key, value in _flatten_metadata(metadata or {}):
+        normalized_key = _normalize_product(key)
+        if normalized_key in {
+            _normalize_product(item)
+            for item in _SOURCE_IDENTITY_METADATA_KEYS
+        }:
+            add(value)
+    return tuple(texts)
+
+
+def _source_identity_facts(
+    texts: Sequence[str],
+) -> tuple[set[str], set[str]]:
+    """Extract conservative product/version facts from source labels.
+
+    A registered product alias followed by a version is a strong identity
+    signal.  Product-less policies may use an explicit ``版``/``版本``/``年度``
+    marker, while bare numbers remain ignored.  The latter is important for
+    filenames containing dates, ticket numbers, or section counters.
+    """
+
+    products: set[str] = set()
+    versions: set[str] = set()
+    known_aliases = sorted(
+        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
+        key=len,
+        reverse=True,
+    )
+    product_version_pattern = re.compile(
+        rf"(?P<product>{'|'.join(re.escape(alias) for alias in known_aliases)})"
+        rf"\s*(?:版本\s*|[vV]\s*)?"
+        rf"(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
+        re.IGNORECASE,
+    )
+
+    for text in texts:
+        source = str(text or "")
+        for alias in known_aliases:
+            match = _alias_search_pattern(alias).search(source)
+            if match is not None:
+                products.add(match.group(0).strip())
+
+        for match in product_version_pattern.finditer(source):
+            version = match.group("version") or ""
+            if "." not in version and _VERSION_UNIT_WORDS.match(
+                source[match.end():]
+            ):
+                # ``云枢 8 个节点`` is a quantity, not a product version.
+                continue
+            products.add(match.group("product").strip())
+            versions.add(_normalize_version(version))
+
+        for match in _SOURCE_VERSION_RE.finditer(source):
+            version = match.group("prefix_version") or match.group("suffix_version")
+            if version:
+                versions.add(_normalize_version(version))
+    return products, versions
+
+
 def _declared_document_identity(
     candidate: dict[str, Any],
 ) -> tuple[set[str], set[str], set[str]]:
-    """Extract only explicit document identity fields from one chunk."""
+    """Extract explicit document identity fields from one chunk.
+
+    In addition to structured fields in the body/metadata, source labels are
+    parsed conservatively so a document whose header chunk was not retrieved
+    can still participate in ambiguity and comparison decisions.
+    """
 
     products: set[str] = set()
     versions: set[str] = set()
@@ -419,6 +577,31 @@ def _declared_document_identity(
         value = match.group(1).strip()
         if value:
             projects.add(value)
+    source_products, source_versions = _source_identity_facts(
+        _source_identity_texts(candidate)
+    )
+    products.update(source_products)
+    versions.update(source_versions)
+    # A filename often carries only the product generation (``云枢6配置``),
+    # while structured metadata carries the full release (``6.0.1``).  Treat
+    # the shorter numeric prefix as a display alias of the detailed identity;
+    # retaining both would manufacture a second mutually-exclusive scope for
+    # one document and make a comparison ask about a version the source never
+    # declared as a separate release.
+    detailed_versions = {
+        value
+        for value in versions
+        if "." in value
+    }
+    if detailed_versions:
+        versions = {
+            value
+            for value in versions
+            if not any(
+                value != other and other.startswith(f"{value}.")
+                for other in detailed_versions
+            )
+        }
     return products, versions, projects
 
 
@@ -576,7 +759,7 @@ def evaluate_candidate_constraints(
 ) -> ConstraintEvaluation:
     """使用候选的文件名、标签、metadata 和正文校验显式产品版本约束。"""
 
-    if not constraints.has_product_constraint:
+    if not constraints.has_scope_constraint:
         return ConstraintEvaluation(
             status="neutral",
             reason="查询没有可确定的显式产品约束",
@@ -608,10 +791,17 @@ def evaluate_candidate_constraints(
         if normalized_key in _NORMALIZED_COMPATIBLE_VERSION_KEYS:
             compatible_versions.update(_versions_from_value(value))
 
-    # 文件名和标签通常是文档身份的强信号；正文只在明确字段/兼容语句中
-    # 参与强判定，避免“本文比较云枢8.6与云枢6”把旧版本文档误判 exact。
-    searchable_parts = [filename]
-    identity_text_parts = [filename]
+    # 文件名、原始 source/heading 标签和标签字段通常是文档身份的强信号；
+    # 正文只在明确字段/兼容语句中参与强判定，避免“本文比较云枢8.6与云枢6”
+    # 把旧版本文档误判 exact。
+    source_identity_texts = _source_identity_texts(candidate)
+    source_products, source_versions = _source_identity_facts(
+        source_identity_texts
+    )
+    candidate_products.update(source_products)
+    declared_versions.update(source_versions)
+    searchable_parts = [*source_identity_texts]
+    identity_text_parts = [*source_identity_texts]
     if isinstance(tags, (list, tuple, set)):
         for tag in tags:
             tag_text = str(tag)
@@ -675,6 +865,55 @@ def evaluate_candidate_constraints(
 
     sorted_products = tuple(sorted(candidate_products, key=str.casefold))
     sorted_versions = tuple(sorted(declared_versions | mentioned_versions))
+    if not constraints.has_product_constraint:
+        # A product-less explicit version (for example ``版本8.6`` or
+        # ``2025版``) may still be enforced against source-declared versions.
+        # Do not use incidental body mentions as identity evidence, and do not
+        # infer a product from an unrelated candidate.
+        if target_version in compatible_versions:
+            return ConstraintEvaluation(
+                status="compatible",
+                reason=f"候选明确声明兼容或适用于版本“{target_version}”",
+                candidate_products=sorted_products,
+                candidate_versions=sorted_versions,
+            )
+        if target_version in declared_versions and declared_versions == {
+            target_version
+        }:
+            return ConstraintEvaluation(
+                status="exact",
+                reason=f"候选明确包含目标版本“{target_version}”",
+                candidate_products=sorted_products,
+                candidate_versions=sorted_versions,
+            )
+        if target_version in declared_versions:
+            return ConstraintEvaluation(
+                status="mismatch",
+                reason=(
+                    f"候选同时声明目标版本“{target_version}”与其他版本"
+                    f"“{'、'.join(sorted(declared_versions - {target_version}))}”，"
+                    "无法作为精确版本依据"
+                ),
+                candidate_products=sorted_products,
+                candidate_versions=sorted_versions,
+            )
+        if declared_versions:
+            return ConstraintEvaluation(
+                status="mismatch",
+                reason=(
+                    f"查询要求版本“{target_version}”，候选明确版本为"
+                    f"“{'、'.join(sorted(declared_versions))}”，版本冲突"
+                ),
+                candidate_products=sorted_products,
+                candidate_versions=sorted_versions,
+            )
+        return ConstraintEvaluation(
+            status="unknown",
+            reason=f"候选未标注明确版本，无法确认是否适用于“{target_version}”",
+            candidate_products=sorted_products,
+            candidate_versions=sorted_versions,
+        )
+
     product_matches = any(_same_product(product, item) for item in candidate_products)
     if candidate_products and not product_matches:
         return ConstraintEvaluation(

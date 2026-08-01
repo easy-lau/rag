@@ -1,18 +1,28 @@
+import asyncio
 import json
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from core.conversation_context import (
+    ConversationContext,
+    RouteTurnCandidate,
+    resolve_routed_conversation_context,
+    route_context_payloads,
+)
 from core.intent_router import (
     DEFAULT_INTENT_CATEGORIES,
     INTENT_MAX_TOKENS,
     _apply_routing_policy,
     _classification_prompt,
+    build_verified_evidence_scope_result,
     classify_intent_result,
     _classify_with_llm,
     _default_config,
     _fallback_decision,
     _make_decision,
+    _is_normative_query,
     _parse_llm_decision_result,
     _response_format_is_unsupported,
     _requires_knowledge_retrieval,
@@ -34,11 +44,13 @@ def _model_settings(
     intent_model: str = "intent-model",
     chat_model: str = "chat-model",
     timeout: float = 17.5,
+    route_timeout: float = 12.0,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         intent_model=intent_model,
         chat_model=chat_model,
         llm_request_timeout_seconds=timeout,
+        rag_route_timeout_seconds=route_timeout,
     )
 
 
@@ -81,6 +93,70 @@ def _model_response(
 class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.config = _default_config()
+
+    def test_verified_evidence_scope_builds_contract_without_model(self) -> None:
+        db = SimpleNamespace(add=Mock())
+        kb_id = uuid.uuid4()
+        user = SimpleNamespace(id=uuid.uuid4())
+        conversation_id = uuid.uuid4()
+
+        with (
+            patch("core.intent_router.get_client") as get_client,
+            patch("core.intent_router.trace_event") as trace,
+        ):
+            result = build_verified_evidence_scope_result(
+                db,
+                "普通员工的出差标准是什么",
+                user=user,
+                selected_kb_ids=[kb_id],
+                conversation_id=conversation_id,
+                trace_id="verified-scope",
+            )
+
+        get_client.assert_not_called()
+        self.assertGreaterEqual(result.latency_ms, 0)
+        self.assertLess(result.latency_ms, 100)
+        self.assertTrue(result.task_contract.dispatch_authorized)
+        self.assertEqual(result.task_contract.relation, "continuation")
+        self.assertEqual(result.task_contract.response_mode, "grounded_qa")
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        self.assertEqual(
+            result.task_contract.decision_reason,
+            "evidence_scope_selected",
+        )
+        self.assertEqual(result.task_contract.source, "evidence_pending_rule")
+        self.assertEqual(
+            result.task_contract.requirements[0].description,
+            "普通员工的出差标准是什么",
+        )
+        self.assertEqual(result.route_decision.query_resolution.mode, "current")
+        self.assertEqual(result.route_decision.query_resolution.context_turn_keys, ())
+        self.assertIsNotNone(result.route_log_id)
+        db.add.assert_called_once()
+        route_log = db.add.call_args.args[0]
+        self.assertEqual(route_log.decision_reason, "evidence_scope_selected")
+        self.assertEqual(route_log.selected_kb_count, 1)
+        self.assertEqual(
+            [call.args[0] for call in trace.call_args_list],
+            ["intent.contract_compiled"],
+        )
+
+    def test_verified_evidence_refinement_has_distinct_reason(self) -> None:
+        db = SimpleNamespace(add=Mock())
+        result = build_verified_evidence_scope_result(
+            db,
+            "员工标准是什么\n用户补充的适用范围：出差",
+            selected_kb_ids=[uuid.uuid4()],
+            record_log=False,
+            refined=True,
+        )
+
+        self.assertIsNone(result.route_log_id)
+        self.assertEqual(
+            result.decision.decision_reason,
+            "evidence_scope_refined",
+        )
+        db.add.assert_not_called()
 
     async def test_v1_route_separates_followup_relation_from_current_query(self) -> None:
         route_payload = {
@@ -137,6 +213,8 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                     "assistant_answer": "普通员工属于 D 级。",
                     "reusable_source_count": 2,
                 }],
+                fallback_relation="followup",
+                fallback_query_mode="current",
                 record_log=False,
             )
 
@@ -252,7 +330,15 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             patch("core.intent_router.get_intent_router_config", new=AsyncMock(return_value=_default_config())),
             patch("core.intent_router.list_intent_categories", new=AsyncMock(return_value=_categories())),
             patch("core.intent_router.get_client", return_value=_model_client(create)),
-            patch("core.intent_router.get_settings", return_value=_model_settings(intent_model="intent-model", chat_model="intent-model")),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=_model_settings(
+                    intent_model="intent-model",
+                    chat_model="intent-model",
+                    timeout=60.0,
+                    route_timeout=3.25,
+                ),
+            ),
             patch("core.intent_router.trace_event"),
         ):
             result = await classify_intent_result(
@@ -276,6 +362,8 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             {"type": "json_object"},
         )
         for call in create.await_args_list:
+            self.assertGreater(call.kwargs["timeout"], 0)
+            self.assertLessEqual(call.kwargs["timeout"], 3.25)
             user_payload = json.loads(call.kwargs["messages"][1]["content"])
             self.assertEqual(user_payload["output_contract"], "json")
         fallback_messages = create.await_args_list[1].kwargs["messages"]
@@ -283,6 +371,49 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             "json",
             "\n".join(str(item.get("content") or "") for item in fallback_messages),
         )
+
+    async def test_route_total_timeout_falls_back_to_required_retrieval(self) -> None:
+        async def slow_create(**_kwargs):
+            await asyncio.sleep(1)
+
+        create = AsyncMock(side_effect=slow_create)
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch(
+                "core.intent_router.get_settings",
+                return_value=_model_settings(timeout=60.0, route_timeout=0.1),
+            ),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await asyncio.wait_for(
+                classify_intent_result(
+                    object(),
+                    "解释一下向量数据库",
+                    selected_kb_count_override=1,
+                    route_context=(),
+                    record_log=False,
+                ),
+                timeout=0.5,
+            )
+
+        self.assertEqual(result.decision.source, "fallback")
+        self.assertEqual(result.task_contract.response_mode, "grounded_qa")
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        self.assertTrue(result.task_contract.need_retrieval)
+        self.assertTrue(result.diagnostics["safe_fallback_used"])
+        self.assertEqual(result.diagnostics["rejection_reason"], "route_timeout")
+        self.assertLessEqual(create.await_args.kwargs["timeout"], 0.1)
 
     async def test_high_confidence_enterprise_question_skips_remote_route_model(self) -> None:
         create = AsyncMock(side_effect=AssertionError("确定性企业问题不应调用路由模型"))
@@ -312,6 +443,190 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.task_contract.retrieval_policy, "required")
                 self.assertEqual(len(result.task_contract.requirements), 1)
                 self.assertEqual(result.task_contract.requirements[0].role, "answer")
+        create.assert_not_awaited()
+
+    async def test_selected_kb_without_enterprise_source_still_uses_route_model(
+        self,
+    ) -> None:
+        # A selected KB is a weak prior, not a topic classifier.  Unknown
+        # vocabulary must be decided semantically instead of being added to a
+        # growing V2 business-word shortcut.
+        question = "甲类对象每季度可领取多少"
+        self.assertFalse(_requires_knowledge_retrieval(question))
+        route_payload = {
+            "schema_version": "rag_route_decision.v1",
+            "readiness": "ready",
+            "intent_code": "knowledge_qa",
+            "relation": "new",
+            "evidence_scope": "enterprise_kb",
+            "query_resolution": {"mode": "current", "context_turn_keys": []},
+            "requirements": [{
+                "role": "answer",
+                "origin": "user_text",
+                "description": question,
+            }],
+            "clarification": {"question": "", "unresolved": []},
+            "confidence": 0.93,
+            "rationale": "所选知识库中的对象规则查询",
+        }
+        create = AsyncMock(return_value=_model_response(json.dumps(route_payload)))
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_count_override=1,
+                route_context=(),
+                record_log=False,
+            )
+
+        self.assertEqual(result.decision.source, "llm")
+        self.assertEqual(result.task_contract.response_mode, "grounded_qa")
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        self.assertTrue(result.task_contract.dispatch_authorized)
+        self.assertNotIn("deterministic_preflight", result.diagnostics)
+        create.assert_awaited_once()
+
+    async def test_unknown_normative_query_cannot_be_downgraded_to_chat(self) -> None:
+        question = "不存在的火星基地量子补贴标准是什么"
+        create = AsyncMock(side_effect=AssertionError("规范查询不应走通用聊天"))
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch("core.intent_router.get_client", return_value=_model_client(create)),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_ids=["kb-1"],
+                record_log=False,
+            )
+
+        self.assertEqual(result.decision.source, "rule")
+        self.assertEqual(result.decision.response_mode, "grounded_qa")
+        self.assertEqual(result.decision.retrieval_policy, "required")
+        self.assertTrue(result.decision.need_retrieval)
+        create.assert_not_awaited()
+
+    async def test_high_confidence_direct_modes_skip_route_model_even_with_history(
+        self,
+    ) -> None:
+        cases = (
+            ("谢谢你的帮助", "general_chat"),
+            ("今天上海天气怎么样？", "general_chat"),
+            ("你是谁", "general_chat"),
+            ("帮我写一首诗", "writing"),
+            ("当前RAG平台如何上传文档", "platform_help"),
+        )
+        for question, expected_mode in cases:
+            with self.subTest(question=question):
+                create = AsyncMock(
+                    side_effect=AssertionError("高确定性直接模式不应调用路由模型")
+                )
+                with (
+                    patch(
+                        "core.intent_router.get_intent_router_config",
+                        new=AsyncMock(return_value=_default_config()),
+                    ),
+                    patch(
+                        "core.intent_router.list_intent_categories",
+                        new=AsyncMock(return_value=_categories()),
+                    ),
+                    patch(
+                        "core.intent_router.get_client",
+                        return_value=_model_client(create),
+                    ),
+                    patch("core.intent_router.get_settings", return_value=_model_settings()),
+                    patch("core.intent_router.trace_event"),
+                ):
+                    result = await classify_intent_result(
+                        object(),
+                        question,
+                        selected_kb_count_override=1,
+                        route_context=({
+                            "candidate_key": "t1",
+                            "user_input": "公司的采购审批制度是什么",
+                            "assistant_answer": "请参考采购制度。",
+                            "reusable_source_count": 1,
+                        },),
+                        fallback_relation="new",
+                        fallback_query_mode="current",
+                        record_log=False,
+                    )
+
+                self.assertEqual(result.task_contract.response_mode, expected_mode)
+                self.assertFalse(result.task_contract.need_retrieval)
+                create.assert_not_awaited()
+
+    async def test_independent_enterprise_question_with_history_uses_preflight(
+        self,
+    ) -> None:
+        question = "公司制度对采购审批有什么要求？"
+        self.assertTrue(_requires_knowledge_retrieval(question))
+        create = AsyncMock(
+            side_effect=AssertionError("本地已判定 new/current 时不应调用路由模型")
+        )
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_count_override=1,
+                route_context=({
+                    "candidate_key": "t1",
+                    "user_input": "普通员工出差的住宿标准是什么？",
+                    "assistant_answer": "一线城市每晚不超过 450 元。",
+                    "reusable_source_count": 1,
+                },),
+                fallback_relation="new",
+                fallback_query_mode="current",
+                record_log=False,
+            )
+
+        self.assertEqual(result.route_decision.relation, "new")
+        self.assertEqual(result.task_contract.query_mode, "current")
+        self.assertEqual(result.task_contract.context_turn_keys, ())
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        self.assertEqual(
+            result.diagnostics["deterministic_preflight"],
+            "enterprise_question",
+        )
         create.assert_not_awaited()
 
     async def test_knowledge_dependent_writing_keeps_writing_route(self) -> None:
@@ -383,6 +698,64 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.task_contract.context_turn_keys, ("t1",))
         self.assertTrue(result.task_contract.dispatch_authorized)
         create.assert_not_awaited()
+
+    async def test_deterministic_elliptical_followup_builds_standalone_query(
+        self,
+    ) -> None:
+        question = "那住宿呢"
+        previous_question = "普通员工的出差标准是什么"
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+            previous_user_question=previous_question,
+            route_turn_candidates=(
+                RouteTurnCandidate(
+                    candidate_key="t1",
+                    user_question=previous_question,
+                    assistant_answer="普通员工属于 D 级。",
+                    raw_sources=(),
+                ),
+            ),
+        )
+        create = AsyncMock(side_effect=AssertionError("确定性企业追问不应调用路由模型"))
+        with (
+            patch("core.intent_router.get_intent_router_config", new=AsyncMock(return_value=_default_config())),
+            patch("core.intent_router.list_intent_categories", new=AsyncMock(return_value=_categories())),
+            patch("core.intent_router.get_client", return_value=_model_client(create)),
+            patch("core.intent_router.get_settings", return_value=_model_settings(intent_model="intent-model", chat_model="chat-model")),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_count_override=1,
+                route_context=route_context_payloads(context),
+                fallback_relation="followup",
+                fallback_query_mode="contextualize",
+                record_log=False,
+            )
+
+        self.assertEqual(result.route_decision.relation, "followup")
+        self.assertEqual(result.task_contract.relation, "followup")
+        self.assertEqual(result.task_contract.query_mode, "contextualize")
+        self.assertEqual(result.task_contract.context_turn_keys, ("t1",))
+        self.assertTrue(result.task_contract.dispatch_authorized)
+        create.assert_not_awaited()
+
+        resolved = await resolve_routed_conversation_context(
+            object(),
+            context=context,
+            question=question,
+            kb_ids=(),
+            route_decision=result.route_decision,
+        )
+
+        self.assertIn("住宿", resolved.standalone_query)
+        self.assertIn("普通员工", resolved.standalone_query)
+        self.assertIn("出差", resolved.standalone_query)
 
     def test_external_product_help_misclassification_is_forced_to_retrieve(self) -> None:
         classified = _make_decision(_category("system_help"), 0.99, "llm")
@@ -647,6 +1020,10 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             "Python 官方文档在哪里？",
             "合同是什么？",
             "介绍技术规范含义",
+            "今天上海天气怎么样？",
+            "谢谢你的帮助",
+            "你是谁",
+            "帮我写一首关于政策的诗",
         )
         for question in questions:
             with self.subTest(question=question):
@@ -665,7 +1042,47 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(_requires_knowledge_retrieval(question))
                 self.assertFalse(decision.need_retrieval)
                 self.assertEqual(decision.retrieval_policy, "skip")
-                self.assertEqual(decision.decision_reason, "classified_general_chat")
+                expected_reason = (
+                    "explicit_general_chat"
+                    if question in {"今天上海天气怎么样？", "谢谢你的帮助", "你是谁"}
+                    else "explicit_creative_writing"
+                    if question == "帮我写一首关于政策的诗"
+                    else "classified_general_chat"
+                )
+                self.assertEqual(decision.decision_reason, expected_reason)
+
+    def test_normative_query_gate_is_domain_agnostic_and_conservative(self) -> None:
+        lookup_questions = (
+            "不存在的火星基地量子补贴标准是什么",
+            "查询任意对象的资格条件有哪些？",
+            "某项目的执行规则如何适用",
+            "公司制度对报销有什么要求？",
+        )
+        for question in lookup_questions:
+            with self.subTest(question=question):
+                self.assertTrue(_is_normative_query(question))
+                self.assertTrue(_requires_knowledge_retrieval(question))
+                classified = _make_decision(_category("general_chat"), 0.99, "llm")
+                decision = _apply_routing_policy(
+                    question,
+                    classified,
+                    self.config,
+                    selected_kb_count=1,
+                )
+                self.assertTrue(decision.need_retrieval)
+                self.assertEqual(decision.response_mode, "grounded_qa")
+                self.assertEqual(decision.decision_reason, "knowledge_scope_guard")
+
+        non_lookup_questions = (
+            "介绍技术规范含义",
+            "什么是政策",
+            "今天上海天气怎么样？",
+            "谢谢你的帮助",
+            "帮我写一首关于政策的诗",
+        )
+        for question in non_lookup_questions:
+            with self.subTest(question=question):
+                self.assertFalse(_is_normative_query(question))
 
     def test_explicit_enterprise_source_indicators_require_retrieval(self) -> None:
         questions = (

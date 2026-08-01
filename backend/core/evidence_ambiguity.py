@@ -29,6 +29,13 @@ AMBIGUITY_TOPIC_RELEVANCE_THRESHOLD = 0.30
 MAX_AMBIGUITY_CHOICES = 6
 MAX_CHOICE_TEXT_CHARS = 500
 
+# A document-level ambiguity is intentionally a second, conservative layer
+# after product/version/project scope detection.  It is driven by the
+# retrieved documents' own titles/content and query-term distribution; it does
+# not contain a business-topic allow-list.  The limits keep a broad query from
+# turning a large knowledge base into an unusable choice list.
+MAX_TOPIC_DOCUMENT_CHOICES = 6
+
 _ALL_SCOPES_REQUEST_RE = re.compile(
     r"(?:所有|全部|各个?|不同|多个)\s*(?:产品|版本|项目|范围)|"
     r"(?:(?:这|那)\s*)?(?:两个|两项|这些|上述|前述)\s*"
@@ -75,6 +82,11 @@ _EXPLICIT_ALL_DIMENSION_RE = re.compile(
 _SHORT_ALL_SCOPES_RE = re.compile(
     r"^(?:(?:两个|两项|这些|上述|前述)\s*)?"
     r"都(?:要|查|看(?:看)?|对比)(?:一下|吧|。|！|!)?$",
+    re.IGNORECASE,
+)
+_TOPIC_ALL_DOCUMENTS_RE = re.compile(
+    r"(?:全部|所有|各项|各类|汇总|总览|完整(?:内容|资料)|整体(?:内容|情况)|"
+    r"分别(?:说明|回答|列出|介绍)|都(?:要|查|看|了解|列出))",
     re.IGNORECASE,
 )
 
@@ -165,6 +177,11 @@ class EvidenceAmbiguityDecision:
     reason: str = ""
     choices: tuple[EvidenceScopeChoice, ...] = ()
     relevant_document_count: int = 0
+    # Internal execution allow-list resolved from an explicit scope in the
+    # current query.  An empty tuple means that ambiguity assessment did not
+    # narrow the candidate document set; callers must not interpret it as an
+    # instruction to discard every document.
+    allowed_doc_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +192,7 @@ class EvidenceAmbiguityDecision:
             "reason": self.reason,
             "choices": [choice.to_dict() for choice in self.choices],
             "relevant_document_count": self.relevant_document_count,
+            "allowed_doc_ids": list(self.allowed_doc_ids),
         }
 
 
@@ -390,10 +408,14 @@ def _document_scopes(
             ):
                 continue
             evaluation = evaluate_candidate_constraints(constraints, item)
-            if constraints.has_product_constraint and evaluation.status in {
-                "mismatch",
-                "unknown",
-            }:
+            # Keep all source-declared versions together until the explicit
+            # version scope filter below runs.  Otherwise a product-less query
+            # such as ``2025版`` would discard the 2024/2025 alternatives before
+            # it can produce an allow-list for the selected 2025 document.
+            if (
+                constraints.has_product_constraint
+                and evaluation.status in {"mismatch", "unknown"}
+            ):
                 continue
             eligible.append(item)
         if not eligible:
@@ -708,6 +730,304 @@ def _scope_groups_to_choices(
             )
         )
     return tuple(choices)
+
+
+# These are sentence-structure words rather than business vocabulary.  They
+# prevent a broad request such as ``员工标准是什么`` from being made specific
+# merely by the shared words ``标准``/``是什么``.  A subject such as ``出差`` or
+# ``请假`` remains available to distinguish documents because it is not in this
+# set and must be supported by the retrieved document text itself.
+_TOPIC_QUERY_STOP_TERMS = frozenset({
+    "什么",
+    "如何",
+    "怎么",
+    "怎样",
+    "哪些",
+    "哪个",
+    "哪一个",
+    "是否",
+    "能否",
+    "可否",
+    "可以",
+    "请问",
+    "查询",
+    "查一下",
+    "说明",
+    "介绍",
+    "标准",
+    "制度",
+    "政策",
+    "规定",
+    "办法",
+    "规范",
+    "要求",
+    "信息",
+    "内容",
+    "资料",
+    "相关",
+    "一下",
+})
+_TOPIC_PRIMARY_ORIGIN_TOKENS = frozenset({
+    "initial_retrieval",
+    "current_retrieval",
+    "carryover_current_retrieval",
+})
+_TOPIC_CONJUNCTION_RE = re.compile(
+    r"(?:和|与|及|以及|并且|同时|分别|还有|另外|兼顾)",
+    re.IGNORECASE,
+)
+
+
+def _topic_terms(value: Any) -> set[str]:
+    """Return bounded, language-neutral title/content n-grams.
+
+    The repository intentionally does not depend on a tokenizer package.  For
+    CJK text, two- and three-character n-grams provide enough title overlap to
+    distinguish independently named documents; ASCII words are kept as whole
+    tokens.  Query stop terms are removed only after extraction and are never
+    used as a business-topic list.
+    """
+
+    text = str(value or "").casefold()
+    terms: set[str] = set()
+    for match in re.finditer(r"[a-z0-9][a-z0-9_.+/-]{1,}|[\u3400-\u9fff]+", text):
+        token = match.group(0)
+        if re.fullmatch(r"[\u3400-\u9fff]+", token):
+            if len(token) <= 4:
+                terms.add(token)
+            for size in (2, 3):
+                if len(token) < size:
+                    continue
+                terms.update(token[index:index + size] for index in range(len(token) - size + 1))
+        else:
+            terms.add(token)
+    return {
+        term
+        for term in terms
+        if term
+        and term not in _TOPIC_QUERY_STOP_TERMS
+        and not _PROJECT_PLACEHOLDER_EXACT_RE.fullmatch(term)
+    }
+
+
+def _topic_primary_origins(candidate: dict[str, Any]) -> set[str]:
+    values: list[Any] = []
+    for field in ("candidate_origins", "origins"):
+        raw = candidate.get(field)
+        if isinstance(raw, str):
+            values.append(raw)
+        elif isinstance(raw, (list, tuple, set)):
+            values.extend(raw)
+    for field in ("candidate_origin", "origin"):
+        if candidate.get(field):
+            values.append(candidate.get(field))
+    return {
+        str(value or "").strip().casefold()
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _topic_document_rows(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate only current-query document anchors for topic ambiguity.
+
+    Full-document/structural expansion chunks cannot introduce a new choice;
+    at least one current-query seed must have retrieved the document.  Test and
+    legacy adapters that omit origin metadata remain compatible and are treated
+    as primary candidates.
+    """
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for position, raw in enumerate(candidates):
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("evidence_role") or "").strip().casefold() == "irrelevant":
+            continue
+        origins = _topic_primary_origins(raw)
+        if origins and not origins.intersection(_TOPIC_PRIMARY_ORIGIN_TOKENS):
+            continue
+        kb_id = str(raw.get("kb_id") or "").strip()
+        doc_id = str(raw.get("doc_id") or "").strip()
+        if not kb_id or not doc_id:
+            continue
+        raw_metadata = raw.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        filename = str(
+            raw.get("filename")
+            or metadata.get("filename")
+            or metadata.get("source")
+            or ""
+        ).strip()
+        if not filename:
+            continue
+        key = (kb_id, doc_id)
+        row = grouped.setdefault(
+            key,
+            {
+                "kb_id": kb_id,
+                "doc_id": doc_id,
+                "filenames": set(),
+                "text_parts": [],
+                "positions": [],
+                "scores": [],
+                "topic_relevance": [],
+                "answer_support": [],
+            },
+        )
+        row["filenames"].add(filename)
+        row["text_parts"].append(f"{filename}\n{str(raw.get('content') or '')[:1800]}")
+        row["positions"].append(position)
+        for field in ("score", "retrieval_score", "vector_score", "keyword_score", "trigram_score"):
+            try:
+                value = float(raw.get(field))
+            except (TypeError, ValueError):
+                continue
+            if value == value and value >= 0:
+                row["scores"].append(value)
+        for field in ("topic_relevance", "answer_support"):
+            try:
+                value = float(raw.get(field))
+            except (TypeError, ValueError):
+                continue
+            if value == value and value >= 0:
+                row[field].append(value)
+    rows = list(grouped.values())
+    for row in rows:
+        row["filename"] = sorted(row["filenames"], key=str.casefold)[0]
+        row["text"] = "\n".join(row["text_parts"])
+        row["position"] = min(row["positions"] or [0])
+        row["best_score"] = max(row["scores"] or [0.0])
+        row["max_topic_relevance"] = max(row["topic_relevance"] or [0.0])
+        row["max_answer_support"] = max(row["answer_support"] or [0.0])
+    return sorted(rows, key=lambda row: (row["position"], row["filename"].casefold()))
+
+
+def _topic_label_key(filename: str) -> str:
+    value = str(filename or "").casefold()
+    value = re.sub(r"\.(?:docx?|pdf|xlsx?|pptx?|md|txt)$", "", value)
+    value = re.sub(r"[（(]?副本[）)]?|[（(]?copy[）)]?", "", value)
+    value = re.sub(r"[\s_—–-]+", "", value)
+    return value
+
+
+def _topic_groups_to_choices(rows: list[dict[str, Any]]) -> tuple[EvidenceScopeChoice, ...]:
+    choices: list[EvidenceScopeChoice] = []
+    for index, row in enumerate(rows, start=1):
+        filename = str(row["filename"] or "未命名文档")[:MAX_CHOICE_TEXT_CHARS]
+        choices.append(
+            EvidenceScopeChoice(
+                key=f"c{index}",
+                label=f"《{filename}》",
+                products=(),
+                canonical_products=(),
+                versions=(),
+                projects=(),
+                kb_ids=(str(row["kb_id"]),),
+                doc_ids=(str(row["doc_id"]),),
+                anchor_doc_ids=(str(row["doc_id"]),),
+                companion_doc_ids=(),
+                filenames=(filename,),
+                max_topic_relevance=round(float(row["max_topic_relevance"]), 4),
+                max_answer_support=round(float(row["max_answer_support"]), 4),
+            )
+        )
+    return tuple(choices)
+
+
+def _detect_topic_document_ambiguity(
+    *,
+    query: str,
+    candidates: list[dict[str, Any]],
+) -> EvidenceAmbiguityDecision | None:
+    """Detect a broad query whose equally relevant hits are different docs.
+
+    This gate is deliberately narrower than ``len(results) > 1``.  It needs
+    distinct source labels, balanced retrieval support, and no query term that
+    uniquely identifies one document.  Thus a normal multi-chunk answer or a
+    query such as ``出差标准`` remains answerable, while ``员工标准是什么``
+    asks the user to choose between independent policy documents.
+    """
+
+    text = str(query or "").strip()
+    if not text or _TOPIC_ALL_DOCUMENTS_RE.search(text):
+        return None
+    # If source metadata already declares an applicability scope, the product/
+    # version/project grouping above is the authoritative decision—even when a
+    # compatibility document bridges those groups.  Topic labels must not
+    # split such a source-anchored set a second time.
+    scoped_documents = _document_scopes(candidates, QueryConstraints())
+    if any(
+        document.products or document.versions or document.projects
+        for document in scoped_documents
+    ):
+        return None
+    rows = _topic_document_rows(candidates)
+    if len(rows) < 2:
+        return None
+    # Identical source labels do not give the user a meaningful choice.  Scope
+    # metadata (handled by the caller) remains the correct disambiguator there.
+    if len({_topic_label_key(row["filename"]) for row in rows}) < 2:
+        return None
+    if len(rows) > MAX_TOPIC_DOCUMENT_CHOICES:
+        return EvidenceAmbiguityDecision(
+            needs_clarification=True,
+            dimension="document",
+            question=(
+                "检索到多篇可能相关的资料，但当前问题范围较宽。"
+                "请补充具体主题或文档名称后再查询。"
+            ),
+            reason="too_many_mutually_relevant_documents",
+            relevant_document_count=len(rows),
+        )
+
+    query_terms = _topic_terms(text)
+    document_terms = [_topic_terms(row["text"]) for row in rows]
+    unique_docs: set[int] = set()
+    for term in query_terms:
+        matched = {
+            index for index, terms in enumerate(document_terms) if term in terms
+        }
+        if len(matched) == 1:
+            # Two-character CJK n-grams are trusted only when they occur in a
+            # source label; content-only short overlaps are often accidental.
+            matched_index = next(iter(matched))
+            if len(term) >= 3 or term in _topic_terms(rows[matched_index]["filename"]):
+                unique_docs.update(matched)
+    if unique_docs:
+        # A query explicitly combining two document-specific subjects is a
+        # legitimate multi-document request, not an ambiguity to resolve.
+        if len(unique_docs) > 1 and _TOPIC_CONJUNCTION_RE.search(text):
+            return None
+        # One document-specific subject gives retrieval a deterministic anchor.
+        if len(unique_docs) == 1:
+            return None
+
+    # If there are raw retrieval scores, reject a long-tail candidate whose
+    # support is less than roughly half of the best document.  RRF values are
+    # ordering signals, not confidence; this is only a noise guard.
+    scored = sorted(
+        (float(row["best_score"]) for row in rows if row["best_score"] > 0),
+        reverse=True,
+    )
+    if len(scored) >= 2 and scored[1] < scored[0] * 0.5:
+        return None
+    return EvidenceAmbiguityDecision(
+        needs_clarification=True,
+        dimension="document",
+        question=(
+            "检索到多篇可能相关的资料，但当前问题范围较宽：\n"
+            + "\n".join(
+                f"{index}. 《{row['filename'][:MAX_CHOICE_TEXT_CHARS]}》"
+                for index, row in enumerate(rows, start=1)
+            )
+            + "\n请问需要查询哪一篇？也可以回复“都要”。"
+        ),
+        reason="multiple_mutually_relevant_documents",
+        choices=_topic_groups_to_choices(rows),
+        relevant_document_count=len(rows),
+    )
 
 
 def _version_prefixes(version: str) -> tuple[str, ...]:
@@ -1046,6 +1366,7 @@ def detect_evidence_scope_ambiguity(
             ),
             choices=comparison_plan.choices,
             relevant_document_count=len(comparison_plan.allowed_doc_ids),
+            allowed_doc_ids=comparison_plan.allowed_doc_ids,
         )
     if comparison_plan.reason == "too_many_explicit_scopes_for_complete_plan":
         return EvidenceAmbiguityDecision(
@@ -1074,20 +1395,55 @@ def detect_evidence_scope_ambiguity(
             reason="query_requests_all_scopes",
         )
 
+    # Establish the comparison baseline with the product constraint (if any),
+    # but without the query's explicit version.  Version/project labels are
+    # the dimensions this function narrows; applying the full constraint first
+    # would remove every non-target document before we can publish the
+    # request-local allow-list (notably for product-less ``2025版`` queries).
+    baseline_constraints = (
+        QueryConstraints(product=constraints.product)
+        if constraints.product
+        else QueryConstraints()
+    )
+    unfiltered_documents = _document_scopes(candidates, baseline_constraints)
     documents = _filter_explicit_query_project(
         query,
         _filter_explicit_query_version(
             query,
-            _document_scopes(candidates, constraints),
+            unfiltered_documents,
             constraints,
         ),
     )
+    unfiltered_doc_ids = {document.doc_id for document in unfiltered_documents}
+    filtered_doc_ids = {document.doc_id for document in documents}
+    # The two filters narrow only when the query names exactly one
+    # source-declared version or project.  Preserve the default empty value for
+    # ordinary questions so downstream execution never mistakes all retrieved
+    # documents for an explicit user selection.
+    allowed_doc_ids = (
+        tuple(sorted(filtered_doc_ids))
+        if filtered_doc_ids < unfiltered_doc_ids
+        else ()
+    )
     groups, dimension = _scope_groups(documents, constraints)
+    # Scope metadata is the preferred disambiguator.  Only when no explicit
+    # product/version/project constraint is present, and those dimensions do
+    # not already explain the result set, inspect independent document topics.
+    # This catches broad requests such as ``员工标准是什么`` without turning a
+    # scoped multi-document answer into a filename picker.
+    if dimension is None and not constraints.has_scope_constraint:
+        topic_decision = _detect_topic_document_ambiguity(
+            query=query,
+            candidates=candidates,
+        )
+        if topic_decision is not None:
+            return topic_decision
     if dimension is None or len(groups) < 2:
         return EvidenceAmbiguityDecision(
             needs_clarification=False,
             reason="single_or_overlapping_scope",
             relevant_document_count=len(documents),
+            allowed_doc_ids=allowed_doc_ids,
         )
     if len(groups) > MAX_AMBIGUITY_CHOICES:
         # Do not silently discard a real alternative. A broad generic question
@@ -1098,6 +1454,7 @@ def detect_evidence_scope_ambiguity(
             question="检索到多个互不相同的适用范围，请补充具体产品和版本。",
             reason="too_many_mutually_exclusive_scopes",
             relevant_document_count=len(documents),
+            allowed_doc_ids=allowed_doc_ids,
         )
 
     choices = _scope_groups_to_choices(groups, constraints)
@@ -1114,4 +1471,5 @@ def detect_evidence_scope_ambiguity(
         reason="multiple_mutually_exclusive_relevant_scopes",
         choices=choices,
         relevant_document_count=len(documents),
+        allowed_doc_ids=allowed_doc_ids,
     )

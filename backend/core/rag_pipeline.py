@@ -1058,7 +1058,7 @@ def _eligible_expansion_seed(
     status = str(item.get("constraint_status") or "")
     if status == "mismatch":
         return False
-    if constraints.has_product_constraint and status == "unknown":
+    if constraints.has_scope_constraint and status == "unknown":
         return False
     return status in {"exact", "compatible", "neutral", "unknown"}
 
@@ -1101,6 +1101,42 @@ def _required_answer_requirements(
             source="explicit",
         ),
     )
+
+
+def _required_coverage_ids(
+    results: Sequence[dict],
+    requirements: Sequence[AnswerRequirement],
+    *,
+    standalone_only: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Return covered and missing explicit required ids in contract order."""
+
+    required_ids = tuple(dict.fromkeys(
+        item.id
+        for item in requirements
+        if item.importance == "required" and item.source == "explicit"
+    ))
+    supported_ids = {
+        requirement_id
+        for item in results
+        if not standalone_only
+        or (
+            item.get("evidence_role") == "direct"
+            and item.get("contribution_role") == "standalone_answer"
+        )
+        for requirement_id in (item.get("supports_requirement_ids") or [])
+    }
+    covered_ids = tuple(
+        requirement_id
+        for requirement_id in required_ids
+        if requirement_id in supported_ids
+    )
+    missing_ids = tuple(
+        requirement_id
+        for requirement_id in required_ids
+        if requirement_id not in supported_ids
+    )
+    return covered_ids, missing_ids
 
 
 def _expansion_query_matches_scope(
@@ -1205,21 +1241,13 @@ def _resolve_document_expansion_plan(
         for item in eligible
         if item.get("contribution_role") in {"bridge", "complement"}
     ]
-    explicit_required_ids = {
-        item.id
-        for item in requirements
-        if item.importance == "required" and item.source == "explicit"
-    }
-    standalone_covered_ids = {
-        requirement_id
-        for item in direct
-        if item.get("contribution_role") == "standalone_answer"
-        for requirement_id in (item.get("supports_requirement_ids") or [])
-    }
-    if direct and (
-        not explicit_required_ids
-        or explicit_required_ids.issubset(standalone_covered_ids)
-    ):
+    _, missing_standalone_required_ids = _required_coverage_ids(
+        direct,
+        requirements,
+        standalone_only=True,
+    )
+    standalone_complete = bool(direct) and not missing_standalone_required_ids
+    if standalone_complete:
         return None, requirements, "standalone_direct"
     if model_plan is not None and model_plan.needed:
         target_indexes = tuple(
@@ -1247,15 +1275,20 @@ def _resolve_document_expansion_plan(
                 "model_plan",
             )
 
-    # 已有完整单片段依据，或模型明确判定无需扩展且也没有桥接片段时，走快速路径。
-    if direct and not bridge_like:
-        return None, requirements, "standalone_direct"
-    if model_plan is not None and not model_plan.needed and not bridge_like:
+    # 没有 direct/bridge 且模型明确判定无需扩展时保持旧兼容路径。只要存在
+    # direct，就必须先由代码确认所有显式 required 均被 standalone 证据覆盖；
+    # 不能再用“存在任意 direct”替代完整性判断。
+    if (
+        model_plan is not None
+        and not model_plan.needed
+        and not bridge_like
+        and not direct
+    ):
         return None, requirements, "model_sufficient_or_no_bridge"
 
-    # 兼容旧版/不完整的结构化输出：只有“无直接证据”或模型明确识别了桥接/补充
-    # 片段时才兜底扩展，避免给普通单片段问答增加一次昂贵模型调用。
-    fallback_seeds = bridge_like or ([] if direct else eligible)
+    # 兼容旧版/不完整的结构化输出：桥接片段优先；若已有 direct 但显式必要
+    # 需求尚未覆盖，也以当前合格候选为种子执行一次有界补检。
+    fallback_seeds = bridge_like or eligible
     fallback_seeds = fallback_seeds[:3]
     target_indexes = tuple(
         index
@@ -1276,17 +1309,21 @@ def _resolve_document_expansion_plan(
             needed=True,
             target_candidate_indexes=target_indexes,
             queries=queries,
-            missing_requirement_ids=tuple(
-                item.id
-                for item in requirements
-                if item.importance == "required" and item.source == "explicit"
-            ),
+            missing_requirement_ids=missing_standalone_required_ids,
             reason="首轮证据需要通过同文档片段补齐回答链路",
             model_requested=False,
             overridden_reason="pipeline_safe_fallback",
         ),
         requirements,
-        "bridge_fallback" if bridge_like else "related_without_direct",
+        (
+            "bridge_fallback"
+            if bridge_like
+            else (
+                "incomplete_direct_coverage"
+                if direct
+                else "related_without_direct"
+            )
+        ),
     )
 
 
@@ -1396,7 +1433,7 @@ def _dominant_document_lexical_seeds(
         if not status:
             status = evaluate_candidate_constraints(constraints, item).status
         if status == "mismatch" or (
-            constraints.has_product_constraint and status == "unknown"
+            constraints.has_scope_constraint and status == "unknown"
         ):
             return [], "constraint_conflict"
     if not any(_has_deterministic_lexical_signal(item) for item in leading):
@@ -1470,7 +1507,7 @@ def _resolve_pre_rerank_small_document_plan(
             continue
         status = evaluate_candidate_constraints(constraints, result).status
         if status == "mismatch" or (
-            constraints.has_product_constraint and status == "unknown"
+            constraints.has_scope_constraint and status == "unknown"
         ):
             continue
         competing_doc_ids.add(doc_key)
@@ -2083,6 +2120,12 @@ def _select_verified_evidence(
             role = "related"
         if constraint_status == "unknown" and result.get("query_has_constraint"):
             role = "related"
+            if result.get("query_has_version_constraint"):
+                # Unknown cannot confirm an explicitly requested version.  A
+                # product-only query keeps the historical related-reference
+                # behavior because it did not select a concrete version.
+                rejected += 1
+                continue
         if (
             role == "direct"
             and topic >= RELEVANCE_THRESHOLD
@@ -2133,7 +2176,8 @@ def _select_verified_evidence(
             "version_mismatch"
             if statuses == {"mismatch"}
             and all(
-                item.get("query_has_hard_constraint")
+                item.get("query_has_version_constraint")
+                or item.get("query_has_hard_constraint")
                 for item in supported_related
             )
             else "partial"
@@ -2141,7 +2185,17 @@ def _select_verified_evidence(
         # optional 通常来自“已选择知识库的通用聊天”。只有相近资料而没有
         # direct 时，把 related 注入模型会让一次误召回劫持原本可独立回答的
         # 闲聊；required 检索才允许在明确警告下使用 supported related。
-        context_results = supported_related if allow_related_context else []
+        productless_version_mismatch = all(
+            item.get("constraint_status") == "mismatch"
+            and item.get("query_has_version_constraint")
+            and not item.get("query_has_product_constraint")
+            for item in supported_related
+        )
+        context_results = (
+            supported_related
+            if allow_related_context and not productless_version_mismatch
+            else []
+        )
     else:
         evidence_status = "no_hit"
         context_results = []
@@ -2174,8 +2228,10 @@ def annotate_deterministic_constraints(
         evaluation = evaluate_candidate_constraints(constraints, item)
         item["constraint_status"] = evaluation.status
         item["constraint_reason"] = evaluation.reason
-        item["query_has_constraint"] = constraints.has_product_constraint
+        item["query_has_constraint"] = constraints.has_scope_constraint
+        item["query_has_product_constraint"] = constraints.has_product_constraint
         item["query_has_hard_constraint"] = constraints.has_hard_constraint
+        item["query_has_version_constraint"] = constraints.has_version_constraint
         item["rerank_status"] = item.get("rerank_status") or "unverified"
         item["evidence_role"] = "related" if evaluation.status == "mismatch" else None
         annotated.append(item)
@@ -2194,11 +2250,13 @@ def _enforce_verified_constraints(
         evaluation = evaluate_candidate_constraints(constraints, item)
         item["constraint_status"] = evaluation.status
         item["constraint_reason"] = evaluation.reason
-        item["query_has_constraint"] = constraints.has_product_constraint
+        item["query_has_constraint"] = constraints.has_scope_constraint
+        item["query_has_product_constraint"] = constraints.has_product_constraint
         item["query_has_hard_constraint"] = constraints.has_hard_constraint
+        item["query_has_version_constraint"] = constraints.has_version_constraint
         if evaluation.status == "mismatch" or (
             evaluation.status == "unknown"
-            and constraints.has_product_constraint
+            and constraints.has_scope_constraint
         ):
             item["evidence_role"] = "related"
             item["score"] = 0.0
@@ -2226,13 +2284,17 @@ def _select_unverified_evidence(
     ]
     unknown = [item for item in results if item.get("constraint_status") == "unknown"]
     mismatch = [item for item in results if item.get("constraint_status") == "mismatch"]
-    if constraints.has_product_constraint and exact_or_compatible:
+    if constraints.has_scope_constraint and exact_or_compatible:
         primary = exact_or_compatible
         status = "unverified"
-    elif constraints.has_product_constraint and mismatch:
+    elif constraints.has_scope_constraint and mismatch:
         primary = mismatch
-        status = "version_mismatch" if constraints.has_hard_constraint else "partial"
-    elif constraints.has_product_constraint:
+        status = (
+            "version_mismatch"
+            if constraints.has_version_constraint
+            else "partial"
+        )
+    elif constraints.has_scope_constraint:
         # An explicit product/version query must fail closed when deterministic
         # metadata cannot establish candidate scope.  In particular, generic
         # vector neighbours such as travel or leave policies must not be shown
@@ -2256,11 +2318,22 @@ def _select_unverified_evidence(
         return _safe_score(previous_support) > 0
 
     context = [item for item in primary if can_enter_context(item)][:limit]
+    if (
+        constraints.has_version_constraint
+        and not constraints.has_product_constraint
+        and status == "version_mismatch"
+    ):
+        # A version without a product can safely select an exact source label,
+        # but a conflicting label does not identify which product's nearby
+        # material the user intended. Keep it visible as diagnostic retrieval
+        # only; never ask the generator to reinterpret it as an answer.
+        context = []
     if primary and not context:
-        status = "no_hit"
+        if status != "version_mismatch":
+            status = "no_hit"
 
     display: list[dict] = []
-    display_tail = () if constraints.has_product_constraint else (*unknown, *mismatch)
+    display_tail = () if constraints.has_scope_constraint else (*unknown, *mismatch)
     for item in (*primary, *display_tail):
         if any(item is existing for existing in display):
             continue
@@ -2366,6 +2439,13 @@ def _build_system_prompt(
                 "你是企业知识库问答助手。本次知识库检索或证据验证暂时失败，"
                 "无法获得可靠资料。请简洁告知用户检索或验证服务暂时不可用并建议稍后重试；"
                 "禁止声称知识库中没有相关内容，也禁止用自己的知识猜测企业事实。"
+            )
+        elif evidence_status == "version_mismatch":
+            prompt = (
+                "你是企业知识库问答助手。本次只检索到明确属于其他版本的资料，"
+                "这些资料没有进入回答上下文。请简洁说明知识库没有可用于回答目标版本的"
+                "直接证据，并建议用户确认产品名称或版本；禁止转述其他版本的配置，"
+                "也禁止用自己的知识猜测企业事实。"
             )
         else:
             prompt = (
@@ -4022,23 +4102,37 @@ async def run_rag_stream(
             evidence_validation_error_message = expansion_error_message
             evidence_validation_error_stage = "expansion"
 
-        explicit_required_count = sum(
-            item.importance == "required" and item.source == "explicit"
+        explicit_required_ids = tuple(dict.fromkeys(
+            item.id
             for item in joint_requirements
-        )
+            if item.importance == "required" and item.source == "explicit"
+        ))
+        explicit_required_count = len(explicit_required_ids)
         if joint_coverage_status is not None:
             coverage_status_for_trace = joint_coverage_status
             selected_for_trace = sum(
                 bool(item.get("jointly_selected")) for item in results
             )
+            covered_requirement_count_for_trace = max(
+                0,
+                explicit_required_count - len(coverage_missing_ids),
+            )
         else:
             direct_for_trace = [
                 item for item in results if item.get("evidence_role") == "direct"
             ]
-            coverage_status_for_trace = (
-                "complete" if direct_for_trace else "insufficient"
+            covered_required_ids, coverage_missing_ids = _required_coverage_ids(
+                direct_for_trace,
+                joint_requirements,
             )
+            if direct_for_trace and not coverage_missing_ids:
+                coverage_status_for_trace = "complete"
+            elif direct_for_trace and covered_required_ids:
+                coverage_status_for_trace = "partial"
+            else:
+                coverage_status_for_trace = "insufficient"
             selected_for_trace = len(direct_for_trace)
+            covered_requirement_count_for_trace = len(covered_required_ids)
         requirements_json = json.dumps(
             [item.as_dict() for item in joint_requirements],
             ensure_ascii=False,
@@ -4051,10 +4145,7 @@ async def run_rag_stream(
             requirement_count=len(joint_requirements),
             required_requirement_count=explicit_required_count,
             missing_requirement_count=len(coverage_missing_ids),
-            covered_requirement_count=max(
-                0,
-                explicit_required_count - len(coverage_missing_ids),
-            ),
+            covered_requirement_count=covered_requirement_count_for_trace,
             selected_candidate_count=selected_for_trace,
             joint_support_score=(
                 joint_outcome.joint_support_score if joint_outcome else None
@@ -4204,7 +4295,7 @@ async def run_rag_stream(
             max(1, len(results)),
         )
         lexical_rejected = max(0, len(results) - len(lexical_candidates))
-        if rerank_constraints.has_product_constraint:
+        if rerank_constraints.has_scope_constraint:
             (
                 results,
                 context_results,

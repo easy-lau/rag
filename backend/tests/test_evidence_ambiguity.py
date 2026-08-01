@@ -1,6 +1,7 @@
 import unittest
 
 from core.evidence_ambiguity import (
+    _topic_document_rows,
     _version_key,
     detect_evidence_scope_ambiguity,
     query_requests_all_scopes,
@@ -35,6 +36,124 @@ def _candidate(
 
 
 class EvidenceAmbiguityTests(unittest.TestCase):
+    def test_topic_document_rows_tolerates_non_dict_metadata(self) -> None:
+        for metadata in (None, "legacy source", ["legacy source"]):
+            with self.subTest(metadata=metadata):
+                rows = _topic_document_rows(
+                    [
+                        {
+                            "kb_id": "kb-1",
+                            "doc_id": "doc-legacy",
+                            "metadata": metadata,
+                        }
+                    ]
+                )
+                self.assertEqual(rows, [])
+
+        rows = _topic_document_rows(
+            [
+                {
+                    "kb_id": "kb-1",
+                    "doc_id": "doc-mapping",
+                    "metadata": {"source": "员工制度.docx"},
+                }
+            ]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["filename"], "员工制度.docx")
+
+    def test_broad_unscoped_query_clarifies_independent_documents(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="leave-1",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                content="员工请假制度、审批流程和休假要求。",
+                topic=0.90,
+                support=0.80,
+            ),
+            _candidate(
+                chunk_id="travel-1",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                content="员工出差交通、住宿和餐饮标准。",
+                topic=0.88,
+                support=0.78,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="员工标准是什么",
+            constraints=extract_query_constraints("员工标准是什么"),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "document")
+        self.assertEqual(decision.reason, "multiple_mutually_relevant_documents")
+        self.assertEqual(
+            {choice.doc_ids for choice in decision.choices},
+            {("doc-leave",), ("doc-travel",)},
+        )
+        self.assertIn("员工请假管理办法.docx", decision.question)
+        self.assertIn("公司出差管理标准.docx", decision.question)
+
+    def test_document_topic_gate_keeps_specific_query_answerable(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="leave-1",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                content="员工请假制度、审批流程和休假要求。",
+                topic=0.35,
+                support=0.20,
+            ),
+            _candidate(
+                chunk_id="travel-1",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                content="员工出差交通、住宿和餐饮标准。",
+                topic=0.90,
+                support=0.88,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="员工的出差标准是什么",
+            constraints=extract_query_constraints("员工的出差标准是什么"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+
+    def test_document_topic_gate_respects_explicit_all_documents_request(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id="leave-all",
+                doc_id="doc-leave",
+                filename="员工请假管理办法.docx",
+                content="员工请假制度。",
+                topic=0.90,
+                support=0.80,
+            ),
+            _candidate(
+                chunk_id="travel-all",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                content="员工出差标准。",
+                topic=0.88,
+                support=0.78,
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="请汇总所有员工制度",
+            constraints=extract_query_constraints("请汇总所有员工制度"),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+
     def test_log9_two_relevant_versions_require_clarification(self) -> None:
         candidates = [
             _candidate(
@@ -94,6 +213,8 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         self.assertIn("中青建安", decision.question)
         self.assertIn("都对比", decision.question)
         self.assertNotIn("云枢7配置", decision.question)
+        self.assertEqual(decision.allowed_doc_ids, ())
+        self.assertEqual(decision.to_dict()["allowed_doc_ids"], [])
 
     def test_same_version_complementary_documents_do_not_clarify(self) -> None:
         candidates = [
@@ -332,6 +453,7 @@ class EvidenceAmbiguityTests(unittest.TestCase):
 
         self.assertFalse(decision.needs_clarification)
         self.assertEqual(decision.relevant_document_count, 1)
+        self.assertEqual(decision.allowed_doc_ids, ("doc-a-explicit",))
 
     def test_explicit_all_versions_request_does_not_clarify(self) -> None:
         candidates = [
@@ -497,6 +619,14 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         )
         self.assertFalse(explicit.needs_clarification)
         self.assertEqual(explicit.relevant_document_count, 1)
+        self.assertEqual(
+            explicit.allowed_doc_ids,
+            ("doc-policy-2025",),
+        )
+        self.assertEqual(
+            explicit.to_dict()["allowed_doc_ids"],
+            ["doc-policy-2025"],
+        )
 
         arbitrary_number = detect_evidence_scope_ambiguity(
             query="出差需要2天怎么报销",
@@ -504,6 +634,76 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             candidates=candidates,
         )
         self.assertTrue(arbitrary_number.needs_clarification)
+
+    def test_filename_and_source_labels_anchor_version_ambiguity(self) -> None:
+        # Ingestion often places applicability only in the filename/source
+        # label; the answer chunks themselves may not repeat a header field.
+        candidates = [
+            _candidate(
+                chunk_id="filename-v6",
+                doc_id="doc-filename-v6",
+                filename="云枢6配置参数说明",
+                content="登录用户名枚举配置说明",
+                metadata={
+                    "source": "云枢6配置参数说明",
+                    "heading": "云枢6配置参数说明 › 四、解决方案",
+                },
+                topic=0.9,
+                support=0.8,
+                role="direct",
+            ),
+            _candidate(
+                chunk_id="filename-v7",
+                doc_id="doc-filename-v7",
+                filename="云枢7配置",
+                content="登录用户名枚举配置说明",
+                metadata={"source": "云枢7配置"},
+                topic=0.9,
+                support=0.8,
+                role="direct",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query="登录用户名枚举要配置什么",
+            constraints=extract_query_constraints("登录用户名枚举要配置什么"),
+            candidates=candidates,
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "version")
+        self.assertEqual(
+            {choice.versions for choice in decision.choices},
+            {("6",), ("7",)},
+        )
+
+    def test_filename_only_versions_are_hard_limited_in_comparison(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"filename-cmp-{version}",
+                doc_id=f"doc-filename-cmp-{version}",
+                filename=f"云枢{version}配置",
+                content="登录安全配置说明",
+                metadata={"source": f"云枢{version}配置"},
+                topic=0.9,
+                support=0.8,
+                role="direct",
+            )
+            for version in ("6", "7", "8")
+        ]
+        query = "比较云枢6和云枢7的登录安全配置"
+        plan = resolve_explicit_scope_comparison(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertTrue(plan.matched)
+        self.assertEqual(
+            set(plan.allowed_doc_ids),
+            {"doc-filename-cmp-6", "doc-filename-cmp-7"},
+        )
+        self.assertNotIn("doc-filename-cmp-8", plan.allowed_doc_ids)
 
     def test_overlapping_multi_product_document_bridges_product_groups(self) -> None:
         candidates = [
@@ -782,6 +982,46 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         self.assertFalse(decision.needs_clarification)
         self.assertEqual(decision.reason, "explicit_enumerated_scopes")
         self.assertEqual(len(decision.choices), 2)
+        self.assertEqual(
+            set(decision.allowed_doc_ids),
+            {"doc-6", "doc-8", "doc-shared"},
+        )
+
+    def test_v6_v7_comparison_decision_carries_allowed_documents(self) -> None:
+        candidates = [
+            _candidate(
+                chunk_id=f"cloudpivot-{version}",
+                doc_id=f"doc-cloudpivot-{version}",
+                filename=f"CloudPivot {version} 安全配置",
+                content="安全配置说明",
+                metadata={"product": "CloudPivot", "version": version},
+                topic=0.9,
+                support=0.8,
+            )
+            for version in ("6", "7", "8")
+        ]
+        query = "比较 CloudPivot 6 和 CloudPivot 7 的安全配置"
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "explicit_enumerated_scopes")
+        self.assertEqual(
+            {choice.versions for choice in decision.choices},
+            {("6",), ("7",)},
+        )
+        self.assertEqual(
+            decision.allowed_doc_ids,
+            ("doc-cloudpivot-6", "doc-cloudpivot-7"),
+        )
+        self.assertEqual(
+            decision.to_dict()["allowed_doc_ids"],
+            ["doc-cloudpivot-6", "doc-cloudpivot-7"],
+        )
 
     def test_source_versions_generate_only_unique_prefix_aliases(self) -> None:
         candidates = [
@@ -1104,6 +1344,7 @@ class EvidenceAmbiguityTests(unittest.TestCase):
 
         self.assertFalse(decision.needs_clarification)
         self.assertEqual(decision.relevant_document_count, 1)
+        self.assertEqual(decision.allowed_doc_ids, ("doc-year-2025",))
 
 
 if __name__ == "__main__":

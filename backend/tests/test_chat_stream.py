@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
 from api.chat import (
+    _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE,
     _messages_with_current_source_scope,
     _parse_sse_payload,
     _public_stream_error_message,
@@ -201,7 +202,13 @@ class ChatHistoricalSourceScopeTests(unittest.IsolatedAsyncioTestCase):
         conversation_id = uuid.uuid4()
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()
-        for evidence_status in ("no_hit", "skipped", "error", "needs_clarification"):
+        for evidence_status in (
+            "no_hit",
+            "skipped",
+            "error",
+            "needs_clarification",
+            "version_mismatch",
+        ):
             with self.subTest(evidence_status=evidence_status):
                 row = Message(
                     id=uuid.uuid4(),
@@ -233,7 +240,13 @@ class ChatHistoricalSourceScopeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
-    async def _run_successful_stream(self, search_event: dict):
+    async def _run_successful_stream(
+        self,
+        search_event: dict,
+        *,
+        before_search_content: str | None = None,
+        producer_state: dict[str, bool] | None = None,
+    ):
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         route_log_id = uuid.uuid4()
@@ -268,10 +281,32 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def successful_stream(**_kwargs):
-            yield f"data: {json.dumps(search_event, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'text_delta', 'content': '测试回答'}, ensure_ascii=False)}\n\n"
-            yield f"data: {json.dumps({'type': 'usage', 'total_tokens': 12})}\n\n"
-            yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conversation_id)})}\n\n"
+            try:
+                if before_search_content is not None:
+                    yield f"data: {json.dumps({'type': 'text_delta', 'content': before_search_content}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(search_event, ensure_ascii=False)}\n\n"
+                if producer_state is not None:
+                    producer_state["resumed_after_search"] = True
+                yield f"data: {json.dumps({'type': 'text_delta', 'content': '测试回答'}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'type': 'usage', 'total_tokens': 12})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conversation_id)})}\n\n"
+            finally:
+                if producer_state is not None:
+                    producer_state["closed"] = True
+
+        async def trusted_source_refresh(_db, *, raw_sources, raw_results, selected_kb_ids):
+            # These tests exercise persistence/event accounting.  The dedicated
+            # source-validation tests cover the real DB refresh boundary; use a
+            # trusted fixture here so arbitrary UUID snapshots do not need a
+            # database row for every case.
+            del raw_results, selected_kb_ids
+            sources = list(raw_sources or [])
+            pairs = {
+                (uuid.UUID(str(source["kb_id"])), uuid.UUID(str(source["doc_id"])))
+                for source in sources
+                if isinstance(source, dict)
+            }
+            return sources, pairs, None
 
         with (
             patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
@@ -284,6 +319,10 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=routing_result),
             ),
             patch("api.chat.run_rag_stream", new=successful_stream),
+            patch(
+                "api.chat._validate_stream_answer_sources",
+                new=trusted_source_refresh,
+            ),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -356,7 +395,13 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_answer_statuses_fail_closed_on_claimed_answer_sources(self) -> None:
         claimed_source = self._source(role="direct", filename="错误携带的证据.md")
-        for evidence_status in ("no_hit", "skipped", "error", "needs_clarification"):
+        for evidence_status in (
+            "no_hit",
+            "skipped",
+            "error",
+            "needs_clarification",
+            "version_mismatch",
+        ):
             with self.subTest(evidence_status=evidence_status):
                 event = {
                     "type": "search_results",
@@ -382,7 +427,7 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(route_log.hit_count, 0)
                 self.assertEqual(
                     response_trace.kwargs["displayed_result_count"],
-                    1,
+                    0,
                 )
                 self.assertEqual(
                     response_trace.kwargs["context_evidence_count"],
@@ -438,6 +483,127 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
                     len(response_trace.kwargs["sources"]),
                     len(answer_sources),
                 )
+
+    async def test_positive_status_without_valid_sources_locks_generation(self) -> None:
+        event = {
+            "type": "search_results",
+            "results": [],
+            "answer_sources": [],
+            "retrieval_executed": True,
+            "evidence_status": "hit",
+            "direct_evidence_count": 1,
+            "related_reference_count": 0,
+        }
+
+        producer_state = {
+            "resumed_after_search": False,
+            "closed": False,
+        }
+        payloads, assistant, route_log, response_trace = (
+            await self._run_successful_stream(
+                event,
+                before_search_content="不应被保存的前置模型片段",
+                producer_state=producer_state,
+            )
+        )
+
+        text_deltas = [
+            item["content"]
+            for item in payloads
+            if item and item.get("type") == "text_delta"
+        ]
+        # SSE cannot retract a custom producer's already-sent prefix, but the
+        # API clears its persistence buffer and suppresses every later model
+        # delta once the invalid evidence event arrives.
+        self.assertIn("不应被保存的前置模型片段", text_deltas)
+        self.assertIn(
+            _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE,
+            text_deltas,
+        )
+        self.assertNotIn("测试回答", text_deltas)
+        self.assertEqual(
+            assistant.content,
+            _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE,
+        )
+        self.assertEqual(assistant.sources, [])
+        self.assertEqual(route_log.evidence_status, "error")
+        self.assertTrue(
+            response_trace.kwargs["evidence_source_validation_locked"]
+        )
+        self.assertFalse(producer_state["resumed_after_search"])
+        self.assertTrue(producer_state["closed"])
+
+    async def test_non_answer_status_with_claimed_sources_stops_producer(self) -> None:
+        claimed_source = self._source(
+            role="direct",
+            filename="不应出现的证据.md",
+        )
+        event = {
+            "type": "search_results",
+            "results": [claimed_source],
+            "answer_sources": [claimed_source],
+            "retrieval_executed": True,
+            "evidence_status": "no_hit",
+            "direct_evidence_count": 1,
+            "related_reference_count": 0,
+        }
+        producer_state = {
+            "resumed_after_search": False,
+            "closed": False,
+        }
+
+        payloads, assistant, route_log, response_trace = (
+            await self._run_successful_stream(
+                event,
+                producer_state=producer_state,
+            )
+        )
+
+        text_deltas = [
+            item["content"]
+            for item in payloads
+            if item and item.get("type") == "text_delta"
+        ]
+        self.assertEqual(
+            text_deltas,
+            [_EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE],
+        )
+        self.assertEqual(
+            assistant.content,
+            _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE,
+        )
+        self.assertEqual(assistant.sources, [])
+        self.assertEqual(route_log.evidence_status, "error")
+        self.assertTrue(
+            response_trace.kwargs["evidence_source_validation_locked"]
+        )
+        self.assertFalse(producer_state["resumed_after_search"])
+        self.assertTrue(producer_state["closed"])
+
+    async def test_unknown_evidence_status_is_fail_closed(self) -> None:
+        event = {
+            "type": "search_results",
+            "results": [],
+            "answer_sources": [],
+            "retrieval_executed": True,
+            "evidence_status": "future_status",
+            "direct_evidence_count": 0,
+            "related_reference_count": 0,
+        }
+
+        payloads, assistant, route_log, _trace = (
+            await self._run_successful_stream(event)
+        )
+        search_event = next(
+            item for item in payloads if item and item["type"] == "search_results"
+        )
+        self.assertEqual(search_event["evidence_status"], "error")
+        self.assertEqual(search_event["results"], [])
+        self.assertEqual(
+            assistant.content,
+            _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE,
+        )
+        self.assertEqual(route_log.evidence_status, "error")
 
 
 class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):

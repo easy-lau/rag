@@ -80,6 +80,8 @@ _TRACE_CORE_EVENTS = {
     "evidence.clarification_created",
     "evidence.clarification_repeated",
     "evidence.clarification_resolved",
+    "evidence.route_contract_built",
+    "evidence.route_contract_failed",
     "evidence.scope_filter_applied",
     "evidence.scope_filter_rejected_candidates",
     "retrieval.plan",

@@ -22,9 +22,13 @@ from models.db_models import (
 )
 from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
 from core.rag_pipeline import run_rag_stream
+from core.rag_v2.pipeline import run_rag_v2_stream
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import CHAT_USE
-from core.intent_router import classify_intent_result
+from core.intent_router import (
+    build_verified_evidence_scope_result,
+    classify_intent_result,
+)
 from core.conversation_context import (
     UNRESOLVED_REFERENCE_MESSAGE,
     prepare_conversation_context,
@@ -32,12 +36,8 @@ from core.conversation_context import (
     route_context_payloads,
 )
 from core.query_route_compiler import (
-    CompiledAnswerRequirement,
     RagTaskContract,
-    TaskContractDispatchError,
-    require_rag_task_contract_dispatchable,
 )
-from core.query_route_contract import RouteClarification, RouteRequirement
 from core.rag_trace import content_fields, log_exception_safely, trace_event
 from config import get_settings
 
@@ -48,7 +48,15 @@ _NON_ANSWER_SOURCE_STATUSES = {
     "skipped",
     "error",
     "needs_clarification",
+    "version_mismatch",
 }
+_ANSWER_SOURCE_REQUIRED_STATUSES = {"hit", "partial", "unverified"}
+_SUPPORTED_EVIDENCE_STATUSES = (
+    _NON_ANSWER_SOURCE_STATUSES | _ANSWER_SOURCE_REQUIRED_STATUSES
+)
+_EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE = (
+    "回答依据校验失败，无法可靠生成知识库答案。请稍后重试。"
+)
 _SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = {
     "hit",
     "partial",
@@ -59,7 +67,13 @@ _SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = {
 _EVIDENCE_PENDING_SCHEMA = "rag_pending_clarification.v2"
 _EVIDENCE_PENDING_KIND = "evidence_scope"
 _EVIDENCE_EVENT_SCHEMA = "rag_evidence_clarification.v1"
-_EVIDENCE_DIMENSIONS = {"version", "product", "product_version", "project"}
+_EVIDENCE_DIMENSIONS = {
+    "version",
+    "product",
+    "product_version",
+    "project",
+    "document",
+}
 _EVIDENCE_SELECTION_MODES = {"choice", "refine"}
 _CHOICE_TEXT_FIELDS = (
     "products",
@@ -101,6 +115,43 @@ _EVIDENCE_REFINEMENT_HINT_RE = re.compile(
     r"(?:产品|版本|项目|范围|系统|平台|环境|地区|部门|职级)",
     re.IGNORECASE,
 )
+
+
+def _select_rag_pipeline_version(
+    *,
+    configured_version: Literal["v1", "v2"],
+    task_contract: object,
+    evidence_scope_filter: dict | None,
+    evidence_scope_refinement_active: bool,
+    selected_tags: list[str],
+    is_followup: bool,
+    carryover_sources: tuple[dict, ...] | list[dict],
+) -> tuple[Literal["v1", "v2"], str]:
+    """Choose one pipeline before streaming; never retry through another version."""
+
+    if configured_version != "v2":
+        return "v1", "configured_v1"
+    if not isinstance(task_contract, RagTaskContract):
+        return "v1", "missing_or_invalid_task_contract"
+    if not task_contract.dispatch_authorized:
+        return "v1", "dispatch_not_authorized"
+    if not task_contract.need_retrieval:
+        return "v1", "retrieval_not_required"
+    if task_contract.response_mode != "grounded_qa":
+        return "v1", "unsupported_response_mode"
+    # V2 preserves the existing tag semantics as a soft ordering boost.  Tags
+    # neither widen authorization nor bypass the deterministic relevance gate,
+    # so they no longer require falling back to the slow model-rerank pipeline.
+    # A non-null filter is rebuilt server-side from a validated pending choice
+    # and carries an authorized KB/document allow-list.
+    evidence_scope_selection = evidence_scope_filter is not None
+    if evidence_scope_selection:
+        return "v2", "eligible_evidence_scope_selection"
+    if evidence_scope_refinement_active:
+        return "v2", "eligible_evidence_scope_refinement"
+    if is_followup or carryover_sources:
+        return "v2", "eligible_grounded_followup"
+    return "v2", "eligible_grounded_qa"
 
 
 @dataclass(frozen=True)
@@ -629,80 +680,6 @@ def _refined_evidence_query(original_query: str, refinement: str) -> str:
     ).strip()
 
 
-def _recover_evidence_pending_contract(
-    route_decision: object,
-    task_contract: RagTaskContract,
-    *,
-    pending_state: dict,
-    selected_kb_count: int,
-    refined: bool,
-) -> tuple[object, RagTaskContract] | None:
-    """Recover a blocked second-pass route from a server-validated v2 state."""
-
-    original_query = str(pending_state.get("original_query") or "").strip()
-    if not original_query or selected_kb_count <= 0:
-        return None
-    empty_clarification = RouteClarification(question="", unresolved=())
-    route_requirement = RouteRequirement(
-        role="answer",
-        origin="user_text",
-        description=original_query,
-    )
-    contract_requirement = CompiledAnswerRequirement(
-        id="r1",
-        role="answer",
-        origin="user_text",
-        description=original_query,
-        importance="required",
-        source="explicit",
-    )
-    decision_reason = (
-        "evidence_scope_refined" if refined else "evidence_scope_selected"
-    )
-    try:
-        recovered_route = replace(
-            route_decision,
-            readiness="ready",
-            relation="continuation",
-            evidence_scope="enterprise_kb",
-            query_resolution=replace(
-                route_decision.query_resolution,
-                mode="current",
-                context_turn_keys=(),
-            ),
-            requirements=(route_requirement,),
-            clarification=empty_clarification,
-            confidence=1.0,
-        )
-        recovered_contract = replace(
-            task_contract,
-            readiness="ready",
-            action="retrieve",
-            confidence=1.0,
-            source="evidence_pending_rule",
-            relation="continuation",
-            evidence_scope="enterprise_kb",
-            query_mode="current",
-            context_turn_keys=(),
-            response_mode="grounded_qa",
-            retrieval_policy="required",
-            need_retrieval=True,
-            dispatch_authorized=True,
-            decision_reason=decision_reason,
-            selected_kb_count=selected_kb_count,
-            requirements=(contract_requirement,),
-            clarification=empty_clarification,
-        )
-        require_rag_task_contract_dispatchable(
-            recovered_contract,
-            selected_kb_count=selected_kb_count,
-            available_turn_keys=(),
-        )
-    except (AttributeError, TypeError, TaskContractDispatchError):
-        return None
-    return recovered_route, recovered_contract
-
-
 def _evidence_event_pending_state(
     payload: object,
     *,
@@ -1156,9 +1133,245 @@ def _source_snapshot_identity(
         kb_id = uuid.UUID(str(source.get("kb_id")))
         doc_id = uuid.UUID(str(source.get("doc_id")))
         chunk_id = uuid.UUID(str(source.get("id") or source.get("chunk_id")))
+        # A producer may include both aliases.  They must describe the same
+        # chunk; otherwise accepting the first one would make the source
+        # identity ambiguous and could pair trusted metadata with another
+        # chunk's content.
+        raw_id = source.get("id")
+        raw_chunk_id = source.get("chunk_id")
+        if raw_id is not None and raw_chunk_id is not None:
+            if uuid.UUID(str(raw_id)) != uuid.UUID(str(raw_chunk_id)):
+                return None
     except (TypeError, ValueError, AttributeError):
         return None
     return kb_id, doc_id, chunk_id
+
+
+async def _validate_stream_answer_sources(
+    db: AsyncSession,
+    *,
+    raw_sources: object,
+    raw_results: object,
+    selected_kb_ids: list[uuid.UUID],
+) -> tuple[list[dict], set[tuple[uuid.UUID, uuid.UUID]], str | None]:
+    """Validate and refresh producer-provided answer evidence.
+
+    ``search_results`` is an internal SSE boundary, but it is still possible
+    for a rolling/custom producer to emit stale or forged source snapshots.
+    Before those snapshots are persisted (or used to resolve a pending scope),
+    require a complete ``kb/doc/chunk`` identity, membership in the current
+    request's KB set and a live ``DocumentChunk`` joined to an active/ready
+    document.  The returned source body is reloaded from the database so old
+    or producer-supplied content cannot cross the boundary.
+
+    An empty source list is a valid no-evidence result and returns ``None`` as
+    the validation error.  Any non-empty list is fail-closed when the DB
+    adapter is unavailable or an identity is missing.
+    """
+
+    if not isinstance(raw_sources, list):
+        return [], set(), "answer_sources_not_a_list"
+    if not isinstance(raw_results, list):
+        raw_results = []
+
+    allowed_kb_ids: set[uuid.UUID] = set()
+    for raw_kb_id in selected_kb_ids:
+        parsed_kb_id = (
+            raw_kb_id
+            if isinstance(raw_kb_id, uuid.UUID)
+            else _parse_uuid(raw_kb_id)
+        )
+        if parsed_kb_id is not None:
+            allowed_kb_ids.add(parsed_kb_id)
+
+    # Empty answer evidence is expected for no-hit/error/clarification states.
+    # We still do not need a database round trip in that case; the caller will
+    # independently force the scope anchor state to false.
+    if not raw_sources:
+        return [], set(), None
+    if not allowed_kb_ids:
+        return [], set(), "selected_kb_ids_empty"
+
+    parsed_sources: list[tuple[dict, tuple[uuid.UUID, uuid.UUID, uuid.UUID]]] = []
+    seen_source_identities: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = set()
+    for raw_source in raw_sources:
+        if not isinstance(raw_source, dict):
+            return [], set(), "answer_source_not_an_object"
+        identity = _source_snapshot_identity(raw_source)
+        if identity is None:
+            return [], set(), "answer_source_identity_invalid"
+        kb_id, _doc_id, _chunk_id = identity
+        if kb_id not in allowed_kb_ids:
+            return [], set(), "answer_source_kb_forbidden"
+        if identity in seen_source_identities:
+            return [], set(), "answer_source_duplicate"
+        seen_source_identities.add(identity)
+        role = raw_source.get("evidence_role")
+        if role is not None and str(role).strip().casefold() not in {
+            "direct",
+            "related",
+        }:
+            return [], set(), "answer_source_role_invalid"
+        parsed_sources.append((dict(raw_source), identity))
+
+    # A source claimed as generation context must also be present in the
+    # producer's displayed result snapshot.  This catches a common rolling
+    # upgrade failure where answer_sources is populated from a previous pass.
+    result_identities: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = set()
+    for raw_result in raw_results:
+        if not isinstance(raw_result, dict):
+            continue
+        identity = _source_snapshot_identity(raw_result)
+        if identity is not None:
+            result_identities.add(identity)
+    if any(identity not in result_identities for _, identity in parsed_sources):
+        return [], set(), "answer_source_not_in_results"
+
+    chunk_ids = {identity[2] for _, identity in parsed_sources}
+    try:
+        statement = (
+            select(DocumentChunk, Document)
+            .join(
+                Document,
+                (Document.id == DocumentChunk.doc_id)
+                & (Document.kb_id == DocumentChunk.kb_id),
+            )
+            .where(
+                DocumentChunk.id.in_(chunk_ids),
+                DocumentChunk.kb_id.in_(allowed_kb_ids),
+                Document.is_active.is_(True),
+                Document.status == "ready",
+            )
+        )
+        result = await db.execute(statement)
+        rows = result.all() if hasattr(result, "all") else []
+    except Exception as exc:
+        # Do not expose producer content or clear a pending scope when the
+        # authorization refresh itself is unavailable.  The caller records a
+        # compact reason and persists an empty source list instead.
+        logger.warning(
+            "[chat/evidence source validation] refresh failed error=%s",
+            type(exc).__name__,
+        )
+        return [], set(), f"source_refresh_failed:{type(exc).__name__}"
+
+    current: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], tuple[DocumentChunk, Document]] = {}
+    for row in rows or ():
+        try:
+            chunk, document = row
+            if (
+                document is None
+                or document.is_active is not True
+                or str(document.status or "").strip().casefold() != "ready"
+                or document.id != chunk.doc_id
+                or document.kb_id != chunk.kb_id
+            ):
+                continue
+            identity = (chunk.kb_id, chunk.doc_id, chunk.id)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        current[identity] = (chunk, document)
+
+    if any(identity not in current for _, identity in parsed_sources):
+        return [], set(), "answer_source_not_current"
+
+    refreshed: list[dict] = []
+    answer_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    for source, identity in parsed_sources:
+        chunk, document = current[identity]
+        refreshed.append(
+            {
+                **source,
+                "id": str(chunk.id),
+                "chunk_id": str(chunk.id),
+                "doc_id": str(chunk.doc_id),
+                "kb_id": str(chunk.kb_id),
+                "content": chunk.content,
+                "chunk_index": chunk.chunk_index,
+                "metadata": chunk.metadata_ or {},
+                "filename": document.filename,
+                "file_type": document.file_type,
+                "source_url": document.source_url,
+                "image_url": document.image_url,
+                "doc_tags": document.tags or [],
+            }
+        )
+        answer_pairs.add((chunk.kb_id, chunk.doc_id))
+    return refreshed, answer_pairs, None
+
+
+def _parse_uuid(value: object) -> uuid.UUID | None:
+    """Parse one UUID without allowing malformed values into a SQL filter."""
+
+    try:
+        return uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _scope_anchor_coverage_from_sources(
+    scope_filter: dict | None,
+    answer_pairs: set[tuple[uuid.UUID, uuid.UUID]],
+) -> tuple[bool | None, list[str]]:
+    """Recompute selected-scope anchors from refreshed answer sources.
+
+    The boolean and document list emitted by a producer are advisory only.
+    Pending state can be resolved only when every server-derived choice has at
+    least one anchor document in the evidence set that was actually accepted
+    by ``_validate_stream_answer_sources``.
+    """
+
+    if not isinstance(scope_filter, dict):
+        return None, []
+    anchor_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    for raw_choice in scope_filter.get("choices", []):
+        if not isinstance(raw_choice, dict):
+            continue
+        kb_ids = {
+            parsed
+            for value in raw_choice.get("kb_ids", [])
+            if (parsed := _parse_uuid(value)) is not None
+        }
+        anchor_doc_ids = {
+            str(value).strip()
+            for value in raw_choice.get("anchor_doc_ids", [])
+            if str(value).strip()
+        }
+        for kb_id in kb_ids:
+            for raw_doc_id in anchor_doc_ids:
+                doc_id = _parse_uuid(raw_doc_id)
+                if doc_id is not None:
+                    anchor_pairs.add((kb_id, doc_id))
+    if not anchor_pairs:
+        return False, []
+    covered = anchor_pairs & answer_pairs
+    covered_doc_ids = sorted({str(doc_id) for _, doc_id in covered})
+    return covered == anchor_pairs, covered_doc_ids
+
+
+def _scope_document_pairs(
+    scope_filter: dict | None,
+) -> set[tuple[uuid.UUID, uuid.UUID]]:
+    """Expand a server-derived scope choice into exact KB/document pairs."""
+
+    if not isinstance(scope_filter, dict):
+        return set()
+    pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+    for raw_choice in scope_filter.get("choices", []):
+        if not isinstance(raw_choice, dict):
+            continue
+        kb_ids = {
+            parsed
+            for value in raw_choice.get("kb_ids", [])
+            if (parsed := _parse_uuid(value)) is not None
+        }
+        doc_ids = {
+            parsed
+            for value in raw_choice.get("doc_ids", [])
+            if (parsed := _parse_uuid(value)) is not None
+        }
+        pairs.update((kb_id, doc_id) for kb_id in kb_ids for doc_id in doc_ids)
+    return pairs
 
 
 def _source_snapshot_is_answer_evidence(source: object) -> bool:
@@ -1392,6 +1605,10 @@ async def send_message(
         if evidence_pending_state is not None and evidence_filter is not None
         else refined_evidence_query
     )
+    evidence_pending_execution = bool(
+        evidence_pending_state is not None
+        and (evidence_filter is not None or evidence_refinement_active)
+    )
 
     # 在保存本轮用户消息之前读取已有对话。带“这些配置/上述内容”等指代的追问
     # 会得到独立检索问题；上一轮来源只作为候选 id，随后按当前知识库范围和文档
@@ -1412,7 +1629,8 @@ async def send_message(
     # 在任何路由/检索之前记录请求和多轮上下文，保证调用链的第一阶段始终
     # 是“接收请求”。此前这里等意图模型返回后才写 chat.request，导致模型
     # 事件排在请求之前；路由校验失败时也会留下没有起点的 running 记录。
-    trace_include_content = get_settings().rag_trace_include_content
+    settings = get_settings()
+    trace_include_content = settings.rag_trace_include_content
     search_config = payload.search_config.model_dump()
     trace_search_config = dict(search_config)
     if not trace_include_content:
@@ -1427,11 +1645,11 @@ async def send_message(
         selected_tag_count=len(search_config.get("tags") or []),
         intent=None,
         decision_reason=(
-            "unresolved_reference"
-            if conversation_context.unresolved_reference
+            "pending_evidence_scope_selection"
+            if evidence_pending_execution
             else (
-                "pending_evidence_scope_selection"
-                if evidence_filter is not None or evidence_refinement_active
+                "unresolved_reference"
+                if conversation_context.unresolved_reference
                 else "pending_intent_routing"
             )
         ),
@@ -1506,7 +1724,11 @@ async def send_message(
         ),
         has_pending_clarification=bool(pending_route_state),
     )
-    if conversation_context.unresolved_reference and not route_candidates:
+    if (
+        conversation_context.unresolved_reference
+        and not route_candidates
+        and not evidence_pending_execution
+    ):
         trace_event(
             "conversation.reference_unresolved",
             trace_id=trace_id,
@@ -1540,66 +1762,67 @@ async def send_message(
             )
         return response
 
-    # 模型接收原始当前输入和 request-local t1/t2/t3 候选。查询是否需要改写由
-    # 语义合同独立表达，不能再由旧 is_followup 正则提前决定。
+    # 普通请求由语义合同判断是否需要改写。服务端已验证的证据选择/补充范围
+    # 不包含新的路由语义，直接构造 continuation 合同，避免为“2”之类的短回复
+    # 再等待一次外部意图模型。
     routing_question = evidence_routing_query or (
         payload.question if route_candidates else conversation_context.standalone_query
     )
-    try:
-        routing_result = await classify_intent_result(
-            db,
-            routing_question,
-            user=user,
-            selected_kb_ids=payload.knowledge_base_ids,
-            conversation_id=conv.id,
-            record_log=True,
-            trace_id=trace_id,
-            route_context=route_candidates,
-            has_pending_clarification=bool(pending_route_state),
-            fallback_relation=conversation_context.relation,
-            fallback_query_mode=conversation_context.query_resolution_mode,
-            fallback_unresolved=conversation_context.unresolved_reference,
-        )
-    except Exception as exc:
-        # 路由配置/数据库故障不应让调用链停留在 running；接口仍按原语义
-        # 抛出异常，但保留安全的阶段错误供后台排查。
-        trace_event(
-            "chat.error",
-            trace_id=trace_id,
-            conversation_id=conv.id,
-            user_id=user.id,
-            stage="intent_routing",
-            error=exc,
-        )
-        log_exception_safely(
-            logger,
-            "[chat/intent routing error] trace=%s conv=%s",
-            trace_id,
-            conv.id,
-            exc=exc,
-        )
-        raise
-    decision = routing_result.decision
-    route_decision = getattr(routing_result, "route_decision", None)
-    task_contract = getattr(routing_result, "task_contract", None)
-    evidence_pending_execution = bool(
-        evidence_pending_state is not None
-        and (evidence_filter is not None or evidence_refinement_active)
-    )
-    if (
-        evidence_pending_execution
-        and route_decision is not None
-        and isinstance(task_contract, RagTaskContract)
-        and not task_contract.dispatch_authorized
-    ):
-        recovered = _recover_evidence_pending_contract(
-            route_decision,
-            task_contract,
-            pending_state=evidence_pending_state,
-            selected_kb_count=len(set(payload.knowledge_base_ids)),
-            refined=evidence_refinement_active,
-        )
-        if recovered is None:
+    if evidence_pending_execution:
+        try:
+            routing_result = build_verified_evidence_scope_result(
+                db,
+                pipeline_base_query or routing_question,
+                user=user,
+                selected_kb_ids=payload.knowledge_base_ids,
+                conversation_id=conv.id,
+                record_log=True,
+                trace_id=trace_id,
+                refined=evidence_refinement_active,
+            )
+            trace_event(
+                "evidence.route_contract_built",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                pending_state_id=evidence_pending_state["state_id"],
+                resolution=(
+                    "refined"
+                    if evidence_refinement_active
+                    else (
+                        "compare_all"
+                        if evidence_filter.get("mode") == "compare_all"
+                        else "selected"
+                    )
+                ),
+                selected_kb_count=len(set(payload.knowledge_base_ids)),
+                decision_reason=routing_result.decision.decision_reason,
+            )
+        except Exception as exc:
+            trace_event(
+                "evidence.route_contract_failed",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                pending_state_id=evidence_pending_state["state_id"],
+                resolution=(
+                    "refined"
+                    if evidence_refinement_active
+                    else (
+                        "compare_all"
+                        if evidence_filter.get("mode") == "compare_all"
+                        else "selected"
+                    )
+                ),
+                error=exc,
+            )
+            log_exception_safely(
+                logger,
+                "[chat/evidence pending route error] trace=%s conv=%s",
+                trace_id,
+                conv.id,
+                exc=exc,
+            )
             return await _evidence_pending_direct_response(
                 db=db,
                 conv=conv,
@@ -1610,19 +1833,44 @@ async def send_message(
                 action="repeat",
                 repeat_reason="route_contract_unavailable",
             )
-        route_decision, task_contract = recovered
-        trace_event(
-            "evidence.route_contract_recovered",
-            trace_id=trace_id,
-            conversation_id=conv.id,
-            user_id=user.id,
-            pending_state_id=evidence_pending_state["state_id"],
-            resolution=(
-                "refined" if evidence_refinement_active else "selected"
-            ),
-            selected_kb_count=len(set(payload.knowledge_base_ids)),
-            decision_reason=task_contract.decision_reason,
-        )
+    else:
+        try:
+            routing_result = await classify_intent_result(
+                db,
+                routing_question,
+                user=user,
+                selected_kb_ids=payload.knowledge_base_ids,
+                conversation_id=conv.id,
+                record_log=True,
+                trace_id=trace_id,
+                route_context=route_candidates,
+                has_pending_clarification=bool(pending_route_state),
+                fallback_relation=conversation_context.relation,
+                fallback_query_mode=conversation_context.query_resolution_mode,
+                fallback_unresolved=conversation_context.unresolved_reference,
+            )
+        except Exception as exc:
+            # 路由配置/数据库故障不应让调用链停留在 running；接口仍按原语义
+            # 抛出异常，但保留安全的阶段错误供后台排查。
+            trace_event(
+                "chat.error",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                stage="intent_routing",
+                error=exc,
+            )
+            log_exception_safely(
+                logger,
+                "[chat/intent routing error] trace=%s conv=%s",
+                trace_id,
+                conv.id,
+                exc=exc,
+            )
+            raise
+    decision = routing_result.decision
+    route_decision = getattr(routing_result, "route_decision", None)
+    task_contract = getattr(routing_result, "task_contract", None)
     if route_decision is not None and task_contract is not None:
         conversation_context = await resolve_routed_conversation_context(
             db,
@@ -1731,6 +1979,27 @@ async def send_message(
             )
         intent_payload = decision.to_dict()
 
+    pipeline_version, pipeline_reason = _select_rag_pipeline_version(
+        configured_version=settings.rag_pipeline_version,
+        task_contract=task_contract,
+        evidence_scope_filter=evidence_filter,
+        evidence_scope_refinement_active=evidence_refinement_active,
+        selected_tags=search_config.get("tags") or [],
+        is_followup=conversation_context.is_followup,
+        carryover_sources=conversation_context.carryover_sources,
+    )
+    rag_stream_runner = (
+        run_rag_v2_stream if pipeline_version == "v2" else run_rag_stream
+    )
+    trace_event(
+        "chat.pipeline_selected",
+        trace_id=trace_id,
+        conversation_id=conv.id,
+        user_id=user.id,
+        version=pipeline_version,
+        reason=pipeline_reason,
+    )
+
     # 保存用户消息
     user_msg = Message(
         id=uuid.uuid4(),
@@ -1785,13 +2054,22 @@ async def send_message(
         related_reference_count = None
         evidence_scope_anchor_hit = None
         evidence_scope_anchor_doc_ids: list[str] = []
+        # This is deliberately independent from the producer's boolean
+        # ``evidence_scope_anchor_hit``.  It is recomputed from DB-refreshed
+        # answer sources below and is the only value allowed to resolve a
+        # pending evidence scope.
+        evidence_source_validation_ok: bool | None = None
+        evidence_source_validation_error: str | None = None
+        evidence_answer_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
+        evidence_source_validation_locked = False
+        evidence_source_validation_failure_emitted = False
         pending_done_chunk = None
         evidence_clarification_payload = None
         evidence_clarification_locked = False
         # 会话和用户消息已提交。先告知前端会话 ID，用户在首条回答完成前停止时也能继续该会话。
         yield f"data: {json.dumps({'type': 'conversation_started', 'conversation_id': str(conv.id)})}\n\n"
         try:
-            async for chunk in run_rag_stream(
+            rag_stream = rag_stream_runner(
                 question=pipeline_base_query or payload.question,
                 kb_ids=payload.knowledge_base_ids,
                 search_config=search_config,
@@ -1812,18 +2090,24 @@ async def send_message(
                 is_followup=conversation_context.is_followup,
                 followup_reason=conversation_context.followup_reason,
                 evidence_scope_filter=evidence_filter,
-            ):
+            )
+            async for chunk in rag_stream:
                 data = _parse_sse_payload(chunk)
                 event_type = data.get("type") if data else None
+                source_validation_delta: str | None = None
                 # done 必须等 AI 消息持久化成功后再发给前端；其它事件保持实时流式。
                 if event_type == "done":
                     pending_done_chunk = chunk
                     continue
                 if event_type == "text_delta":
-                    if evidence_clarification_locked:
+                    if (
+                        evidence_clarification_locked
+                        or evidence_source_validation_locked
+                    ):
                         # Chat emits the trusted clarification question exactly
-                        # once when the gate event arrives.  Any later model or
-                        # custom-producer delta must not append an answer.
+                        # once when the gate event arrives.  A failed source
+                        # validation similarly emits one deterministic message.
+                        # Any later model/custom-producer delta is suppressed.
                         continue
                     full_response.append(str(data.get("content") or ""))
                 elif event_type == "evidence_clarification":
@@ -1901,6 +2185,15 @@ async def send_message(
                         display_results = []
                     raw_answer_sources = data.get("answer_sources")
                     has_answer_source_list = isinstance(raw_answer_sources, list)
+                    evidence_answer_pairs = set()
+                    answer_source_required = (
+                        normalized_evidence_status
+                        in _ANSWER_SOURCE_REQUIRED_STATUSES
+                    )
+                    evidence_status_invalid = (
+                        normalized_evidence_status
+                        not in _SUPPORTED_EVIDENCE_STATUSES
+                    )
                     non_answer_source_status = (
                         normalized_evidence_status in _NON_ANSWER_SOURCE_STATUSES
                     )
@@ -1910,11 +2203,90 @@ async def send_message(
                         # 把这些正文保存成历史回答依据。持久化层必须 fail closed，
                         # 不能只依赖正常 Pipeline 或前端隐藏。
                         direct_evidence_count = 0
-                    if not has_answer_source_list or non_answer_source_status:
-                        # Fail closed for rolling upgrades, custom stream
-                        # producers, and all non-answer evidence states: broad
-                        # candidates must never be persisted as answer sources.
+                    if evidence_status_invalid:
                         raw_answer_sources = []
+                        evidence_source_validation_ok = False
+                        evidence_source_validation_error = (
+                            "evidence_status_invalid"
+                        )
+                    elif not has_answer_source_list:
+                        # Fail closed for rolling upgrades and custom stream
+                        # producers: a missing answer_sources list cannot be
+                        # treated as the generation context.
+                        raw_answer_sources = []
+                        evidence_source_validation_ok = False
+                        evidence_source_validation_error = (
+                            "answer_sources_not_a_list"
+                        )
+                    elif non_answer_source_status:
+                        # Non-answer states never persist producer snapshots,
+                        # even if an old producer accidentally included them.
+                        if raw_answer_sources:
+                            evidence_source_validation_ok = False
+                            evidence_source_validation_error = (
+                                "non_answer_status_with_sources"
+                            )
+                        else:
+                            evidence_source_validation_ok = True
+                            evidence_source_validation_error = None
+                        raw_answer_sources = []
+                    else:
+                        (
+                            answer_source_items,
+                            evidence_answer_pairs,
+                            evidence_source_validation_error,
+                        ) = await _validate_stream_answer_sources(
+                            db,
+                            raw_sources=raw_answer_sources,
+                            raw_results=display_results,
+                            selected_kb_ids=payload.knowledge_base_ids,
+                        )
+                        if (
+                            evidence_filter is not None
+                            and evidence_source_validation_error is None
+                        ):
+                            allowed_scope_pairs = _scope_document_pairs(
+                                evidence_filter
+                            )
+                            if not evidence_answer_pairs.issubset(
+                                allowed_scope_pairs
+                            ):
+                                evidence_source_validation_error = (
+                                    "answer_source_scope_forbidden"
+                                )
+                        evidence_source_validation_ok = (
+                            evidence_source_validation_error is None
+                        )
+                        # If refresh/identity validation fails, do not retain
+                        # producer-provided body or metadata.  The validation
+                        # lock below replaces the model stream with one
+                        # deterministic retry message and keeps pending scope.
+                        raw_answer_sources = answer_source_items
+                        if evidence_source_validation_error is not None:
+                            raw_answer_sources = []
+                            answer_source_items = []
+                            evidence_answer_pairs = set()
+                            if normalized_evidence_status not in {
+                                "error",
+                                "no_hit",
+                                "skipped",
+                                "needs_clarification",
+                            }:
+                                evidence_status = "error"
+                                normalized_evidence_status = "error"
+                    recomputed_anchor_hit, recomputed_anchor_doc_ids = (
+                        _scope_anchor_coverage_from_sources(
+                            evidence_filter,
+                            evidence_answer_pairs,
+                        )
+                    )
+                    if evidence_filter is not None:
+                        # Ignore producer-advertised anchor fields entirely.
+                        evidence_scope_anchor_hit = recomputed_anchor_hit
+                        evidence_scope_anchor_doc_ids = recomputed_anchor_doc_ids
+                    else:
+                        evidence_scope_anchor_hit = False
+                        evidence_scope_anchor_doc_ids = []
                     displayed_result_count = data.get(
                         "displayed_result_count",
                         data.get("total", len(display_results)),
@@ -1927,9 +2299,103 @@ async def send_message(
                         displayed_result_count = len(display_results)
                     answer_source_items = [
                         source
-                        for source in raw_answer_sources[:20]
+                        for source in (raw_answer_sources or [])[:20]
                         if isinstance(source, dict)
                     ]
+                    if evidence_source_validation_error is not None:
+                        # Once producer evidence fails identity/authorization
+                        # validation, its broad panel snapshot is untrusted too.
+                        # Do not expose stale or cross-scope content through the
+                        # UI while merely clearing the persisted citation list.
+                        display_results = []
+                        data["results"] = []
+                        data["total"] = 0
+                        data["displayed_result_count"] = 0
+                        data["related_reference_count"] = 0
+                        displayed_result_count = 0
+                        related_reference_count = 0
+                    source_validation_failed = bool(
+                        evidence_status_invalid
+                        or evidence_source_validation_error is not None
+                        or (answer_source_required and not answer_source_items)
+                    )
+                    if (
+                        not evidence_clarification_locked
+                        and (
+                            source_validation_failed
+                            or evidence_source_validation_locked
+                        )
+                    ):
+                        if evidence_source_validation_error is None:
+                            evidence_source_validation_error = (
+                                "required_answer_sources_empty"
+                            )
+                        display_results = []
+                        data["results"] = []
+                        data["total"] = 0
+                        data["displayed_result_count"] = 0
+                        data["related_reference_count"] = 0
+                        displayed_result_count = 0
+                        related_reference_count = 0
+                        evidence_source_validation_ok = False
+                        evidence_source_validation_locked = True
+                        evidence_answer_pairs = set()
+                        evidence_scope_anchor_hit = False
+                        evidence_scope_anchor_doc_ids = []
+                        evidence_status = "error"
+                        normalized_evidence_status = "error"
+                        answer_source_items = []
+                        raw_answer_sources = []
+                        sources = []
+                        context_evidence_count = 0
+                        hit_count = 0
+                        direct_evidence_count = 0
+                        full_response.clear()
+                        full_response.append(
+                            _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE
+                        )
+                        if not evidence_source_validation_failure_emitted:
+                            source_validation_delta = (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "text_delta",
+                                        "content": (
+                                            _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE
+                                        ),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n\n"
+                            )
+                            evidence_source_validation_failure_emitted = True
+                    # Counts are derived from the validated context snapshot,
+                    # never copied from a producer that may have counted broad
+                    # candidates or stale sources.
+                    direct_evidence_count = sum(
+                        str(source.get("evidence_role") or "")
+                        .strip()
+                        .casefold()
+                        == "direct"
+                        for source in answer_source_items
+                    )
+                    data["answer_sources"] = answer_source_items
+                    data["answer_source_count"] = len(answer_source_items)
+                    data["context_evidence_count"] = len(answer_source_items)
+                    data["direct_evidence_count"] = direct_evidence_count
+                    data["hit_count"] = direct_evidence_count
+                    data["evidence_scope_anchor_hit"] = (
+                        evidence_scope_anchor_hit
+                    )
+                    data["evidence_scope_anchor_doc_ids"] = list(
+                        evidence_scope_anchor_doc_ids
+                    )
+                    data["evidence_status"] = evidence_status
+                    chunk = (
+                        "data: "
+                        + json.dumps(data, ensure_ascii=False)
+                        + "\n\n"
+                    )
                     context_evidence_count = len(answer_source_items)
                     hit_count = direct_evidence_count
                     source_meta = {
@@ -1954,6 +2420,43 @@ async def send_message(
                 elif event_type == "usage":
                     tokens = data.get("total_tokens")
                 yield chunk
+                if source_validation_delta is not None:
+                    yield source_validation_delta
+                if (
+                    event_type == "search_results"
+                    and evidence_source_validation_locked
+                ):
+                    # ``search_results`` is emitted before final generation in
+                    # both pipelines.  Once its source identity/authorization
+                    # contract fails, pulling one more item would let the
+                    # producer open an LLM stream whose output is guaranteed
+                    # to be discarded.  Stop at the gate, close the suspended
+                    # async generator, persist the deterministic failure
+                    # message below, and emit ``done`` only after that commit.
+                    trace_event(
+                        "generation.skipped",
+                        trace_id=trace_id,
+                        pipeline_version=pipeline_version,
+                        reason="answer_source_validation_failed",
+                        evidence_status=evidence_status,
+                        validation_error=evidence_source_validation_error,
+                    )
+                    close_stream = getattr(rag_stream, "aclose", None)
+                    if callable(close_stream):
+                        try:
+                            await close_stream()
+                        except Exception as close_exc:
+                            # The answer is already fail-closed.  Cleanup is
+                            # best-effort and must not replace it with a generic
+                            # stream error or delay persistence/retry guidance.
+                            trace_event(
+                                "chat.stream_close_error",
+                                trace_id=trace_id,
+                                conversation_id=conv.id,
+                                stage="answer_source_validation",
+                                error=close_exc,
+                            )
+                    break
         except asyncio.CancelledError:
             # 浏览器停止生成、断开连接或服务关闭都会取消流协程。同步入队即可
             # 立即把调用链标成 interrupted；不要在已取消任务里继续等待数据库。
@@ -2078,6 +2581,8 @@ async def send_message(
                     and retrieval_executed is True
                     and normalized_final_evidence_status
                     in _SUCCESSFUL_EVIDENCE_SCOPE_STATUSES
+                    and evidence_source_validation_ok is True
+                    and not evidence_source_validation_locked
                     and (
                         evidence_refinement_active
                         or evidence_scope_anchor_hit is True
@@ -2198,6 +2703,9 @@ async def send_message(
                 hit_count=hit_count or 0,
                 direct_evidence_count=direct_evidence_count,
                 related_reference_count=related_reference_count,
+                evidence_source_validation_ok=evidence_source_validation_ok,
+                evidence_source_validation_error=evidence_source_validation_error,
+                evidence_source_validation_locked=evidence_source_validation_locked,
                 tokens=tokens,
                 sources=[
                     {

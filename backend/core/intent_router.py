@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -23,11 +24,13 @@ from config import get_settings
 from core.openai_client import get_client
 from core.query_constraints import match_known_enterprise_product
 from core.query_route_compiler import (
+    CompiledAnswerRequirement,
     RagTaskContract,
     RouteCategoryPolicy,
     RouteCompilerConfig,
     TaskContractCompilationError,
     compile_rag_task_contract,
+    require_rag_task_contract_dispatchable,
 )
 from core.query_route_contract import (
     ROUTE_DECISION_SCHEMA_VERSION,
@@ -204,6 +207,20 @@ _GREETING_RE = re.compile(
     r"^(?:你好|您好|嗨|哈喽|hello|hi|早上好|中午好|下午好|晚上好|在吗|在不在|谢谢|感谢|多谢|再见|拜拜)[!！。,.，?？~～\s]*$",
     re.IGNORECASE,
 )
+_HIGH_CONFIDENCE_GENERAL_CHAT_RE = re.compile(
+    r"^(?:(?:谢谢|感谢|多谢)(?:你|您)?(?:的)?(?:帮助|解答|回复)?|"
+    r"(?:你|您)(?:是谁|叫什么|是什么(?:模型|助手)|能做什么)|"
+    r"(?:请问|帮我(?:查|查询|看看))?\s*.{0,20}"
+    r"(?:天气|气温|空气质量)(?:怎么样|如何|多少|查询|预报|是什么)?)"
+    r"[!！。,.，?？~～\s]*$",
+    re.IGNORECASE,
+)
+_HIGH_CONFIDENCE_CREATIVE_WRITING_RE = re.compile(
+    r"^(?:(?:请|帮我|麻烦|我要|我想|能否|可以)?\s*"
+    r"(?:写|创作|生成|讲|说).{0,20}(?:诗|歌|故事|笑话|祝福语))"
+    r"[!！。,.，?？~～\s]*$",
+    re.IGNORECASE,
+)
 _GENERIC_SYSTEM_HELP_RE = re.compile(
     r"^(?:帮助|系统帮助|怎么使用(?:这个)?系统|如何使用(?:这个)?系统|系统如何检索)"
     r"[!！。,.，?？\s]*$",
@@ -287,6 +304,60 @@ _ENTERPRISE_TARGET_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Normative-query gate.  These are document/query *structures*, not business
+# topics: an unseen subject such as “火星基地量子补贴” must be handled the
+# same way as an existing company policy.  The suffix/prefix checks keep plain
+# language questions (for example “介绍技术规范含义”) and creative requests
+# out of the gate.
+_NORMATIVE_TERMS = (
+    "标准",
+    "政策",
+    "制度",
+    "规范",
+    "规定",
+    "办法",
+    "细则",
+    "流程",
+    "规则",
+    "要求",
+    "条件",
+    "资格",
+    "额度",
+    "上限",
+    "下限",
+)
+_NORMATIVE_QUERY_MARKERS = (
+    "是什么",
+    "是多少",
+    "有哪些",
+    "有什么",
+    "如何",
+    "怎么",
+    "怎样",
+    "是否",
+    "能否",
+    "可否",
+    "具体",
+    "分别",
+    "查询",
+    "说明",
+    "适用",
+    "包含",
+    "呢",
+)
+_NORMATIVE_CONCEPT_MARKERS = (
+    "什么是",
+    "何为",
+    "含义",
+    "定义",
+    "概念",
+    "指什么",
+    "是什么意思",
+)
+_NORMATIVE_LOOKUP_PREFIX_RE = re.compile(
+    r"(?:请问|查询|查看|了解|说明|告诉我|想知道|我想了解|我想知道)",
+    re.IGNORECASE,
+)
 
 def _is_explicit_platform_help(question: str) -> bool:
     """只识别当前 RAG 平台自身的帮助问题，不把外部产品用法混入系统帮助。"""
@@ -340,6 +411,47 @@ def _is_knowledge_dependent_writing_request(question: str) -> bool:
     )
 
 
+def _is_normative_query(question: str) -> bool:
+    """Recognize a conservative policy/standard lookup by sentence shape.
+
+    The function intentionally has no product, department, allowance, login,
+    or other business-topic vocabulary.  It only accepts a concrete subject
+    before a normative term plus a lookup marker (or an explicit lookup
+    prefix).  Concept definitions and writing requests are excluded because
+    they can be answered without the selected knowledge base.
+    """
+
+    text = str(question or "").strip()
+    if not text:
+        return False
+    if (
+        _is_knowledge_dependent_writing_request(text)
+        or _is_inline_writing_request(text)
+        or _HIGH_CONFIDENCE_CREATIVE_WRITING_RE.fullmatch(text)
+    ):
+        return False
+    if any(marker in text for marker in _NORMATIVE_CONCEPT_MARKERS):
+        return False
+
+    for term in _NORMATIVE_TERMS:
+        start = text.find(term)
+        while start >= 0:
+            prefix = text[:start].strip()
+            suffix = text[start + len(term):].strip()
+            # A bare “标准是什么” has no resolvable subject and should remain
+            # with the semantic router; “某对象的标准是什么” is concrete.
+            subject = re.sub(r"^[请问查询查看了解\s]+|[的之\s]+$", "", prefix)
+            if len(subject) >= 2:
+                if (
+                    any(marker in suffix for marker in _NORMATIVE_QUERY_MARKERS)
+                    or (not suffix and _NORMATIVE_LOOKUP_PREFIX_RE.search(prefix))
+                    or (suffix in {"?", "？", "。", "！", "!"})
+                ):
+                    return True
+            start = text.find(term, start + len(term))
+    return False
+
+
 def _requires_knowledge_retrieval(question: str) -> bool:
     """Return whether a chat-like classification still needs source evidence.
 
@@ -352,7 +464,11 @@ def _requires_knowledge_retrieval(question: str) -> bool:
     text = question.strip()
     if not text:
         return False
-    if _KNOWLEDGE_SOURCE_RE.search(text) or _ENTERPRISE_TARGET_RE.search(text):
+    if (
+        _KNOWLEDGE_SOURCE_RE.search(text)
+        or _ENTERPRISE_TARGET_RE.search(text)
+        or _is_normative_query(text)
+    ):
         return True
     # 只有命中集中维护的企业产品词典且确实询问产品操作时，才用策略层纠正
     # general_chat。查询约束提取还能识别 Python3.11 等任意产品版本表达，不能
@@ -519,6 +635,10 @@ def _rule_match(
         item = category_by_code.get("general_chat")
         if item:
             return _make_decision(item, 0.99, "rule")
+    if _HIGH_CONFIDENCE_GENERAL_CHAT_RE.fullmatch(text):
+        item = category_by_code.get("general_chat")
+        if item:
+            return _make_decision(item, 0.99, "rule")
     if _is_explicit_platform_help(text):
         item = category_by_code.get("system_help")
         if item:
@@ -531,6 +651,10 @@ def _rule_match(
         item = category_by_code.get("writing")
         if item:
             return _make_decision(item, 0.95, "rule")
+    if _HIGH_CONFIDENCE_CREATIVE_WRITING_RE.fullmatch(text):
+        item = category_by_code.get("writing")
+        if item:
+            return _make_decision(item, 0.98, "rule")
     # Positive enterprise-source/product signals may safely upgrade a request
     # to retrieval locally.  A false positive can only add grounding work; it
     # cannot skip required retrieval or widen the selected knowledge-base
@@ -1285,7 +1409,7 @@ async def _route_with_llm(
     intent_model = str(settings.intent_model or "").strip()
     chat_model = str(settings.chat_model or "").strip()
     primary_model = intent_model or chat_model
-    timeout_seconds = max(0.1, float(settings.llm_request_timeout_seconds))
+    timeout_seconds = max(0.1, float(settings.rag_route_timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
     if not primary_model:
         return RouteWorkflowResult(
@@ -1323,18 +1447,68 @@ async def _route_with_llm(
             rejection_reason="client_error",
         )
 
-    primary = await _run_route_model_attempt(
-        client,
-        question,
-        categories,
-        model=primary_model,
-        attempt="primary",
-        timeout_seconds=max(0.1, deadline - time.monotonic()),
-        selected_kb_count=selected_kb_count,
-        route_context=route_context,
-        has_pending_clarification=has_pending_clarification,
-        trace_id=trace_id,
-    )
+    async def run_attempt_with_deadline(
+        *,
+        model: str,
+        attempt: str,
+        primary_rejection_reason: str | None = None,
+    ) -> RouteModelAttemptResult:
+        """Enforce the route workflow deadline even if a provider ignores timeout."""
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("意图路由总期限已耗尽")
+        return await asyncio.wait_for(
+            _run_route_model_attempt(
+                client,
+                question,
+                categories,
+                model=model,
+                attempt=attempt,
+                timeout_seconds=remaining,
+                selected_kb_count=selected_kb_count,
+                route_context=route_context,
+                has_pending_clarification=has_pending_clarification,
+                trace_id=trace_id,
+                primary_rejection_reason=primary_rejection_reason,
+            ),
+            timeout=remaining,
+        )
+
+    try:
+        primary = await run_attempt_with_deadline(
+            model=primary_model,
+            attempt="primary",
+        )
+    except TimeoutError as exc:
+        latency_ms = max(0, round((time.perf_counter() - started) * 1000))
+        logger.warning(
+            "[智能路由] 语义路由总期限耗尽 timeout=%.2fs latency=%dms",
+            timeout_seconds,
+            latency_ms,
+        )
+        trace_event(
+            "intent.model_error",
+            trace_id=trace_id,
+            attempt="workflow",
+            model=primary_model,
+            prompt_version=ROUTE_PROMPT_VERSION,
+            route_schema_version=ROUTE_DECISION_SCHEMA_VERSION,
+            rejection_reason="route_timeout",
+            attempt_latency_ms=latency_ms,
+            timeout_seconds=timeout_seconds,
+            error=exc,
+        )
+        return RouteWorkflowResult(
+            route_decision=None,
+            source="fallback",
+            latency_ms=latency_ms,
+            schema_valid=False,
+            strict_schema_used=True,
+            json_object_fallback_used=False,
+            fallback_model_used=False,
+            rejection_reason="route_timeout",
+        )
     if primary.route_decision is not None:
         return RouteWorkflowResult(
             route_decision=primary.route_decision,
@@ -1364,19 +1538,42 @@ async def _route_with_llm(
             rejection_reason=primary.rejection_reason,
         )
 
-    fallback = await _run_route_model_attempt(
-        client,
-        question,
-        categories,
-        model=chat_model,
-        attempt="fallback_chat_model",
-        timeout_seconds=max(0.1, deadline - time.monotonic()),
-        selected_kb_count=selected_kb_count,
-        route_context=route_context,
-        has_pending_clarification=has_pending_clarification,
-        trace_id=trace_id,
-        primary_rejection_reason=primary.rejection_reason,
-    )
+    try:
+        fallback = await run_attempt_with_deadline(
+            model=chat_model,
+            attempt="fallback_chat_model",
+            primary_rejection_reason=primary.rejection_reason,
+        )
+    except TimeoutError as exc:
+        latency_ms = max(0, round((time.perf_counter() - started) * 1000))
+        logger.warning(
+            "[智能路由] 备用路由模型耗尽总期限 timeout=%.2fs latency=%dms",
+            timeout_seconds,
+            latency_ms,
+        )
+        trace_event(
+            "intent.model_error",
+            trace_id=trace_id,
+            attempt="workflow",
+            model=chat_model,
+            prompt_version=ROUTE_PROMPT_VERSION,
+            route_schema_version=ROUTE_DECISION_SCHEMA_VERSION,
+            rejection_reason="route_timeout",
+            primary_rejection_reason=primary.rejection_reason,
+            attempt_latency_ms=latency_ms,
+            timeout_seconds=timeout_seconds,
+            error=exc,
+        )
+        return RouteWorkflowResult(
+            route_decision=None,
+            source="fallback",
+            latency_ms=latency_ms,
+            schema_valid=False,
+            strict_schema_used=primary.strict_schema_used,
+            json_object_fallback_used=primary.json_object_fallback_used,
+            fallback_model_used=True,
+            rejection_reason="route_timeout",
+        )
     return RouteWorkflowResult(
         route_decision=fallback.route_decision,
         source=("llm_fallback" if fallback.route_decision is not None else "fallback"),
@@ -1607,6 +1804,15 @@ def _apply_routing_policy(
             decision_reason="explicit_platform_help",
         )
 
+    if _HIGH_CONFIDENCE_GENERAL_CHAT_RE.fullmatch(question.strip()):
+        return _with_execution_policy(
+            decision,
+            response_mode="general_chat",
+            retrieval_policy="skip",
+            need_retrieval=False,
+            decision_reason="explicit_general_chat",
+        )
+
     # 同时附带原文并不代表不需要知识库。例如“根据员工手册润色以下申请”
     # 的主要动作是写作，但外部手册仍是事实约束；知识依赖必须优先于 inline。
     if _is_knowledge_dependent_writing_request(question):
@@ -1625,6 +1831,15 @@ def _apply_routing_policy(
             retrieval_policy="skip",
             need_retrieval=False,
             decision_reason="inline_writing_content",
+        )
+
+    if _HIGH_CONFIDENCE_CREATIVE_WRITING_RE.fullmatch(question.strip()):
+        return _with_execution_policy(
+            decision,
+            response_mode="writing",
+            retrieval_policy="skip",
+            need_retrieval=False,
+            decision_reason="explicit_creative_writing",
         )
 
     # 模型不可用、低置信度或返回空内容时，除了上面三类完全确定的本地
@@ -1748,18 +1963,21 @@ async def _classify_route_contract_result(
         and fallback_query_mode == "contextualize"
         and bool(available_turn_keys)
         and _requires_knowledge_retrieval(deterministic_followup_text)
+        and not _HIGH_CONFIDENCE_GENERAL_CHAT_RE.fullmatch(question.strip())
+        and not _HIGH_CONFIDENCE_CREATIVE_WRITING_RE.fullmatch(question.strip())
     )
     preflight_enterprise_new = (
         selected_kb_count > 0
         and not has_pending_clarification
         and not fallback_unresolved
-        and not available_turn_keys
         and fallback_relation == "new"
         and fallback_query_mode == "current"
         and _requires_knowledge_retrieval(question)
         and not _is_knowledge_dependent_writing_request(question)
         and not _is_explicit_platform_help(question)
         and not _is_inline_writing_request(question)
+        and not _HIGH_CONFIDENCE_GENERAL_CHAT_RE.fullmatch(question.strip())
+        and not _HIGH_CONFIDENCE_CREATIVE_WRITING_RE.fullmatch(question.strip())
     )
     if preflight_enterprise_followup or preflight_enterprise_new:
         fallback_decision = _fallback_decision(config, categories, source="rule")
@@ -1983,6 +2201,145 @@ def record_intent_route_log(
     )
     db.add(log)
     return log
+
+
+def build_verified_evidence_scope_result(
+    db: AsyncSession,
+    question: str,
+    *,
+    user: User | None = None,
+    selected_kb_ids: Iterable[uuid.UUID] | None = None,
+    conversation_id: uuid.UUID | None = None,
+    record_log: bool = True,
+    trace_id: str | None = None,
+    refined: bool = False,
+) -> IntentClassificationResult:
+    """Build an executable route for a server-validated evidence reply.
+
+    A pending evidence choice is created from authorized retrieval results and
+    is validated again by the chat boundary before this function is called.
+    The short follow-up (for example ``2``) therefore contains no new semantic
+    routing decision for a model to make.  Constructing the continuation
+    contract locally removes an unnecessary remote call while preserving the
+    same dispatch gate, route log and trace contract as ordinary routing.
+
+    This function does not accept KB or document ids from the user text.  The
+    caller remains responsible for rebuilding the request-local evidence
+    allow-list from the validated pending state and current authorization.
+    """
+
+    started = time.perf_counter()
+    normalized_question = str(question or "").strip()
+    if not normalized_question:
+        raise ValueError("已验证证据范围的原始问题不能为空")
+    selected_kb_id_list = tuple(dict.fromkeys(selected_kb_ids or ()))
+    if not selected_kb_id_list:
+        raise ValueError("已验证证据范围必须至少包含一个知识库")
+
+    decision_reason = (
+        "evidence_scope_refined" if refined else "evidence_scope_selected"
+    )
+    requirement_description = normalized_question[:240]
+    clarification = RouteClarification(question="", unresolved=())
+    route = RagRouteDecision(
+        schema_version=ROUTE_DECISION_SCHEMA_VERSION,
+        readiness="ready",
+        intent_code="knowledge_qa",
+        relation="continuation",
+        evidence_scope="enterprise_kb",
+        query_resolution=RouteQueryResolution(
+            mode="current",
+            context_turn_keys=(),
+        ),
+        requirements=(
+            RouteRequirement(
+                role="answer",
+                origin="user_text",
+                description=requirement_description,
+            ),
+        ),
+        clarification=clarification,
+        confidence=1.0,
+        rationale="服务端已验证证据范围，使用确定性续问合同",
+    )
+    contract = RagTaskContract(
+        schema_version="rag_task_contract.v1",
+        route_schema_version=ROUTE_DECISION_SCHEMA_VERSION,
+        readiness="ready",
+        intent_code="knowledge_qa",
+        intent_name="知识库问答",
+        action="retrieve",
+        confidence=1.0,
+        source="evidence_pending_rule",
+        relation="continuation",
+        evidence_scope="enterprise_kb",
+        query_mode="current",
+        context_turn_keys=(),
+        response_mode="grounded_qa",
+        retrieval_policy="required",
+        need_retrieval=True,
+        dispatch_authorized=True,
+        decision_reason=decision_reason,
+        selected_kb_count=len(selected_kb_id_list),
+        requirements=(
+            CompiledAnswerRequirement(
+                id="r1",
+                role="answer",
+                origin="user_text",
+                description=requirement_description,
+                importance="required",
+                source="explicit",
+            ),
+        ),
+        clarification=clarification,
+    )
+    require_rag_task_contract_dispatchable(
+        contract,
+        selected_kb_count=len(selected_kb_id_list),
+        available_turn_keys=(),
+    )
+
+    decision = _project_task_contract(contract)
+    latency_ms = max(0, round((time.perf_counter() - started) * 1000))
+    route_log: IntentRouteLog | None = None
+    if record_log:
+        route_log = record_intent_route_log(
+            db,
+            decision,
+            latency_ms=latency_ms,
+            user=user,
+            conversation_id=conversation_id,
+            selected_kb_ids=selected_kb_id_list,
+            trace_id=trace_id,
+            task_contract=contract,
+        )
+    diagnostics = {
+        "schema_valid": True,
+        "strict_schema_used": False,
+        "json_object_fallback_used": False,
+        "fallback_model_used": False,
+        "safe_fallback_used": False,
+        "deterministic_preflight": decision_reason,
+        "route_schema_version": ROUTE_DECISION_SCHEMA_VERSION,
+        "contract_schema_version": contract.schema_version,
+        "contract_valid": True,
+        "latency_ms": latency_ms,
+    }
+    trace_event(
+        "intent.contract_compiled",
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+        user_id=(user.id if user is not None else None),
+        **contract.safe_summary(),
+    )
+    return IntentClassificationResult(
+        decision=decision,
+        latency_ms=latency_ms,
+        route_log_id=route_log.id if route_log is not None else None,
+        route_decision=route,
+        task_contract=contract,
+        diagnostics=diagnostics,
+    )
 
 
 async def classify_intent_result(

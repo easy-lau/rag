@@ -758,7 +758,7 @@ def _parse_expansion_plan(
         if expansion_query in queries:
             raise ValueError("expansion.queries 重复")
         original_constraints = extract_query_constraints(query)
-        if original_constraints.has_product_constraint:
+        if original_constraints.has_scope_constraint:
             expansion_evaluation = evaluate_candidate_constraints(
                 original_constraints,
                 # 扩展词不是正式文档，但产品/版本通常以“云枢7 ...”这样的
@@ -1747,7 +1747,7 @@ def _resolve_evidence_role(
     if status == "mismatch":
         # 版本冲突最多只能作为“相近版本资料”；确实不相关时仍保留 irrelevant。
         return "related" if topic_relevance >= 0.3 else "irrelevant"
-    if status == "unknown" and constraints.has_product_constraint and model_role == "direct":
+    if status == "unknown" and constraints.has_scope_constraint and model_role == "direct":
         return "related"
     if model_role == "direct" and (
         topic_relevance < DIRECT_SUPPORT_THRESHOLD
@@ -1785,7 +1785,7 @@ def _effective_score(
 
     if role == "irrelevant" or status == "mismatch":
         return 0.0
-    if status == "unknown" and constraints.has_product_constraint:
+    if status == "unknown" and constraints.has_scope_constraint:
         return 0.0
     return assessment.answer_support
 
@@ -1840,8 +1840,10 @@ def _fallback_results(
                 "topic_relevance": None,
                 "answer_support": None,
                 "constraint_status": evaluation.status,
-                "query_has_constraint": constraints.has_product_constraint,
+                "query_has_constraint": constraints.has_scope_constraint,
+                "query_has_product_constraint": constraints.has_product_constraint,
                 "query_has_hard_constraint": constraints.has_hard_constraint,
+                "query_has_version_constraint": constraints.has_version_constraint,
                 # 明确冲突是代码可验证事实，可标为 related；其它候选仍保持
                 # 未验证，不能冒充 direct。
                 "evidence_role": "related" if evaluation.status == "mismatch" else None,
@@ -2014,8 +2016,10 @@ async def rerank_with_status(
                     "topic_relevance": assessment.topic_relevance,
                     "answer_support": assessment.answer_support,
                     "constraint_status": final_status,
-                    "query_has_constraint": constraints.has_product_constraint,
+                    "query_has_constraint": constraints.has_scope_constraint,
+                    "query_has_product_constraint": constraints.has_product_constraint,
                     "query_has_hard_constraint": constraints.has_hard_constraint,
+                    "query_has_version_constraint": constraints.has_version_constraint,
                     "evidence_role": final_role,
                     "rerank_reason": assessment.reason,
                     "rerank_candidate_index": assessment.index,
@@ -2160,8 +2164,10 @@ def _materialize_joint_candidates(
                     "topic_relevance": 0.0,
                     "answer_support": 0.0,
                     "constraint_status": final_status,
-                    "query_has_constraint": constraints.has_product_constraint,
+                    "query_has_constraint": constraints.has_scope_constraint,
+                    "query_has_product_constraint": constraints.has_product_constraint,
                     "query_has_hard_constraint": constraints.has_hard_constraint,
+                    "query_has_version_constraint": constraints.has_version_constraint,
                     "evidence_role": "irrelevant",
                     "contribution_role": "irrelevant",
                     "contribution_role_original": None,
@@ -2221,8 +2227,10 @@ def _materialize_joint_candidates(
                 "topic_relevance": assessment.topic_relevance,
                 "answer_support": assessment.answer_support,
                 "constraint_status": final_status,
-                "query_has_constraint": constraints.has_product_constraint,
+                "query_has_constraint": constraints.has_scope_constraint,
+                "query_has_product_constraint": constraints.has_product_constraint,
                 "query_has_hard_constraint": constraints.has_hard_constraint,
+                "query_has_version_constraint": constraints.has_version_constraint,
                 "evidence_role": final_role,
                 "contribution_role": assessment.contribution_role,
                 "contribution_role_original": assessment.contribution_role_original,
@@ -2270,7 +2278,7 @@ def _joint_candidate_is_eligible(
     status = str(item.get("constraint_status") or "")
     if status == "mismatch":
         return False
-    if constraints.has_product_constraint and status == "unknown":
+    if constraints.has_scope_constraint and status == "unknown":
         return False
     if item.get("evidence_role") == "irrelevant":
         return False
@@ -2472,8 +2480,10 @@ def _joint_fallback_results(
                     "topic_relevance": None,
                     "answer_support": None,
                     "constraint_status": evaluation.status,
-                    "query_has_constraint": constraints.has_product_constraint,
+                    "query_has_constraint": constraints.has_scope_constraint,
+                    "query_has_product_constraint": constraints.has_product_constraint,
                     "query_has_hard_constraint": constraints.has_hard_constraint,
+                    "query_has_version_constraint": constraints.has_version_constraint,
                     "evidence_role": (
                         "related" if evaluation.status == "mismatch" else None
                     ),
@@ -2531,7 +2541,7 @@ def _materialize_small_document_selection(
             continue
         evaluation = evaluate_candidate_constraints(constraints, result)
         if evaluation.status == "mismatch" or (
-            constraints.has_product_constraint
+            constraints.has_scope_constraint
             and evaluation.status == "unknown"
         ):
             raise ValueError("小文档模型选择了产品或版本约束不合格的候选")

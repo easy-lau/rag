@@ -14,8 +14,11 @@ from core.rag_pipeline import (
     _fallback_to_initial_verified_evidence,
     _knowledge_context_message,
     _merge_retrieval_candidates,
+    _resolve_document_expansion_plan,
     _rescue_missing_joint_evidence,
+    _select_unverified_evidence,
     _select_verified_evidence,
+    annotate_deterministic_constraints,
     run_rag_stream,
 )
 from core.evidence_ambiguity import EvidenceAmbiguityDecision, EvidenceScopeChoice
@@ -2157,6 +2160,62 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(selected[2], "partial")
 
+    def test_productless_version_mismatch_is_diagnostic_only(self) -> None:
+        constraints = extract_query_constraints("版本8.6登录配置")
+        results = annotate_deterministic_constraints(
+            [
+                _candidate(filename="登录制度7版", content="旧版配置", score=0.9),
+                _candidate(filename="通用登录制度", content="通用配置", score=0.8),
+            ],
+            constraints,
+        )
+
+        selected = _select_unverified_evidence(results, 5, constraints)
+
+        self.assertEqual(selected[2], "version_mismatch")
+        self.assertEqual(len(selected[0]), 1)
+        self.assertEqual(selected[0][0]["constraint_status"], "mismatch")
+        self.assertEqual(selected[1], [])
+
+    def test_productless_version_unknown_never_enters_verified_context(self) -> None:
+        unknown = {
+            **_candidate(content="未声明适用版本的通用配置"),
+            "topic_relevance": 0.99,
+            "answer_support": 0.99,
+            "constraint_status": "unknown",
+            "query_has_constraint": True,
+            "query_has_product_constraint": False,
+            "query_has_hard_constraint": False,
+            "query_has_version_constraint": True,
+            "evidence_role": "direct",
+        }
+
+        selected = _select_verified_evidence([unknown], 5)
+
+        self.assertEqual(selected[0], [])
+        self.assertEqual(selected[1], [])
+        self.assertEqual(selected[2], "no_hit")
+
+    def test_productless_version_mismatch_never_enters_verified_context(self) -> None:
+        mismatch = {
+            **_candidate(filename="登录制度7版", content="旧版配置"),
+            "topic_relevance": 0.99,
+            "answer_support": 0.99,
+            "constraint_status": "mismatch",
+            "query_has_constraint": True,
+            "query_has_product_constraint": False,
+            "query_has_hard_constraint": False,
+            "query_has_version_constraint": True,
+            "evidence_role": "direct",
+        }
+
+        selected = _select_verified_evidence([mismatch], 5)
+
+        self.assertEqual(selected[2], "version_mismatch")
+        self.assertEqual(len(selected[0]), 1)
+        self.assertEqual(selected[0][0]["evidence_role"], "related")
+        self.assertEqual(selected[1], [])
+
     def test_low_answer_support_is_rejected_from_display_and_generation(self) -> None:
         for support in (0.0, 0.09):
             with self.subTest(support=support):
@@ -3460,6 +3519,89 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         event = _search_event(chunks)
         self.assertEqual(event["evidence_status"], "hit")
         self.assertFalse(event["expansion_attempted"])
+
+    def test_incomplete_standalone_direct_does_not_skip_expansion(self) -> None:
+        requirements = (
+            AnswerRequirement("channel", "确认提交渠道"),
+            AnswerRequirement("format", "确认文件格式"),
+        )
+        partial = {
+            **_candidate(content="材料应通过门户提交"),
+            "rerank_candidate_index": 1,
+            "topic_relevance": 0.98,
+            "answer_support": 0.95,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "standalone_answer",
+            "supports_requirement_ids": ["channel"],
+        }
+
+        plan, resolved_requirements, trigger = _resolve_document_expansion_plan(
+            question="材料应从哪里提交，需要什么格式",
+            results=[partial],
+            outcome=RerankOutcome(
+                results=[partial],
+                succeeded=True,
+                requirements=requirements,
+                expansion_plan=ExpansionPlan(needed=False),
+            ),
+            constraints=extract_query_constraints(
+                "材料应从哪里提交，需要什么格式"
+            ),
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.target_candidate_indexes, (1,))
+        self.assertEqual(plan.missing_requirement_ids, ("format",))
+        self.assertEqual(
+            tuple(item.id for item in resolved_requirements),
+            ("channel", "format"),
+        )
+        self.assertEqual(trigger, "incomplete_direct_coverage")
+
+    async def test_initial_coverage_is_partial_when_direct_misses_required_id(
+        self,
+    ) -> None:
+        requirements = (
+            AnswerRequirement("channel", "确认提交渠道"),
+            AnswerRequirement("format", "确认文件格式"),
+        )
+        partial = {
+            **_candidate(content="材料应通过门户提交"),
+            # 不提供候选序号，使本用例只验证 coverage 推导而不实际执行扩展。
+            "topic_relevance": 0.98,
+            "answer_support": 0.95,
+            "constraint_status": "neutral",
+            "evidence_role": "direct",
+            "rerank_status": "verified",
+            "contribution_role": "standalone_answer",
+            "supports_requirement_ids": ["channel"],
+        }
+
+        with patch("core.rag_pipeline.trace_event") as trace_mock:
+            await self._run(
+                question="材料应从哪里提交，需要什么格式",
+                intent={
+                    "response_mode": "grounded_qa",
+                    "retrieval_policy": "required",
+                    "need_retrieval": True,
+                    "decision_reason": "business_question",
+                },
+                results=[partial],
+                rerank_outcome=RerankOutcome(
+                    results=[partial],
+                    succeeded=True,
+                    requirements=requirements,
+                    expansion_plan=ExpansionPlan(needed=False),
+                ),
+            )
+
+        coverage = _trace_event(trace_mock, "evidence.coverage_assessed")
+        self.assertEqual(coverage["coverage_status"], "partial")
+        self.assertEqual(coverage["required_requirement_count"], 2)
+        self.assertEqual(coverage["covered_requirement_count"], 1)
+        self.assertEqual(coverage["missing_requirement_count"], 1)
 
     async def test_version_mismatch_cannot_seed_document_expansion(self) -> None:
         old = {

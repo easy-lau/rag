@@ -144,6 +144,52 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertFalse(constraints.has_hard_constraint)
         self.assertTrue(constraints.has_product_constraint)
 
+    def test_productless_explicit_version_labels_are_extracted(self) -> None:
+        for query, version in (
+            ("版本8.6登录配置", "8.6"),
+            ("v8.6登录配置", "8.6"),
+            ("普通员工的2025版出差标准", "2025"),
+        ):
+            with self.subTest(query=query):
+                constraints = extract_query_constraints(query)
+                self.assertIsNone(constraints.product)
+                self.assertEqual(constraints.version, version)
+                self.assertTrue(constraints.explicit_version)
+                self.assertTrue(constraints.has_version_constraint)
+                self.assertTrue(constraints.has_scope_constraint)
+                self.assertFalse(constraints.has_hard_constraint)
+
+        quantity = extract_query_constraints("出差需要2天怎么报销")
+        self.assertIsNone(quantity.version)
+        self.assertFalse(quantity.explicit_version)
+
+    def test_productless_version_is_checked_against_filename_identity(self) -> None:
+        constraints = extract_query_constraints("版本8.6登录配置")
+        exact = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "制度8.6配置",
+                "metadata": {"source": "制度8.6配置"},
+                "content": "登录安全说明",
+            },
+        )
+        mismatch = evaluate_candidate_constraints(
+            constraints,
+            {
+                "filename": "制度7配置",
+                "metadata": {"source": "制度7配置"},
+                "content": "登录安全说明",
+            },
+        )
+        unknown = evaluate_candidate_constraints(
+            constraints,
+            {"filename": "通用登录配置", "content": "登录安全说明"},
+        )
+
+        self.assertEqual(exact.status, "exact")
+        self.assertEqual(mismatch.status, "mismatch")
+        self.assertEqual(unknown.status, "unknown")
+
     def test_component_version_cannot_override_declared_product_version(self) -> None:
         constraints = extract_query_constraints("我是云枢8.6，用户名枚举怎么配置")
         evaluation = evaluate_candidate_constraints(
@@ -452,6 +498,50 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(item["answer_support"], 0.99)
             self.assertTrue(item["constraint_overridden"])
             self.assertIn("版本冲突", item["constraint_reason"])
+
+    async def test_productless_version_still_applies_hard_rerank_gate(self) -> None:
+        results = [
+            {
+                "id": "v7",
+                "filename": "登录制度7版",
+                "content": "旧版登录配置",
+                "score": 0.9,
+            },
+            {
+                "id": "v86",
+                "filename": "登录制度8.6版",
+                "content": "目标版登录配置",
+                "score": 0.2,
+            },
+        ]
+        client = _client_with_payload({
+            "results": [
+                _assessment(1, topic=0.99, support=0.99, constraint="exact"),
+                _assessment(2, topic=0.85, support=0.85, constraint="exact"),
+            ]
+        })
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch(
+                "core.reranker.get_settings",
+                return_value=SimpleNamespace(chat_model="test"),
+            ),
+        ):
+            outcome = await rerank_with_status("版本8.6登录配置", results)
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual([item["id"] for item in outcome.results], ["v86", "v7"])
+        exact, mismatch = outcome.results
+        self.assertEqual(exact["constraint_status"], "exact")
+        self.assertEqual(exact["evidence_role"], "direct")
+        self.assertEqual(mismatch["constraint_status"], "mismatch")
+        self.assertEqual(mismatch["evidence_role"], "related")
+        self.assertEqual(mismatch["score"], 0.0)
+        self.assertTrue(mismatch["query_has_constraint"])
+        self.assertFalse(mismatch["query_has_product_constraint"])
+        self.assertTrue(mismatch["query_has_version_constraint"])
+        self.assertFalse(mismatch["query_has_hard_constraint"])
 
     async def test_rerank_inherits_product_scope_for_answer_chunk(self) -> None:
         results = [

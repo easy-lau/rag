@@ -213,7 +213,14 @@ async def hybrid_search(
     *,
     trace_id: str | None = None,
     surface: str = "chat",
+    diagnostics: dict | None = None,
 ) -> list[dict]:
+    if diagnostics is not None:
+        diagnostics.update(
+            requested_method=method,
+            vector_channel_failed=False,
+            vector_error_type=None,
+        )
     if not kb_ids or top_k <= 0 or not query.strip():
         return []
 
@@ -231,6 +238,7 @@ async def hybrid_search(
         include_vector=True,
         trace_id=trace_id,
         surface=surface,
+        diagnostics=diagnostics,
     )
 
 
@@ -398,6 +406,7 @@ async def _hybrid_rrf(
     include_vector: bool = True,
     trace_id: str | None = None,
     surface: str = "chat",
+    diagnostics: dict | None = None,
 ) -> list[dict]:
     embedding = None
     vector_enabled = include_vector
@@ -407,6 +416,9 @@ async def _hybrid_rrf(
         except Exception as exc:
             # 向量服务故障时保留 FTS/pg_trgm 词面通道，避免整个混合检索不可用。
             vector_enabled = False
+            if diagnostics is not None:
+                diagnostics["vector_channel_failed"] = True
+                diagnostics["vector_error_type"] = type(exc).__name__
             logger.warning(
                 "[检索降级] 向量通道不可用，继续执行关键词通道 error=%s",
                 exception_log_text(exc),

@@ -2,6 +2,7 @@ from pydantic_settings import BaseSettings
 from pydantic import Field
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 
 ROOT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -30,6 +31,24 @@ class Settings(BaseSettings):
     rag_trace_queue_size: int = Field(500, ge=100, le=100000)
     rag_trace_max_event_bytes: int = Field(131072, ge=16384, le=1048576)
     rag_trace_max_events_per_run: int = Field(500, ge=20, le=5000)
+    # 新主链默认启用；部署环境仍可显式设为 v1 并重启以无迁移回滚。
+    rag_pipeline_version: Literal["v1", "v2"] = "v2"
+    # V2 检索的各阶段期限还受整段工作流总期限约束；扩展超时只降级证据，
+    # 不清空首轮召回。改回 rag_pipeline_version=v1 可整体回滚 V2 主链。
+    rag_v2_retrieval_timeout_seconds: float = Field(15.0, ge=1.0, le=120.0)
+    rag_v2_expansion_timeout_seconds: float = Field(8.0, ge=0.5, le=60.0)
+    rag_v2_retrieval_workflow_timeout_seconds: float = Field(
+        22.0,
+        ge=1.0,
+        le=180.0,
+    )
+    # 包住建流、首分片前重试、退避等待和完整流读取，避免 max_attempts 倍增
+    # llm_request_timeout_seconds。首个文本分片后的异常仍由流层直接抛出，不重放。
+    rag_v2_generation_workflow_timeout_seconds: float = Field(
+        60.0,
+        ge=1.0,
+        le=300.0,
+    )
 
     # Docker Compose 会显式覆盖；该默认值仅用于宿主机本地开发的端口约定。
     database_url: str = "postgresql+asyncpg://rag:password@127.0.0.1:5433/rag_prod"
@@ -59,6 +78,9 @@ class Settings(BaseSettings):
     )
     # 聊天流在首个文本分片前发生的瞬时上游故障可安全重试。
     llm_request_timeout_seconds: float = 60.0
+    # 语义路由只负责生成小型结构化合同，使用独立的整段工作流期限；超时后
+    # 回退到需检索的安全合同，不能占用回答生成所允许的 60 秒预算。
+    rag_route_timeout_seconds: float = Field(12.0, ge=1.0, le=60.0)
     llm_max_attempts: int = 3
     llm_retry_base_delay_seconds: float = 1.0
 

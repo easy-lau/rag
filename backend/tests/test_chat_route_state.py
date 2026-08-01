@@ -13,6 +13,8 @@ from api.chat import (
     _parse_sse_payload,
     _parse_evidence_scope_reply,
     _route_clarification_response,
+    _scope_anchor_coverage_from_sources,
+    _validate_stream_answer_sources,
     _scoped_evidence_query,
     send_message,
 )
@@ -23,7 +25,7 @@ from core.query_route_compiler import (
     compile_rag_task_contract,
 )
 from core.query_route_contract import parse_rag_route_decision
-from models.db_models import IntentRouteLog
+from models.db_models import Document, DocumentChunk, IntentRouteLog
 from models.schemas import ChatRequest, IntentEvidenceStatus
 
 
@@ -44,6 +46,15 @@ class _RouteStateDB:
 
     async def commit(self):
         self.commits += 1
+
+
+class _RouteStateSourceDB(_RouteStateDB):
+    def __init__(self, conversation, *, source_rows):
+        super().__init__(conversation)
+        self.source_rows = source_rows
+
+    async def execute(self, _statement):
+        return _RowsResult(self.source_rows)
 
 
 class _SaveStateDB:
@@ -87,6 +98,28 @@ class _SaveStateDB:
                         f"value too long for evidence_status VARCHAR({max_length})"
                     )
         self.commits += 1
+
+
+class _FailingSaveStateDB(_SaveStateDB):
+    def __init__(self, conversation):
+        super().__init__(conversation)
+        self._pending_snapshot = json.loads(
+            json.dumps(conversation.pending_route_state, ensure_ascii=False)
+        )
+        self._revision_snapshot = conversation.route_state_revision
+
+    async def __aexit__(self, exc_type, _exc, _traceback):
+        if exc_type is not None:
+            # Mirror the rollback performed when a real AsyncSession closes an
+            # uncommitted transaction.  The request-session object is separate
+            # below, so a failed response save can never appear to resolve the
+            # user's outstanding evidence choice.
+            self.conversation.pending_route_state = self._pending_snapshot
+            self.conversation.route_state_revision = self._revision_snapshot
+        return False
+
+    async def commit(self):
+        raise RuntimeError("simulated response persistence failure")
 
 
 def _evidence_pending_state(
@@ -230,6 +263,142 @@ def _context(*, pending_route_state=None):
         carryover_sources=(),
         pending_route_state=pending_route_state,
     )
+
+
+class _RowsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+class _SourceValidationDB:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def execute(self, _statement):
+        return _RowsResult(self.rows)
+
+
+class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refreshes_only_active_ready_current_chunk(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="当前制度.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="数据库中的真实内容",
+            chunk_index=3,
+            metadata_={"section": "交通"},
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "producer 伪造内容",
+            "evidence_role": "direct",
+        }
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(chunk, document)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+        )
+        self.assertIsNone(error)
+        self.assertEqual(pairs, {(kb_id, doc_id)})
+        self.assertEqual(refreshed[0]["content"], "数据库中的真实内容")
+        self.assertEqual(refreshed[0]["filename"], "当前制度.md")
+
+    async def test_refresh_failure_clears_sources_fail_closed(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "不应被保存",
+            "evidence_role": "direct",
+        }
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            object(),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+        )
+        self.assertEqual(refreshed, [])
+        self.assertEqual(pairs, set())
+        self.assertTrue(str(error).startswith("source_refresh_failed:"))
+
+    async def test_inactive_document_is_not_accepted_from_adapter_rows(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="已停用.md",
+            status="ready",
+            is_active=False,
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="不应进入上下文",
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "旧快照",
+        }
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(chunk, document)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+        )
+        self.assertEqual(refreshed, [])
+        self.assertEqual(pairs, set())
+        self.assertEqual(error, "answer_source_not_current")
+
+    def test_scope_anchor_uses_actual_answer_pairs_not_producer_boolean(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        scope_filter = {
+            "choices": [
+                {
+                    "kb_ids": [str(kb_id)],
+                    "anchor_doc_ids": [str(doc_id)],
+                }
+            ]
+        }
+        self.assertEqual(
+            _scope_anchor_coverage_from_sources(scope_filter, set()),
+            (False, []),
+        )
+        self.assertEqual(
+            _scope_anchor_coverage_from_sources(
+                scope_filter,
+                {(kb_id, doc_id)},
+            ),
+            (True, [str(doc_id)]),
+        )
 
 
 class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
@@ -977,7 +1146,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("evidence.clarification_created", events)
         self.assertNotIn("evidence.clarification_resolved", events)
 
-    async def test_v2_selection_reenters_router_and_clears_only_after_saved_answer(self) -> None:
+    async def test_v2_selection_keeps_pending_when_answer_context_is_empty(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
@@ -992,14 +1161,9 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         request_db = _RouteStateDB(conv)
         save_db = _SaveStateDB(conv)
         context = _context(pending_route_state=pending)
-        _route, _contract, routing_result = _route_and_contract(
-            intent_code="knowledge_qa",
-            action="retrieve",
-            evidence_scope="enterprise_kb",
-            selected_kb_count=1,
-            relation="continuation",
+        classify = AsyncMock(
+            side_effect=AssertionError("证据范围选择不应调用意图模型")
         )
-        classify = AsyncMock(return_value=routing_result)
         received_kwargs = []
 
         async def answer_stream(**kwargs):
@@ -1035,7 +1199,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.resolve_routed_conversation_context",
                 new=AsyncMock(return_value=context),
             ),
-            patch("api.chat.run_rag_stream", new=answer_stream),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -1053,10 +1217,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(conv.route_state_revision, 4)
             [chunk async for chunk in response.body_iterator]
 
-        routed_question = classify.await_args.args[1]
-        self.assertIn(pending["original_query"], routed_question)
-        self.assertIn("8.2.75", routed_question)
-        self.assertNotEqual(routed_question, "2")
+        classify.assert_not_awaited()
         scope_filter = received_kwargs[0]["evidence_scope_filter"]
         self.assertEqual(scope_filter["mode"], "single")
         self.assertEqual(scope_filter["choices"][0]["key"], "c2")
@@ -1067,17 +1228,309 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             received_kwargs[0]["standalone_query"],
             pending["original_query"],
         )
-        self.assertIsNone(conv.pending_route_state)
-        self.assertEqual(conv.route_state_revision, 5)
+        self.assertEqual(
+            received_kwargs[0]["task_contract"].decision_reason,
+            "evidence_scope_selected",
+        )
+        # A producer-advertised anchor cannot resolve the scope when the
+        # actual answer context is empty.  The pending choice remains
+        # available for a retry after retrieval is healthy.
+        self.assertIs(conv.pending_route_state, pending)
+        self.assertEqual(conv.route_state_revision, 4)
+        self.assertNotIn(
+            "evidence.clarification_resolved",
+            [call.args[0] for call in trace.call_args_list],
+        )
+
+    async def test_v2_selection_clears_pending_after_valid_source_commit(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        pending = _evidence_pending_state(kb_id=kb_id)
+        selected_doc_id = uuid.UUID(pending["choices"][1]["doc_ids"][0])
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=selected_doc_id,
+            kb_id=kb_id,
+            filename="二开发送钉钉工作通知.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=selected_doc_id,
+            kb_id=kb_id,
+            content="数据库刷新后的 8.2.75 配置依据",
+            chunk_index=2,
+            metadata_={"section": "用户名枚举"},
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(selected_doc_id),
+            "kb_id": str(kb_id),
+            "filename": "producer 旧标题.md",
+            "content": "producer 旧正文",
+            "evidence_role": "direct",
+            "score": 0.98,
+        }
+        request_conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=pending,
+            route_state_revision=4,
+        )
+        persisted_conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=json.loads(
+                json.dumps(pending, ensure_ascii=False)
+            ),
+            route_state_revision=4,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RouteStateSourceDB(
+            request_conv,
+            source_rows=[(chunk, document)],
+        )
+        save_db = _SaveStateDB(persisted_conv)
+        context = _context(pending_route_state=pending)
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+            relation="continuation",
+        )
+
+        async def answer_stream(**_kwargs):
+            yield "data: " + json.dumps(
+                {
+                    "type": "search_results",
+                    "results": [source],
+                    "answer_sources": [source],
+                    "total": 1,
+                    "displayed_result_count": 1,
+                    "retrieval_executed": True,
+                    "evidence_status": "hit",
+                    "direct_evidence_count": 1,
+                    "related_reference_count": 0,
+                    # These producer claims are intentionally ignored.  The
+                    # API must recompute anchor coverage from refreshed rows.
+                    "evidence_scope_anchor_hit": False,
+                    "evidence_scope_anchor_doc_ids": [],
+                },
+                ensure_ascii=False,
+            ) + "\n\n"
+            yield 'data: {"type":"text_delta","content":"8.2.75 的配置答案"}\n\n'
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch(
+                "api.chat.resolve_routed_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question="c2",
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            # The request transaction only saves the user's choice.  Pending
+            # scope remains until the streamed answer transaction commits.
+            self.assertIs(request_conv.pending_route_state, pending)
+            self.assertEqual(request_conv.route_state_revision, 4)
+            payloads = [
+                _parse_sse_payload(
+                    item.decode() if isinstance(item, bytes) else item
+                )
+                async for item in response.body_iterator
+            ]
+
+        self.assertIsNone(persisted_conv.pending_route_state)
+        self.assertEqual(persisted_conv.route_state_revision, 5)
+        assistant = next(item for item in save_db.added if item.role == "assistant")
+        self.assertEqual(assistant.content, "8.2.75 的配置答案")
+        self.assertEqual(
+            assistant.sources[0]["content"],
+            "数据库刷新后的 8.2.75 配置依据",
+        )
+        self.assertEqual(
+            assistant.sources[0]["filename"],
+            "二开发送钉钉工作通知.md",
+        )
+        search_result = next(
+            item for item in payloads if item and item["type"] == "search_results"
+        )
+        self.assertEqual(
+            search_result["answer_sources"][0]["content"],
+            "数据库刷新后的 8.2.75 配置依据",
+        )
+        self.assertTrue(search_result["evidence_scope_anchor_hit"])
+        self.assertEqual(
+            search_result["evidence_scope_anchor_doc_ids"],
+            [str(selected_doc_id)],
+        )
         resolved = next(
             call
             for call in trace.call_args_list
             if call.args[0] == "evidence.clarification_resolved"
         )
-        self.assertEqual(resolved.kwargs["pending_state_id"], pending["state_id"])
+        self.assertEqual(resolved.kwargs["resolution"], "selected")
         self.assertEqual(resolved.kwargs["selected_choice_keys"], ["c2"])
 
-    async def test_v2_selection_recovers_blocked_second_pass_route(self) -> None:
+    async def test_v2_selection_keeps_pending_when_answer_save_fails(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        pending = _evidence_pending_state(kb_id=kb_id)
+        selected_doc_id = uuid.UUID(pending["choices"][1]["doc_ids"][0])
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=selected_doc_id,
+            kb_id=kb_id,
+            filename="二开发送钉钉工作通知.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=selected_doc_id,
+            kb_id=kb_id,
+            content="数据库中的有效依据",
+            chunk_index=2,
+            metadata_={},
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(selected_doc_id),
+            "kb_id": str(kb_id),
+            "filename": document.filename,
+            "content": "producer 快照",
+            "evidence_role": "direct",
+        }
+        request_conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=pending,
+            route_state_revision=12,
+        )
+        persisted_conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=json.loads(
+                json.dumps(pending, ensure_ascii=False)
+            ),
+            route_state_revision=12,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RouteStateSourceDB(
+            request_conv,
+            source_rows=[(chunk, document)],
+        )
+        save_db = _FailingSaveStateDB(persisted_conv)
+        context = _context(pending_route_state=pending)
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+            relation="continuation",
+        )
+
+        async def answer_stream(**_kwargs):
+            yield "data: " + json.dumps(
+                {
+                    "type": "search_results",
+                    "results": [source],
+                    "answer_sources": [source],
+                    "total": 1,
+                    "retrieval_executed": True,
+                    "evidence_status": "hit",
+                    "direct_evidence_count": 1,
+                    "related_reference_count": 0,
+                },
+                ensure_ascii=False,
+            ) + "\n\n"
+            yield 'data: {"type":"text_delta","content":"已经生成的答案"}\n\n'
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch(
+                "api.chat.resolve_routed_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question="c2",
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            payloads = [
+                _parse_sse_payload(
+                    item.decode() if isinstance(item, bytes) else item
+                )
+                async for item in response.body_iterator
+            ]
+
+        self.assertIs(request_conv.pending_route_state, pending)
+        self.assertEqual(request_conv.route_state_revision, 12)
+        self.assertEqual(
+            persisted_conv.pending_route_state["state_id"],
+            pending["state_id"],
+        )
+        self.assertEqual(persisted_conv.route_state_revision, 12)
+        error = next(item for item in payloads if item and item["type"] == "error")
+        self.assertEqual(error["message"], "回答已生成，但保存失败，请重试")
+        self.assertEqual(
+            [item["type"] for item in payloads if item][-1],
+            "done",
+        )
+        events = [call.args[0] for call in trace.call_args_list]
+        self.assertIn("chat.persistence_error", events)
+        self.assertNotIn("evidence.clarification_resolved", events)
+        self.assertNotIn("chat.response", events)
+
+    async def test_v2_selection_builds_route_without_intent_model(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
@@ -1092,61 +1545,8 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         request_db = _RouteStateDB(conv)
         save_db = _SaveStateDB(conv)
         context = _context(pending_route_state=pending)
-        blocked_route = parse_rag_route_decision(
-            {
-                "schema_version": "rag_route_decision.v1",
-                "readiness": "needs_clarification",
-                "intent_code": "knowledge_qa",
-                "relation": "continuation",
-                "evidence_scope": "enterprise_kb",
-                "query_resolution": {
-                    "mode": "current",
-                    "context_turn_keys": [],
-                },
-                "requirements": [],
-                "clarification": {
-                    "question": "请再次说明要查询什么。",
-                    "unresolved": [
-                        {
-                            "role": "subject",
-                            "reason": "missing",
-                            "candidate_keys": [],
-                        }
-                    ],
-                },
-                "confidence": 0.4,
-                "rationale": "second-pass route drift",
-            },
-            allowed_intent_codes=["knowledge_qa"],
-        )
-        blocked_contract = compile_rag_task_contract(
-            blocked_route,
-            RouteCategoryPolicy(
-                code="knowledge_qa",
-                name="知识库问答",
-                action="retrieve",
-            ),
-            RouteCompilerConfig(),
-            question=pending["original_query"],
-            selected_kb_count=1,
-            source="llm",
-        )
-        self.assertFalse(blocked_contract.dispatch_authorized)
-        decision = SimpleNamespace(
-            need_retrieval=True,
-            decision_reason="semantic_clarification",
-            to_dict=lambda: {
-                "intent_code": "knowledge_qa",
-                "need_retrieval": True,
-                "decision_reason": "semantic_clarification",
-            },
-        )
-        routing_result = SimpleNamespace(
-            decision=decision,
-            route_decision=blocked_route,
-            task_contract=blocked_contract,
-            diagnostics={},
-            route_log_id=None,
+        classify = AsyncMock(
+            side_effect=AssertionError("证据范围选择不应调用意图模型")
         )
         received_kwargs = []
 
@@ -1179,13 +1579,13 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "api.chat.classify_intent_result",
-                new=AsyncMock(return_value=routing_result),
+                new=classify,
             ),
             patch(
                 "api.chat.resolve_routed_conversation_context",
                 new=AsyncMock(return_value=context),
             ),
-            patch("api.chat.run_rag_stream", new=answer_stream),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
             patch(
                 "api.chat._route_clarification_response",
                 new=AsyncMock(),
@@ -1206,6 +1606,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             [chunk async for chunk in response.body_iterator]
 
         route_clarification.assert_not_awaited()
+        classify.assert_not_awaited()
         self.assertEqual(len(received_kwargs), 1)
         recovered_contract = received_kwargs[0]["task_contract"]
         self.assertTrue(recovered_contract.dispatch_authorized)
@@ -1219,10 +1620,10 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             received_kwargs[0]["evidence_scope_filter"]["choices"][0]["key"],
             "c2",
         )
-        self.assertIsNone(conv.pending_route_state)
-        self.assertEqual(conv.route_state_revision, 9)
+        self.assertIs(conv.pending_route_state, pending)
+        self.assertEqual(conv.route_state_revision, 8)
         self.assertIn(
-            "evidence.route_contract_recovered",
+            "evidence.route_contract_built",
             [call.args[0] for call in trace.call_args_list],
         )
 
@@ -1241,14 +1642,9 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         request_db = _RouteStateDB(conv)
         save_db = _SaveStateDB(conv)
         context = _context(pending_route_state=pending)
-        _route, _contract, routing_result = _route_and_contract(
-            intent_code="knowledge_qa",
-            action="retrieve",
-            evidence_scope="enterprise_kb",
-            selected_kb_count=1,
-            relation="continuation",
+        classify = AsyncMock(
+            side_effect=AssertionError("证据范围补充不应调用意图模型")
         )
-        classify = AsyncMock(return_value=routing_result)
         received_kwargs = []
 
         async def answer_stream(**kwargs):
@@ -1280,7 +1676,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.resolve_routed_conversation_context",
                 new=AsyncMock(return_value=context),
             ),
-            patch("api.chat.run_rag_stream", new=answer_stream),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -1296,11 +1692,15 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(conv.pending_route_state, pending)
             [chunk async for chunk in response.body_iterator]
 
-        routed_question = classify.await_args.args[1]
-        self.assertIn(pending["original_query"], routed_question)
-        self.assertIn("用户补充的适用范围：2025版", routed_question)
-        self.assertEqual(received_kwargs[0]["question"], routed_question)
-        self.assertEqual(received_kwargs[0]["standalone_query"], routed_question)
+        classify.assert_not_awaited()
+        refined_query = received_kwargs[0]["question"]
+        self.assertIn(pending["original_query"], refined_query)
+        self.assertIn("用户补充的适用范围：2025版", refined_query)
+        self.assertEqual(received_kwargs[0]["standalone_query"], refined_query)
+        self.assertEqual(
+            received_kwargs[0]["task_contract"].decision_reason,
+            "evidence_scope_refined",
+        )
         self.assertIsNone(received_kwargs[0]["evidence_scope_filter"])
         self.assertEqual(received_kwargs[0]["kb_ids"], [kb_id])
         self.assertIsNone(conv.pending_route_state)
@@ -1383,7 +1783,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=clarification_stream),
+            patch("api.chat.run_rag_v2_stream", new=clarification_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -1501,7 +1901,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=failing_stream),
+            patch("api.chat.run_rag_v2_stream", new=failing_stream),
             patch("api.chat.trace_event") as trace,
         ):
             response = await send_message(
@@ -1590,7 +1990,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                         new=AsyncMock(return_value=routing_result),
                     ),
                     patch(
-                        "api.chat.run_rag_stream",
+                        "api.chat.run_rag_v2_stream",
                         new=handled_failure_stream,
                     ),
                     patch("database.AsyncSessionLocal", return_value=save_db),
@@ -1686,7 +2086,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=companion_stream),
+            patch("api.chat.run_rag_v2_stream", new=companion_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
