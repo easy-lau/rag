@@ -238,6 +238,7 @@
 
       <div class="text-xs text-gray-400 mt-1 px-1">
         {{ formatTime(message.created_at) }}
+        <span v-if="!isUser && responseDurationText"> · 思考回答耗时 {{ responseDurationText }}</span>
         <span v-if="message.tokens"> · {{ message.tokens }} tokens</span>
       </div>
     </div>
@@ -369,6 +370,12 @@ const showSources = computed(() => settingsStore.data.show_sources !== false)
 // 普通问答角色可查看本轮命中片段，但不能因此获得整篇文档读取能力。
 // 只有后端同样允许的 doc:read 角色才显示可点击的全文预览行为。
 const canPreviewSources = computed(() => authStore.hasPerm('doc:read'))
+const responseDurationText = computed(() => {
+  const milliseconds = Number(props.message.duration_ms)
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return ''
+  if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)} 秒`
+})
 
 // 去掉正文里的内联引用标记（如 [1]、[2,3]），来源改到底部统一展示。
 // 单次扫描：命中代码块/行内代码则原样保留（避免误删代码里的 [0]），命中引用标记则删除。
@@ -450,10 +457,10 @@ const hasPersistedEvidence = computed(() => (
 ))
 
 function sourceSupportScore(source) {
-  // answer_support 是“能否直接支撑答案”的专用指标；旧数据缺失时才回退到
-  // 经过约束惩罚的 effective_score。原始 retrieval_score 只代表召回排序，
-  // 不能在回答卡片上展示为答案匹配率。
-  return finiteScore(source.answer_support) ?? finiteScore(source.effective_score)
+  // answer_support 是“能否直接支撑答案”的专用指标。effective_score 和
+  // retrieval_score 都只是召回排序，绝不能在回答卡片上伪装成支持度。
+  // 历史数据没有该字段时，展示“已验证”而非杜撰百分比。
+  return finiteScore(source.answer_support)
 }
 
 const evidenceSummary = computed(() => {

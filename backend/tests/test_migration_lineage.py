@@ -226,7 +226,7 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertIn("turn_status", message_columns)
         self.assertIn("search_snapshot", message_columns)
 
-    def test_alembic_has_single_0030_head(self) -> None:
+    def test_alembic_has_single_0031_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -234,8 +234,22 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0030"])
-        self.assertEqual(scripts.get_revision("0030").down_revision, "0029")
+        self.assertEqual(scripts.get_heads(), ["0031"])
+        self.assertEqual(scripts.get_revision("0031").down_revision, "0030")
+
+    def test_message_duration_migration_is_additive(self) -> None:
+        migration_31 = _load_migration("0031_add_message_answer_duration.py")
+        recorder = _MigrationRecorder()
+        with patch.object(migration_31, "op", recorder):
+            migration_31.upgrade()
+
+        added = {
+            column.name: column
+            for table_name, column in recorder.added_columns
+            if table_name == "messages"
+        }
+        self.assertIn("duration_ms", added)
+        self.assertIsInstance(added["duration_ms"].type, Integer)
 
 
 if __name__ == "__main__":  # pragma: no cover

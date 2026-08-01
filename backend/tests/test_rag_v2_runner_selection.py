@@ -126,7 +126,6 @@ class RagPipelineSelectionTests(unittest.TestCase):
             "task_contract": _task_contract(),
             "evidence_scope_filter": None,
             "evidence_scope_refinement_active": False,
-            "selected_tags": [],
             "is_followup": False,
             "carryover_sources": (),
         }
@@ -209,7 +208,6 @@ class RagPipelineSelectionTests(unittest.TestCase):
             "scope_refinement": (
                 None,
                 True,
-                [],
                 False,
                 (),
                 "eligible_evidence_scope_refinement",
@@ -217,7 +215,6 @@ class RagPipelineSelectionTests(unittest.TestCase):
             "followup": (
                 None,
                 False,
-                [],
                 True,
                 (),
                 "eligible_grounded_followup",
@@ -225,7 +222,6 @@ class RagPipelineSelectionTests(unittest.TestCase):
             "carryover": (
                 None,
                 False,
-                [],
                 False,
                 ({"doc_id": "doc-1"},),
                 "eligible_grounded_followup",
@@ -234,7 +230,6 @@ class RagPipelineSelectionTests(unittest.TestCase):
         for name, (
             scope_filter,
             refinement_active,
-            tags,
             is_followup,
             carryover,
             reason,
@@ -244,30 +239,11 @@ class RagPipelineSelectionTests(unittest.TestCase):
                     self._select(
                         evidence_scope_filter=scope_filter,
                         evidence_scope_refinement_active=refinement_active,
-                        selected_tags=tags,
                         is_followup=is_followup,
                         carryover_sources=carryover,
                     ),
                     ("v2", reason),
                 )
-
-    def test_tags_use_v2_soft_boost(self) -> None:
-        self.assertEqual(
-            self._select(selected_tags=["制度"]),
-            ("v2", "eligible_grounded_qa"),
-        )
-
-    def test_tags_keep_scope_selection_on_v2(self) -> None:
-        self.assertEqual(
-            self._select(
-                evidence_scope_filter={"mode": "choice"},
-                selected_tags=["制度"],
-                is_followup=True,
-                carryover_sources=({"doc_id": "doc-1"},),
-            ),
-            ("v2", "eligible_evidence_scope_selection"),
-        )
-
 
 class RagV2ScopeFilterSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_or_unauthorized_scope_filter_fails_closed(self) -> None:

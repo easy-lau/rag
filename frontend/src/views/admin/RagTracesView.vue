@@ -294,7 +294,6 @@ const EVENT_LABELS = {
   'retrieval.plan_query_error': '补充查询召回失败',
   'retrieval.small_document_candidates_completed': '完成小文档候选装配',
   'retrieval.carryover_anchor': '复验历史证据锚点',
-  'retrieval.tag_boost_applied': '应用标签召回增强',
   'rerank.candidate': '评估候选证据',
   'rerank.completed': '完成重排',
   'rerank.fast_path_skipped': '跳过模型重排',

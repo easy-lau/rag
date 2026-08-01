@@ -24,6 +24,7 @@ from core.chat_turns import (
     request_context_fingerprint,
     reserve_turn,
     transition_turn,
+    turn_duration_ms,
     turn_lease_expired,
 )
 from models.db_models import ChatTurn, Conversation, Message
@@ -277,6 +278,14 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn.status, "completed")
         self.assertEqual(turn.answer_content, "答案")
 
+    def test_completed_turn_duration_uses_server_timestamps(self) -> None:
+        started_at = datetime(2026, 8, 1, 9, 0, tzinfo=timezone.utc)
+        turn = SimpleNamespace(
+            created_at=started_at,
+            completed_at=started_at + timedelta(seconds=12, milliseconds=345),
+        )
+        self.assertEqual(turn_duration_ms(turn), 12_345)
+
     async def test_bare_commit_is_not_retried_after_rollback(self) -> None:
         db = _CommitDB(failures=2)
         with self.assertRaises(RuntimeError):
@@ -363,7 +372,6 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
                 "method": "hybrid",
                 "rerank": True,
                 "top_k": 5,
-                "tags": ["制度", "差旅", "制度"],
             },
             pending_route_revision=3,
             pending_state_id="state-3",
@@ -376,7 +384,6 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
                 "method": "hybrid",
                 "rerank": True,
                 "top_k": 5,
-                "tags": ["差旅", "制度"],
             },
             pending_route_revision=3,
             pending_state_id="state-3",
@@ -587,7 +594,6 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
                 "method": "hybrid",
                 "rerank": True,
                 "top_k": 5,
-                "tags": [],
             },
             pending_route_revision=0,
             pending_state_id=None,
@@ -626,7 +632,6 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
                         "method": "keyword",
                         "rerank": False,
                         "top_k": 10,
-                        "tags": [],
                     },
                 ),
             ):
@@ -690,7 +695,6 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
                 "method": "hybrid",
                 "rerank": True,
                 "top_k": 5,
-                "tags": [],
             },
             pending_route_revision=0,
             pending_state_id=None,

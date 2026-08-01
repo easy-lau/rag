@@ -349,6 +349,16 @@ def transition_turn(
     return turn
 
 
+def turn_duration_ms(turn: ChatTurn) -> int | None:
+    """Return completed end-to-end turn duration without trusting client clocks."""
+
+    started_at = getattr(turn, "created_at", None)
+    completed_at = getattr(turn, "completed_at", None)
+    if not isinstance(started_at, datetime) or not isinstance(completed_at, datetime):
+        return None
+    return max(0, round((completed_at - started_at).total_seconds() * 1000))
+
+
 def message_turn_metadata(turn: ChatTurn, *, status: str | None = None) -> dict[str, Any]:
     """Build nullable Message fields from the current turn snapshot."""
 
@@ -367,6 +377,7 @@ def message_turn_metadata(turn: ChatTurn, *, status: str | None = None) -> dict[
             if effective_status == "completed"
             else ("failed" if effective_status == "persist_failed" else "pending")
         ),
+        "duration_ms": turn_duration_ms(turn),
         "search_snapshot": getattr(turn, "search_snapshot", None),
     }
 

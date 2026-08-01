@@ -806,6 +806,101 @@ def _topic_terms(value: Any) -> set[str]:
     }
 
 
+def _query_anchored_document_keys(
+    query: str,
+    candidates: Iterable[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    """Return documents whose retrieved text names a concrete query subject.
+
+    Scope metadata answers *where* a rule applies, not *what* the user asked.
+    In the degraded rerank path every candidate is intentionally retained for
+    safe recovery, so a DingTalk version header may otherwise manufacture a
+    version choice for an unrelated question such as an employee meal
+    allowance.  This lexical guard is used only to decide whether an inferred
+    product/version/project may create a clarification choice.  It never
+    removes a candidate from retrieval or answer generation.
+
+    Chinese two-character grams are useful for recall but too weak as a scope
+    anchor (for example, a generic document mentioning ``员工``).  Require a
+    three-character CJK n-gram or an ASCII/numeric token; an explicit product,
+    version, or project constraint is handled separately and bypasses this
+    guard.
+    """
+
+    query_terms = {
+        term
+        for term in _topic_terms(query)
+        if len(term) >= 3 or bool(re.search(r"[a-z0-9]", term, re.IGNORECASE))
+    }
+    if not query_terms:
+        # A product name may be an arbitrary source-declared label (for
+        # example ``产品A``) that the global product parser deliberately does
+        # not register.  Keep the identity check below available even when the
+        # n-gram extractor has no sufficiently strong term.
+        query_terms = set()
+
+    anchored: set[tuple[str, str]] = set()
+    query_text = str(query or "").casefold()
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("evidence_role") or "").strip().casefold() == "irrelevant":
+            continue
+        kb_id = str(raw.get("kb_id") or "").strip()
+        doc_id = str(raw.get("doc_id") or "").strip()
+        if not kb_id or not doc_id:
+            continue
+        metadata = raw.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        source_text = "\n".join(
+            str(value or "")[:1800]
+            for value in (
+                raw.get("filename"),
+                metadata.get("filename"),
+                metadata.get("source"),
+                raw.get("content"),
+            )
+        )
+        identity = extract_document_constraint_identity(raw)
+        identity_values = (
+            *identity.products,
+            *identity.projects,
+        )
+        identity_matches_query = any(
+            len(str(value).strip()) >= 2
+            and str(value).strip().casefold() in query_text
+            for value in identity_values
+        )
+        if identity_matches_query or query_terms.intersection(_topic_terms(source_text)):
+            anchored.add((kb_id, doc_id))
+    return anchored
+
+
+def _unverified_document_keys(
+    candidates: Iterable[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    """Return document identities that have no verified rerank candidate."""
+
+    statuses: dict[tuple[str, str], set[str]] = {}
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("evidence_role") or "").strip().casefold() == "irrelevant":
+            continue
+        kb_id = str(raw.get("kb_id") or "").strip()
+        doc_id = str(raw.get("doc_id") or "").strip()
+        if not kb_id or not doc_id:
+            continue
+        statuses.setdefault((kb_id, doc_id), set()).add(
+            str(raw.get("rerank_status") or "").strip().casefold()
+        )
+    return {
+        key
+        for key, document_statuses in statuses.items()
+        if "verified" not in document_statuses
+    }
+
+
 def _topic_primary_origins(candidate: dict[str, Any]) -> set[str]:
     values: list[Any] = []
     for field in ("candidate_origins", "origins"):
@@ -1497,6 +1592,23 @@ def detect_evidence_scope_ambiguity(
         if filtered_doc_ids < unfiltered_doc_ids
         else ()
     )
+    if not constraints.has_scope_constraint:
+        # A source-declared scope must be grounded in the user's concrete
+        # subject before it can force a product/version/project picker.  This
+        # is especially important when reranking failed: unverified candidates
+        # stay available to the pipeline, but unrelated version headers cannot
+        # hijack a policy question into a false clarification.
+        anchored_document_keys = _query_anchored_document_keys(query, candidates)
+        unverified_document_keys = _unverified_document_keys(candidates)
+        documents = [
+            document
+            for document in documents
+            if (
+                not (document.products or document.versions or document.projects)
+                or (document.kb_id, document.doc_id) not in unverified_document_keys
+                or (document.kb_id, document.doc_id) in anchored_document_keys
+            )
+        ]
     groups, dimension = _scope_groups(documents, constraints)
     # Scope metadata is the preferred disambiguator.  Only when no explicit
     # product/version/project constraint is present, and those dimensions do

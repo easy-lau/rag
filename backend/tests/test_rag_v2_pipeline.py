@@ -520,7 +520,6 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         vector_channel_failed: bool = False,
         carryover_sources: list[dict] | None = None,
         standalone_query: str | None = None,
-        selected_tags: list[str] | None = None,
         initial_sequence: list[list[dict] | Exception] | None = None,
         initial_delay_seconds: float = 0,
         blocking_scoped: bool = False,
@@ -606,7 +605,6 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
                         "top_k": 5,
                         "method": "hybrid",
                         "rerank": True,
-                        "tags": selected_tags or [],
                     },
                     conversation_id="v2-test-conversation",
                     db=SimpleNamespace(),
@@ -1153,7 +1151,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("旧值为10", prompt)
         self.assertNotIn("上一轮旧标准", prompt)
 
-    async def test_selected_tags_soft_boost_v2_without_admitting_noise(self) -> None:
+    async def test_document_tags_do_not_change_v2_retrieval_order(self) -> None:
         kb_id = uuid.uuid4()
         tagged_doc_id = uuid.uuid4()
         other_doc_id = uuid.uuid4()
@@ -1181,13 +1179,11 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             kb_id=kb_id,
             initial=[other, tagged],
             full_document=[],
-            selected_tags=["重点"],
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["answer_sources"][0]["doc_id"], str(tagged_doc_id))
-        # The tag only changes ordering; both candidates still pass the normal
-        # lexical/vector gate and remain in the bounded result set.
+        self.assertEqual(result["answer_sources"][0]["doc_id"], str(other_doc_id))
+        # 文档标签可供管理和约束识别使用，但不再作为用户偏好参与检索排序。
         self.assertEqual(
             {item["doc_id"] for item in result["answer_sources"]},
             {str(tagged_doc_id), str(other_doc_id)},

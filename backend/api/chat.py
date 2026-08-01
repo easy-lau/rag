@@ -36,6 +36,7 @@ from core.chat_turns import (
     renew_turn_lease,
     reserve_turn,
     transition_turn,
+    turn_duration_ms,
     turn_lease_expired,
 )
 from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
@@ -157,7 +158,6 @@ def _select_rag_pipeline_version(
     task_contract: object,
     evidence_scope_filter: dict | None,
     evidence_scope_refinement_active: bool,
-    selected_tags: list[str],
     is_followup: bool,
     carryover_sources: tuple[dict, ...] | list[dict],
     selected_kb_count: int | None = None,
@@ -224,6 +224,27 @@ class _EvidenceScopeReply:
         "new_question",
     ]
     choices: tuple[dict, ...] = ()
+
+
+def _evidence_scope_reply_display_text(
+    question: str,
+    reply: _EvidenceScopeReply | None,
+) -> str:
+    """Turn an accepted internal choice token into readable chat history."""
+
+    original = str(question or "").strip()
+    if reply is None or reply.action not in {"single", "compare_all"}:
+        return original
+    labels = [
+        str(choice.get("label") or "").strip()
+        for choice in reply.choices
+        if isinstance(choice, dict) and str(choice.get("label") or "").strip()
+    ]
+    if not labels:
+        return original
+    if reply.action == "single":
+        return f"选择：{labels[0]}"
+    return "选择：都对比（" + "；".join(labels) + "）"
 
 
 def _future_expiry(value: object) -> datetime | None:
@@ -2065,6 +2086,7 @@ async def _messages_with_current_source_scope(
             error_code=getattr(row, "error_code", None),
             delivery_status=getattr(row, "delivery_status", None),
             persistence_status=getattr(row, "persistence_status", None),
+            duration_ms=getattr(row, "duration_ms", None),
             search_snapshot=visible_search_snapshot,
             created_at=row.created_at,
         )
@@ -2235,6 +2257,7 @@ def _turn_state_event(turn: ChatTurn, *, replayed: bool = False) -> dict:
         "evidence_status": turn.evidence_status,
         "retrieval_executed": turn.retrieval_executed,
         "error_code": turn.error_code,
+        "duration_ms": turn_duration_ms(turn),
         "persistence_status": persistence_status,
         "same_request_recoverable": bool(
             turn.status in RECOVERABLE_TURN_STATUSES
@@ -2713,6 +2736,7 @@ async def _existing_turn_response(
         persistence_status=(
             "completed" if turn.status == "completed" else turn.status
         ),
+        duration_ms=turn_duration_ms(turn),
         search_snapshot=turn.search_snapshot,
         created_at=turn.completed_at or turn.updated_at or turn.created_at or now_utc(),
     )
@@ -3073,6 +3097,10 @@ async def send_message(
         evidence_pending_state is not None
         and (evidence_filter is not None or evidence_refinement_active)
     )
+    user_message_content = _evidence_scope_reply_display_text(
+        payload.question,
+        evidence_reply if evidence_pending_execution else None,
+    )
 
     # 在保存本轮用户消息之前读取已有对话。带“这些配置/上述内容”等指代的追问
     # 会得到独立检索问题；上一轮来源只作为候选 id，随后按当前知识库范围和文档
@@ -3096,17 +3124,13 @@ async def send_message(
     settings = get_settings()
     trace_include_content = settings.rag_trace_include_content
     search_config = payload.search_config.model_dump()
-    trace_search_config = dict(search_config)
-    if not trace_include_content:
-        trace_search_config["tags"] = []
     trace_event(
         "chat.request",
         trace_id=trace_id,
         conversation_id=conv.id,
         user_id=user.id,
         selected_kb_ids=payload.knowledge_base_ids,
-        search_config=trace_search_config,
-        selected_tag_count=len(search_config.get("tags") or []),
+        search_config=search_config,
         intent=None,
         decision_reason=(
             "pending_evidence_scope_selection"
@@ -3469,7 +3493,6 @@ async def send_message(
         task_contract=task_contract,
         evidence_scope_filter=evidence_filter,
         evidence_scope_refinement_active=evidence_refinement_active,
-        selected_tags=search_config.get("tags") or [],
         is_followup=conversation_context.is_followup,
         carryover_sources=conversation_context.carryover_sources,
         selected_kb_count=len(set(payload.knowledge_base_ids)),
@@ -3608,7 +3631,7 @@ async def send_message(
         loaded_user_msg = await db.get(Message, durable_turn.user_message_id)
         if isinstance(loaded_user_msg, Message):
             user_msg = loaded_user_msg
-            user_msg.content = payload.question
+            user_msg.content = user_message_content
             for key, value in user_metadata.items():
                 setattr(user_msg, key, value)
     if user_msg is None:
@@ -3621,7 +3644,7 @@ async def send_message(
             ),
             conversation_id=conv.id,
             role="user",
-            content=payload.question,
+            content=user_message_content,
             **user_metadata,
         )
         db.add(user_msg)

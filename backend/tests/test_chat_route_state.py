@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from api.chat import (
     _active_pending_route_state,
     _evidence_event_pending_state,
+    _evidence_scope_reply_display_text,
     _evidence_scope_filter,
     _parse_sse_payload,
     _parse_evidence_scope_reply,
@@ -671,6 +672,26 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 broad_pending,
             ).action,
             "refine",
+        )
+
+    def test_evidence_scope_selection_uses_readable_history_text(self) -> None:
+        pending = _evidence_pending_state()
+        single = _parse_evidence_scope_reply("c2", pending)
+        comparison = _parse_evidence_scope_reply("都对比", pending)
+
+        self.assertEqual(
+            _evidence_scope_reply_display_text("c2", single),
+            f"选择：{pending['choices'][1]['label']}",
+        )
+        self.assertEqual(
+            _evidence_scope_reply_display_text("都对比", comparison),
+            "选择：都对比（"
+            + "；".join(choice["label"] for choice in pending["choices"])
+            + "）",
+        )
+        self.assertEqual(
+            _evidence_scope_reply_display_text("新的业务问题", None),
+            "新的业务问题",
         )
 
     def test_explicit_subset_comparison_does_not_include_unmentioned_choice(self) -> None:

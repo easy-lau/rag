@@ -831,10 +831,6 @@ PRE_RERANK_COMPETING_DOCUMENTS = 3
 JOINT_CONTEXT_MAX_CHUNKS = 12
 JOINT_CONTEXT_MAX_CHARS = 16000
 
-# 标签软加权：命中用户所选标签的文档，排序分上浮该比例（0.5 = 上浮 50%）。
-# 软加权——只影响排序先后，不排除未命中文档，因此不会把库里相关内容直接漏掉。
-TAG_BOOST = 0.5
-
 # 未经过重排器验证时，仅对 optional 检索使用保守词面证据门槛。required 检索
 # 仍以召回优先，避免专有名词、配置项或同义表达因简单词面规则被漏掉。
 _LATIN_TERM_RE = re.compile(r"[a-z0-9][a-z0-9_.-]+", re.IGNORECASE)
@@ -866,23 +862,6 @@ def rerank_candidate_limit(top_k: int, *, simple: bool = False) -> int:
         RERANK_CANDIDATE_MAX,
         max(RERANK_CANDIDATE_MIN, normalized * RERANK_CANDIDATE_MULTIPLIER),
     )
-
-
-def apply_tag_boost(results: list[dict], selected_tags: list[str]) -> list[dict]:
-    """用户手动勾选的标签做软加权：命中标签的文档片段排序分上浮，未命中的保持原样。
-    关键：只用上浮后的分数『重新排序』，不改写每条结果的语义相关度分 score，
-    因此 _select_relevant 的相关度阈值仍作用于真实语义分，标签不会让不相关内容蒙混过关。"""
-    if not selected_tags or not results:
-        return results
-    wanted = set(selected_tags)
-
-    def sort_key(r: dict) -> float:
-        base = float(r.get("score") or 0)
-        matched = bool(wanted & set(r.get("doc_tags") or []))
-        # 仅对正分上浮：负分（已属不相关）上浮只会更糟，保持原值即可
-        return base * (1 + TAG_BOOST) if (matched and base > 0) else base
-
-    return sorted(results, key=sort_key, reverse=True)
 
 
 def _select_relevant(results: list[dict], top_k: int, reranked: bool) -> list[dict]:
@@ -1557,8 +1536,8 @@ def _resolve_failed_rerank_expansion_plan(
     """仅在召回证据确定性很强时，允许首轮模型失败后做同文档补检。"""
 
     requirements = _required_answer_requirements((), question)
-    # 标签软加权可能改变展示顺序；失败兜底必须仍以原始召回序号判断“前三条
-    # 同文档”，不能让后处理排序人为制造文档占优。
+    # 失败兜底必须仍以原始召回序号判断“前三条同文档”，不能让后处理排序
+    # 人为制造文档占优。
     leading, reason = _dominant_document_lexical_seeds(
         results,
         constraints,
@@ -2874,8 +2853,6 @@ async def run_rag_stream(
         rerank_candidate_max=RERANK_CANDIDATE_MAX,
         rerank_profile="simple" if simple_rerank else "full",
         rerank=rerank_requested,
-        selected_tags=(search_config.get("tags") or []) if trace_include_content else [],
-        selected_tag_count=len(search_config.get("tags") or []),
         query_constraints=trace_query_constraints(query_constraints),
         is_followup=is_followup,
         followup_reason=followup_reason,
@@ -3597,15 +3574,6 @@ async def run_rag_stream(
                 else ("no_candidates" if rerank_requested else "disabled")
             ),
         )
-
-    # 标签软加权：命中用户所选标签的文档上浮排序（不改语义分、不排除未命中）
-    selected_tags = search_config.get("tags") or []
-    results = apply_tag_boost(results, selected_tags)
-    if selected_tags:
-        if trace_include_content:
-            logger.info("[标签加权] 所选标签=%s", selected_tags)
-        else:
-            logger.info("[标签加权] 标签数=%d", len(selected_tags))
 
     # Step 4.5: 复杂知识问题的文档内补检与联合覆盖。首轮成功时使用模型计划；
     # 首轮失败时只有“前三条同文档且存在词面命中”才允许安全补检。新增片段

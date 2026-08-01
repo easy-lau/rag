@@ -70,37 +70,6 @@
             />
           </div>
         </n-popover>
-        <n-popover
-          v-if="tagOptions.length"
-          trigger="click"
-          placement="top-start"
-          :show-arrow="false"
-        >
-          <template #trigger>
-            <button type="button" class="composer-setting composer-setting--tag" aria-label="按标签筛选">
-              <n-icon :size="16"><PricetagOutline /></n-icon>
-              <span class="composer-setting__content">
-                <span class="composer-setting__label">标签筛选</span>
-                <span class="composer-setting__value">{{ tagSummary }}</span>
-              </span>
-              <n-icon :size="14" class="composer-setting__chevron"><ChevronDownOutline /></n-icon>
-            </button>
-          </template>
-          <div class="composer-popover">
-            <p>标签筛选</p>
-            <span>标签用于让匹配内容在检索结果中优先排序</span>
-            <n-select
-              v-model:value="chatStore.searchConfig.tags"
-              :options="tagOptions"
-              multiple
-              clearable
-              placeholder="不限标签"
-              class="composer-popover__select"
-              :input-props="{ 'aria-label': '按标签筛选' }"
-              :max-tag-count="1"
-            />
-          </div>
-        </n-popover>
         <n-tooltip trigger="hover" placement="top">
           <template #trigger>
             <button
@@ -141,12 +110,11 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted } from 'vue'
 import { NInput, NSelect, NButton, NIcon, NTooltip, NPopover } from 'naive-ui'
-import { SendOutline, StopOutline, FolderOpenOutline, SearchOutline, PricetagOutline, SparklesOutline, ChevronDownOutline } from '@vicons/ionicons5'
+import { SendOutline, StopOutline, FolderOpenOutline, SearchOutline, SparklesOutline, ChevronDownOutline } from '@vicons/ionicons5'
 import { useChatStore } from '@/stores/chat'
 import { useKnowledgeStore } from '@/stores/knowledge'
-import { getDocumentTags } from '@/api/knowledge'
 
 const chatStore = useChatStore()
 const kbStore = useKnowledgeStore()
@@ -164,35 +132,13 @@ const knowledgeBaseSummary = computed(() => {
   return `${selected.length} 个已选`
 })
 
-const availableTags = ref([])
-const tagOptions = computed(() => availableTags.value.map(t => ({ label: t, value: t })))
-
-// 所选知识库变化时刷新可用标签，并把已选但不再可用的标签剔除，避免发送无效过滤
-async function refreshTags() {
-  if (!chatStore.selectedKbIds.length) {
-    availableTags.value = []
-    chatStore.searchConfig.tags = []
-    return
-  }
-  try {
-    availableTags.value = await getDocumentTags(chatStore.selectedKbIds)
-  } catch {
-    availableTags.value = []
-  }
-  const allowed = new Set(availableTags.value)
-  chatStore.searchConfig.tags = (chatStore.searchConfig.tags || []).filter(t => allowed.has(t))
-}
-
 onMounted(async () => {
   await kbStore.fetchList()
   // selectedKbIds 存在 localStorage 且跨用户共用：仅保留当前用户可访问的知识库，
   // 剔除他人残留/无权访问的选择 —— 新用户登录后默认即为空。
   const allowed = new Set(kbStore.list.map(kb => kb.id))
   chatStore.selectedKbIds = chatStore.selectedKbIds.filter(id => allowed.has(id))
-  await refreshTags()
 })
-
-watch(() => chatStore.selectedKbIds, refreshTags, { deep: true })
 
 const methodOptions = [
   { label: '混合检索（向量 + 关键词）', value: 'hybrid' },
@@ -203,12 +149,6 @@ const methodOptions = [
 const methodSummary = computed(() => {
   const current = methodOptions.find(option => option.value === chatStore.searchConfig.method)
   return current?.label?.replace(/（.*）/, '') || '混合检索'
-})
-
-const tagSummary = computed(() => {
-  const selected = chatStore.searchConfig.tags || []
-  if (!selected.length) return '不限'
-  return selected.length === 1 ? selected[0] : `${selected.length} 个已选`
 })
 
 function handleSend() {

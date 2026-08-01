@@ -50,7 +50,6 @@ class SearchConfig(BaseModel):
     method: Literal["hybrid", "vector", "keyword"] = "hybrid"
     rerank: bool = True
     top_k: int = Field(5, ge=1, le=20)
-    tags: list[str] = Field(default_factory=list, max_length=100)
 
 
 class ChatRequest(BaseModel):
@@ -92,6 +91,7 @@ class MessageOut(BaseModel):
     error_code: str | None = None
     delivery_status: str | None = None
     persistence_status: str | None = None
+    duration_ms: int | None = None
     search_snapshot: dict | None = None
     created_at: datetime
 
@@ -117,7 +117,6 @@ class SearchRequest(BaseModel):
     method: Literal["hybrid", "vector", "keyword"] = "hybrid"
     top_k: int = Field(5, ge=1, le=20)
     rerank: bool = True
-    tags: list[str] = Field(default_factory=list, max_length=100)  # 标签软加权
 
 
 class SearchResultItem(BaseModel):

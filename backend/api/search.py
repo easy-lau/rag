@@ -12,7 +12,6 @@ from core.reranker import rerank_with_status
 from core.query_constraints import extract_query_constraints
 from core.rag_pipeline import (
     annotate_deterministic_constraints,
-    apply_tag_boost,
     rerank_candidate_limit,
 )
 from core.rag_trace import (
@@ -57,8 +56,6 @@ async def search_test(
         top_k=payload.top_k,
         candidate_k=candidate_k,
         rerank=payload.rerank,
-        selected_tags=payload.tags if trace_include_content else [],
-        selected_tag_count=len(payload.tags),
         query_constraints=trace_query_constraints(constraints),
         **content_fields("query", payload.query),
     )
@@ -216,8 +213,8 @@ async def search_test(
         )
         raise
 
-    # 标签软加权后再截断最终 Top K；检索测试与真实问答保持“扩大召回→重排→Top K”。
-    results = apply_tag_boost(results, payload.tags)[:payload.top_k]
+    # 检索测试与真实问答保持“扩大召回→重排→Top K”。
+    results = results[:payload.top_k]
 
     items = [
         SearchResultItem(

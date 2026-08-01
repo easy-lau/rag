@@ -62,7 +62,7 @@ export const useChatStore = defineStore('chat', () => {
   // 加载失败时保留当前会话 ID 与深链，供页面提供明确的重试/返回选择；
   // 不能把网络或服务端临时错误误当成“会话不存在”。
   const conversationLoadError = ref(null)
-  const searchConfig = ref({ method: 'hybrid', rerank: true, top_k: 5, tags: [] })
+  const searchConfig = ref({ method: 'hybrid', rerank: true, top_k: 5 })
 
   const _savedKbIds = localStorage.getItem('selectedKbIds')
   const selectedKbIds = ref(_savedKbIds ? JSON.parse(_savedKbIds) : [])
@@ -204,6 +204,9 @@ export const useChatStore = defineStore('chat', () => {
   async function sendMessage(question, options = {}) {
     const normalizedQuestion = typeof question === 'string' ? question.trim() : ''
     if (isStreaming.value || !normalizedQuestion) return
+    const displayQuestion = typeof options.displayContent === 'string'
+      ? options.displayContent.trim() || normalizedQuestion
+      : normalizedQuestion
     const runId = ++streamRunId
     const requestedRequestId = normalizeClientRequestId(options.requestId)
     const requestId = requestedRequestId || createClientRequestId()
@@ -259,7 +262,8 @@ export const useChatStore = defineStore('chat', () => {
     const createUserMessage = () => ({
       id: `client-user-${requestId}-${runId}`,
       role: 'user',
-      content: normalizedQuestion,
+      // c1/c2 are transport tokens, never user-facing conversation text.
+      content: displayQuestion,
       request_id: requestId,
       delivery_status: 'sent',
       created_at: now,
@@ -279,6 +283,8 @@ export const useChatStore = defineStore('chat', () => {
       retrieval_executed: null,
       delivery_status: 'streaming',
       persistence_status: 'pending',
+      duration_ms: null,
+      answer_started_at_ms: Date.now(),
       retryable: false,
       search_snapshot: null,
       search_meta: null,
@@ -561,6 +567,10 @@ export const useChatStore = defineStore('chat', () => {
       if (typeof data.error_code === 'string' && data.error_code) aiMsg.error_code = data.error_code
       if (data.evidence_status) aiMsg.evidence_status = data.evidence_status
       if (typeof data.retrieval_executed === 'boolean') aiMsg.retrieval_executed = data.retrieval_executed
+      const serverDuration = Number(data.duration_ms)
+      if (Number.isFinite(serverDuration) && serverDuration >= 0) {
+        aiMsg.duration_ms = Math.round(serverDuration)
+      }
       applyTurnLifecycleState(aiMsg, data)
       if (aiMsg.retryable) {
         aiMsg.failure_reason = data.status === 'persist_failed' ? 'persistence_failed' : 'server_error'
@@ -632,6 +642,13 @@ export const useChatStore = defineStore('chat', () => {
       aiMsg.tokens = data.total_tokens
     } else if (data.type === 'done') {
       markDone()
+      const serverDuration = Number(data.duration_ms)
+      const localStartedAt = Number(aiMsg.answer_started_at_ms)
+      if (Number.isFinite(serverDuration) && serverDuration >= 0) {
+        aiMsg.duration_ms = Math.round(serverDuration)
+      } else if (Number.isFinite(localStartedAt) && localStartedAt > 0) {
+        aiMsg.duration_ms = Math.max(0, Date.now() - localStartedAt)
+      }
       if (data.conversation_id) currentConvId.value = data.conversation_id
       const clarification = applyClarificationLifecycleEvent(aiMsg, data)
       if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
@@ -682,11 +699,16 @@ export const useChatStore = defineStore('chat', () => {
     if (!target || target !== latestPendingClarificationMessage()) return false
     const clarification = normalizeEvidenceClarification(target.clarification)
     if (!isClarificationSubmittable(clarification)) return false
+    const selected = clarification.choices.find(choice => choice.reply === reply)
+    const displayContent = reply === '都对比'
+      ? '选择：都对比'
+      : (selected ? `选择：${selected.label}` : reply)
 
     // Reuse the exact same request/conversation/SSE path as typed questions.
     void sendMessage(reply, {
       clarificationSource: target,
       allowFreeText: false,
+      displayContent,
       requestId: clarification.retryable
         ? clarification.last_submission_request_id
         : null,

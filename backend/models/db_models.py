@@ -51,7 +51,7 @@ class Document(Base):
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="processing")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    tags: Mapped[list] = mapped_column(JSONB, default=list)  # 文档级标签，用于检索软加权（命中所选标签的文档排序分上浮）
+    tags: Mapped[list] = mapped_column(JSONB, default=list)  # 文档级标签，用于管理、展示与产品/版本约束识别
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -211,6 +211,8 @@ class Message(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
     persistence_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # 从请求受理到回答持久化完成的端到端耗时（毫秒）。历史会话重载后仍可展示。
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     search_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 

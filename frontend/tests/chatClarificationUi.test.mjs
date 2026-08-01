@@ -14,6 +14,14 @@ const chatViewSource = readFileSync(
   new URL('../src/views/ChatView.vue', import.meta.url),
   'utf8',
 )
+const chatInputSource = readFileSync(
+  new URL('../src/components/chat/ChatInput.vue', import.meta.url),
+  'utf8',
+)
+const searchTestSource = readFileSync(
+  new URL('../src/views/SearchTestView.vue', import.meta.url),
+  'utf8',
+)
 
 test('chat store 同时消费结构化事件和 search_results 内嵌澄清', () => {
   assert.ok(chatStoreSource.includes("data.type === 'evidence_clarification'"))
@@ -42,6 +50,9 @@ test('组件选择事件经 ChatView 回到 store 的统一 sendMessage 链', ()
   assert.ok(chatViewSource.includes('chatStore.submitClarification(message, reply)'))
   assert.ok(chatStoreSource.includes('void sendMessage(reply, {'))
   assert.ok(chatStoreSource.includes('clarificationSource: target'))
+  assert.ok(chatStoreSource.includes("content: displayQuestion"))
+  assert.ok(chatStoreSource.includes("? '选择：都对比'"))
+  assert.ok(chatStoreSource.includes('`选择：${selected.label}`'))
 })
 
 test('未 ack、错误、中止和无 ack done 都会保持 picker 失效', () => {
@@ -116,4 +127,30 @@ test('空回答 spinner 仅由活跃 request 状态驱动，终态与失败态�
   assert.doesNotMatch(chatMessageSource, /<div v-else class="flex items-center gap-2 text-gray-400 text-sm">\s*<n-spin/)
   assert.ok(chatStoreSource.includes("activeRequestId.value = requestId"))
   assert.ok(chatStoreSource.includes("if (activeRequestId.value === requestId) activeRequestId.value = ''"))
+})
+
+test('回答依据仅使用 answer_support，不把召回排序伪装成匹配率', () => {
+  assert.match(
+    chatMessageSource,
+    /function sourceSupportScore\(source\) \{[\s\S]*return finiteScore\(source\.answer_support\)\n\}/,
+  )
+  assert.doesNotMatch(
+    chatMessageSource,
+    /return finiteScore\(source\.answer_support\) \?\? finiteScore\(source\.effective_score\)/,
+  )
+  assert.ok(chatMessageSource.includes("const level = score === null ? '已验证'"))
+})
+
+test('聊天与检索测试不再提供或发送用户标签检索偏好', () => {
+  assert.doesNotMatch(chatInputSource, /标签筛选|searchConfig\.tags|getDocumentTags|PricetagOutline/)
+  assert.doesNotMatch(searchTestSource, /config\.tags|getDocumentTags|标签（软加权|标签筛选/)
+  assert.doesNotMatch(chatStoreSource, /searchConfig = ref\([^\n]*tags:/)
+})
+
+test('助手消息在底部展示本次思考回答耗时，流式完成后写入时长', () => {
+  assert.ok(chatMessageSource.includes('思考回答耗时 {{ responseDurationText }}'))
+  assert.ok(chatMessageSource.includes('const responseDurationText = computed'))
+  assert.ok(chatStoreSource.includes('duration_ms: null'))
+  assert.ok(chatStoreSource.includes('answer_started_at_ms: Date.now()'))
+  assert.ok(chatStoreSource.includes('const serverDuration = Number(data.duration_ms)'))
 })

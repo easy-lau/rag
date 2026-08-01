@@ -1,7 +1,7 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <div class="max-w-5xl mx-auto space-y-5">
-      <PageHeader title="检索测试" description="使用指定知识库、检索方式和标签，快速验证召回与重排效果。" />
+      <PageHeader title="检索测试" description="使用指定知识库和检索方式，快速验证召回与重排效果。" />
 
       <SurfaceCard class="space-y-4">
         <n-input v-model:value="query" type="textarea" :rows="3" placeholder="输入测试查询语句..." />
@@ -25,16 +25,8 @@
             <n-switch v-model:value="config.rerank" />
           </div>
           <n-select v-model:value="config.knowledge_base_ids" :options="kbOptions" multiple placeholder="选择知识库" class="w-52" />
-          <n-select
-            v-if="tagOptions.length"
-            v-model:value="config.tags" :options="tagOptions"
-            multiple clearable placeholder="标签（软加权，可选）" class="w-52"
-          />
           <n-button type="primary" :loading="loading" @click="runSearch">开始检索</n-button>
         </div>
-        <p v-if="tagOptions.length" class="text-xs leading-5 text-gray-400">
-          勾选标签后再检索，可对比同一查询「选标签 vs 不选」的排序差异：命中标签的文档片段会被上浮（软加权，不排除其他结果）。
-        </p>
       </SurfaceCard>
 
       <SurfaceCard v-if="results.length || searchMeta.evidence_status" class="space-y-4">
@@ -77,13 +69,6 @@
               <span v-if="r.answer_support !== null && r.answer_support !== undefined">回答支持 {{ scoreDisplay(r.answer_support) }}</span>
               <span v-if="constraintLabel(r)" :title="r.constraint_reason || ''">{{ constraintLabel(r) }}</span>
             </div>
-            <div v-if="r.tags && r.tags.length" class="flex flex-wrap gap-1.5 mt-2">
-              <n-tag
-                v-for="t in r.tags" :key="t" size="small" round
-                :type="config.tags.includes(t) ? 'success' : 'default'"
-                :bordered="false"
-              >{{ t }}</n-tag>
-            </div>
           </article>
           <div v-if="!results.length" class="rounded-[var(--ui-radius-card)] border border-dashed border-[var(--ui-border)] px-4 py-10 text-center text-sm text-[var(--ui-text-tertiary)]">
             本次没有返回可展示的检索候选。
@@ -95,11 +80,10 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { NInput, NInputNumber, NSelect, NSwitch, NButton, NTooltip, NIcon, NTag } from 'naive-ui'
 import { HelpCircleOutline } from '@vicons/ionicons5'
 import { searchTest } from '@/api/search'
-import { getDocumentTags } from '@/api/knowledge'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import ScoreTag from '@/components/common/ScoreTag.vue'
@@ -112,7 +96,7 @@ const loading = ref(false)
 const results = ref([])
 const elapsed = ref(0)
 const searchMeta = ref({})
-const config = ref({ method: 'hybrid', top_k: 5, rerank: true, knowledge_base_ids: [], tags: [] })
+const config = ref({ method: 'hybrid', top_k: 5, rerank: true, knowledge_base_ids: [] })
 
 const kbOptions = computed(() => kbStore.list.map(kb => ({ label: kb.name, value: kb.id })))
 const methodOptions = [
@@ -152,24 +136,7 @@ function constraintLabel(result) {
   })[result?.constraint_status] || ''
 }
 
-const availableTags = ref([])
-const tagOptions = computed(() => availableTags.value.map(t => ({ label: t, value: t })))
-
-// 所选知识库变化时刷新可用标签，并剔除已选但不再可用的标签
-async function refreshTags() {
-  if (!config.value.knowledge_base_ids.length) {
-    availableTags.value = []
-    config.value.tags = []
-    return
-  }
-  try { availableTags.value = await getDocumentTags(config.value.knowledge_base_ids) }
-  catch { availableTags.value = [] }
-  const allowed = new Set(availableTags.value)
-  config.value.tags = config.value.tags.filter(t => allowed.has(t))
-}
-
 onMounted(() => kbStore.fetchList())
-watch(() => config.value.knowledge_base_ids, refreshTags, { deep: true })
 
 async function runSearch() {
   if (!query.value.trim()) return

@@ -21,6 +21,7 @@ def _candidate(
     support: float,
     role: str = "related",
     metadata: dict | None = None,
+    rerank_status: str = "verified",
 ) -> dict:
     return {
         "id": chunk_id,
@@ -32,7 +33,7 @@ def _candidate(
         "topic_relevance": topic,
         "answer_support": support,
         "evidence_role": role,
-        "rerank_status": "verified",
+        "rerank_status": rerank_status,
     }
 
 
@@ -420,6 +421,61 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         self.assertNotIn("云枢7配置", decision.question)
         self.assertEqual(decision.allowed_doc_ids, ())
         self.assertEqual(decision.to_dict()["allowed_doc_ids"], [])
+
+    def test_unrelated_version_metadata_does_not_hijack_meal_allowance_query(
+        self,
+    ) -> None:
+        """A policy question must not become a product-version picker.
+
+        This mirrors the live regression where a rerank timeout left the
+        versioned DingTalk documents unverified.  Their source labels are
+        valid scope metadata, but neither document contains an anchor for the
+        employee meal-allowance question, so they cannot create choices.
+        """
+
+        query = "普通员工餐补标准是多少？请说明对应职级和每日金额。"
+        candidates = [
+            _candidate(
+                chunk_id="travel-meal",
+                doc_id="doc-travel",
+                filename="公司出差管理标准.docx",
+                content="普通员工、专员属于D级，餐饮补贴为100元/天。",
+                topic=0.0,
+                support=0.0,
+                metadata={},
+                rerank_status="error",
+            ),
+            _candidate(
+                chunk_id="dingtalk-v6",
+                doc_id="doc-dingtalk-v6",
+                filename="钉钉 6.0.1 工作通知配置.md",
+                content="通过工作通知接口发送钉钉消息。",
+                topic=0.0,
+                support=0.0,
+                metadata={"product": "钉钉", "version": "6.0.1"},
+                rerank_status="error",
+            ),
+            _candidate(
+                chunk_id="dingtalk-v8",
+                doc_id="doc-dingtalk-v8",
+                filename="钉钉 8.2.75 工作通知配置.md",
+                content="使用新版工作通知接口发送消息。",
+                topic=0.0,
+                support=0.0,
+                metadata={"product": "钉钉", "version": "8.2.75"},
+                rerank_status="error",
+            ),
+        ]
+
+        decision = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=extract_query_constraints(query),
+            candidates=candidates,
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_or_overlapping_scope")
+        self.assertEqual(decision.allowed_doc_ids, ())
 
     def test_same_version_complementary_documents_do_not_clarify(self) -> None:
         candidates = [

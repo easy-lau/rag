@@ -42,7 +42,6 @@ from core.rag_pipeline import (
     _restrict_candidates_to_scope,
     _scope_anchor_coverage,
     _scope_filter_queries,
-    apply_tag_boost,
 )
 from core.rag_trace import content_fields, json_safe, trace_event
 from core.rag_v2.context import build_evidence_context
@@ -1845,29 +1844,6 @@ async def run_rag_v2_stream(
                 raw_initial_candidates,
                 normalized_scope_filter,
             )
-        # Keep V1's tag contract: selected tags are a soft ordering preference,
-        # never an authorization or relevance signal.  Applying the boost only
-        # after KB/document scope checks prevents a tag from admitting an
-        # otherwise forbidden candidate; the relevance gate below still reads
-        # the unmodified lexical/vector channel scores.
-        selected_tags = [
-            str(value).strip()
-            for value in (search_config.get("tags") or [])
-            if str(value).strip()
-        ]
-        raw_initial_candidates = apply_tag_boost(
-            raw_initial_candidates,
-            selected_tags,
-        )
-        if selected_tags:
-            trace_event(
-                "retrieval.tag_boost_applied",
-                trace_id=trace_id,
-                pipeline_version=PIPELINE_VERSION,
-                selected_tag_count=len(set(selected_tags)),
-                candidate_count=len(raw_initial_candidates),
-            )
-
         # The primary pass deliberately remains the original resolved query.
         # For decomposed answer/bridge plans, run each *different* plan query
         # as a sequential, bounded global pass.  AsyncSession cannot safely
@@ -1904,10 +1880,6 @@ async def run_rag_v2_stream(
                     raw_supplemental = _authorized_candidates(
                         raw_supplemental,
                         kb_ids=retrieval_kb_ids,
-                    )
-                    raw_supplemental = apply_tag_boost(
-                        raw_supplemental,
-                        selected_tags,
                     )
                     raw_supplemental = _mark_global_plan_query_candidates(
                         raw_supplemental,
