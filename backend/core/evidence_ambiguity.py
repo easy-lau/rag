@@ -256,6 +256,17 @@ class DocumentEvidenceAssessment:
     # these only for a complete, parser-identified table; a same-document
     # section name or a retrieval neighbourhood cannot manufacture one.
     composable_answer_group_ids: tuple[str, ...] = ()
+    # Source-declared product/version/project values found elsewhere in this
+    # document but not provably attached to this closed answer route.  Only
+    # *multiple* values of one dimension are retained.  They preserve the
+    # fail-closed boundary for legacy documents that declare several scopes in
+    # nearby headers while their answer clauses have lost structural lineage.
+    # A document with merely several complementary steps has no such signal.
+    unbound_document_scope_dimensions: tuple[str, ...] = ()
+    # Bounded audit categories for the preceding declarations, represented as
+    # ``dimension:metadata`` or ``dimension:explicit_scope_header``.  Values
+    # and source content are intentionally excluded from traces.
+    unbound_document_scope_origins: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1427,16 +1438,15 @@ def _same_document_answer_scope_is_unresolved(
     rows: Iterable[Mapping[str, Any]],
     *,
     required_answer_ids: set[str],
-) -> bool:
+) -> tuple[str, ...]:
     """Whether one physical scope contains distinct closed answer routes.
 
-    This is deliberately narrower than a generic same-document duplicate:
-    complementary chapters and repeated evidence retain no route identity (or
-    the same identity) and remain one answer source.  A positive result means
-    the final graph proved more than one answer proposition for the same
-    required answer, but the source did not prove an applicability dimension
-    capable of separating them.  The only safe UX is a free-text refinement,
-    never two copies of the same document choice.
+    This is deliberately narrower than a generic same-document duplicate.
+    Distinct answer routes are not by themselves an ambiguity: an operation
+    guide commonly has several closed, complementary steps.  Refinement is
+    required only when the source declares multiple applicability values that
+    cannot be tied to those routes.  Closed scalar/categorical contradictions
+    are handled by the evidence graph's dedicated conflict path.
     """
 
     for row in rows:
@@ -1469,8 +1479,17 @@ def _same_document_answer_scope_is_unresolved(
                 if isinstance(group_route_keys, (set, frozenset, tuple, list))
             ):
                 continue
-            return True
-    return False
+            dimensions = row.get("unbound_document_scope_dimensions")
+            if not isinstance(dimensions, (set, frozenset, tuple, list)):
+                continue
+            normalized_dimensions = tuple(sorted({
+                str(value).strip()
+                for value in dimensions
+                if str(value).strip() in {"product", "version", "project"}
+            }))
+            if normalized_dimensions:
+                return normalized_dimensions
+    return ()
 
 
 def _merge_interdependent_answer_graph_rows(
@@ -1495,16 +1514,29 @@ def _merge_interdependent_answer_graph_rows(
     if len(rows) < 2:
         return rows
 
+    # If one route in a physical document has no source-declared applicability
+    # identity, that document cannot be split into user choices merely because
+    # another route exposed a partial/malformed identity.  Keep the routes
+    # together; any genuinely distinct declarations are still retained in the
+    # row and are handled by the unbound-scope guard below.
+    documents_with_unscoped_routes = {
+        (str(row["kb_id"]), str(row["doc_id"]))
+        for row in rows
+        if not tuple(row.get("applicability_scope_identity") or ())
+    }
+
+    def anchor_group_key(
+        row: Mapping[str, Any],
+    ) -> tuple[str, str, tuple[tuple[str, ...], ...]]:
+        document_key = (str(row["kb_id"]), str(row["doc_id"]))
+        identity = tuple(row.get("applicability_scope_identity") or ())
+        if document_key in documents_with_unscoped_routes:
+            identity = ()
+        return (*document_key, identity)
+
     anchor_indexes: dict[tuple[str, str, tuple[tuple[str, ...], ...]], list[int]] = {}
     for index, row in enumerate(rows):
-        anchor_indexes.setdefault(
-            (
-                str(row["kb_id"]),
-                str(row["doc_id"]),
-                tuple(row.get("applicability_scope_identity") or ()),
-            ),
-            [],
-        ).append(index)
+        anchor_indexes.setdefault(anchor_group_key(row), []).append(index)
 
     adjacency = [set() for _ in rows]
     dependency_targets = [set() for _ in rows]
@@ -1600,6 +1632,7 @@ def _merge_interdependent_answer_graph_rows(
             "supported_required_answer_ids",
             "chunk_ids",
             "section_keys",
+            "unbound_document_scope_dimensions",
         ):
             merged[field] = {
                 value
@@ -1975,6 +2008,7 @@ def detect_post_evidence_document_ambiguity(
                 # A complete source table is a composition certificate, not
                 # an applicability scope, and must never become a user choice.
                 "composable_answer_route_keys_by_requirement": {},
+                "unbound_document_scope_dimensions": set(),
             },
         )
         row["filenames"].add(filename)
@@ -2010,6 +2044,11 @@ def detect_post_evidence_document_ambiguity(
         )
         row["chunk_ids"].update(assessment.chunk_ids or ())
         row["section_keys"].update(assessment.section_keys or ())
+        row["unbound_document_scope_dimensions"].update(
+            str(value).strip()
+            for value in assessment.unbound_document_scope_dimensions or ()
+            if str(value).strip() in {"product", "version", "project"}
+        )
         answer_route_key = _answer_route_key(assessment)
         if answer_route_key is not None:
             for requirement_id in supported_ids:
@@ -2042,10 +2081,11 @@ def detect_post_evidence_document_ambiguity(
         row["filename"] = sorted(row["filenames"], key=str.casefold)[0]
     rows.sort(key=lambda row: (row["position"], row["filename"].casefold()))
     rows = _merge_interdependent_answer_graph_rows(rows)
-    if _same_document_answer_scope_is_unresolved(
+    unresolved_scope_dimensions = _same_document_answer_scope_is_unresolved(
         rows,
         required_answer_ids=required_answer_id_set,
-    ):
+    )
+    if unresolved_scope_dimensions:
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension="scope",
@@ -2054,7 +2094,7 @@ def detect_post_evidence_document_ambiguity(
                 "它们分别适用于什么范围。请补充产品、版本、项目、章节或"
                 "制度范围后再查询。"
             ),
-            reason="same_document_answer_scope_unresolved",
+            reason="same_document_unbound_scope_declarations",
             relevant_document_count=len({
                 (str(row["kb_id"]), str(row["doc_id"]))
                 for row in rows

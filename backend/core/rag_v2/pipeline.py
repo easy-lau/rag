@@ -38,7 +38,7 @@ from core.query_constraints import (
     QueryConstraints,
     admit_candidates_for_scopes,
     candidate_section_key,
-    extract_document_constraint_identity,
+    extract_document_applicability_declaration,
     extract_query_constraints,
     inherit_document_constraint_metadata,
 )
@@ -4593,6 +4593,74 @@ def _post_evidence_document_assessments(
     visible_item_ids = set(graph.visible_evidence_item_ids)
     item_by_id = {item.chunk_id: item for item in graph.evidence_items}
     claim_by_id = {claim.id: claim for claim in graph.claims}
+    # Keep only declarations that could make otherwise complementary routes
+    # genuinely ambiguous.  Their source is the document, not a route: a
+    # legacy header may state two versions while neither answer clause carries
+    # the section lineage needed to bind one version to one result.
+    document_unbound_scope_dimensions: dict[tuple[str, str], tuple[str, ...]] = {}
+    document_unbound_scope_origins: dict[tuple[str, str], tuple[str, ...]] = {}
+    document_scope_partitions: dict[
+        tuple[str, str],
+        dict[str, set[tuple[str, ...]]],
+    ] = {}
+    document_scope_origins: dict[tuple[str, str], dict[str, set[str]]] = {}
+    # ``bundle.items`` is the authorized, bounded candidate set for this
+    # request.  It deliberately includes nearby source declarations which may
+    # be omitted from the final answer context.  Ignoring those declarations
+    # would make a legacy 2024/2025 header pair disappear exactly when neither
+    # answer clause has lineage that proves which version it belongs to.  Do
+    # not reuse broad retrieval identity here: a product mentioned in an
+    # ordinary operation step does not create an applicability partition.
+    for item in bundle.items:
+        declaration = extract_document_applicability_declaration(item.to_dict())
+        identity = declaration.identity
+        partitions = document_scope_partitions.setdefault(
+            (item.kb_id, item.doc_id),
+            {"product": set(), "version": set(), "project": set()},
+        )
+        values_by_dimension = {
+            "product": identity.canonical_products or identity.products,
+            "version": identity.versions,
+            "project": identity.projects,
+        }
+        origins = document_scope_origins.setdefault(
+            (item.kb_id, item.doc_id),
+            {"product": set(), "version": set(), "project": set()},
+        )
+        for dimension, values in values_by_dimension.items():
+            normalized_values = tuple(sorted({
+                str(value).strip()
+                for value in values
+                if str(value).strip()
+            }))
+            if normalized_values:
+                partitions[dimension].add(normalized_values)
+        for origin in declaration.origins:
+            dimension, separator, category = origin.partition(":")
+            if separator and dimension in origins and category:
+                origins[dimension].add(category)
+    for document_key, partitions in document_scope_partitions.items():
+        unbound_dimensions: list[str] = []
+        unbound_origins: set[str] = set()
+        for dimension in ("product", "version", "project"):
+            # A single declaration containing several values is inclusive
+            # ("适用版本：2024、2025"), not a proof of separate answer
+            # partitions.  Refinement is justified only by at least two
+            # source sections that each declare one distinct scope value.
+            atomic_values = {
+                values[0]
+                for values in partitions[dimension]
+                if len(values) == 1
+            }
+            if len(atomic_values) <= 1:
+                continue
+            unbound_dimensions.append(dimension)
+            unbound_origins.update(
+                f"{dimension}:{origin}"
+                for origin in document_scope_origins[document_key][dimension]
+            )
+        document_unbound_scope_dimensions[document_key] = tuple(unbound_dimensions)
+        document_unbound_scope_origins[document_key] = tuple(sorted(unbound_origins))
     # A table becomes a composable answer source only after the graph proves
     # every parser-declared part is visible.  Section/chunk proximity alone is
     # never enough to turn multiple answer routes into one response.
@@ -4804,7 +4872,13 @@ def _post_evidence_document_assessments(
         projects: set[str] = set()
         companion_scope_slices: dict[tuple[str, str, str, str], EvidenceScopeSlice] = {}
         for item in route_items:
-            identity = extract_document_constraint_identity(item.to_dict())
+            # Final clarification choices need applicability declarations, not
+            # every product/version hint that was useful while retrieving the
+            # route.  Otherwise one guide that mentions its host system and a
+            # notification target becomes two fabricated product choices.
+            identity = extract_document_applicability_declaration(
+                item.to_dict(),
+            ).identity
             products.update(identity.products)
             canonical_products.update(identity.canonical_products)
             versions.update(identity.versions)
@@ -4856,6 +4930,18 @@ def _post_evidence_document_assessments(
             answer_route_key=str(row.get("answer_route_key") or "") or None,
             composable_answer_group_ids=tuple(
                 row.get("composable_answer_group_ids") or ()
+            ),
+            unbound_document_scope_dimensions=(
+                document_unbound_scope_dimensions.get(
+                    (anchor.kb_id, anchor.doc_id),
+                    (),
+                )
+            ),
+            unbound_document_scope_origins=(
+                document_unbound_scope_origins.get(
+                    (anchor.kb_id, anchor.doc_id),
+                    (),
+                )
             ),
         ))
     return tuple(sorted(
@@ -6512,6 +6598,9 @@ async def run_rag_v2_stream(
         )
         if claim.id in final_conflict_claim_ids
     }
+    post_evidence_assessment_count = 0
+    post_evidence_unbound_scope_dimensions: tuple[str, ...] = ()
+    post_evidence_unbound_scope_origins: tuple[str, ...] = ()
     if (
         not retrieval_failed
         and not ambiguity.needs_clarification
@@ -6525,13 +6614,25 @@ async def run_rag_v2_stream(
             and normalized_scope_filter.valid
         )
     ):
+        post_evidence_assessments = _post_evidence_document_assessments(
+            bundle=bundle,
+            requirements=plan.requirements,
+        )
+        post_evidence_assessment_count = len(post_evidence_assessments)
+        post_evidence_unbound_scope_dimensions = tuple(sorted({
+            dimension
+            for assessment in post_evidence_assessments
+            for dimension in assessment.unbound_document_scope_dimensions
+        }))
+        post_evidence_unbound_scope_origins = tuple(sorted({
+            origin
+            for assessment in post_evidence_assessments
+            for origin in assessment.unbound_document_scope_origins
+        }))
         final_graph_ambiguity = detect_post_evidence_document_ambiguity(
             query=query,
             requirements=plan.requirements,
-            assessments=_post_evidence_document_assessments(
-                bundle=bundle,
-                requirements=plan.requirements,
-            ),
+            assessments=post_evidence_assessments,
         )
         # The detector now consumes only final graph routes.  A semantic
         # conflict is stronger than ordinary multi-document ambiguity: it was
@@ -6605,6 +6706,13 @@ async def run_rag_v2_stream(
         reason=ambiguity.reason,
         choice_count=len(ambiguity.choices),
         relevant_document_count=ambiguity.relevant_document_count,
+        post_evidence_assessment_count=post_evidence_assessment_count,
+        post_evidence_unbound_scope_dimensions=list(
+            post_evidence_unbound_scope_dimensions,
+        ),
+        post_evidence_unbound_scope_origins=list(
+            post_evidence_unbound_scope_origins,
+        ),
         choices=(
             [choice.to_dict() for choice in ambiguity.choices]
             if trace_include_content

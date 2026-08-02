@@ -10,6 +10,7 @@ from core.evidence_ambiguity import (
     resolve_explicit_scope_comparison,
 )
 from core.query_constraints import (
+    extract_document_applicability_declaration,
     extract_document_constraint_identity,
     extract_query_constraints,
     inherit_document_constraint_metadata,
@@ -44,6 +45,63 @@ def _candidate(
 
 
 class EvidenceAmbiguityTests(unittest.TestCase):
+    def test_document_applicability_declaration_requires_explicit_scope_field(
+        self,
+    ) -> None:
+        """Operation targets are not mutually exclusive document scopes."""
+
+        operation_step = extract_document_applicability_declaration({
+            "filename": "二开发送钉钉工作通知.md",
+            "content": (
+                "产品名称：云枢\n"
+                "调用钉钉工作通知接口，并在系统中配置回调地址。"
+            ),
+            "metadata": {},
+        })
+        declared_scope = extract_document_applicability_declaration({
+            "filename": "历史安全配置.md",
+            "content": "## 适用版本：2024、2025\n安全策略配置说明。",
+            "metadata": {},
+        })
+        breadcrumb_scope = extract_document_applicability_declaration({
+            "filename": "接口配置.md",
+            "content": (
+                "所属产品：云枢8>> 产品版本：8.2.75>> 所属项目：中青建安"
+            ),
+            "metadata": {},
+        })
+
+        self.assertEqual(operation_step.identity.products, ())
+        self.assertEqual(operation_step.origins, ())
+        self.assertEqual(declared_scope.identity.versions, ("2024", "2025"))
+        self.assertEqual(
+            declared_scope.origins,
+            ("version:explicit_scope_header",),
+        )
+        self.assertEqual(breadcrumb_scope.identity.products, ("云枢8",))
+        self.assertEqual(breadcrumb_scope.identity.versions, ("8.2.75",))
+        self.assertEqual(breadcrumb_scope.identity.projects, ("中青建安",))
+
+    def test_document_applicability_declaration_keeps_structured_metadata(
+        self,
+    ) -> None:
+        declaration = extract_document_applicability_declaration({
+            "content": "普通操作步骤。",
+            "metadata": {
+                "product": "云枢",
+                "version": "8.6",
+                "project": "华东项目",
+            },
+        })
+
+        self.assertEqual(declaration.identity.canonical_products, ("云枢",))
+        self.assertEqual(declaration.identity.versions, ("8.6",))
+        self.assertEqual(declaration.identity.projects, ("华东项目",))
+        self.assertEqual(
+            declaration.origins,
+            ("product:metadata", "project:metadata", "version:metadata"),
+        )
+
     def test_topic_document_rows_tolerates_non_dict_metadata(self) -> None:
         for metadata in (None, "legacy source", ["legacy source"]):
             with self.subTest(metadata=metadata):
@@ -2317,6 +2375,124 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         self.assertFalse(decision.needs_clarification)
         self.assertEqual(decision.reason, "single_assessed_answer_document")
         self.assertEqual(decision.relevant_document_count, 1)
+
+    def test_same_document_distinct_procedure_routes_are_complementary_without_unbound_scope(
+        self,
+    ) -> None:
+        """Several closed procedure steps are one answer unless scope conflicts.
+
+        Route keys identify source propositions, not an implicit requirement for
+        the user to choose one proposition.  This protects multi-step guides
+        and other complementary sections from being treated as alternatives.
+        """
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="如何发送工作通知",
+            requirements=({
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            },),
+            assessments=[
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-procedure",
+                    filename="工作通知操作说明.md",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=1.0,
+                    answer_support=1.0,
+                    assessment_valid=True,
+                    chunk_ids=(f"step-{step}",),
+                    section_keys=(f"step-{step}",),
+                    answer_route_key=f"send-notification:step-{step}",
+                )
+                for step in ("configure", "select-receiver", "send")
+            ],
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+
+    def test_same_document_partial_scope_identity_does_not_duplicate_choice(
+        self,
+    ) -> None:
+        """One attributed chunk cannot split an otherwise unscoped guide."""
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="如何发送工作通知",
+            requirements=({
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            },),
+            assessments=(
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-procedure",
+                    filename="工作通知操作说明.md",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=1.0,
+                    answer_support=1.0,
+                    assessment_valid=True,
+                    canonical_products=("云枢",),
+                    chunk_ids=("step-configure",),
+                    answer_route_key="send-notification:configure",
+                ),
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-procedure",
+                    filename="工作通知操作说明.md",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=1.0,
+                    answer_support=1.0,
+                    assessment_valid=True,
+                    chunk_ids=("step-send",),
+                    answer_route_key="send-notification:send",
+                ),
+            ),
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+
+    def test_same_document_routes_with_unbound_version_declarations_refine(
+        self,
+    ) -> None:
+        """Multiple source-declared versions remain fail-closed without lineage."""
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="安全配置是什么",
+            requirements=({
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            },),
+            assessments=[
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-legacy-policy",
+                    filename="历史安全配置.md",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=1.0,
+                    answer_support=1.0,
+                    assessment_valid=True,
+                    chunk_ids=(f"rule-{version}",),
+                    answer_route_key=f"security-mode:{version}",
+                    unbound_document_scope_dimensions=("version",),
+                )
+                for version in ("2024", "2025")
+            ],
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(
+            decision.reason,
+            "same_document_unbound_scope_declarations",
+        )
 
     def test_post_evidence_same_document_composable_answer_dimensions_do_not_require_choice(
         self,

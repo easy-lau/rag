@@ -1261,6 +1261,204 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             _evidence_scope_filter(reply, current_kb_ids=[uuid.uuid4()])
         )
 
+    def test_post_evidence_ignores_operation_product_mentions_as_scope_partitions(
+        self,
+    ) -> None:
+        """A guide may name several systems without becoming a scope picker."""
+
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="如何发送钉钉工作通知",
+        )
+        items = (
+            EvidenceItem(
+                chunk_id="configure",
+                doc_id="dingtalk-guide",
+                kb_id="kb-1",
+                content="产品名称：云枢\n配置发送通知的服务地址。",
+                role="direct",
+                contribution_kind="answer_claim",
+                supports_requirement_ids=("r1",),
+                metadata={"filename": "二开发送钉钉工作通知.md"},
+            ),
+            EvidenceItem(
+                chunk_id="send",
+                doc_id="dingtalk-guide",
+                kb_id="kb-1",
+                content="产品名称：钉钉\n选择接收人后发送工作通知。",
+                role="direct",
+                contribution_kind="answer_claim",
+                supports_requirement_ids=("r1",),
+                metadata={"filename": "二开发送钉钉工作通知.md"},
+            ),
+        )
+        bundle = EvidenceBundle(
+            state=EvidenceState(
+                availability="ok",
+                confidence="verified",
+                completeness="complete",
+            ),
+            items=items,
+            context_item_ids=("configure", "send"),
+            answer_source_ids=("configure", "send"),
+        )
+        graph = build_evidence_coverage_graph(
+            bundle,
+            (requirement,),
+            claims=(
+                EvidenceClaim(
+                    id="configure-claim",
+                    requirement_id="r1",
+                    evidence_item_id="configure",
+                    document_key=("kb-1", "dingtalk-guide"),
+                    contribution_kind="answer_claim",
+                    applicability="direct_subject",
+                    result_kind="procedure",
+                    normalized_result="configure service",
+                    claim_key="send work notification",
+                ),
+                EvidenceClaim(
+                    id="send-claim",
+                    requirement_id="r1",
+                    evidence_item_id="send",
+                    document_key=("kb-1", "dingtalk-guide"),
+                    contribution_kind="answer_claim",
+                    applicability="direct_subject",
+                    result_kind="procedure",
+                    normalized_result="send notification",
+                    claim_key="send work notification",
+                ),
+            ),
+        )
+        assessment = assess_evidence_coverage_graph(graph)
+        bundle = replace(
+            bundle,
+            coverage_graph=graph,
+            coverage_assessment=assessment,
+        )
+
+        assessments = _post_evidence_document_assessments(
+            bundle=bundle,
+            requirements=(requirement,),
+        )
+        decision = detect_post_evidence_document_ambiguity(
+            query="如何发送钉钉工作通知",
+            requirements=(requirement,),
+            assessments=assessments,
+        )
+
+        self.assertTrue(assessments)
+        self.assertTrue(all(
+            not item.unbound_document_scope_dimensions
+            for item in assessments
+        ))
+        self.assertFalse(decision.needs_clarification)
+
+    def test_post_evidence_keeps_separate_explicit_version_headers_fail_closed(
+        self,
+    ) -> None:
+        """Two separately declared versions remain unsafe without lineage."""
+
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="安全配置是什么",
+        )
+        items = (
+            EvidenceItem(
+                chunk_id="header-2024",
+                doc_id="security-guide",
+                kb_id="kb-1",
+                content="## 适用版本：2024",
+                metadata={"filename": "历史安全配置.md"},
+            ),
+            EvidenceItem(
+                chunk_id="rule-2024",
+                doc_id="security-guide",
+                kb_id="kb-1",
+                content="启用安全策略。",
+                role="direct",
+                contribution_kind="answer_claim",
+                supports_requirement_ids=("r1",),
+                metadata={"filename": "历史安全配置.md"},
+            ),
+            EvidenceItem(
+                chunk_id="header-2025",
+                doc_id="security-guide",
+                kb_id="kb-1",
+                content="## 适用版本：2025",
+                metadata={"filename": "历史安全配置.md"},
+            ),
+            EvidenceItem(
+                chunk_id="rule-2025",
+                doc_id="security-guide",
+                kb_id="kb-1",
+                content="更新安全策略。",
+                role="direct",
+                contribution_kind="answer_claim",
+                supports_requirement_ids=("r1",),
+                metadata={"filename": "历史安全配置.md"},
+            ),
+        )
+        bundle = EvidenceBundle(
+            state=EvidenceState(
+                availability="ok",
+                confidence="verified",
+                completeness="complete",
+            ),
+            items=items,
+            context_item_ids=("rule-2024", "rule-2025"),
+            answer_source_ids=("rule-2024", "rule-2025"),
+        )
+        graph = build_evidence_coverage_graph(
+            bundle,
+            (requirement,),
+            claims=tuple(
+                EvidenceClaim(
+                    id=f"{chunk_id}-claim",
+                    requirement_id="r1",
+                    evidence_item_id=chunk_id,
+                    document_key=("kb-1", "security-guide"),
+                    contribution_kind="answer_claim",
+                    applicability="direct_subject",
+                    result_kind="procedure",
+                    normalized_result=chunk_id,
+                    claim_key="security configuration",
+                )
+                for chunk_id in ("rule-2024", "rule-2025")
+            ),
+        )
+        assessment = assess_evidence_coverage_graph(graph)
+        bundle = replace(
+            bundle,
+            coverage_graph=graph,
+            coverage_assessment=assessment,
+        )
+
+        assessments = _post_evidence_document_assessments(
+            bundle=bundle,
+            requirements=(requirement,),
+        )
+        decision = detect_post_evidence_document_ambiguity(
+            query="安全配置是什么",
+            requirements=(requirement,),
+            assessments=assessments,
+        )
+
+        self.assertTrue(all(
+            item.unbound_document_scope_dimensions == ("version",)
+            for item in assessments
+        ))
+        self.assertTrue(all(
+            item.unbound_document_scope_origins
+            == ("version:explicit_scope_header",)
+            for item in assessments
+        ))
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(
+            decision.reason,
+            "same_document_unbound_scope_declarations",
+        )
+
     def test_pipeline_choice_graph_merge_satisfies_chat_fail_closed_contract(
         self,
     ) -> None:

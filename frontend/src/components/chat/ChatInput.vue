@@ -10,6 +10,7 @@
       :input-props="{ 'aria-label': '输入问题' }"
       class="chat-composer__input"
       @keydown.enter.exact="handleEnter"
+      @paste="handlePaste"
     />
     <div class="chat-composer__footer">
       <div class="chat-composer__config" aria-label="检索配置">
@@ -115,6 +116,7 @@ import { NInput, NSelect, NButton, NIcon, NTooltip, NPopover } from 'naive-ui'
 import { SendOutline, StopOutline, FolderOpenOutline, SearchOutline, SparklesOutline, ChevronDownOutline } from '@vicons/ionicons5'
 import { useChatStore } from '@/stores/chat'
 import { useKnowledgeStore } from '@/stores/knowledge'
+import { normalizeSingleLinePaste } from '@/utils/chatComposer'
 
 const chatStore = useChatStore()
 const kbStore = useKnowledgeStore()
@@ -163,6 +165,25 @@ function handleEnter(event) {
   if (event.isComposing || event.keyCode === 229) return
   event.preventDefault()
   handleSend()
+}
+
+// 复制块级用户气泡时，浏览器可能在纯文本两端附加换行。只在剪贴板中
+// 实际只有一条非空内容时处理，避免破坏代码、列表和用户主动换行的问题。
+function handlePaste(event) {
+  const clipboardText = event.clipboardData?.getData('text/plain')
+  if (typeof clipboardText !== 'string') return
+
+  const normalized = normalizeSingleLinePaste(clipboardText)
+  if (normalized === clipboardText) return
+
+  const target = event.target
+  if (!(target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement)) {
+    return
+  }
+
+  event.preventDefault()
+  target.setRangeText(normalized, target.selectionStart, target.selectionEnd, 'end')
+  target.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
 // 供欢迎态示例与后续外部调用安全复用：不发送消息、不改变知识库或检索设置。

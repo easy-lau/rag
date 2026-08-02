@@ -341,6 +341,24 @@ _DOCUMENT_PROJECT_FIELD_RE = re.compile(
     r"(?:所属项目|项目名称|项目(?!版本))\s*[：:]\s*([^\n\r>,，;；]+)",
     re.IGNORECASE,
 )
+# These labels are intentionally stricter than the general identity parser
+# above.  A product name in an operation description (for example, a target
+# system named in one step) is useful for retrieval, but it does not prove
+# that the document is partitioned into mutually exclusive applicability
+# scopes.  Only an explicit scope header may participate in the final
+# fail-closed clarification guard.
+_DECLARED_APPLICABILITY_PRODUCT_FIELD_RE = re.compile(
+    r"(?im)(?:^|[\n\r；;。]|>>)[ \t>*#-]*(?:适用产品|所属产品)"
+    r"\s*[：:]\s*(?P<value>[^\n\r；;。>]+)",
+)
+_DECLARED_APPLICABILITY_VERSION_FIELD_RE = re.compile(
+    r"(?im)(?:^|[\n\r；;。]|>>)[ \t>*#-]*(?:适用版本|所属版本|产品版本)"
+    r"\s*[：:]\s*(?P<value>[^\n\r；;。>]+)",
+)
+_DECLARED_APPLICABILITY_PROJECT_FIELD_RE = re.compile(
+    r"(?im)(?:^|[\n\r；;。]|>>)[ \t>*#-]*(?:适用项目|所属项目)"
+    r"\s*[：:]\s*(?P<value>[^\n\r；;。>]+)",
+)
 # A version declaration is a small, typed grammar rather than an arbitrary
 # stretch of prose after ``产品版本：``.  In particular, a sentence such as
 # ``产品版本：6。住宿上限为 1200 元/天`` has exactly one declared version.  The
@@ -611,6 +629,24 @@ class DocumentConstraintIdentity:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class DocumentApplicabilityDeclaration:
+    """Explicit source declarations eligible for document-scope refinement.
+
+    ``DocumentConstraintIdentity`` intentionally has a broad remit: it also
+    supports retrieval admission where source titles and ordinary product
+    mentions are useful signals.  This narrower representation is only for
+    deciding whether a fully covered answer must be withheld for an unknown
+    applicability partition.
+
+    Origins are bounded diagnostic categories in ``dimension:origin`` form;
+    no source text or declared value is retained in trace diagnostics.
+    """
+
+    identity: DocumentConstraintIdentity = DocumentConstraintIdentity()
+    origins: tuple[str, ...] = ()
 
 
 def _canonical_project(value: object) -> str:
@@ -1421,6 +1457,105 @@ def extract_document_constraint_identity(
         canonical_products=tuple(sorted(canonical_products, key=str.casefold)),
         versions=tuple(sorted(versions)),
         projects=tuple(sorted(projects, key=str.casefold)),
+    )
+
+
+def _declared_scope_values(value: Any) -> set[str]:
+    """Split a structured scope declaration without treating prose as scope.
+
+    This helper is called only after a recognized metadata key or an explicit
+    applicability header has established that ``value`` is a scope field.
+    Separators describe one inclusive declaration partition (for example,
+    "适用版本：2024、2025"), not separate document sections.
+    """
+
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        entries: set[str] = set()
+        for item in value:
+            entries.update(_declared_scope_values(item))
+        return entries
+    if isinstance(value, dict):
+        return set()
+    return {
+        item.strip()
+        for item in re.split(r"[、,，;/；|]", str(value))
+        if item.strip()
+    }
+
+
+def extract_document_applicability_declaration(
+    candidate: Mapping[str, Any],
+) -> DocumentApplicabilityDeclaration:
+    """Extract only explicit scope declarations from one source chunk.
+
+    The result must not be substituted for
+    :func:`extract_document_constraint_identity`: ordinary title/body product
+    mentions remain valid retrieval evidence.  This API is deliberately for
+    the much stricter question of whether several source-declared sections
+    are mutually exclusive but cannot be bound to a closed answer route.
+    """
+
+    products: set[str] = set()
+    versions: set[str] = set()
+    projects: set[str] = set()
+    origins: set[str] = set()
+
+    raw_metadata = candidate.get("metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+    # Inherited/ambiguous identities are retrieval aids, not source-authored
+    # declarations for this particular chunk.
+    metadata.pop("inherited_document_identity", None)
+    metadata.pop("ambiguous_document_identity", None)
+    for key, value in _flatten_metadata(metadata):
+        normalized_key = _normalize_product(key)
+        if normalized_key in _NORMALIZED_PRODUCT_METADATA_KEYS:
+            declared = _declared_scope_values(value)
+            if declared:
+                products.update(declared)
+                origins.add("product:metadata")
+        elif normalized_key in _NORMALIZED_VERSION_METADATA_KEYS:
+            declared = _versions_from_value(value)
+            if declared:
+                versions.update(declared)
+                origins.add("version:metadata")
+        elif normalized_key in _NORMALIZED_PROJECT_METADATA_KEYS:
+            declared = _declared_scope_values(value)
+            if declared:
+                projects.update(declared)
+                origins.add("project:metadata")
+
+    content = str(candidate.get("content") or "")
+    for match in _DECLARED_APPLICABILITY_PRODUCT_FIELD_RE.finditer(content):
+        declared = _declared_scope_values(match.group("value"))
+        if declared:
+            products.update(declared)
+            origins.add("product:explicit_scope_header")
+    for match in _DECLARED_APPLICABILITY_VERSION_FIELD_RE.finditer(content):
+        declared = _versions_from_value(match.group("value"))
+        if declared:
+            versions.update(declared)
+            origins.add("version:explicit_scope_header")
+    for match in _DECLARED_APPLICABILITY_PROJECT_FIELD_RE.finditer(content):
+        declared = _declared_scope_values(match.group("value"))
+        if declared:
+            projects.update(declared)
+            origins.add("project:explicit_scope_header")
+
+    canonical_products = {
+        _canonical_product(product)
+        for product in products
+        if _canonical_product(product)
+    }
+    return DocumentApplicabilityDeclaration(
+        identity=DocumentConstraintIdentity(
+            products=tuple(sorted(products, key=str.casefold)),
+            canonical_products=tuple(sorted(canonical_products, key=str.casefold)),
+            versions=tuple(sorted(versions)),
+            projects=tuple(sorted(projects, key=str.casefold)),
+        ),
+        origins=tuple(sorted(origins)),
     )
 
 
