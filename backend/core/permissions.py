@@ -22,6 +22,7 @@ MENU_KNOWLEDGE = "menu:knowledge"
 MENU_DOCUMENTS = "menu:documents"
 MENU_SEARCH_TEST = "menu:search_test"
 MENU_INTENT_ROUTING = "menu:intent_routing"
+MENU_TERMINOLOGY = "menu:terminology"
 MENU_SETTINGS = "menu:settings"
 MENU_USERS = "menu:users"
 MENU_ROLES = "menu:roles"
@@ -34,6 +35,7 @@ DERIVED_MENU_KEYS: tuple[str, ...] = (
     MENU_DOCUMENTS,
     MENU_SEARCH_TEST,
     MENU_INTENT_ROUTING,
+    MENU_TERMINOLOGY,
     MENU_SETTINGS,
     MENU_USERS,
     MENU_ROLES,
@@ -57,6 +59,8 @@ SETTINGS_READ = "settings:read"
 SETTINGS_WRITE = "settings:write"
 INTENT_READ = "intent:read"
 INTENT_MANAGE = "intent:manage"
+TERMINOLOGY_READ = "terminology:read"
+TERMINOLOGY_MANAGE = "terminology:manage"
 USER_MANAGE = "user:manage"
 ROLE_MANAGE = "role:manage"
 LOG_READ = "log:read"
@@ -210,6 +214,25 @@ CAPABILITY_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "requires": (INTENT_READ,),
     },
     {
+        "key": TERMINOLOGY_READ,
+        "group": "knowledge",
+        "module": "terminology",
+        "label": "查看受控术语",
+        "description": "查看授权知识库中已审核的术语、同义关系及其适用范围。",
+        "risk": "medium",
+        "requires": (KB_READ,),
+    },
+    {
+        "key": TERMINOLOGY_MANAGE,
+        "group": "knowledge",
+        "module": "terminology",
+        "label": "管理受控术语",
+        "description": "维护会改变检索和证据语义的术语定义、别名与适用范围。",
+        "risk": "critical",
+        "superadmin_only": True,
+        "requires": (TERMINOLOGY_READ, KB_READ),
+    },
+    {
         "key": USER_MANAGE,
         "group": "system",
         "module": "users",
@@ -263,10 +286,16 @@ HIGH_RISK_CAPABILITIES = frozenset({
     KB_UPDATE,
     KB_DELETE,
     SETTINGS_WRITE,
+    TERMINOLOGY_MANAGE,
     USER_MANAGE,
     ROLE_MANAGE,
 })
-NON_SUPERADMIN_GRANT_FORBIDDEN = frozenset({USER_MANAGE, ROLE_MANAGE, SETTINGS_WRITE})
+NON_SUPERADMIN_GRANT_FORBIDDEN = frozenset({
+    USER_MANAGE,
+    ROLE_MANAGE,
+    SETTINGS_WRITE,
+    TERMINOLOGY_MANAGE,
+})
 
 # These capabilities read or mutate KB-backed data.  Their authorization is
 # meaningless without a data scope, so a role with ``scope_mode=none`` cannot
@@ -283,6 +312,8 @@ KB_SCOPE_REQUIRED_CAPABILITIES = frozenset({
     DOC_CREATE,
     DOC_UPDATE,
     DOC_DELETE,
+    TERMINOLOGY_READ,
+    TERMINOLOGY_MANAGE,
 })
 
 
@@ -306,6 +337,7 @@ MENU_REQUIRE_ANY: dict[str, frozenset[str]] = {
     MENU_DOCUMENTS: frozenset({DOC_READ, DOC_CREATE, DOC_UPDATE, DOC_DELETE}),
     MENU_SEARCH_TEST: frozenset({SEARCH_USE}),
     MENU_INTENT_ROUTING: frozenset({INTENT_READ, INTENT_MANAGE}),
+    MENU_TERMINOLOGY: frozenset({TERMINOLOGY_READ, TERMINOLOGY_MANAGE}),
     MENU_SETTINGS: frozenset({SETTINGS_READ, SETTINGS_WRITE}),
     MENU_USERS: frozenset({USER_MANAGE}),
     MENU_ROLES: frozenset({ROLE_MANAGE}),
@@ -319,6 +351,7 @@ MENUS: list[dict[str, Any]] = [
     {"key": MENU_DOCUMENTS, "route": "documents", "title": "文档管理", "permission": MENU_DOCUMENTS, "derived": True},
     {"key": MENU_SEARCH_TEST, "route": "search-test", "title": "检索测试", "permission": MENU_SEARCH_TEST, "derived": True},
     {"key": MENU_INTENT_ROUTING, "route": "intent-routing", "title": "智能路由", "permission": MENU_INTENT_ROUTING, "derived": True},
+    {"key": MENU_TERMINOLOGY, "route": "terminology", "title": "受控术语", "permission": MENU_TERMINOLOGY, "derived": True},
     {"key": MENU_SETTINGS, "route": "settings", "title": "系统设置", "permission": MENU_SETTINGS, "derived": True},
     {"key": MENU_USERS, "route": "users", "title": "用户管理", "permission": MENU_USERS, "derived": True},
     {"key": MENU_ROLES, "route": "roles", "title": "角色管理", "permission": MENU_ROLES, "derived": True},
@@ -336,6 +369,7 @@ MODULE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {"key": "documents", "group": "knowledge", "label": "文档管理", "description": "知识库文档与标签。", "menu": MENU_DOCUMENTS},
     {"key": "search_test", "group": "knowledge", "label": "检索测试", "description": "检索召回与效果测试。", "menu": MENU_SEARCH_TEST},
     {"key": "intent_routing", "group": "knowledge", "label": "智能路由", "description": "意图分类、路由策略和反馈。", "menu": MENU_INTENT_ROUTING},
+    {"key": "terminology", "group": "knowledge", "label": "受控术语", "description": "审核术语、同义关系及其知识库适用范围。", "menu": MENU_TERMINOLOGY},
     {"key": "settings", "group": "system", "label": "系统设置", "description": "模型、检索策略和站点配置。", "menu": MENU_SETTINGS},
     {"key": "users", "group": "system", "label": "用户管理", "description": "用户账号与角色分配。", "menu": MENU_USERS},
     {"key": "roles", "group": "system", "label": "角色管理", "description": "角色、能力和知识库范围。", "menu": MENU_ROLES},
@@ -404,7 +438,7 @@ ROLE_TEMPLATES: tuple[dict[str, Any], ...] = (
 
 
 PERMISSION_CATALOG: dict[str, Any] = {
-    "version": 4,
+    "version": 5,
     "capabilities": [dict(item) for item in CAPABILITY_DEFINITIONS],
     "groups": (
         {"key": "workspace", "label": "问答工作台"},

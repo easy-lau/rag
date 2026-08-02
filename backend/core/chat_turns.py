@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from core.evidence_status import canonical_evidence_status
 from models.db_models import ChatTurn, Message, now_utc
 
 
@@ -322,7 +323,13 @@ def transition_turn(
     if trace_id is not None:
         turn.trace_id = str(trace_id)[:64]
     if evidence_status is not None:
-        turn.evidence_status = str(evidence_status)[:32]
+        # A state transition is a persistence boundary shared by API and
+        # recovery paths.  Accept the one rolling legacy spelling on input,
+        # but never write it back; unknown producer values fail closed to the
+        # canonical infrastructure-error status.
+        turn.evidence_status = (
+            canonical_evidence_status(evidence_status) or "error"
+        )[:32]
     if retrieval_executed is not None:
         turn.retrieval_executed = bool(retrieval_executed)
     if error_code is not None:

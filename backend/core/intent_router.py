@@ -43,6 +43,7 @@ from core.query_route_contract import (
     build_rag_route_response_format,
     parse_rag_route_decision,
 )
+from core.query_surface_structure import parse_query_surface_frame
 from core.rag_trace import content_fields, exception_log_text, trace_event
 from core.rag_v2.query_plan import infer_implicit_bridge
 from models.db_models import (
@@ -423,6 +424,48 @@ def _is_knowledge_dependent_writing_request(question: str) -> bool:
     )
 
 
+def _is_current_turn_entity_attribute_lookup(question: str) -> bool:
+    """Whether the current text itself asks for an entity's source-backed attribute.
+
+    Routing and evidence planning answer different questions.  The planner may
+    deliberately decline to add a classification bridge for a stable entity
+    such as ``供应商甲`` or ``客户A`` because the requested attribute can be
+    proved directly.  That must not make the router treat the same explicit
+    entity-attribute request as general chat.  Use the shared current-turn
+    surface frame instead of a bridge inference so the route decision is
+    independent of later retrieval-plan topology.
+
+    This remains conservative: a frame needs an explicit entity qualifier and
+    a distinct answer target.  A bare concept such as ``普通员工是什么`` keeps
+    its ordinary semantic-routing path rather than being forced to the KB.
+    """
+
+    frame = parse_query_surface_frame(question)
+    if frame is None or not frame.entity_qualifiers:
+        return False
+    target = str(frame.answer_target or "").strip()
+    if not target:
+        return False
+    entity_values = {
+        str(item.text or "").strip().casefold()
+        for item in frame.entity_qualifiers
+        if str(item.text or "").strip()
+    }
+    if not entity_values or target.casefold() in entity_values:
+        return False
+    # An explicit interrogative/operator makes this a concrete lookup even
+    # when the attribute has no policy noun (for example ``餐补是多少``).
+    if frame.question_operator != "unknown":
+        return True
+    # Compact noun phrases can omit the interrogative, e.g. ``客户A审批额度``.
+    # Keep the no-operator route limited to generic governance/attribute heads
+    # rather than promoting arbitrary entity mentions to mandatory retrieval.
+    return any(
+        term in target
+        for term in (*_NORMATIVE_TERMS, *_STRUCTURAL_NORMATIVE_TERMS)
+    )
+
+
 def _is_normative_query(question: str) -> bool:
     """Recognize a conservative policy/standard lookup by sentence shape.
 
@@ -445,17 +488,14 @@ def _is_normative_query(question: str) -> bool:
     if any(marker in text for marker in _NORMATIVE_CONCEPT_MARKERS):
         return False
 
-    # A predicate is optional only when the query planner can independently
-    # prove a concrete entity/condition -> policy-attribute shape, for example
-    # ``总经理的住宿标准`` or ``供应商A风险处置要求``.  This lets a selected
-    # enterprise KB take the deterministic route even when the user omits
-    # ``是什么`` without turning bare noun phrases such as ``住宿标准`` into
-    # enterprise lookups.
-    structural_lookup = infer_implicit_bridge(text) is not None
+    # A current-turn entity/attribute frame is sufficient to require
+    # grounding.  Do not use ``infer_implicit_bridge`` here: it is an evidence
+    # planning decision, and correctly returns no bridge for direct stable
+    # entity attributes such as ``客户A的审批额度``.
+    if _is_current_turn_entity_attribute_lookup(text):
+        return True
 
-    for term in (*_NORMATIVE_TERMS, *_STRUCTURAL_NORMATIVE_TERMS):
-        if term in _STRUCTURAL_NORMATIVE_TERMS and not structural_lookup:
-            continue
+    for term in _NORMATIVE_TERMS:
         start = text.find(term)
         while start >= 0:
             prefix = text[:start].strip()
@@ -471,7 +511,6 @@ def _is_normative_query(question: str) -> bool:
                         not suffix
                         and _NORMATIVE_LOOKUP_PREFIX_RE.search(prefix)
                     )
-                    or (not suffix and structural_lookup)
                     or (suffix in {"?", "？", "。", "！", "!"})
                 ):
                     return True

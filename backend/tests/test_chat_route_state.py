@@ -1,6 +1,8 @@
 import unittest
 import uuid
 import json
+from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import get_args
@@ -21,7 +23,10 @@ from api.chat import (
     _scoped_evidence_query,
     send_message,
 )
-from core.conversation_context import ConversationContext
+from core.conversation_context import ConversationContext, RouteTurnCandidate
+from core.query_analysis_execution import get_query_analysis_execution_service
+from core.query_analysis_contract import QueryAnalysisSourceRef
+from core.query_semantics import ResolvedAnswerUnit, ResolvedTurnSemantics
 from core.evidence_ambiguity import detect_post_evidence_document_ambiguity
 from core.query_route_compiler import (
     RouteCategoryPolicy,
@@ -31,11 +36,20 @@ from core.query_route_compiler import (
 from core.query_route_contract import parse_rag_route_decision
 from core.rag_v2.contracts import (
     AnswerRequirementV2,
+    BridgeClaimBinding,
     EvidenceBundle,
+    EvidenceClaim,
     EvidenceItem,
     EvidenceState,
 )
+from core.rag_v2.evidence_graph import (
+    assess_evidence_coverage_graph,
+    build_evidence_coverage_graph,
+)
 from core.rag_v2.pipeline import _post_evidence_document_assessments
+from core.rag_v2.query_plan import plan_query_locally
+from core.rag_v2.task_graph import compile_rag_execution_bundle
+from config import get_settings
 from models.db_models import Document, DocumentChunk, IntentRouteLog
 from models.schemas import ChatRequest, IntentEvidenceStatus
 
@@ -287,9 +301,359 @@ class _RowsResult:
 class _SourceValidationDB:
     def __init__(self, rows):
         self.rows = rows
+        self.rollback_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback):
+        return False
 
     async def execute(self, _statement):
         return _RowsResult(self.rows)
+
+    async def rollback(self):
+        self.rollback_calls += 1
+
+
+class QuerySemanticApiHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_v2_uses_semantic_rendering_after_active_analysis(self) -> None:
+        # This covers the deliberately retained ``legacy`` semantic entry.
+        # V3 is the production default and has its own catalog-bound handoff
+        # coverage; do not let a global default silently change the authority
+        # exercised by this legacy regression.
+        legacy_settings = get_settings().model_copy(
+            update={
+                "rag_semantic_entry": "legacy",
+                "rag_query_analyzer_mode": "active",
+            }
+        )
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RouteStateDB(conv)
+        save_db = _SaveStateDB(conv)
+        raw_question = "餐补呢"
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query="餐补呢。普通员工的住宿标准是多少",
+            history_messages=(),
+            carryover_sources=(),
+        )
+        semantic_context = ConversationContext(
+            is_followup=True,
+            followup_reason="resolved_turn_semantics_contextual",
+            standalone_query="普通员工 餐补",
+            history_messages=[
+                {"role": "user", "content": "普通员工的住宿标准是多少"},
+            ],
+            carryover_sources=(),
+            relation="followup",
+            query_resolution_mode="contextualize",
+            context_turn_keys=("t1",),
+        )
+        target = QueryAnalysisSourceRef(
+            turn_key="current",
+            start=0,
+            end=2,
+            span="餐补",
+        )
+        qualifier = QueryAnalysisSourceRef(
+            turn_key="t1",
+            start=0,
+            end=4,
+            span="普通员工",
+        )
+        semantics = ResolvedTurnSemantics(
+            schema_version="resolved_turn_semantics.v1",
+            relation="followup",
+            self_contained=False,
+            selected_context_turn_keys=("t1",),
+            request_kind="single_fact",
+            answer_units=(ResolvedAnswerUnit(
+                id="a1",
+                target_source_ref=target,
+                qualifier_source_refs=(qualifier,),
+                bridge_candidate_ids=(),
+            ),),
+            bridge_candidates=(),
+            canonical_retrieval_queries=("普通员工 餐补",),
+            canonical_retrieval_query="普通员工 餐补",
+        )
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+        )
+        active_result = SimpleNamespace(
+            applied=True,
+            semantics=semantics,
+            # ``applied`` is a semantic/bundle pair in the production
+            # contract.  Use a real ledgered bundle rather than a permissive
+            # mock that would mask a split-authority handoff.
+            execution_bundle=compile_rag_execution_bundle(
+                plan_query_locally("普通员工的餐补是多少")
+            ),
+            decision="applied",
+            reason="generic_baseline_replaced",
+            analysis_latency_ms=1,
+        )
+        service = SimpleNamespace(
+            run_active=AsyncMock(return_value=active_result),
+            submit_shadow=lambda **_kwargs: False,
+        )
+        received_kwargs: list[dict] = []
+
+        async def answer_stream(**kwargs):
+            received_kwargs.append(kwargs)
+            yield 'data: {"type":"search_results","results":[],"answer_sources":[],"retrieval_executed":true,"evidence_status":"no_hit"}\n\n'
+            yield 'data: {"type":"text_delta","content":"未找到。"}\n\n'
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch("api.chat.prepare_conversation_context", new=AsyncMock(return_value=context)),
+            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=routing_result)),
+            patch("api.chat.get_query_analysis_execution_service", return_value=service),
+            patch("api.chat.apply_resolved_turn_semantics", new=AsyncMock(return_value=semantic_context)),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("api.chat.get_settings", return_value=legacy_settings),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=raw_question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            [chunk async for chunk in response.body_iterator]
+
+        self.assertEqual(len(received_kwargs), 1)
+        handoff = received_kwargs[0]
+        self.assertEqual(handoff["question"], raw_question)
+        self.assertEqual(handoff["standalone_query"], "普通员工 餐补")
+        self.assertTrue(handoff["is_followup"])
+        self.assertEqual(handoff["conversation_history"], semantic_context.history_messages)
+        self.assertNotIn("住宿标准", handoff["standalone_query"])
+
+    async def test_v2_resolves_strict_contextual_ellipsis_before_model_analysis(self) -> None:
+        # This is the compatibility-path contract.  Production V3 resolves
+        # the same source pair through its catalog-bound deterministic
+        # producer and is covered separately in test_chat_v3_integration.
+        legacy_settings = get_settings().model_copy(
+            update={
+                "rag_semantic_entry": "legacy",
+                "rag_query_analyzer_mode": "off",
+            }
+        )
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RouteStateDB(conv)
+        save_db = _SaveStateDB(conv)
+        raw_question = "那住宿呢"
+        prior = "普通员工的出差标准是什么"
+        context = ConversationContext(
+            is_followup=True,
+            followup_reason="short_elliptical_question",
+            standalone_query=raw_question,
+            history_messages=(),
+            carryover_sources=(),
+            route_turn_candidates=(RouteTurnCandidate(
+                candidate_key="t1",
+                user_question=prior,
+                assistant_answer="普通员工对应 D级。",
+            ),),
+            relation="followup",
+            query_resolution_mode="contextualize",
+            context_turn_keys=("t1",),
+        )
+        semantic_context = ConversationContext(
+            is_followup=True,
+            followup_reason="resolved_turn_semantics_contextual",
+            standalone_query="普通员工 住宿",
+            history_messages=[{"role": "user", "content": prior}],
+            carryover_sources=(),
+            route_turn_candidates=context.route_turn_candidates,
+            relation="followup",
+            query_resolution_mode="contextualize",
+            context_turn_keys=("t1",),
+        )
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+        )
+        actual_service = get_query_analysis_execution_service()
+
+        async def deterministic(**kwargs):
+            return await actual_service.run_deterministic_contextual_ellipsis(**kwargs)
+
+        deterministic_call = AsyncMock(side_effect=deterministic)
+        service = SimpleNamespace(
+            run_deterministic_contextual_ellipsis=deterministic_call,
+            run_active=AsyncMock(),
+            submit_shadow=lambda **_kwargs: False,
+        )
+        received_kwargs: list[dict] = []
+
+        async def answer_stream(**kwargs):
+            received_kwargs.append(kwargs)
+            yield 'data: {"type":"search_results","results":[],"answer_sources":[],"retrieval_executed":true,"evidence_status":"no_hit"}\n\n'
+            yield 'data: {"type":"text_delta","content":"未找到。"}\n\n'
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch("api.chat.prepare_conversation_context", new=AsyncMock(return_value=context)),
+            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=routing_result)),
+            patch("api.chat.get_query_analysis_execution_service", return_value=service),
+            patch("api.chat.apply_resolved_turn_semantics", new=AsyncMock(return_value=semantic_context)),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("api.chat.get_settings", return_value=legacy_settings),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=raw_question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            [chunk async for chunk in response.body_iterator]
+
+        self.assertEqual(len(received_kwargs), 1)
+        handoff = received_kwargs[0]
+        self.assertEqual(handoff["standalone_query"], "普通员工 住宿")
+        self.assertTrue(handoff["is_followup"])
+        self.assertEqual(handoff["conversation_history"], semantic_context.history_messages)
+        deterministic_call.assert_awaited_once()
+        service.run_active.assert_not_awaited()
+
+    async def test_v2_keeps_route_candidate_history_out_after_analysis_fallback(self) -> None:
+        """A timed-out/rejected analyzer must not revive legacy follow-up state.
+
+        The route context is intentionally populated with the old concatenated
+        query, history and a carry-over source.  The V2 hand-off must contain
+        none of them unless a ResolvedTurnSemantics object was applied.
+        """
+
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RouteStateDB(conv)
+        save_db = _SaveStateDB(conv)
+        raw_question = "餐补呢"
+        legacy_route_context = ConversationContext(
+            is_followup=True,
+            followup_reason="route_contextualized",
+            standalone_query="餐补呢。普通员工的住宿标准是多少",
+            history_messages=(
+                {"role": "user", "content": "普通员工的住宿标准是多少"},
+                {"role": "assistant", "content": "已按 D 级查到住宿标准。"},
+            ),
+            carryover_sources=(
+                {"id": str(uuid.uuid4()), "content": "D级住宿标准"},
+            ),
+            relation="followup",
+            query_resolution_mode="contextualize",
+            context_turn_keys=("t1",),
+        )
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+            relation="followup",
+        )
+        active_result = SimpleNamespace(
+            applied=False,
+            semantics=None,
+            execution_bundle=None,
+            decision="fallback",
+            reason="analysis_timeout",
+            analysis_latency_ms=1,
+        )
+        service = SimpleNamespace(
+            run_active=AsyncMock(return_value=active_result),
+            submit_shadow=lambda **_kwargs: False,
+        )
+        received_kwargs: list[dict] = []
+
+        async def answer_stream(**kwargs):
+            received_kwargs.append(kwargs)
+            yield 'data: {"type":"search_results","results":[],"answer_sources":[],"retrieval_executed":true,"evidence_status":"no_hit"}\n\n'
+            yield 'data: {"type":"text_delta","content":"未找到。"}\n\n'
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=legacy_route_context),
+            ),
+            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=routing_result)),
+            patch(
+                "api.chat.resolve_routed_conversation_context",
+                new=AsyncMock(return_value=legacy_route_context),
+            ),
+            patch("api.chat.get_query_analysis_execution_service", return_value=service),
+            patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=raw_question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            [chunk async for chunk in response.body_iterator]
+
+        self.assertEqual(len(received_kwargs), 1)
+        handoff = received_kwargs[0]
+        self.assertEqual(handoff["standalone_query"], raw_question)
+        self.assertFalse(handoff["is_followup"])
+        self.assertEqual(handoff["conversation_history"], [])
+        self.assertEqual(handoff["carryover_sources"], [])
+        self.assertEqual(handoff["followup_reason"], "v2_current_turn_baseline")
 
 
 class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
@@ -353,6 +717,162 @@ class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed, [])
         self.assertEqual(pairs, set())
         self.assertTrue(str(error).startswith("source_refresh_failed:"))
+
+    async def test_refresh_uses_owned_read_session_not_request_transaction(self) -> None:
+        """A source refresh must survive an earlier optional read failure.
+
+        The request session models the transaction that owns turn/message
+        persistence.  It deliberately rejects reads: a successful refresh
+        proves the validation boundary opened a separate short-lived session
+        rather than attempting to recover a poisoned request transaction.
+        """
+
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="当前制度.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="数据库中的真实内容",
+            chunk_index=3,
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "不可信的生产者快照",
+            "evidence_role": "direct",
+        }
+
+        class RequestSession:
+            def __init__(self):
+                self.execute_calls = 0
+                self.rollback_calls = 0
+
+            async def execute(self, *_args, **_kwargs):
+                self.execute_calls += 1
+                raise AssertionError("source refresh must not use request db")
+
+            async def rollback(self):
+                self.rollback_calls += 1
+
+        request_session = RequestSession()
+        owned_sessions: list[_SourceValidationDB] = []
+
+        @asynccontextmanager
+        async def read_session_factory():
+            session = _SourceValidationDB([(chunk, document)])
+            session.rollback_calls = 0
+
+            async def rollback():
+                session.rollback_calls += 1
+
+            session.rollback = rollback
+            owned_sessions.append(session)
+            yield session
+
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            request_session,
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+            read_session_factory=read_session_factory,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(refreshed[0]["content"], "数据库中的真实内容")
+        self.assertEqual(pairs, {(kb_id, doc_id)})
+        self.assertEqual(request_session.execute_calls, 0)
+        self.assertEqual(request_session.rollback_calls, 0)
+        self.assertEqual(len(owned_sessions), 1)
+        self.assertEqual(owned_sessions[0].rollback_calls, 1)
+
+    async def test_owned_refresh_projects_rows_before_rollback_detaches_them(self) -> None:
+        """The read-session boundary must not leak expired ORM objects.
+
+        A real SQLAlchemy ``rollback`` expires all loaded attributes.  This
+        proxy makes every later attribute access fail, so the test proves that
+        source snapshot projection happens while the owned read session is
+        still live rather than after ``isolated_read_session`` exits.
+        """
+
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="当前制度.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="数据库中的真实内容",
+            chunk_index=3,
+            metadata_={"section": "交通"},
+        )
+        expired = {"value": False}
+
+        class ExpiringRow:
+            def __init__(self, value):
+                self._value = value
+
+            def __getattr__(self, name):
+                if expired["value"]:
+                    raise AssertionError(
+                        "ORM attribute was accessed after owned read-session rollback"
+                    )
+                return getattr(self._value, name)
+
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "不可信的生产者快照",
+            "evidence_role": "direct",
+        }
+
+        @asynccontextmanager
+        async def read_session_factory():
+            session = _SourceValidationDB([
+                (ExpiringRow(chunk), ExpiringRow(document)),
+            ])
+
+            async def rollback():
+                session.rollback_calls += 1
+                expired["value"] = True
+
+            session.rollback = rollback
+            yield session
+
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            object(),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+            read_session_factory=read_session_factory,
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(pairs, {(kb_id, doc_id)})
+        self.assertEqual(refreshed[0]["content"], "数据库中的真实内容")
+        self.assertEqual(refreshed[0]["metadata"], {"section": "交通"})
+        self.assertTrue(expired["value"])
 
     async def test_inactive_document_is_not_accepted_from_adapter_rows(self) -> None:
         kb_id = uuid.uuid4()
@@ -755,6 +1275,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             AnswerRequirementV2(
                 id="r1",
                 description="查询普通员工的当前规则",
+                depends_on_requirement_ids=("r2",),
             ),
             AnswerRequirementV2(
                 id="r2",
@@ -763,6 +1284,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 importance="helpful",
                 source="inferred",
                 bridge_subject="普通员工",
+                bridge_kind="classification",
             ),
         )
         bundle = EvidenceBundle(
@@ -776,48 +1298,42 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                     chunk_id=str(dependent_chunk_id),
                     doc_id=str(dependent_doc_id),
                     kb_id=str(kb_id),
-                    content="规则明细需要结合职级总表。",
+                    content="规则明细：D级当前规则为100。",
                     role="direct",
+                    contribution_kind="answer_claim",
                     supports_requirement_ids=("r1",),
                     metadata={
                         "filename": "规则明细.md",
                         "product": "云枢",
                         "version": "6.0.1",
-                        "resolved_bridge_joins": [{
-                            "answer_requirement_id": "r1",
-                            "bridge_requirement_id": "r2",
-                            "bridge_source_chunk_id": str(dominant_chunk_id),
-                            "bridge_source_doc_id": str(dominant_doc_id),
-                            "bridge_source_kb_id": str(kb_id),
-                        }],
                     },
                 ),
                 EvidenceItem(
                     chunk_id=str(dominant_chunk_id),
                     doc_id=str(dominant_doc_id),
                     kb_id=str(kb_id),
-                    content="职级总表也直接列出了当前规则。",
-                    role="direct",
-                    supports_requirement_ids=("r1", "r2"),
+                    content="普通员工对应D级。",
+                    role="bridge",
+                    contribution_kind="bridge_fact",
+                    supports_requirement_ids=("r2",),
                     metadata={
                         "filename": "规则总表.md",
                         "product": "云枢",
                         "version": "6.0.1",
-                        "direct_subject_answer_requirement_ids": ["r1"],
                     },
                 ),
                 EvidenceItem(
                     chunk_id=str(independent_chunk_id),
                     doc_id=str(independent_doc_id),
                     kb_id=str(kb_id),
-                    content="另一套规则独立回答当前问题。",
+                    content="普通员工当前规则为100。",
                     role="direct",
+                    contribution_kind="answer_claim",
                     supports_requirement_ids=("r1",),
                     metadata={
                         "filename": "另一套规则.md",
                         "product": "云枢",
                         "version": "7.1.0",
-                        "direct_subject_answer_requirement_ids": ["r1"],
                     },
                 ),
             ),
@@ -831,6 +1347,58 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 str(dominant_chunk_id),
                 str(independent_chunk_id),
             ),
+        )
+        # This test previously fabricated route topology from renderer
+        # metadata.  The V2 clarification producer only consumes a final
+        # closed evidence graph, so construct the same typed bridge/answer
+        # claims that a ledgered pipeline must provide.
+        graph = build_evidence_coverage_graph(
+            bundle,
+            requirements,
+            claims=(
+                EvidenceClaim(
+                    id="r2-bridge",
+                    requirement_id="r2",
+                    evidence_item_id=str(dominant_chunk_id),
+                    document_key=(str(kb_id), str(dominant_doc_id)),
+                    contribution_kind="bridge_fact",
+                    applicability="bridge_value",
+                ),
+                EvidenceClaim(
+                    id="r1-dependent",
+                    requirement_id="r1",
+                    evidence_item_id=str(dependent_chunk_id),
+                    document_key=(str(kb_id), str(dependent_doc_id)),
+                    contribution_kind="answer_claim",
+                    applicability="bridge_value",
+                    result_kind="scalar",
+                    normalized_result="100",
+                    claim_key="当前规则",
+                    bridge_bindings=(BridgeClaimBinding(
+                        bridge_requirement_id="r2",
+                        bridge_source_item_id=str(dominant_chunk_id),
+                        bridge_value="D级",
+                    ),),
+                ),
+                EvidenceClaim(
+                    id="r1-independent",
+                    requirement_id="r1",
+                    evidence_item_id=str(independent_chunk_id),
+                    document_key=(str(kb_id), str(independent_doc_id)),
+                    contribution_kind="answer_claim",
+                    applicability="direct_subject",
+                    result_kind="scalar",
+                    normalized_result="100",
+                    claim_key="当前规则",
+                ),
+            ),
+        )
+        assessment = assess_evidence_coverage_graph(graph)
+        bundle = replace(
+            bundle,
+            coverage_graph=graph,
+            coverage_assessment=assessment,
+            missing_requirement_ids=assessment.missing_requirement_ids,
         )
         decision = detect_post_evidence_document_ambiguity(
             query="当前规则是什么",
@@ -1372,13 +1940,33 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             conv.pending_route_state["unresolved"][0]["role"],
-            "query_plan",
+            "query_execution",
+        )
+        self.assertEqual(
+            conv.pending_route_state["unresolved"][0]["reason"],
+            "missing",
         )
         intent = next(
             item["decision"] for item in payloads if item and item["type"] == "intent"
         )
         self.assertEqual(intent["readiness"], "needs_clarification")
         self.assertFalse(intent["dispatch_authorized"])
+        # ``query.plan`` describes the question structure.  The additional
+        # execution projection is the only authority that says the final
+        # plan/bundle pair must stop before retrieval.
+        self.assertEqual(
+            intent["query_execution"],
+            {
+                "schema_version": "rag_query_execution.v1",
+                "state": "needs_clarification",
+                "dispatch_authorized": False,
+                "decision_reason": "execution_baseline_not_runnable",
+                "unresolved": [{
+                    "role": "query_execution",
+                    "reason": "missing",
+                }],
+            },
+        )
         answer = "".join(
             str(item.get("content") or "")
             for item in payloads
@@ -1389,6 +1977,16 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         trace_events = [call.args[0] for call in trace.call_args_list if call.args]
         self.assertNotIn("retrieval.plan", trace_events)
         self.assertIn("query.plan", trace_events)
+        self.assertIn("query.execution", trace_events)
+        execution_trace = next(
+            call.kwargs
+            for call in trace.call_args_list
+            if call.args and call.args[0] == "query.execution"
+        )
+        self.assertEqual(execution_trace["state"], "needs_clarification")
+        self.assertFalse(execution_trace["dispatch_authorized"])
+        self.assertEqual(execution_trace["unresolved_role"], "query_execution")
+        self.assertEqual(execution_trace["unresolved_reason"], "missing")
 
     def test_broad_refinement_remains_one_query_plan(self) -> None:
         refined = _refined_evidence_query("员工标准是什么", "2025版")
@@ -1542,8 +2140,12 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["schema_version"], "rag_pending_clarification.v2")
         self.assertEqual(state["kind"], "evidence_scope")
         self.assertFalse(state["dispatch_authorized"])
-        self.assertEqual(state["original_query"], pending_template["original_query"])
-        self.assertNotEqual(state["original_query"], raw_followup_question)
+        # No source-anchored semantic context was supplied to this mocked
+        # request.  The V2 boundary must preserve the current user text rather
+        # than recover a previous topic through the legacy standalone-query
+        # concatenation path.
+        self.assertEqual(state["original_query"], raw_followup_question)
+        self.assertNotEqual(state["original_query"], pending_template["original_query"])
         self.assertEqual([item["key"] for item in state["choices"]], ["c1", "c2"])
         self.assertEqual(conv.route_state_revision, 1)
         self.assertEqual(_active_pending_route_state(state), state)
@@ -1871,6 +2473,8 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "done", "conversation_id": str(conversation_id)}
             ) + "\n\n"
 
+        source_read_db = _SourceValidationDB([(chunk, document)])
+
         with (
             patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
             patch(
@@ -1886,6 +2490,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=context),
             ),
             patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("api.chat.TaskReadSessionLocal", return_value=source_read_db),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -2021,6 +2626,8 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 {"type": "done", "conversation_id": str(conversation_id)}
             ) + "\n\n"
 
+        source_read_db = _SourceValidationDB([(chunk, document)])
+
         with (
             patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
             patch(
@@ -2036,6 +2643,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=context),
             ),
             patch("api.chat.run_rag_v2_stream", new=answer_stream),
+            patch("api.chat.TaskReadSessionLocal", return_value=source_read_db),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
         ):
@@ -2482,8 +3090,12 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             [call.args[0] for call in trace.call_args_list],
         )
 
-    async def test_broad_refinement_keeps_pending_on_handled_error_or_skipped_status(self) -> None:
-        for terminal_status in ("error", "skipped"):
+    async def test_broad_refinement_keeps_pending_on_non_answer_terminal_status(self) -> None:
+        # A related-but-unclosed evidence graph is not a successful scoped
+        # answer.  It must preserve the pending choice just like a technical
+        # error or a skipped retrieval, otherwise a user could lose the only
+        # route back to a selectable evidence scope.
+        for terminal_status in ("error", "skipped", "insufficient_evidence"):
             with self.subTest(terminal_status=terminal_status):
                 conversation_id = uuid.uuid4()
                 user_id = uuid.uuid4()

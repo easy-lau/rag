@@ -15,7 +15,7 @@ from api.chat import (
     _public_stream_error_message,
     send_message,
 )
-from core.conversation_context import ConversationContext
+from core.conversation_context import ConversationContext, RouteTurnCandidate
 from core.query_route_compiler import (
     RouteCategoryPolicy,
     RouteCompilerConfig,
@@ -411,6 +411,7 @@ class ChatHistoricalSourceScopeTests(unittest.IsolatedAsyncioTestCase):
         doc_id = uuid.uuid4()
         for evidence_status in (
             "no_hit",
+            "insufficient_evidence",
             "skipped",
             "error",
             "needs_clarification",
@@ -636,12 +637,19 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
                 if producer_state is not None:
                     producer_state["closed"] = True
 
-        async def trusted_source_refresh(_db, *, raw_sources, raw_results, selected_kb_ids):
+        async def trusted_source_refresh(
+            _db,
+            *,
+            raw_sources,
+            raw_results,
+            selected_kb_ids,
+            read_session_factory=None,
+        ):
             # These tests exercise persistence/event accounting.  The dedicated
             # source-validation tests cover the real DB refresh boundary; use a
             # trusted fixture here so arbitrary UUID snapshots do not need a
             # database row for every case.
-            del raw_results, selected_kb_ids
+            del raw_results, selected_kb_ids, read_session_factory
             sources = list(raw_sources or [])
             pairs = {
                 (uuid.UUID(str(source["kb_id"])), uuid.UUID(str(source["doc_id"])))
@@ -739,6 +747,7 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
         claimed_source = self._source(role="direct", filename="错误携带的证据.md")
         for evidence_status in (
             "no_hit",
+            "insufficient_evidence",
             "skipped",
             "error",
             "needs_clarification",
@@ -1012,7 +1021,9 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
         answer = next(item for item in payloads if item["type"] == "text_delta")
         self.assertIn("无法确定", answer["content"])
 
-    async def test_missing_object_followup_uses_standalone_query_for_intent_router(self) -> None:
+    async def test_missing_object_followup_passes_current_turn_and_route_candidate_separately(
+        self,
+    ) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
@@ -1029,6 +1040,13 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "assistant", "content": "它是一类登录信息泄露风险。"},
             ),
             carryover_sources=(),
+            route_turn_candidates=(
+                RouteTurnCandidate(
+                    candidate_key="t1",
+                    user_question="登录用户名枚举是什么",
+                    assistant_answer="它是一类登录信息泄露风险。",
+                ),
+            ),
         )
         routing_result = _routing_result(
             selected_kb_count=1,
@@ -1055,7 +1073,21 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                 user=user,
             )
 
-        self.assertEqual(classify.await_args.args[1], standalone_query)
+        # V2 routing receives only the current user text.  Historical wording
+        # is an explicit, bounded ``t1`` candidate rather than being merged
+        # into a synthetic standalone question before the route contract is
+        # validated.
+        self.assertEqual(classify.await_args.args[1], "云枢中如何配置")
+        self.assertNotEqual(classify.await_args.args[1], standalone_query)
+        self.assertEqual(
+            classify.await_args.kwargs["route_context"],
+            ({
+                "candidate_key": "t1",
+                "user_input": "登录用户名枚举是什么",
+                "assistant_answer": "它是一类登录信息泄露风险。",
+                "reusable_source_count": 0,
+            },),
+        )
         self.assertEqual(classify.await_args.kwargs["selected_kb_ids"], [kb_id])
 
     async def test_required_retrieval_without_kb_finishes_trace_as_validation_error(self) -> None:

@@ -2318,6 +2318,170 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         self.assertEqual(decision.reason, "single_assessed_answer_document")
         self.assertEqual(decision.relevant_document_count, 1)
 
+    def test_post_evidence_same_document_composable_answer_dimensions_do_not_require_choice(
+        self,
+    ) -> None:
+        """Table dimensions are answer content, not applicability choices.
+
+        A single policy may contain several closed propositions for one answer:
+        city bands, region bands, or deadline bands. A parser-identified,
+        complete source table is the graph-level proof that those propositions
+        are one jointly presentable answer rather than competing rules.
+        """
+
+        cases = {
+            "city": (
+                "普通员工的住宿标准是多少",
+                ("一线城市", "二线城市", "其他城市"),
+            ),
+            "region": (
+                "特殊地区的出差补贴规则是什么",
+                ("偏远地区", "艰苦地区"),
+            ),
+            "date": (
+                "出差结束后的办理期限是什么",
+                ("回程后3个工作日", "结束后5个工作日"),
+            ),
+        }
+        requirements = ({
+            "id": "r1",
+            "role": "answer",
+            "importance": "required",
+        },)
+
+        for dimension, (query, values) in cases.items():
+            with self.subTest(answer_dimension=dimension):
+                decision = detect_post_evidence_document_ambiguity(
+                    query=query,
+                    requirements=requirements,
+                    assessments=[
+                        DocumentEvidenceAssessment(
+                            kb_id="kb-1",
+                            doc_id="doc-travel-policy",
+                            filename="公司出差管理标准.docx",
+                            evidence_role="standalone_answer",
+                            supports_requirement_ids=("r1",),
+                            topic_relevance=0.98,
+                            answer_support=0.97,
+                            assessment_valid=True,
+                            chunk_ids=(f"{dimension}-{index}",),
+                            section_keys=(f"{dimension}-{index}",),
+                            answer_route_key=(
+                                f"{dimension}:{value}"
+                            ),
+                            composable_answer_group_ids=(
+                                f"complete-table:{dimension}",
+                            ),
+                        )
+                        for index, value in enumerate(values, start=1)
+                    ],
+                )
+
+                self.assertFalse(decision.needs_clarification)
+                self.assertEqual(
+                    decision.reason,
+                    "single_assessed_answer_document",
+                )
+                self.assertEqual(decision.relevant_document_count, 1)
+
+    def test_composable_table_certificate_survives_route_companion_merge(
+        self,
+    ) -> None:
+        """Different route companions cannot erase a table's composition proof.
+
+        This exercises the production topology in which final graph routes
+        from one table have different bridge/condition companions.  They are
+        collapsed to one physical policy document before ambiguity assessment,
+        so the table certificate must be unioned with their route identities.
+        """
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="普通员工的住宿标准是多少",
+            requirements=({
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            },),
+            assessments=[
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-travel-policy",
+                    filename="公司出差管理标准.docx",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=0.98,
+                    answer_support=0.97,
+                    assessment_valid=True,
+                    chunk_ids=("lodging-city-a",),
+                    section_keys=("lodging",),
+                    companion_doc_ids=("doc-city-definition",),
+                    answer_route_key="lodging:一线城市",
+                    composable_answer_group_ids=("complete-table:lodging",),
+                ),
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-travel-policy",
+                    filename="公司出差管理标准.docx",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=0.98,
+                    answer_support=0.97,
+                    assessment_valid=True,
+                    chunk_ids=("lodging-city-b",),
+                    section_keys=("lodging",),
+                    companion_doc_ids=("doc-city-definition", "doc-policy-note"),
+                    answer_route_key="lodging:二线城市",
+                    composable_answer_group_ids=("complete-table:lodging",),
+                ),
+            ],
+        )
+
+        self.assertFalse(decision.needs_clarification)
+        self.assertEqual(decision.reason, "single_assessed_answer_document")
+        self.assertEqual(decision.relevant_document_count, 1)
+
+    def test_post_evidence_same_document_explicit_projects_still_require_choice(
+        self,
+    ) -> None:
+        """A declared mutually exclusive scope must not be merged as a table."""
+
+        decision = detect_post_evidence_document_ambiguity(
+            query="消息接口怎么配置",
+            requirements=({
+                "id": "r1",
+                "role": "answer",
+                "importance": "required",
+            },),
+            assessments=[
+                DocumentEvidenceAssessment(
+                    kb_id="kb-1",
+                    doc_id="doc-shared-config",
+                    filename="统一消息接口配置.docx",
+                    evidence_role="standalone_answer",
+                    supports_requirement_ids=("r1",),
+                    topic_relevance=0.98,
+                    answer_support=0.97,
+                    assessment_valid=True,
+                    projects=(project,),
+                    chunk_ids=(f"{project}-chunk",),
+                    section_keys=(f"section-{project}",),
+                    answer_route_key=f"{project}:消息接口配置",
+                )
+                for project in ("华东项目", "华南项目")
+            ],
+        )
+
+        self.assertTrue(decision.needs_clarification)
+        self.assertEqual(decision.dimension, "project")
+        self.assertEqual(
+            decision.reason,
+            "multiple_mutually_exclusive_assessed_scopes",
+        )
+        self.assertEqual(
+            {choice.projects for choice in decision.choices},
+            {("华东项目",), ("华南项目",)},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

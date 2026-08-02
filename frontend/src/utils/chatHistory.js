@@ -1,10 +1,6 @@
 import { normalizeTraceId } from './chatRequest.js'
 import { restoreHistoryMessageClarification } from './chatClarification.js'
-
-const EVIDENCE_STATUSES = new Set([
-  'skipped', 'hit', 'partial', 'version_mismatch', 'needs_clarification',
-  'no_hit', 'unverified', 'error',
-])
+import { normalizeEvidenceStatus } from './evidenceStatus.js'
 
 function objectValue(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : null
@@ -15,9 +11,7 @@ function firstDefined(...values) {
 }
 
 function normalizedStatus(value) {
-  if (typeof value !== 'string') return ''
-  const status = value.trim().toLowerCase()
-  return EVIDENCE_STATUSES.has(status) ? status : ''
+  return normalizeEvidenceStatus(value)
 }
 
 function normalizedBoolean(value) {

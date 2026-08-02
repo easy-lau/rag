@@ -6,7 +6,12 @@ from sqlalchemy import UUID as SA_UUID
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import selectinload
 from database import get_db
-from models.db_models import KnowledgeBase, Document, User
+from models.db_models import (
+    KnowledgeBase,
+    Document,
+    TerminologyRegistryState,
+    User,
+)
 from models.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
 from core.audit import AuditLogger, get_audit
 from core.deps import (
@@ -111,7 +116,12 @@ async def create_knowledge_base(
         created_by=user.id,
     )
     db.add(kb)
-    await db.flush()  # 取得 kb.id 以记审计
+    await db.flush()  # 取得 kb.id，以在同一事务初始化该 KB 的术语 revision 状态
+    db.add(TerminologyRegistryState(
+        kb_id=kb.id,
+        revision=0,
+        updated_by=user.id,
+    ))
     audit.log(db, "kb.create", target_type="knowledge_base", target_id=kb.id, target_name=kb.name)
     await db.commit()
     await db.refresh(kb)

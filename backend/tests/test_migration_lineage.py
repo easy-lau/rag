@@ -1,14 +1,25 @@
 """Alembic migration lineage regression tests."""
 
 import importlib.util
+import io
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, ForeignKeyConstraint, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
+
+from models.db_models import (
+    TerminologyConcept,
+    TerminologyRegistryRevision,
+    TerminologyRegistryState,
+    TerminologyScopeBinding,
+    TerminologyTerm,
+)
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -31,6 +42,7 @@ class _MigrationRecorder:
         self.executed: list[str] = []
         self.added_columns: list[tuple[str, Column]] = []
         self.created_indexes: list[tuple[str, str, tuple[str, ...], bool]] = []
+        self.created_unique_constraints: list[tuple[str, str, tuple[str, ...]]] = []
         self.altered_columns: list[tuple[str, str, dict]] = []
 
     def create_table(self, name, *items, **_kwargs) -> None:
@@ -51,6 +63,9 @@ class _MigrationRecorder:
         self.created_indexes.append(
             (name, table_name, tuple(columns), unique)
         )
+
+    def create_unique_constraint(self, name: str, table_name: str, columns) -> None:
+        self.created_unique_constraints.append((name, table_name, tuple(columns)))
 
     def execute(self, statement) -> None:
         self.executed.append(str(statement))
@@ -226,7 +241,7 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertIn("turn_status", message_columns)
         self.assertIn("search_snapshot", message_columns)
 
-    def test_alembic_has_single_0031_head(self) -> None:
+    def test_alembic_has_single_0033_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -234,8 +249,8 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0031"])
-        self.assertEqual(scripts.get_revision("0031").down_revision, "0030")
+        self.assertEqual(scripts.get_heads(), ["0033"])
+        self.assertEqual(scripts.get_revision("0032").down_revision, "0031")
 
     def test_message_duration_migration_is_additive(self) -> None:
         migration_31 = _load_migration("0031_add_message_answer_duration.py")
@@ -250,6 +265,212 @@ class MigrationLineageTests(unittest.TestCase):
         }
         self.assertIn("duration_ms", added)
         self.assertIsInstance(added["duration_ms"].type, Integer)
+
+    def test_terminology_registry_migration_has_kb_owned_scope_proof_and_revision_seed(self) -> None:
+        migration = _load_migration("0032_add_terminology_registry.py")
+        recorder = _MigrationRecorder()
+        with patch.object(migration, "op", recorder):
+            migration.upgrade()
+
+        self.assertIn(
+            ("uq_documents_id_kb_id", "documents", ("id", "kb_id")),
+            recorder.created_unique_constraints,
+        )
+        for table_name in (
+            "terminology_concepts",
+            "terminology_terms",
+            "terminology_scope_bindings",
+            "terminology_registry_state",
+            "terminology_registry_revisions",
+        ):
+            with self.subTest(table_name=table_name):
+                self.assertIn(table_name, recorder.tables)
+
+        concept_columns = {
+            item.name
+            for item in recorder.tables["terminology_concepts"]
+            if isinstance(item, Column)
+        }
+        self.assertTrue({"id", "kb_id", "code", "canonical_term"}.issubset(concept_columns))
+        concept_constraints = recorder.tables["terminology_concepts"]
+        self.assertTrue(any(
+            isinstance(item, UniqueConstraint)
+            and item.name == "uq_terminology_concepts_id_kb_id"
+            for item in concept_constraints
+        ))
+        self.assertTrue(any(
+            isinstance(item, UniqueConstraint)
+            and item.name == "uq_terminology_concepts_kb_code"
+            for item in concept_constraints
+        ))
+
+        term_columns = {
+            item.name
+            for item in recorder.tables["terminology_terms"]
+            if isinstance(item, Column)
+        }
+        self.assertTrue({"concept_id", "kb_id", "term", "normalized_term", "match_mode"}.issubset(term_columns))
+        term_constraints = recorder.tables["terminology_terms"]
+        self.assertTrue(any(
+            isinstance(item, UniqueConstraint)
+            and item.name == "uq_terminology_terms_concept_kb_normalized"
+            for item in term_constraints
+        ))
+        term_concept_fk = next(
+            item for item in term_constraints
+            if isinstance(item, ForeignKeyConstraint)
+            and item.name == "fk_terminology_terms_concept_kb"
+        )
+        self.assertEqual(tuple(term_concept_fk.column_keys), ("concept_id", "kb_id"))
+        self.assertEqual(
+            tuple(element.target_fullname for element in term_concept_fk.elements),
+            ("terminology_concepts.id", "terminology_concepts.kb_id"),
+        )
+
+        binding_constraints = recorder.tables["terminology_scope_bindings"]
+        concept_fk = next(
+            item for item in binding_constraints
+            if isinstance(item, ForeignKeyConstraint)
+            and item.name == "fk_terminology_scope_bindings_concept_kb"
+        )
+        self.assertEqual(tuple(concept_fk.column_keys), ("concept_id", "kb_id"))
+        self.assertEqual(
+            tuple(element.target_fullname for element in concept_fk.elements),
+            ("terminology_concepts.id", "terminology_concepts.kb_id"),
+        )
+        composite_fk = next(
+            item for item in binding_constraints
+            if isinstance(item, ForeignKeyConstraint)
+            and item.name == "fk_terminology_scope_bindings_document_kb"
+        )
+        self.assertEqual(tuple(composite_fk.column_keys), ("document_id", "kb_id"))
+        self.assertEqual(
+            tuple(element.target_fullname for element in composite_fk.elements),
+            ("documents.id", "documents.kb_id"),
+        )
+
+        sql = "\n".join(recorder.executed)
+        state_columns = {
+            item.name
+            for item in recorder.tables["terminology_registry_state"]
+            if isinstance(item, Column)
+        }
+        self.assertTrue({"kb_id", "revision", "updated_at"}.issubset(state_columns))
+        self.assertNotIn("id", state_columns)
+        revision_columns = {
+            item.name
+            for item in recorder.tables["terminology_registry_revisions"]
+            if isinstance(item, Column)
+        }
+        self.assertTrue({"kb_id", "revision", "change_payload"}.issubset(revision_columns))
+
+        self.assertIn("INSERT INTO terminology_registry_state (kb_id, revision, updated_at)", sql)
+        self.assertIn("SELECT id, 0, CURRENT_TIMESTAMP FROM knowledge_bases", sql)
+        self.assertIn("ON CONFLICT (kb_id) DO NOTHING", sql)
+        self.assertIn("CREATE UNIQUE INDEX uq_terminology_scope_bindings_identity", sql)
+        self.assertIn("COALESCE(document_id", sql)
+
+    def test_terminology_registry_migration_compiles_as_postgresql_ddl(self) -> None:
+        """Compile 0032 itself without relying on a live developer database."""
+
+        migration = _load_migration("0032_add_terminology_registry.py")
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        operations = Operations(context)
+        with patch.object(migration, "op", operations):
+            migration.upgrade()
+        sql = output.getvalue()
+        for fragment in (
+            "ALTER TABLE documents ADD CONSTRAINT uq_documents_id_kb_id",
+            "CREATE TABLE terminology_concepts",
+            "kb_id UUID NOT NULL",
+            "CREATE TABLE terminology_scope_bindings",
+            "FOREIGN KEY(document_id, kb_id) REFERENCES documents (id, kb_id)",
+            "FOREIGN KEY(concept_id, kb_id) REFERENCES terminology_concepts (id, kb_id)",
+            "CREATE UNIQUE INDEX uq_terminology_scope_bindings_identity",
+            "COALESCE(document_id, '00000000-0000-0000-0000-000000000000'::uuid)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, sql)
+
+    def test_terminology_orm_and_migration_keep_named_constraints_and_indexes_aligned(self) -> None:
+        """Prevent a model-only rule from drifting away from rollout DDL."""
+
+        migration = _load_migration("0032_add_terminology_registry.py")
+        recorder = _MigrationRecorder()
+        with patch.object(migration, "op", recorder):
+            migration.upgrade()
+
+        expected_constraints = {
+            "terminology_concepts": {
+                "ck_terminology_concepts_code_nonempty",
+                "ck_terminology_concepts_canonical_term_nonempty",
+                "uq_terminology_concepts_id_kb_id",
+                "uq_terminology_concepts_kb_code",
+            },
+            "terminology_terms": {
+                "ck_terminology_terms_match_mode",
+                "ck_terminology_terms_term_nonempty",
+                "ck_terminology_terms_normalized_term_nonempty",
+                "uq_terminology_terms_concept_kb_normalized",
+                "fk_terminology_terms_concept_kb",
+            },
+            "terminology_scope_bindings": {
+                "ck_terminology_scope_bindings_product_key_nonempty",
+                "ck_terminology_scope_bindings_version_key_nonempty",
+                "ck_terminology_scope_bindings_project_key_nonempty",
+                "fk_terminology_scope_bindings_concept_kb",
+                "fk_terminology_scope_bindings_document_kb",
+                "fk_terminology_scope_bindings_kb",
+            },
+            "terminology_registry_state": {
+                "ck_terminology_registry_state_revision",
+            },
+            "terminology_registry_revisions": {
+                "ck_terminology_registry_revisions_revision",
+                "uq_terminology_registry_revisions_kb_revision",
+            },
+        }
+        model_tables = {
+            "terminology_concepts": TerminologyConcept.__table__,
+            "terminology_terms": TerminologyTerm.__table__,
+            "terminology_scope_bindings": TerminologyScopeBinding.__table__,
+            "terminology_registry_state": TerminologyRegistryState.__table__,
+            "terminology_registry_revisions": TerminologyRegistryRevision.__table__,
+        }
+        for table_name, expected in expected_constraints.items():
+            with self.subTest(table_name=table_name):
+                migration_names = {
+                    item.name
+                    for item in recorder.tables[table_name]
+                    if getattr(item, "name", None)
+                }
+                model_names = {
+                    item.name
+                    for item in model_tables[table_name].constraints
+                    if item.name
+                }
+                self.assertTrue(expected.issubset(migration_names))
+                self.assertTrue(expected.issubset(model_names))
+
+        expected_indexes = {
+            "ix_terminology_concepts_kb_active",
+            "ix_terminology_terms_kb_normalized_active",
+            "ix_terminology_scope_bindings_kb_active",
+            "ix_terminology_scope_bindings_document_active",
+            "ix_terminology_registry_revisions_kb_created_at",
+        }
+        migration_indexes = {name for name, *_rest in recorder.created_indexes}
+        model_indexes = {
+            index.name
+            for table in model_tables.values()
+            for index in table.indexes
+        }
+        self.assertTrue(expected_indexes.issubset(migration_indexes))
+        self.assertTrue(expected_indexes.issubset(model_indexes))
 
 
 if __name__ == "__main__":  # pragma: no cover

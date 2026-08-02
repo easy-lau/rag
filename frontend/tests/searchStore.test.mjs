@@ -57,6 +57,34 @@ test('no_hit 会覆盖旧协议中自相矛盾的非零命中数', () => {
   assert.deepEqual(store.results.map(item => item.evidence_role), ['related', 'related'])
 })
 
+test('insufficient_evidence 保留相关候选但绝不显示回答依据', () => {
+  const store = freshStore()
+  store.setResults({
+    evidence_status: 'insufficient_evidence',
+    retrieval_executed: true,
+    displayed_result_count: 2,
+    hit_count: 2,
+    direct_evidence_count: 2,
+    related_reference_count: 0,
+    context_evidence_count: 2,
+    answer_source_count: 2,
+    results: [
+      { id: 'mapping', evidence_role: 'direct' },
+      { id: 'policy', evidence_role: 'related' },
+    ],
+  })
+
+  assert.equal(store.searchMeta.evidence_status, 'insufficient_evidence')
+  assert.equal(store.searchMeta.retrieval_executed, true)
+  assert.equal(store.searchMeta.displayed_candidate_count, 2)
+  assert.equal(store.searchMeta.hit_count, 0)
+  assert.equal(store.searchMeta.direct_evidence_count, 0)
+  assert.equal(store.searchMeta.context_evidence_count, 0)
+  assert.equal(store.searchMeta.answer_source_count, 0)
+  assert.equal(store.searchMeta.related_reference_count, 2)
+  assert.deepEqual(store.results.map(item => item.evidence_role), ['related', 'related'])
+})
+
 test('skipped 和 error 不保留异常候选或旧版命中统计', () => {
   for (const evidenceStatus of ['skipped', 'error']) {
     const store = freshStore()
@@ -77,6 +105,50 @@ test('skipped 和 error 不保留异常候选或旧版命中统计', () => {
     assert.equal(store.searchMeta.related_reference_count, 0)
     assert.deepEqual(store.results, [])
   }
+})
+
+test('scope_mismatch 会清空范围外候选，不能以相近资料形式泄漏回面板', () => {
+  const store = freshStore()
+  store.setResults({
+    evidence_status: 'scope_mismatch',
+    retrieval_executed: true,
+    displayed_result_count: 2,
+    hit_count: 2,
+    direct_evidence_count: 2,
+    related_reference_count: 2,
+    context_evidence_count: 2,
+    results: [
+      { id: 'wrong-project', evidence_role: 'direct' },
+      { id: 'wrong-version', evidence_role: 'related' },
+    ],
+  })
+
+  assert.equal(store.searchMeta.evidence_status, 'scope_mismatch')
+  assert.equal(store.searchMeta.retrieval_executed, true)
+  assert.equal(store.searchMeta.displayed_candidate_count, 0)
+  assert.equal(store.searchMeta.hit_count, 0)
+  assert.equal(store.searchMeta.direct_evidence_count, 0)
+  assert.equal(store.searchMeta.related_reference_count, 0)
+  assert.equal(store.searchMeta.context_evidence_count, 0)
+  assert.deepEqual(store.results, [])
+})
+
+test('历史 scope_mismatch 快照恢复后仍会清空范围外候选', () => {
+  const store = freshStore()
+  const restored = store.restoreSnapshot({
+    schema_version: 'rag_search_snapshot.v1',
+    evidence_status: 'scope_mismatch',
+    retrieval_executed: true,
+    displayed_result_count: 1,
+    candidates: [{ id: 'historical-wrong-version', evidence_role: 'related' }],
+  })
+
+  assert.equal(restored, true)
+  assert.equal(store.contextMode, 'history')
+  assert.equal(store.searchMeta.evidence_status, 'scope_mismatch')
+  assert.equal(store.searchMeta.displayed_candidate_count, 0)
+  assert.equal(store.searchMeta.context_evidence_count, 0)
+  assert.deepEqual(store.results, [])
 })
 
 test('needs_clarification 表示检索已执行但选择前没有回答依据', () => {

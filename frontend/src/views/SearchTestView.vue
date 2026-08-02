@@ -89,6 +89,7 @@ import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import ScoreTag from '@/components/common/ScoreTag.vue'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
+import { evidenceStatusMeta as getEvidenceStatusMeta } from '@/utils/evidenceStatus'
 
 const kbStore = useKnowledgeStore()
 const query = ref('')
@@ -105,13 +106,12 @@ const methodOptions = [
   { label: '关键词检索（全文 + 词面）', value: 'keyword' },
 ]
 
-const evidenceStatusMeta = computed(() => ({
-  hit: { label: '存在回答依据', type: 'success' },
-  partial: { label: '部分证据可用', type: 'warning' },
-  version_mismatch: { label: '仅相近版本', type: 'warning' },
-  no_hit: { label: '无回答依据', type: 'default' },
-  unverified: { label: '结果待验证', type: 'default' },
-})[searchMeta.value.evidence_status] || { label: searchMeta.value.evidence_status, type: 'default' })
+const evidenceStatusMeta = computed(() => {
+  const meta = getEvidenceStatusMeta(searchMeta.value.evidence_status)
+  return meta
+    ? { label: meta.label, type: meta.tagType }
+    : { label: searchMeta.value.evidence_status, type: 'default' }
+})
 
 function evidenceRoleMeta(result) {
   return ({

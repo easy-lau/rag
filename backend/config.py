@@ -48,6 +48,12 @@ class Settings(BaseSettings):
         ge=1.0,
         le=180.0,
     )
+    # 任务图同一 wave 内的检索并发数。每个任务使用独立只读会话，避免并发
+    # 复用请求事务；范围限制在连接池和单次工作流期限可承受的边界内。
+    rag_v2_task_query_parallelism: int = Field(3, ge=1, le=8)
+    # 受控术语仅产生额外的、范围收窄的检索变体；0 可在不回滚 V2 的情况下
+    # 关闭术语召回增强。严格等价的证据解释仍要求注册表和来源文本共同成立。
+    rag_v2_terminology_max_aliases: int = Field(3, ge=0, le=8)
     # 包住建流、首分片前重试、退避等待和完整流读取，避免 max_attempts 倍增
     # llm_request_timeout_seconds。首个文本分片后的异常仍由流层直接抛出，不重放。
     rag_v2_generation_workflow_timeout_seconds: float = Field(
@@ -55,6 +61,51 @@ class Settings(BaseSettings):
         ge=1.0,
         le=300.0,
     )
+    # ``rag_pipeline_version`` 只选择证据执行器；语义理解入口由此开关单独
+    # 决定。默认 V3：模型只能选择服务器签发的 source span，随后由后端编译
+    # V2 任务图。``legacy`` 仅保留给已知回滚场景使用 query_analysis.v2。
+    rag_semantic_entry: Literal["legacy", "v3"] = "v3"
+    # V3 是当前生产语义入口：模型只能选择服务器签发的 source span，随后由
+    # 后端编译为 V2 任务图。模型失败、schema 拒绝或容量不足时原子回退当前轮
+    # 本地计划；本地 planner 的未知/不可运行不再能在 V3 前提前拦截请求。
+    rag_query_understanding_v3_mode: Literal["off", "shadow", "active"] = "active"
+    rag_query_understanding_v3_active_timeout_seconds: float = Field(
+        2.5,
+        ge=0.5,
+        le=15.0,
+    )
+    rag_query_understanding_v3_active_max_inflight: int = Field(2, ge=1, le=32)
+    # 与 V3 模型理解并发的不可变 anchor 预取。超过这个短期限直接丢弃，由
+    # 正常 V2 DAG 重新召回，不能为了缓存而延迟用户首个检索阶段。
+    rag_query_understanding_v3_anchor_prefetch_enabled: bool = True
+    rag_query_understanding_v3_anchor_prefetch_timeout_seconds: float = Field(
+        2.5,
+        ge=0.5,
+        le=15.0,
+    )
+    # 旧 query_analysis.v2 仅为回滚/对照保留，不能与 V3 同时成为生产语义
+    # authority；默认关闭，避免同一请求连续等待两次模型分析。
+    rag_query_analyzer_mode: Literal["off", "shadow", "active"] = "off"
+    # Direct/unit callers retain this legacy default.  Production active and
+    # shadow execution below each declare their own bounded budget explicitly.
+    rag_query_analyzer_timeout_seconds: float = Field(5.0, ge=0.5, le=30.0)
+    # Active mode sits on the request path, so it has a separate short budget.
+    # Shadow analysis remains asynchronous and may use the diagnostic budget.
+    rag_query_analyzer_active_timeout_seconds: float = Field(
+        1.5,
+        ge=0.5,
+        le=10.0,
+    )
+    rag_query_analyzer_active_max_inflight: int = Field(2, ge=1, le=32)
+    rag_query_analyzer_shadow_timeout_seconds: float = Field(
+        5.0,
+        ge=0.5,
+        le=30.0,
+    )
+    rag_query_analyzer_shadow_max_inflight: int = Field(2, ge=1, le=32)
+    # Deterministic per-trace sampling; 0 disables background telemetry and 1
+    # observes every eligible request without changing its retrieval result.
+    rag_query_analyzer_shadow_sample_rate: float = Field(0.1, ge=0.0, le=1.0)
 
     # Docker Compose 会显式覆盖；该默认值仅用于宿主机本地开发的端口约定。
     database_url: str = "postgresql+asyncpg://rag:password@127.0.0.1:5433/rag_prod"
@@ -132,6 +183,21 @@ class Settings(BaseSettings):
         validation_alias="__DATABASE_SETTINGS_ONLY_SHOW_SOURCES",
     )  # 是否在问答回答下方展示知识库来源 / 参考来源
     upload_dir: str = "uploads"
+    # 文档入库由独立进程从 PostgreSQL 领取任务；API 进程只负责在同一事务中
+    # 持久化文档和任务。租约过期后可由任一 worker 接手，避免重启丢任务。
+    document_job_max_attempts: int = Field(3, ge=1, le=20)
+    document_job_lease_seconds: int = Field(900, ge=30, le=86400)
+    document_job_poll_seconds: float = Field(1.0, ge=0.1, le=60.0)
+    # Compose/生产由 Supervisor 独立拉起 worker；宿主机 ``uvicorn`` 开发时
+    # 默认同进程托管一个领取器，避免本地上传还要记住额外开终端。两种模式都
+    # 使用同一张任务表和 lease，显式开启两者也不会重复消费同一任务。
+    document_job_embedded_worker: bool | None = None
+
+    @property
+    def document_job_runs_embedded_worker(self) -> bool:
+        if self.document_job_embedded_worker is not None:
+            return self.document_job_embedded_worker
+        return self.app_env.strip().lower() not in {"prod", "production"}
 
     # 站点品牌（公开可读，无需鉴权）
     site_title: str = Field(

@@ -1,6 +1,55 @@
 import MarkdownIt from 'markdown-it'
-import hljs from 'highlight.js'
+import hljs from 'highlight.js/lib/core'
+import bash from 'highlight.js/lib/languages/bash'
+import css from 'highlight.js/lib/languages/css'
+import diff from 'highlight.js/lib/languages/diff'
+import dockerfile from 'highlight.js/lib/languages/dockerfile'
+import xml from 'highlight.js/lib/languages/xml'
+import http from 'highlight.js/lib/languages/http'
+import ini from 'highlight.js/lib/languages/ini'
+import java from 'highlight.js/lib/languages/java'
+import javascript from 'highlight.js/lib/languages/javascript'
+import json from 'highlight.js/lib/languages/json'
+import markdown from 'highlight.js/lib/languages/markdown'
+import python from 'highlight.js/lib/languages/python'
+import sql from 'highlight.js/lib/languages/sql'
+import typescript from 'highlight.js/lib/languages/typescript'
+import yaml from 'highlight.js/lib/languages/yaml'
 import DOMPurify from 'dompurify'
+
+// 只注册知识库和对话中常见的代码语言。整包 highlight.js 会包含全部语言定义，
+// 让 Markdown 共享块超过 1 MB；未知语言仍会安全地按纯文本展示。
+const highlightLanguages = {
+  bash,
+  shell: bash,
+  sh: bash,
+  css,
+  diff,
+  dockerfile,
+  docker: dockerfile,
+  html: xml,
+  xml,
+  svg: xml,
+  http,
+  ini,
+  java,
+  javascript,
+  js: javascript,
+  json,
+  markdown,
+  md: markdown,
+  python,
+  py: python,
+  sql,
+  typescript,
+  ts: typescript,
+  yaml,
+  yml: yaml,
+}
+
+for (const [name, definition] of Object.entries(highlightLanguages)) {
+  hljs.registerLanguage(name, definition)
+}
 
 const md = new MarkdownIt({
   html: false,

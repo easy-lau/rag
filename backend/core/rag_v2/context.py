@@ -84,6 +84,36 @@ def _block_header(item: EvidenceItem) -> str:
     )
 
 
+def evidence_block_char_cost(item: EvidenceItem) -> int:
+    """Return the exact prompt cost of one complete evidence block.
+
+    The assembler and renderer must share this rule.  Counting only body text
+    in one layer and headers in another causes a later renderer to split a
+    proof route that was admitted atomically upstream.
+    """
+
+    if not isinstance(item, EvidenceItem):
+        raise ValueError("item must be an EvidenceItem")
+    return len(_block_header(item)) + len(item.content)
+
+
+def evidence_context_char_cost(items: tuple[EvidenceItem, ...] | list[EvidenceItem]) -> int:
+    """Return the serialized size for complete blocks in render order.
+
+    Block size is order-independent apart from the two-character separators,
+    so the evidence selector can safely use this calculation before the final
+    document/source ordering is applied.
+    """
+
+    normalized_items = tuple(items)
+    if any(not isinstance(item, EvidenceItem) for item in normalized_items):
+        raise ValueError("items must contain EvidenceItem values")
+    return (
+        sum(evidence_block_char_cost(item) for item in normalized_items)
+        + (2 * max(0, len(normalized_items) - 1))
+    )
+
+
 def build_evidence_context(
     bundle: EvidenceBundle,
     *,
@@ -167,5 +197,7 @@ __all__ = [
     "DEFAULT_RENDER_MAX_CHUNKS",
     "EvidenceContext",
     "build_evidence_context",
+    "evidence_block_char_cost",
+    "evidence_context_char_cost",
     "render_evidence_context",
 ]

@@ -11,9 +11,23 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from core.query_constraints import extract_query_constraints
+from core.query_constraints import (
+    ApplicabilityScope,
+    extract_applicability_scopes,
+    extract_query_constraints,
+)
+from core.query_surface_structure import (
+    answer_target_semantics,
+    is_procedure_question,
+    is_distributive_request_tail,
+    normalize_coordination_body,
+    parse_query_surface_frame,
+    parse_distributive_enumeration,
+    split_coordination_body,
+)
 from core.rag_v2.contracts import (
     AnswerRequirementV2,
+    BridgeRequirementKind,
     QueryPlanV2,
     RequirementCoverageMode,
 )
@@ -26,10 +40,6 @@ _MULTI_PART_RE = re.compile(
 )
 _COMPARISON_RE = re.compile(
     r"(?:对比|比较|区别|差异|不同(?:点)?|异同|优劣|(?:^|\s)(?:vs\.?|versus)(?:\s|$))",
-    re.IGNORECASE,
-)
-_PROCESS_RE = re.compile(
-    r"(?:如何|怎么|怎样|步骤|流程|操作方法|办理方法|how\s+to|steps?|procedure)",
     re.IGNORECASE,
 )
 _LIST_RE = re.compile(
@@ -55,6 +65,14 @@ _SCALAR_FACT_RE = re.compile(
     r"when|where|who|which|how\s+many|how\s+much)",
     re.IGNORECASE,
 )
+_CONDITIONAL_POLICY_DISPOSITION_RE = re.compile(
+    r"(?:如何|怎么|怎样)\s*处理$",
+    re.IGNORECASE,
+)
+_POLICY_DISPOSITION_TARGET_RE = re.compile(
+    r"(?:标准|规定|政策|补贴|补助|费用|额度|上限|下限|期限|比例|待遇|规则|要求|条件)$",
+    re.IGNORECASE,
+)
 _OVERVIEW_RE = re.compile(
     r"(?:介绍(?:一下)?|概述|概览|总体|整体|主要内容|说明(?:一下)?|"
     r"overview|introduction)|"
@@ -76,9 +94,15 @@ _COLLECTION_OPEN_RE = re.compile(
     r"what\s+(?:is|are)|list\s+(?:the\s+)?)",
     re.IGNORECASE,
 )
-_COLLECTION_POLICY_TARGET_RE = re.compile(
-    r"(?:制度|政策|规范|规定|办法|细则|流程|规则|标准|要求|条件|资格|权限|待遇|"
-    r"措施|策略|方案|处置)$",
+# A request needs a whole-document proof only when its answer head is itself a
+# governing policy artefact.  This is deliberately much narrower than the
+# vocabulary that can appear in an answer.  For example, ``风险处置措施`` and
+# ``系统权限`` are often concrete attributes of one named supplier/user; making
+# either of them a document-level policy merely because it ends in ``措施`` or
+# ``权限`` turns a directly supported answer into a false ``no document root``
+# result.  Explicit list/process operators still use collection coverage below.
+_DOCUMENT_POLICY_TARGET_RE = re.compile(
+    r"(?:制度|政策|规范|规定|办法|细则|规则|标准|管理要求)$",
     re.IGNORECASE,
 )
 _SINGLE_VALUE_TARGET_RE = re.compile(
@@ -93,18 +117,6 @@ _SINGLE_VALUE_TARGET_RE = re.compile(
 # ``试用期年假天数``).  Keeping the vocabulary at the level of answer
 # attributes makes this useful across HR, travel, security and configuration
 # knowledge bases without teaching the planner any particular company rule.
-_IMPLICIT_TARGET_SUFFIX_RE = re.compile(
-    r"(?:标准|金额|天数|次数|额度|上限|下限|比例|时长|条件|要求|权限|角色|版本|"
-    r"等级|级别|档位|类别|类型|待遇|补贴|补助|补|费用|价格|周期|规则|频率|数量|日期|"
-    r"时间|地址|名称|数值|数额|期限|名额)$",
-    re.IGNORECASE,
-)
-_IMPLICIT_MAPPING_TARGET_SUFFIX_RE = re.compile(
-    r"(?:标准|金额|天数|次数|额度|上限|下限|比例|时长|条件|要求|权限|角色|版本|"
-    r"等级|级别|档位|类别|类型|待遇|补贴|补助|补|费用|价格|周期|规则|频率|数量|日期|"
-    r"时间|地址|名称|数值|数额|期限|名额|措施|策略|方案|处置)$",
-    re.IGNORECASE,
-)
 # Coordinated questions need a wider notion of an already-complete answer
 # target than bridge inference does.  For example, both ``风险处置措施`` and
 # ``风险等级`` are complete siblings in ``...措施和风险等级分别是什么``;
@@ -122,13 +134,6 @@ _COORDINATED_COMPLETE_TARGET_SUFFIX_RE = re.compile(
 # mapping before the requested fact; the source claim answering the question
 # is already the mapping.  This semantic class prevents stable entity IDs from
 # turning every direct attribute lookup into a multi-hop query.
-_IMPLICIT_DIRECT_ATTRIBUTE_TARGET_RE = re.compile(
-    r"(?:名称|姓名|全称|简称|联系人(?:名称|姓名)?|联系方式|联系电话|电话|手机号?|"
-    r"邮箱|邮件地址|地址|位置|坐标|网址|域名|IP地址|端口|编码|编号|代码|标识|"
-    r"ID|账号|账户|统一社会信用代码|身份证号|职级|等级|级别|档位|类别|类型|"
-    r"角色|版本|阶段|状态)$",
-    re.IGNORECASE,
-)
 _IMPLICIT_QUALIFIER_SUFFIX_RE = re.compile(
     r"(?:员工|人员|用户|客户|供应商|合作方|承包商|经销商|代理商|租户|"
     r"组织|机构|岗位|经理|主管|总监|总裁|主任|负责人|顾问|"
@@ -139,6 +144,14 @@ _IMPLICIT_QUALIFIER_SUFFIX_RE = re.compile(
 )
 _IMPLICIT_ENTITY_IDENTIFIER_RE = re.compile(
     r"(?:[A-Za-z0-9_.+-]{1,16}|[甲乙丙丁戊己庚辛壬癸]{1,2})$",
+    re.IGNORECASE,
+)
+_COORDINATED_CLASS_LABEL_RE = re.compile(
+    # Generic compact labels used in a list of subjects, for example
+    # ``A级、B级、C级和D级的餐补``.  This only proves that the final explicit
+    # possessive target can be copied to peer labels; it does not infer any
+    # factual relationship or category value.
+    r"^(?:[A-Za-z]|[甲乙丙丁戊己庚辛壬癸]|\d{1,3})\s*(?:级|类|档|组)$",
     re.IGNORECASE,
 )
 _COMPACT_PREPOSITION_RE = re.compile(
@@ -223,11 +236,17 @@ _IMPLICIT_BROAD_TARGET_RE = re.compile(
     r"标准|要求|规则|内容|制度|政策|规范|办法)$",
     re.IGNORECASE,
 )
-_COORDINATED_ENUMERATION_RE = re.compile(
-    r"^(?P<body>.+?)(?:分别|各自)(?P<tail>[^；;\n]{1,48})$",
+_IMPLICIT_COORDINATED_QUESTION_RE = re.compile(
+    r"^(?P<body>.+?)(?P<tail>"
+    r"(?:是|为)?(?:多少|什么)|"
+    r"(?:如何|怎么|怎样)(?:配置|设置|处理|办理|计算|确定|执行)?"
+    r")$",
     re.IGNORECASE,
 )
-_COORDINATED_SEPARATOR_RE = re.compile(r"(?:、|[,，]|以及|和|及|与)")
+_NON_SEMANTIC_QUERY_PLACEHOLDER_RE = re.compile(
+    r"^(?:请)?回答(?:用户)?当前问题$",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -237,6 +256,10 @@ class ImplicitBridgePlan:
     subject: str
     description: str
     retrieval_query: str
+    # This is inferred only from the grammatical relation used to create the
+    # bridge.  It never contains a business value and is preserved all the way
+    # to source-table verification.
+    kind: BridgeRequirementKind = "classification"
 
 
 def _strip_query_tail(value: str) -> str:
@@ -272,20 +295,140 @@ def _answer_coverage_mode(
     normalized = re.sub(r"\s+", " ", str(question or "")).strip()
     if not normalized:
         return "single"
+    # A process question asks for an ordered/composed procedure even when its
+    # wording is the singular ``流程是什么``.  It therefore needs collection
+    # closure, but it is not a full-document policy request.
+    if is_procedure_question(normalized):
+        return "collection"
     if _LIST_RE.search(normalized):
         return "collection"
-    target = _strip_query_tail(normalized)
+    frame = parse_query_surface_frame(normalized)
+    target = (
+        frame.answer_target
+        if frame is not None
+        else _strip_query_tail(normalized)
+    )
+    # A syntactically named entity (``供应商甲`` / ``客户A`` / ``部门D01``)
+    # makes ``X 的 Y 是什么`` a lookup of that entity's Y attribute.  It can
+    # still be an explicit list above, but an open interrogative must not be
+    # promoted to an exhaustive policy document just because Y resembles a
+    # policy noun.
+    if frame is not None and any(
+        _has_stable_entity_identifier(item.text)
+        for item in frame.entity_qualifiers
+    ):
+        return "single"
+    # An open governing-policy head is not a scalar merely because Chinese
+    # uses ``什么``.  For example, ``管理要求是什么`` asks for the applicable
+    # policy as a whole, whereas ``金额是多少`` still asks for one value.
+    if (
+        _COLLECTION_OPEN_RE.search(normalized)
+        and _DOCUMENT_POLICY_TARGET_RE.search(target)
+    ):
+        return "collection"
     if (
         _SCALAR_FACT_RE.search(normalized)
         or _SINGLE_VALUE_TARGET_RE.search(target)
     ):
         return "single"
-    if (
-        _COLLECTION_OPEN_RE.search(normalized)
-        and _COLLECTION_POLICY_TARGET_RE.search(target)
-    ):
-        return "collection"
     return "single"
+
+
+def _answer_coverage_contract(
+    question: object,
+    *,
+    answer_shape: str | None = None,
+    coverage_mode: RequirementCoverageMode | None = None,
+) -> str:
+    """Choose a proof contract from question structure, not business values.
+
+    A collection has two materially different completion meanings.  An
+    explicit enumeration asks for list members and may be closed by a bounded
+    structured collection.  An open question whose answer head is a governing
+    policy/standard/requirement asks for the applicable policy as a whole; one
+    sentence containing ``分为`` must not pretend to close that request.  The
+    latter therefore requires a complete, authorised document-policy snapshot.
+    """
+
+    mode = coverage_mode or _answer_coverage_mode(
+        question,
+        answer_shape=answer_shape,
+    )
+    if mode == "single":
+        return "single_claim"
+
+    frame = parse_query_surface_frame(question)
+    normalized = re.sub(r"\s+", " ", str(question or "")).strip()
+    # ``供应商管理要求有哪些`` still asks for the governing requirement set;
+    # the presence of ``有哪些`` does not prove that a bounded list is the
+    # complete source.  Check the policy-head contract before the generic
+    # enumeration branch.  Finite lists such as ``登录方式有哪些`` do not pass
+    # this predicate and remain structured collections.
+    if _is_document_policy_request(normalized, frame=frame):
+        return "document_policy"
+    return "structured_collection"
+
+
+def _is_document_policy_request(
+    question: object,
+    *,
+    frame=None,
+) -> bool:
+    """Whether collection completion needs a governing-document snapshot.
+
+    ``coverage_mode=collection`` only says that the answer has more than one
+    component.  It must not be conflated with the much stronger claim that a
+    whole policy document is required.  This predicate keeps that distinction
+    in the planner, where sentence structure and target boundaries are still
+    available, instead of making the evidence layer guess from source text.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(question or "")).strip()
+    if not normalized:
+        return False
+    parsed = frame or parse_query_surface_frame(normalized)
+    if parsed is None:
+        return False
+    if parsed.question_operator == "process":
+        return False
+    if any(
+        _has_stable_entity_identifier(item.text)
+        for item in parsed.entity_qualifiers
+    ):
+        return False
+    return bool(
+        _COLLECTION_OPEN_RE.search(normalized)
+        and _DOCUMENT_POLICY_TARGET_RE.search(parsed.answer_target)
+    )
+
+
+def _is_conditional_policy_disposition(
+    question: object,
+    *,
+    frame=None,
+) -> bool:
+    """Recognise a conditional policy outcome instead of a process list.
+
+    ``如何处理`` asks for an operational procedure in some contexts, but a
+    conditional standard/limit normally has one applicable disposition.  The
+    distinction stays in the shared grammatical planning layer: it neither
+    reads documents nor encodes any company-specific business value.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(question or "")).strip(" 。！？!?")
+    if not _CONDITIONAL_POLICY_DISPOSITION_RE.search(normalized):
+        return False
+    disposition_head = _CONDITIONAL_POLICY_DISPOSITION_RE.sub("", normalized)
+    parsed = frame or parse_query_surface_frame(normalized)
+    if parsed is not None and parsed.condition_qualifiers:
+        target = _strip_query_tail(parsed.answer_target)
+        if _POLICY_DISPOSITION_TARGET_RE.search(target):
+            return True
+    # Conservative surface parsing intentionally leaves some compact forms
+    # intact (for example ``超出报销标准如何处理``).  A visible policy head is
+    # still enough to keep that one disposition on the direct single-claim
+    # path rather than falsely requiring a complete procedure.
+    return bool(_POLICY_DISPOSITION_TARGET_RE.search(disposition_head))
 
 
 def _clean_implicit_subject(value: str) -> str:
@@ -431,6 +574,8 @@ def _is_coordinated_scope_item(value: str) -> bool:
     candidate = _clean_implicit_subject(value)
     if not candidate or "的" in candidate:
         return False
+    if _COORDINATED_CLASS_LABEL_RE.fullmatch(candidate):
+        return True
     qualifier = _implicit_qualifier_anchor(candidate)
     return qualifier == candidate or _has_stable_entity_identifier(candidate)
 
@@ -492,96 +637,104 @@ def _split_compact_prepositional_target(
     return condition, target
 
 
-def _implicit_target_requires_bridge(value: str) -> bool:
-    """Whether a possessive target can denote a policy-derived outcome.
+def _coordinated_answer_target(query: str, subject: str) -> str:
+    """Return a literal answer target after one shared explicit subject."""
 
-    The decision is about answer semantics, independent of any company domain:
-    policy limits, entitlements and actions may depend on an intermediate
-    source-authored class; direct identity/classification fields do not.
+    normalized_query = re.sub(r"\s+", " ", str(query or "")).strip()
+    normalized_subject = re.sub(r"\s+", " ", str(subject or "")).strip()
+    if not normalized_query or not normalized_subject:
+        return ""
+    position = normalized_query.casefold().find(normalized_subject.casefold())
+    if position < 0:
+        return ""
+    target = normalized_query[position + len(normalized_subject):]
+    target = target.lstrip(" 的：:，,")
+    return _strip_query_tail(target)
+
+
+def _can_share_coordinated_bridge(query: str, bridge: ImplicitBridgePlan) -> bool:
+    """Whether a proven sibling bridge is structurally relevant to this item.
+
+    This is intentionally restricted to coordinated questions that already
+    have an explicit common subject.  A bare item such as ``住宿`` should not
+    be turned into an invented policy term, but it may depend on the same
+    category mapping as its sibling ``餐补``.  Direct identity attributes
+    (name, code, role, etc.) remain independent even when they share wording.
     """
 
-    target = _strip_query_tail(value)
-    return bool(
-        target
-        and _IMPLICIT_MAPPING_TARGET_SUFFIX_RE.search(target)
-        and not _IMPLICIT_BROAD_TARGET_RE.search(target)
-        and not _IMPLICIT_DIRECT_ATTRIBUTE_TARGET_RE.search(target)
-    )
+    subject = bridge.subject
+    if not subject or subject.casefold() not in str(query or "").casefold():
+        return False
+    target = _coordinated_answer_target(query, subject)
+    if not target:
+        return False
+    return not answer_target_semantics(
+        query,
+        answer_target=target,
+        entity_qualifier=subject,
+    ).is_direct_attribute
+
+
+def _with_shared_coordinated_bridges(
+    answer_queries: list[str],
+    inferred_by_answer: list[tuple[ImplicitBridgePlan, ...]],
+) -> list[tuple[ImplicitBridgePlan, ...]]:
+    """Propagate an already inferred subject bridge across safe siblings.
+
+    The bridge itself is still inferred from an explicit sibling and remains a
+    helpful lookup.  This helper only attaches that same dependency to sibling
+    answer nodes; it never invents a subject, target, classification or
+    retrieval term.  It fixes a graph inconsistency where ``普通员工的交通、
+    住宿和餐补这些分别是多少`` used one category bridge for ``餐补`` but falsely
+    treated the two sibling policy questions as independent facts.
+    """
+
+    bridge_pool: list[ImplicitBridgePlan] = []
+    for values in inferred_by_answer:
+        for bridge in values:
+            if bridge not in bridge_pool:
+                bridge_pool.append(bridge)
+    if not bridge_pool:
+        return inferred_by_answer
+    expanded: list[tuple[ImplicitBridgePlan, ...]] = []
+    for query, existing in zip(answer_queries, inferred_by_answer):
+        values = list(existing)
+        known = {
+            (
+                item.subject.casefold(),
+                re.sub(r"\s+", " ", item.retrieval_query).strip().casefold(),
+            )
+            for item in values
+        }
+        for bridge in bridge_pool:
+            key = (
+                bridge.subject.casefold(),
+                re.sub(r"\s+", " ", bridge.retrieval_query).strip().casefold(),
+            )
+            if key in known or not _can_share_coordinated_bridge(query, bridge):
+                continue
+            values.append(bridge)
+            known.add(key)
+        expanded.append(tuple(values))
+    return expanded
 
 
 def infer_implicit_bridges(question: object) -> tuple[ImplicitBridgePlan, ...]:
-    """Infer all independently stated classification conditions in one query.
+    """Return at most one bridge, preserving its surface semantics.
 
-    The first bridge is the existing entity/condition mapping.  Additional
-    bridges are admitted only from explicit local prepositional conditions
-    before the answer target (for example ``X在Y的额度``).  Direct clauses
-    that state every original condition can still bypass these helpful edges;
-    otherwise each mapping must be proved from source text.
+    A classification inferred from an ordinary noun phrase is only a possible
+    retrieval enhancement.  It must therefore originate from an explicit
+    ``entity`` qualifier in :func:`parse_query_surface_frame`; a condition
+    (place, duration, phase, threshold or status) never becomes an invented
+    classification axis merely because it appears before a policy noun.
+
+    Explicit relation syntax is handled by :func:`infer_implicit_bridge` as a
+    proof bridge.  There is deliberately no second pass that turns every
+    prepositional condition into another category lookup.
     """
 
-    primary = infer_implicit_bridge(question)
-    if primary is None:
-        return ()
-    normalized = _normalize_query(question)
-    possessive = _IMPLICIT_POSSESSIVE_RE.search(normalized)
-    if possessive is None:
-        compact = _strip_query_tail(normalized)
-        primary_position = compact.casefold().find(primary.subject.casefold())
-        if primary_position < 0:
-            return (primary,)
-        remainder = compact[
-            primary_position + len(primary.subject):
-        ]
-        compact_condition = _split_compact_prepositional_target(remainder)
-        if compact_condition is None:
-            return (primary,)
-        condition, target = compact_condition
-        primary = ImplicitBridgePlan(
-            subject=primary.subject,
-            description=_implicit_bridge_description(primary.subject, target),
-            retrieval_query=primary.retrieval_query,
-        )
-        return (
-            primary,
-            ImplicitBridgePlan(
-                subject=condition,
-                description=_implicit_bridge_description(condition, target),
-                retrieval_query=(
-                    f"{condition} 对应的适用分类 等级 类别 区域 档位 阶段"
-                ),
-            ),
-        )
-    raw_subject = _clean_implicit_subject(possessive.group("subject"))
-    target = _strip_query_tail(possessive.group("target"))
-    if not raw_subject or not target:
-        return (primary,)
-    primary_position = raw_subject.casefold().find(primary.subject.casefold())
-    if primary_position < 0:
-        return (primary,)
-    remainder = raw_subject[primary_position + len(primary.subject):]
-    additional: list[ImplicitBridgePlan] = []
-    for match in re.finditer(
-        r"(?:在|于|位于|针对|面向|对|按)"
-        r"(?P<condition>[\u3400-\u9fffA-Za-z0-9_.+/-]{2,32}?)"
-        r"(?=(?:在|于|位于|针对|面向|对|按)|$)",
-        remainder,
-        re.IGNORECASE,
-    ):
-        condition = _clean_implicit_subject(match.group("condition"))
-        if (
-            not _is_implicit_subject(condition)
-            or condition.casefold() == primary.subject.casefold()
-            or _IMPLICIT_NESTED_CONTEXT_BLOCK_RE.search(condition)
-        ):
-            continue
-        additional.append(ImplicitBridgePlan(
-            subject=condition,
-            description=_implicit_bridge_description(condition, target),
-            retrieval_query=(
-                f"{condition} 对应的适用分类 等级 类别 区域 档位 阶段"
-            ),
-        ))
-    return tuple(dict.fromkeys((primary, *additional)))[:4]
+    bridge = infer_implicit_bridge(question)
+    return (bridge,) if bridge is not None else ()
 
 
 def _implicit_bridge_description(subject: str, target: str) -> str:
@@ -613,34 +766,43 @@ def infer_implicit_bridge(question: object) -> ImplicitBridgePlan | None:
     one_line = re.sub(r"\s+", " ", normalized).strip()
     if "\n" in normalized or _MULTI_PART_RE.search(normalized):
         return None
+    # This phrase is an internal compatibility fallback used when a legacy
+    # caller has no question text.  It has the surface shape of
+    # ``回答用户 + 当前问题`` but is not a user-authored entity/attribute
+    # request, so treating it as a mapping would manufacture a bridge task
+    # and inflate retrieval for an otherwise single-fact contract.
+    if _NON_SEMANTIC_QUERY_PLACEHOLDER_RE.fullmatch(one_line):
+        return None
 
-    # Prefer the suffix only when it can prove a complete structural mapping
-    # by itself.  This separates a leading project/product/version scope from
-    # the real entity (``...8.2.75普通员工``), while preserving the original
-    # parse when the scope occurs inside the answer target
-    # (``普通员工的云枢8.6配置权限``).
+    # Prefer the suffix only when a product/version scope is explicit in the
+    # source text and the suffix independently exposes the same grammar.  The
+    # frame never treats that scope as the entity being classified.
     scoped_suffix = _suffix_after_explicit_scope(one_line)
     if scoped_suffix is not None:
         scoped_bridge = infer_implicit_bridge(scoped_suffix)
         if scoped_bridge is not None:
             return scoped_bridge
 
-    # Explicit relation wording is already a multi-hop signal.  Extract the
-    # two sides when possible; otherwise use a deliberately generic relation
-    # claim so the plan cannot be treated as a single verified fact.
+    frame = parse_query_surface_frame(one_line)
+
+    # Explicit relation wording is a hard proof edge, not a helpful
+    # classification guess.  Preserve the legacy ``由…决定`` form as well as
+    # ``对应``; the frame supplies a normalized right-hand target where one is
+    # syntactically present (for example ``对应什么职级`` -> ``职级``).
     relation = _IMPLICIT_RELATION_RE.search(one_line)
     if relation:
         left = _clean_implicit_subject(relation.group("left"))
         right = _strip_query_tail(relation.group("right"))
+        if frame is not None and frame.question_operator == "relation":
+            right = frame.answer_target or right
         by = _clean_implicit_subject(relation.group("by") or "")
         if _is_implicit_subject(left) and right:
-            description = (
-                f"确认{left}与{right}之间的适用/决定关系"
-            )[:500]
+            description = f"确认{left}与{right}之间的适用/决定关系"[:500]
             return ImplicitBridgePlan(
                 subject=left,
                 description=description,
                 retrieval_query=f"{left} {right} 对应关系",
+                kind="mapping",
             )
         # ``该值由前一项决定`` has a pronoun as the grammatical subject,
         # which is intentionally excluded above.  The deciding operand is
@@ -651,6 +813,7 @@ def infer_implicit_bridge(question: object) -> ImplicitBridgePlan | None:
                 subject=by,
                 description=description,
                 retrieval_query=f"{by} 对应结果的决定关系",
+                kind="condition",
             )
     by_relation = _IMPLICIT_BY_RE.search(one_line)
     if by_relation:
@@ -662,66 +825,43 @@ def infer_implicit_bridge(question: object) -> ImplicitBridgePlan | None:
                 subject=by,
                 description=description,
                 retrieval_query=f"{by} {left or '结果'} 决定关系",
+                kind="condition",
             )
 
-    possessive = _IMPLICIT_POSSESSIVE_RE.search(one_line)
-    if possessive:
-        subject = _clean_implicit_subject(possessive.group("subject"))
-        qualifier = _implicit_qualifier_anchor(subject)
-        target = _strip_query_tail(possessive.group("target"))
-        if (
-            qualifier is not None
-            and _implicit_target_requires_bridge(target)
-        ):
-            description = _implicit_bridge_description(qualifier, target)
-            return ImplicitBridgePlan(
-                subject=qualifier,
-                description=description,
-                retrieval_query=(
-                    f"{qualifier} 对应的适用分类 等级 类别 职级 角色 版本 档位 阶段"
-                ),
-            )
-
-    # Compact policy questions often omit ``的``.  Split only when the left
-    # side has an entity/status suffix; this avoids treating ``交通费用标准``
-    # or ``制度内容`` as an implicit relationship.
-    compact = _strip_query_tail(one_line)
-    if possessive is not None:
+    if frame is None:
         return None
-    compact_candidates: list[tuple[str, str]] = []
-    for split_at in range(2, max(2, len(compact) - 1)):
-        raw_subject = _clean_implicit_subject(compact[:split_at])
-        subject = _implicit_qualifier_anchor(raw_subject)
-        if subject is None:
+    # Only the explicit entity span may request a speculative classification
+    # lookup.  Conditions and scopes retain their literal terms in the direct
+    # answer query, so a directly applicable clause remains answerable even
+    # when no mapping table exists.
+    if frame.question_operator == "relation":
+        return None
+    target = _strip_query_tail(frame.answer_target)
+    for qualifier_span in frame.entity_qualifiers:
+        qualifier = _clean_implicit_subject(qualifier_span.text)
+        if not _is_implicit_subject(qualifier):
             continue
-        # A longer trial split may already contain a local condition, for
-        # example ``客户A按地区``.  The entity anchor is still ``客户A`` and
-        # the condition belongs to the answer target; never silently turn the
-        # generic word ``地区`` into the entity being classified.
-        target = (
-            compact[len(subject):]
-            if raw_subject != subject and compact.startswith(subject)
-            else compact[split_at:]
-        )
-        if (
-            _is_implicit_subject(subject)
-            and len(target) >= 2
-            and _implicit_target_requires_bridge(target)
-        ):
-            compact_candidates.append((subject, target))
-    if compact_candidates:
-        # Prefer the longest qualifier that still has an entity/status suffix;
-        # this keeps modifiers such as ``普通`` with ``员工`` while the suffix
-        # gate prevents a topic phrase such as ``交通费用`` from swallowing the
-        # real target.
-        subject, target = max(compact_candidates, key=lambda item: len(item[0]))
-        description = _implicit_bridge_description(subject, target)
+        # A stable identifier makes this an attribute request about one named
+        # entity (for example ``供应商甲`` / ``客户A`` / ``部门D01``), not a
+        # population whose answer needs speculative class expansion.  Direct
+        # evidence is sufficient unless explicit relation syntax above has
+        # already created a typed proof edge.
+        if _has_stable_entity_identifier(qualifier):
+            continue
+        if not answer_target_semantics(
+            one_line,
+            answer_target=target,
+            entity_qualifier=qualifier,
+        ).classification_augmentation_allowed:
+            continue
+        description = _implicit_bridge_description(qualifier, target)
         return ImplicitBridgePlan(
-            subject=subject,
+            subject=qualifier,
             description=description,
             retrieval_query=(
-                f"{subject} 对应的适用分类 等级 类别 职级 角色 版本 档位 阶段"
+                f"{qualifier} 对应的适用分类 等级 类别 职级 角色 版本 档位 阶段"
             ),
+            kind="classification",
         )
     return None
 
@@ -756,40 +896,61 @@ def _split_multi_part_query(question: str) -> tuple[str, ...]:
     return tuple(unique) or (question,)
 
 
-def _split_coordinated_enumeration(question: str) -> tuple[str, ...]:
-    """Expand an explicit ``A、B 和 C 分别...`` question conservatively.
+def _expand_coordinated_body_tail(
+    body: str,
+    tail: str,
+    *,
+    require_complete_targets: bool,
+    tail_is_validated_distributive_request: bool = False,
+) -> tuple[str, ...]:
+    """Expand coordinated answer units while preserving shared scope.
 
-    The rule is driven by coordination syntax, not by policy vocabulary.  A
-    suffix written once on the final item (``交通、住宿和餐补标准``) is shared
-    with earlier bare items, and an explicit possessive prefix is retained on
-    every generated query.  Without both a coordination separator and
-    ``分别``/``各自``, this helper returns an empty tuple.
+    Explicit distributive markers make every item independently answerable.
+    Natural scalar questions often omit that marker (``A 和 B 是多少``), so
+    the implicit caller additionally requires each expanded sibling to expose
+    a complete target shape.  This avoids splitting arbitrary noun compounds
+    merely because they contain a conjunction.
     """
 
-    normalized = re.sub(r"\s+", " ", str(question or "")).strip()
-    normalized = normalized.strip(" ；;。！？!?")
-    match = _COORDINATED_ENUMERATION_RE.fullmatch(normalized)
-    if match is None:
+    body = str(body or "").strip(" ，,。；;：:")
+    tail = str(tail or "").strip(" ，,。；;：:！？!?")
+    # ``还有`` can join a natural list, but it can also start an interrogative
+    # phrase such as ``还有哪些``.  The shared surface parser normalizes only
+    # the former, so a question word is never manufactured as an answer target.
+    body = normalize_coordination_body(body)
+    if not body or not tail:
         return ()
-    body = match.group("body").strip(" ，,。；;：:")
-    tail = match.group("tail").strip(" ，,。；;：:！？!?")
-    if not body or not tail or not _COORDINATED_SEPARATOR_RE.search(body):
+    if (
+        tail_is_validated_distributive_request
+        and not is_distributive_request_tail(tail)
+    ):
+        # Defensive invariant for future callers: only the shared surface
+        # parser may certify an explicit distributive tail.
         return ()
-    if not any(pattern.search(tail) for pattern in (
-        _PROCESS_RE,
-        _LIST_RE,
-        _JUDGEMENT_RE,
-        _SCALAR_FACT_RE,
-        _OVERVIEW_RE,
-        _COORDINATED_GENERIC_ANSWER_RE,
-    )):
+    if not tail_is_validated_distributive_request and not (
+        is_procedure_question(tail)
+        or any(pattern.search(tail) for pattern in (
+            _LIST_RE,
+            _JUDGEMENT_RE,
+            _SCALAR_FACT_RE,
+            _OVERVIEW_RE,
+            _COORDINATED_GENERIC_ANSWER_RE,
+        ))
+    ):
         return ()
 
-    raw_parts = [
-        value.strip(" ，,。；;：:")
-        for value in _COORDINATED_SEPARATOR_RE.split(body)
-    ]
-    if len(raw_parts) < 2 or any(not value for value in raw_parts):
+    raw_parts = list(split_coordination_body(body))
+    if not raw_parts:
+        return ()
+    if require_complete_targets and any(
+        _IMPLICIT_BROAD_TARGET_RE.fullmatch(
+            _strip_query_tail(value.rsplit("的", 1)[-1])
+        )
+        for value in raw_parts
+    ):
+        # ``制度和标准是什么`` may denote one compound overview rather than
+        # two independently answerable values.  A bare shape noun cannot make
+        # an omitted distributive marker safe merely through suffix sharing.
         return ()
 
     stems = list(raw_parts)
@@ -818,23 +979,14 @@ def _split_coordinated_enumeration(question: str) -> tuple[str, ...]:
             raw_parts[-1],
         ]
     else:
-        # A trailing policy/measurement suffix commonly scopes a list of
-        # answer targets (``交通、住宿和餐补标准``).  Borrow it only for a
-        # sibling whose own local target is incomplete.  In particular,
-        # ``风险处置措施`` must remain intact beside ``风险等级``.
-        suffix_match = _IMPLICIT_TARGET_SUFFIX_RE.search(raw_parts[-1])
-        shared_suffix = (
-            suffix_match.group(0) if suffix_match is not None else ""
-        )
-        stems = [
-            (
-                value + shared_suffix
-                if shared_suffix
-                and not _coordinated_target_is_complete(value)
-                else value
-            )
-            for value in raw_parts
-        ]
+        # A final item such as ``餐补标准`` can grammatically be read either
+        # as a shared head (``交通标准、住宿标准、餐补标准``) or as that item's
+        # own compound.  The text alone cannot prove which.  Older code
+        # guessed by appending a suffix and fabricated terms such as
+        # ``住宿补贴``.  Preserve every literal item instead; the execution
+        # DAG later carries the original full question as a shared retrieval
+        # anchor without changing an answer target's source wording.
+        stems = list(raw_parts)
 
     # ``普通员工的`` is grammatical scope for every coordinated target, not
     # merely the first one.  Retaining it also lets the bridge detector prove
@@ -852,19 +1004,29 @@ def _split_coordinated_enumeration(question: str) -> tuple[str, ...]:
             for index, value in enumerate(stems)
         ]
 
+    if require_complete_targets and not all(
+        _coordinated_target_is_complete(value) for value in stems
+    ):
+        return ()
+
     queries = [f"{value}{tail}" for value in stems]
 
     # Compact forms may omit ``的`` (``普通员工交通、住宿标准分别是多少``).
     # If the first expanded item exposes one safe qualifier, carry only that
     # qualifier to still-unqualified siblings, then re-run bridge inference.
+    # This copies an explicit subject boundary; it never synthesizes a target
+    # suffix such as ``住宿补贴``.
     if not first_prefix and queries:
         first_bridge = infer_implicit_bridge(queries[0])
-        if first_bridge is not None:
-            subject = first_bridge.subject
-            if _is_implicit_subject(subject):
-                for index in range(1, len(queries)):
-                    if infer_implicit_bridge(queries[index]) is None:
-                        queries[index] = f"{subject}{stems[index]}{tail}"
+        subject = (
+            first_bridge.subject
+            if first_bridge is not None
+            else _implicit_qualifier_anchor(stems[0])
+        )
+        if subject is not None and _is_implicit_subject(subject):
+            for index in range(1, len(queries)):
+                if infer_implicit_bridge(queries[index]) is None:
+                    queries[index] = f"{subject}{stems[index]}{tail}"
 
     unique: list[str] = []
     for value in queries:
@@ -876,12 +1038,47 @@ def _split_coordinated_enumeration(question: str) -> tuple[str, ...]:
     return tuple(unique)
 
 
+def _split_coordinated_enumeration(question: str) -> tuple[str, ...]:
+    """Expand an explicit ``A、B 和 C 分别...`` question conservatively."""
+
+    structure = parse_distributive_enumeration(question)
+    if structure is None or structure.contains_historical_reference:
+        return ()
+    return _expand_coordinated_body_tail(
+        structure.body,
+        structure.tail,
+        require_complete_targets=False,
+        tail_is_validated_distributive_request=True,
+    )
+
+
+def _split_implicit_coordinated_targets(question: str) -> tuple[str, ...]:
+    """Split safe ``A 和 B 是多少`` forms without requiring ``分别``.
+
+    A split needs one bounded interrogative plus independently complete target
+    shapes after suffix and possessive-scope propagation.  Ambiguous compounds
+    remain a single requirement and therefore cannot silently change intent.
+    """
+
+    normalized = re.sub(r"\s+", " ", str(question or "")).strip()
+    normalized = normalized.strip(" ；;。！？!?")
+    match = _IMPLICIT_COORDINATED_QUESTION_RE.fullmatch(normalized)
+    if match is None:
+        return ()
+    return _expand_coordinated_body_tail(
+        match.group("body"),
+        match.group("tail"),
+        require_complete_targets=True,
+    )
+
+
 def _build_multi_answer_plan(
     question: str,
     answer_queries: tuple[str, ...],
     *,
     reason: str,
     answer_shape: str = "multi_part",
+    share_coordinated_bridges: bool = False,
 ) -> QueryPlanV2:
     """Compile multiple answer units and their independent bridge edges.
 
@@ -890,6 +1087,10 @@ def _build_multi_answer_plan(
     sibling merely because both occur in the same user turn.
     """
 
+    # Scope fingerprint is part of the bridge identity.  Equal lexical bridge
+    # wording from two projects/versions must remain separate execution
+    # vertices; collapsing it would make a later successful bridge fact bleed
+    # into its sibling answer.
     BridgeKey = tuple[str, str, str, str]
 
     def bridge_key(
@@ -900,8 +1101,8 @@ def _build_multi_answer_plan(
         return (
             inferred.subject.casefold(),
             re.sub(r"\s+", " ", inferred.retrieval_query).strip().casefold(),
-            str(scope.product or "").casefold(),
-            str(scope.version or "").casefold(),
+            inferred.kind,
+            scope.fingerprint,
         )
 
     bounded_answers = list(answer_queries[:8])
@@ -909,6 +1110,11 @@ def _build_multi_answer_plan(
         inferred_by_answer = [
             infer_implicit_bridges(query) for query in bounded_answers
         ]
+        if share_coordinated_bridges:
+            inferred_by_answer = _with_shared_coordinated_bridges(
+                bounded_answers,
+                inferred_by_answer,
+            )
         unique_bridges: dict[BridgeKey, ImplicitBridgePlan] = {}
         for query, inferred_set in zip(bounded_answers, inferred_by_answer):
             for inferred in inferred_set:
@@ -923,11 +1129,13 @@ def _build_multi_answer_plan(
     inferred_by_answer = [
         infer_implicit_bridges(query) for query in bounded_answers
     ]
+    if share_coordinated_bridges:
+        inferred_by_answer = _with_shared_coordinated_bridges(
+            bounded_answers,
+            inferred_by_answer,
+        )
     unique_bridges: dict[BridgeKey, ImplicitBridgePlan] = {}
-    bridge_scope_by_key: dict[
-        BridgeKey,
-        tuple[str | None, str | None, bool],
-    ] = {}
+    bridge_scope_by_key: dict[BridgeKey, ApplicabilityScope] = {}
     bridge_keys_by_answer: list[tuple[BridgeKey, ...]] = []
     for query, inferred_set in zip(bounded_answers, inferred_by_answer):
         scope = extract_query_constraints(query)
@@ -935,10 +1143,7 @@ def _build_multi_answer_plan(
         for inferred in inferred_set:
             key = bridge_key(inferred, query)
             unique_bridges.setdefault(key, inferred)
-            bridge_scope_by_key.setdefault(
-                key,
-                (scope.product, scope.version, scope.explicit_version),
-            )
+            bridge_scope_by_key.setdefault(key, scope)
             answer_keys.append(key)
         bridge_keys_by_answer.append(tuple(dict.fromkeys(answer_keys)))
 
@@ -946,17 +1151,34 @@ def _build_multi_answer_plan(
         key: f"r{len(bounded_answers) + index}"
         for index, key in enumerate(unique_bridges, start=1)
     }
+    answer_specs = [
+        (query, keys, _answer_coverage_mode(query, answer_shape=answer_shape))
+        for query, keys in zip(bounded_answers, bridge_keys_by_answer)
+    ]
     requirements: list[AnswerRequirementV2] = [
         AnswerRequirementV2(
             id=f"r{index}",
             description=query,
-            coverage_mode=_answer_coverage_mode(query),
-            depends_on_requirement_ids=tuple(
-                bridge_id_by_key[key] for key in keys
+            coverage_mode=coverage_mode,
+            coverage_contract=_answer_coverage_contract(
+                query,
+                answer_shape=answer_shape,
+                coverage_mode=coverage_mode,
             ),
+            depends_on_requirement_ids=tuple(
+                bridge_id_by_key[key]
+                for key in keys
+                if unique_bridges[key].kind != "classification"
+            ),
+            augmentation_requirement_ids=tuple(
+                bridge_id_by_key[key]
+                for key in keys
+                if unique_bridges[key].kind == "classification"
+            ),
+            applicability_scope=extract_query_constraints(query),
         )
-        for index, (query, keys) in enumerate(
-            zip(bounded_answers, bridge_keys_by_answer),
+        for index, (query, keys, coverage_mode) in enumerate(
+            answer_specs,
             start=1,
         )
     ]
@@ -968,9 +1190,8 @@ def _build_multi_answer_plan(
             importance="helpful",
             source="inferred",
             bridge_subject=inferred.subject,
-            scope_product=bridge_scope_by_key[key][0],
-            scope_version=bridge_scope_by_key[key][1],
-            scope_explicit_version=bridge_scope_by_key[key][2],
+            bridge_kind=inferred.kind,
+            applicability_scope=bridge_scope_by_key[key],
         )
         for key, inferred in unique_bridges.items()
     )
@@ -982,8 +1203,11 @@ def _build_multi_answer_plan(
             " ".join(
                 value
                 for value in (
-                    str(bridge_scope_by_key[key][0] or ""),
-                    str(bridge_scope_by_key[key][1] or ""),
+                    str(bridge_scope_by_key[key].project or "")
+                    if bridge_scope_by_key[key].has_project_constraint
+                    else "",
+                    str(bridge_scope_by_key[key].product or ""),
+                    str(bridge_scope_by_key[key].version or ""),
                     inferred.retrieval_query,
                 )
                 if value
@@ -1015,7 +1239,9 @@ def _unknown_plan(
             AnswerRequirementV2(
                 id="r1",
                 description=question,
+                coverage_contract="single_claim",
                 depends_on_requirement_ids=(),
+                augmentation_requirement_ids=(),
             ),
         )
         if question
@@ -1057,11 +1283,17 @@ def _ready_plan(
             AnswerRequirementV2(
                 id=f"r{index}",
                 description=description,
-                coverage_mode=_answer_coverage_mode(
+                coverage_mode=(coverage_mode := _answer_coverage_mode(
                     description,
                     answer_shape=answer_shape,
+                )),
+                coverage_contract=_answer_coverage_contract(
+                    description,
+                    answer_shape=answer_shape,
+                    coverage_mode=coverage_mode,
                 ),
                 depends_on_requirement_ids=(),
+                augmentation_requirement_ids=(),
             )
             for index, description in enumerate(
                 requirement_descriptions,
@@ -1078,6 +1310,126 @@ def _ready_plan(
         confidence=confidence,
         source="local",
         reason=reason,
+    )
+
+
+def _comparison_scope_display(scope: ApplicabilityScope) -> str:
+    """Render only source-owned applicability terms for one comparison side."""
+
+    values = (
+        scope.project if scope.has_project_constraint else None,
+        scope.product,
+        scope.version,
+    )
+    return " ".join(
+        value
+        for value in values
+        if isinstance(value, str) and value.strip()
+    )
+
+
+def _comparison_target_tail(
+    question: str,
+    scopes: tuple[ApplicabilityScope, ...],
+) -> str | None:
+    """Return the literal shared target after the final explicit scope.
+
+    This is deliberately a rendering helper, not semantic decomposition.  If
+    the sentence shape is unfamiliar we return ``None`` and retain the full
+    source question on each independently scoped task.  The scope separation
+    remains safe either way; only retrieval wording becomes less precise.
+    """
+
+    source = str(question or "")
+    ends = [
+        item.version_source.end
+        for item in scopes
+        if item.version_source is not None
+    ]
+    if not ends:
+        return None
+    tail = source[max(ends):]
+    tail = re.sub(r"^\s*(?:的|中|下|内|里|分别|各自)\s*", "", tail)
+    tail = tail.strip(" \t\r\n，,。；;：:！!？?")
+    # The comparison operator itself is not an answer target.  Strip only a
+    # bounded comparison shell; all remaining wording is copied verbatim.
+    tail = re.sub(
+        r"(?:有什么|有何|哪些)?(?:区别|差异|不同(?:点)?)$",
+        "",
+        tail,
+    ).strip(" \t\r\n，,。；;：:！!？?")
+    if not tail or len(tail) > 300:
+        return None
+    return tail
+
+
+def _explicit_scope_comparison_plan(question: str) -> QueryPlanV2 | None:
+    """Compile a deterministic one-scope-per-side comparison baseline.
+
+    A model analysis can refine source wording later, but it must never be
+    required to preserve an explicit product/version comparison.  Each side is
+    therefore represented by a separate required answer requirement and its
+    own canonical ``ApplicabilityScope``.  The anchor may recall their union;
+    downstream task admission is still single-scope.
+    """
+
+    scopes = tuple(
+        scope
+        for scope in extract_applicability_scopes(question)
+        if scope.has_version_constraint
+    )
+    unique_scopes: list[ApplicabilityScope] = []
+    seen_fingerprints: set[str] = set()
+    for scope in scopes:
+        if scope.fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(scope.fingerprint)
+        unique_scopes.append(scope)
+    if len(unique_scopes) < 2:
+        return None
+
+    target_tail = _comparison_target_tail(question, tuple(unique_scopes))
+    requirements: list[AnswerRequirementV2] = []
+    descriptions: list[str] = []
+    for index, scope in enumerate(unique_scopes[:8], start=1):
+        scope_display = _comparison_scope_display(scope)
+        # A full original question is an intentionally conservative fallback:
+        # the local scope remains typed and prevents a third version entering
+        # the answer, even when grammar cannot isolate a common target.
+        description = (
+            " ".join((scope_display, target_tail)).strip()
+            if scope_display and target_tail
+            else question
+        )
+        coverage_mode = _answer_coverage_mode(
+            description,
+            answer_shape="comparison",
+        )
+        requirement = AnswerRequirementV2(
+            id=f"r{index}",
+            description=description,
+            role="answer",
+            importance="required",
+            source="explicit",
+            coverage_mode=coverage_mode,
+            coverage_contract=_answer_coverage_contract(
+                description,
+                answer_shape="comparison",
+                coverage_mode=coverage_mode,
+            ),
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+            applicability_scope=scope,
+        )
+        requirements.append(requirement)
+        descriptions.append(description)
+    return _ready_plan(
+        question,
+        answer_shape="comparison",
+        confidence=0.97,
+        reason="explicit_multi_scope_comparison",
+        retrieval_queries=tuple(_unique for _unique in (question, *descriptions)),
+        requirements=tuple(requirements),
     )
 
 
@@ -1104,6 +1456,17 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                 normalized,
                 coordinated_queries,
                 reason="explicit_coordinated_enumeration",
+                share_coordinated_bridges=True,
+            )
+        implicit_coordinated_queries = _split_implicit_coordinated_targets(
+            normalized
+        )
+        if implicit_coordinated_queries:
+            return _build_multi_answer_plan(
+                normalized,
+                implicit_coordinated_queries,
+                reason="implicit_coordinated_answer_targets",
+                share_coordinated_bridges=True,
             )
         if _MULTI_PART_RE.search(normalized):
             return _build_multi_answer_plan(
@@ -1112,6 +1475,9 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                 reason="explicit_multi_part_structure",
             )
         if _COMPARISON_RE.search(normalized):
+            scoped_comparison = _explicit_scope_comparison_plan(normalized)
+            if scoped_comparison is not None:
+                return scoped_comparison
             return _ready_plan(
                 normalized,
                 answer_shape="comparison",
@@ -1124,12 +1490,36 @@ def plan_query_locally(question: object) -> QueryPlanV2:
             bridge_ids = tuple(
                 f"r{index}" for index in range(2, 2 + len(implicit_bridges))
             )
+            proof_bridge_ids = tuple(
+                bridge_id
+                for bridge_id, implicit_bridge in zip(
+                    bridge_ids,
+                    implicit_bridges,
+                )
+                if implicit_bridge.kind != "classification"
+            )
+            augmentation_bridge_ids = tuple(
+                bridge_id
+                for bridge_id, implicit_bridge in zip(
+                    bridge_ids,
+                    implicit_bridges,
+                )
+                if implicit_bridge.kind == "classification"
+            )
             requirements = (
                 AnswerRequirementV2(
                     id="r1",
                     description=normalized,
-                    coverage_mode=_answer_coverage_mode(normalized),
-                    depends_on_requirement_ids=bridge_ids,
+                    coverage_mode=(coverage_mode := _answer_coverage_mode(
+                        normalized,
+                    )),
+                    coverage_contract=_answer_coverage_contract(
+                        normalized,
+                        coverage_mode=coverage_mode,
+                    ),
+                    depends_on_requirement_ids=proof_bridge_ids,
+                    augmentation_requirement_ids=augmentation_bridge_ids,
+                    applicability_scope=local_scope,
                 ),
                 *(
                     AnswerRequirementV2(
@@ -1139,9 +1529,8 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                         importance="helpful",
                         source="inferred",
                         bridge_subject=implicit_bridge.subject,
-                        scope_product=local_scope.product,
-                        scope_version=local_scope.version,
-                        scope_explicit_version=local_scope.explicit_version,
+                        bridge_kind=implicit_bridge.kind,
+                        applicability_scope=local_scope,
                     )
                     for bridge_id, implicit_bridge in zip(
                         bridge_ids,
@@ -1149,11 +1538,29 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                     )
                 ),
             )
+            # A surface-derived classification (for example ``普通员工``)
+            # improves recall only.  The literal user question remains a
+            # complete direct task even if no source ever proves that mapping.
+            # Explicit ``对应`` / ``由…决定`` syntax is different: it requests
+            # a relation and therefore keeps the proof-oriented multi-hop
+            # answer shape.
+            answer_shape = (
+                "multi_hop"
+                if proof_bridge_ids
+                else "list"
+                if (frame := parse_query_surface_frame(normalized)) is not None
+                and frame.question_operator == "enumeration"
+                else "fact"
+            )
             return _ready_plan(
                 normalized,
-                answer_shape="multi_hop",
+                answer_shape=answer_shape,
                 confidence=0.94,
-                reason="implicit_mapping_dependency",
+                reason=(
+                    "explicit_relation_dependency"
+                    if proof_bridge_ids
+                    else "implicit_classification_augmentation"
+                ),
                 retrieval_queries=(
                     normalized,
                     *(
@@ -1185,12 +1592,56 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                     "以及最终需要查询的标准或数值。"
                 ),
             )
-        if _PROCESS_RE.search(normalized):
+        # A broad policy head can be identified from its open grammatical
+        # operator and generic policy suffix even when no leading document
+        # noun (``制度/政策``) is present.  Treat it as an overview so the
+        # requirement receives ``document_policy`` coverage rather than
+        # letting the unknown fallback silently downgrade it to one claim.
+        surface_frame = parse_query_surface_frame(normalized)
+        if (
+            surface_frame is not None
+            and _is_document_policy_request(
+                normalized,
+                frame=surface_frame,
+            )
+        ):
+            return _ready_plan(
+                normalized,
+                answer_shape="overview",
+                confidence=0.88,
+                reason="surface_open_policy_signal",
+            )
+        if is_procedure_question(normalized, frame=surface_frame):
             return _ready_plan(
                 normalized,
                 answer_shape="process",
                 confidence=0.92,
                 reason="explicit_process_signal",
+            )
+        if _is_conditional_policy_disposition(
+            normalized,
+            frame=surface_frame,
+        ):
+            return _ready_plan(
+                normalized,
+                answer_shape="fact",
+                confidence=0.9,
+                reason="conditional_policy_disposition",
+            )
+        if (
+            surface_frame is not None
+            and surface_frame.question_operator == "value"
+        ):
+            # A bounded value question is a direct fact once governing-policy
+            # heads and explicit process/list structures have been handled
+            # above.  This is particularly important for named-entity
+            # attributes: removing an unjustified classification augmentation
+            # must not strand the direct lookup in ``unknown``.
+            return _ready_plan(
+                normalized,
+                answer_shape="fact",
+                confidence=0.88,
+                reason="surface_value_lookup_signal",
             )
         if _LIST_RE.search(normalized):
             return _ready_plan(
@@ -1198,6 +1649,14 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                 answer_shape="list",
                 confidence=0.92,
                 reason="explicit_list_signal",
+            )
+        frame = parse_query_surface_frame(normalized)
+        if frame is not None and frame.question_operator == "enumeration":
+            return _ready_plan(
+                normalized,
+                answer_shape="list",
+                confidence=0.9,
+                reason="surface_enumeration_signal",
             )
         if _JUDGEMENT_RE.search(normalized):
             return _ready_plan(

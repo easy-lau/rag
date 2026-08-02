@@ -1,19 +1,17 @@
 import os
 import json
 import uuid
-import asyncio
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, update
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from database import get_db
 from models.db_models import Document, DocumentChunk, KnowledgeBase, User, now_utc
 from models.schemas import DocumentOut
-from core.document_parser import parse_file, parse_markdown_content, excel_to_markdown, docx_to_markdown
-from core.embeddings import embed_batch
 from core.audit import AuditLogger, get_audit
 from core.deps import require_kb_access
+from core.document_jobs import enqueue_document_processing_job
 from core.permissions import DOC_CREATE, DOC_DELETE, DOC_READ, DOC_UPDATE
 from config import get_settings
 
@@ -104,12 +102,17 @@ async def upload_document(
                    tags=_parse_tags(tags), created_by=user.id)
     db.add(doc)
     await db.flush()
+    enqueue_document_processing_job(
+        db,
+        document=doc,
+        job_type="file",
+        source_path=saved_path,
+        original_name=file.filename,
+    )
     audit.log(db, "doc.upload", target_type="document", target_id=doc.id, target_name=doc.filename,
               detail={"kb_id": str(kb_id), "file_type": ext})
     await db.commit()
     await db.refresh(doc)
-
-    asyncio.create_task(_process_document(doc.id, kb_id, saved_path, file.filename))
     return doc
 
 
@@ -149,12 +152,17 @@ async def upload_image_document(
     )
     db.add(doc)
     await db.flush()
+    enqueue_document_processing_job(
+        db,
+        document=doc,
+        job_type="image",
+        source_path=saved_path,
+        original_name=file.filename,
+    )
     audit.log(db, "doc.upload_image", target_type="document", target_id=doc.id, target_name=doc.filename,
               detail={"kb_id": str(kb_id), "file_type": ext})
     await db.commit()
     await db.refresh(doc)
-
-    asyncio.create_task(_process_image_document(doc.id, kb_id, saved_path, file.filename))
     return doc
 
 
@@ -186,12 +194,11 @@ async def create_text_document(
                    tags=_normalize_tags(body.tags), created_by=user.id)
     db.add(doc)
     await db.flush()
+    enqueue_document_processing_job(db, document=doc, job_type="text")
     audit.log(db, "doc.create_text", target_type="document", target_id=doc.id, target_name=doc.filename,
               detail={"kb_id": str(kb_id)})
     await db.commit()
     await db.refresh(doc)
-
-    asyncio.create_task(_process_text_document(doc.id, kb_id, body.title, body.content))
     return doc
 
 
@@ -228,9 +235,8 @@ async def update_text_document(
     if not doc or doc.kb_id != kb_id:
         raise HTTPException(status_code=404, detail="文档不存在")
 
-    # 删除旧 chunks，重新处理
-    await db.execute(delete(DocumentChunk).where(DocumentChunk.doc_id == doc_id))
-
+    # 新任务拥有新的 revision。旧分块只有在新 revision 完整解析、向量化并
+    # 原子写入后才会被替换；失败任务不会留下“先清空、后失败”的半成品状态。
     doc.filename = body.title
     doc.raw_content = body.content
     doc.source_url = body.source_url
@@ -239,15 +245,15 @@ async def update_text_document(
     doc.file_type = _ext_of(body.title) or doc.file_type or "md"
     doc.status = "processing"
     doc.chunk_count = 0
+    doc.processing_revision += 1
     doc.tags = _normalize_tags(body.tags)
     doc.updated_by = user.id
     doc.updated_at = now_utc()
+    enqueue_document_processing_job(db, document=doc, job_type="text")
     audit.log(db, "doc.update", target_type="document", target_id=doc.id, target_name=doc.filename,
               detail={"kb_id": str(kb_id)})
     await db.commit()
     await db.refresh(doc)
-
-    asyncio.create_task(_process_text_document(doc.id, kb_id, body.title, body.content))
     return doc
 
 
@@ -323,163 +329,3 @@ async def delete_document(
     await db.delete(doc)
     await db.commit()
     return {"message": "删除成功"}
-
-
-async def reset_stuck_processing() -> None:
-    """启动时把卡在 processing 的文档标记为 failed。它们的后台处理任务随上次进程退出已丢失，
-    否则会永远停留在『处理中』。标记为 failed 后用户可重新编辑/上传重试。"""
-    from database import AsyncSessionLocal
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            update(Document).where(Document.status == "processing").values(status="failed")
-        )
-        await db.commit()
-    if result.rowcount:
-        import logging
-        logging.getLogger(__name__).info(f"[startup] 重置 {result.rowcount} 个卡死的处理中文档为 failed")
-
-
-async def _process_document(doc_id: uuid.UUID, kb_id: uuid.UUID, filepath: str, original_name: str | None = None):
-    import logging
-    logger = logging.getLogger(__name__)
-    from database import AsyncSessionLocal
-    async with AsyncSessionLocal() as db:
-        try:
-            # 解析是同步 CPU 活（pypdf/openpyxl/python-docx），放线程池跑，避免阻塞事件循环
-            chunks_data = await asyncio.to_thread(parse_file, filepath, source_name=original_name)
-            if not chunks_data:
-                raise ValueError("文档解析结果为空")
-
-            import os as _os
-            _ext = _os.path.splitext(filepath)[1].lower()
-            if _ext in (".xlsx", ".xls"):
-                raw_md = await asyncio.to_thread(excel_to_markdown, filepath)
-            elif _ext == ".docx":
-                raw_md = await asyncio.to_thread(docx_to_markdown, filepath)
-            else:
-                raw_md = None
-
-            texts = [c["content"] for c in chunks_data]
-            embeddings = await embed_batch(texts)
-
-            chunks = [
-                DocumentChunk(
-                    doc_id=doc_id,
-                    kb_id=kb_id,
-                    content=chunks_data[i]["content"],
-                    embedding=embeddings[i],
-                    chunk_index=i,
-                    metadata_=chunks_data[i].get("metadata"),
-                )
-                for i in range(len(chunks_data))
-            ]
-            db.add_all(chunks)
-
-            doc = await db.get(Document, doc_id)
-            doc.status = "ready"
-            doc.chunk_count = len(chunks)
-            if raw_md:
-                doc.raw_content = raw_md
-
-            await db.commit()
-        except Exception as e:
-            import traceback
-            msg = f"[process_document] doc_id={doc_id} failed: {type(e).__name__}: {e}"
-            logger.error(msg)
-            print(msg)
-            traceback.print_exc()
-            doc = await db.get(Document, doc_id)
-            if doc:
-                doc.status = "failed"
-            await db.commit()
-        finally:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-
-
-async def _process_text_document(doc_id: uuid.UUID, kb_id: uuid.UUID, title: str, content: str):
-    import logging
-    logger = logging.getLogger(__name__)
-    from database import AsyncSessionLocal
-    async with AsyncSessionLocal() as db:
-        try:
-            chunks_data = await asyncio.to_thread(parse_markdown_content, content, title)
-            if not chunks_data:
-                raise ValueError("内容为空")
-
-            texts = [c["content"] for c in chunks_data]
-            embeddings = await embed_batch(texts)
-
-            chunks = [
-                DocumentChunk(
-                    doc_id=doc_id,
-                    kb_id=kb_id,
-                    content=chunks_data[i]["content"],
-                    embedding=embeddings[i],
-                    chunk_index=i,
-                    metadata_=chunks_data[i].get("metadata"),
-                )
-                for i in range(len(chunks_data))
-            ]
-            db.add_all(chunks)
-
-            doc = await db.get(Document, doc_id)
-            doc.status = "ready"
-            doc.chunk_count = len(chunks)
-
-            await db.commit()
-        except Exception as e:
-            logger.error(f"[process_text_document] doc_id={doc_id} failed: {type(e).__name__}: {e}")
-            doc = await db.get(Document, doc_id)
-            if doc:
-                doc.status = "failed"
-            await db.commit()
-
-
-async def _process_image_document(doc_id: uuid.UUID, kb_id: uuid.UUID, image_path: str, original_name: str | None = None):
-    """多模态模型把图片转写为 Markdown，写入 raw_content（供编辑器审阅），并按 Markdown 结构分块入库。"""
-    import logging
-    logger = logging.getLogger(__name__)
-    from database import AsyncSessionLocal
-    from core.vision import image_to_markdown
-    async with AsyncSessionLocal() as db:
-        try:
-            title = os.path.splitext(original_name or "图片")[0]
-            markdown = await image_to_markdown(image_path)
-            if not markdown.strip():
-                raise ValueError("多模态模型未返回任何内容")
-
-            chunks_data = await asyncio.to_thread(parse_markdown_content, markdown, title)
-            if not chunks_data:
-                raise ValueError("识别内容为空")
-
-            texts = [c["content"] for c in chunks_data]
-            embeddings = await embed_batch(texts)
-
-            chunks = [
-                DocumentChunk(
-                    doc_id=doc_id,
-                    kb_id=kb_id,
-                    content=chunks_data[i]["content"],
-                    embedding=embeddings[i],
-                    chunk_index=i,
-                    metadata_=chunks_data[i].get("metadata"),
-                )
-                for i in range(len(chunks_data))
-            ]
-            db.add_all(chunks)
-
-            doc = await db.get(Document, doc_id)
-            doc.status = "ready"
-            doc.chunk_count = len(chunks)
-            doc.raw_content = markdown
-
-            await db.commit()
-        except Exception as e:
-            import traceback
-            logger.error(f"[process_image_document] doc_id={doc_id} failed: {type(e).__name__}: {e}")
-            traceback.print_exc()
-            doc = await db.get(Document, doc_id)
-            if doc:
-                doc.status = "failed"
-            await db.commit()

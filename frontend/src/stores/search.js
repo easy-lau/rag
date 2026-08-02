@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { normalizeEvidenceClarification } from '../utils/chatClarification.js'
+import {
+  evidenceCandidatePolicy,
+  isExecutedEvidenceStatus,
+  isNonAnswerEvidenceStatus,
+  normalizeEvidenceStatus,
+} from '../utils/evidenceStatus.js'
 
 const STEPS = [
   { key: 'analyze',  label: '问题分析' },
@@ -10,30 +16,7 @@ const STEPS = [
   { key: 'generate', label: '生成' },
 ]
 
-const EVIDENCE_STATUSES = new Set([
-  'skipped',
-  'hit',
-  'partial',
-  'version_mismatch',
-  'needs_clarification',
-  'no_hit',
-  'unverified',
-  'error',
-])
 const EVIDENCE_ROLES = new Set(['direct', 'related', 'irrelevant'])
-const EXECUTED_EVIDENCE_STATUSES = new Set([
-  'hit',
-  'partial',
-  'version_mismatch',
-  'needs_clarification',
-  'no_hit',
-])
-const NON_ANSWER_EVIDENCE_STATUSES = new Set([
-  'skipped',
-  'needs_clarification',
-  'no_hit',
-  'error',
-])
 
 function firstDefined(...values) {
   return values.find(value => value !== undefined && value !== null)
@@ -185,17 +168,15 @@ export const useSearchStore = defineStore('search', () => {
     // events cannot promote candidates back into answer evidence.
     const clarificationLocked = Boolean(effectiveClarification)
     const rawExplicitStatus = firstDefined(data.evidence_status, eventMeta.evidence_status)
-    const explicitStatus = typeof rawExplicitStatus === 'string'
-      ? rawExplicitStatus.trim().toLowerCase()
-      : rawExplicitStatus
+    const explicitStatus = normalizeEvidenceStatus(rawExplicitStatus)
     let retrievalExecuted = firstDefined(data.retrieval_executed, eventMeta.retrieval_executed)
     if (typeof retrievalExecuted !== 'boolean') {
       if (explicitStatus === 'skipped') retrievalExecuted = false
-      else if (EXECUTED_EVIDENCE_STATUSES.has(explicitStatus)) retrievalExecuted = true
+      else if (isExecutedEvidenceStatus(explicitStatus)) retrievalExecuted = true
       else retrievalExecuted = null
     }
 
-    let evidenceStatus = EVIDENCE_STATUSES.has(explicitStatus) ? explicitStatus : ''
+    let evidenceStatus = explicitStatus
     if (retrievalExecuted === false && evidenceStatus !== 'error') {
       // 没有执行检索就不可能产生回答依据。异常/旧协议即使同时声称 hit，
       // 也以实际执行状态为准，避免把上一轮或伪造候选显示为本轮依据。
@@ -211,17 +192,17 @@ export const useSearchStore = defineStore('search', () => {
     }
     if (clarificationLocked) evidenceStatus = 'needs_clarification'
 
-    const hasNoAnswerEvidence = NON_ANSWER_EVIDENCE_STATUSES.has(evidenceStatus)
-    if (evidenceStatus === 'no_hit' || evidenceStatus === 'needs_clarification') {
-      // no_hit 和 needs_clarification 都可以保留宽召回候选供右侧解释，但任何
-      // direct 角色都与最终状态冲突，必须降级为相近资料。用户确认适用范围前，
-      // 卡片不得继续显示绿色“回答依据”。
+    const hasNoAnswerEvidence = isNonAnswerEvidenceStatus(evidenceStatus)
+    const candidatePolicy = evidenceCandidatePolicy(evidenceStatus)
+    if (candidatePolicy === 'related_only') {
+      // 无命中、等待澄清和证据不足都可保留宽召回候选供右侧解释，但任何 direct
+      // 角色都与最终状态冲突，必须降级为相近资料；资料相关不等于可以作为答案依据。
       normalizedResults = normalizedResults.map(item => (
         item?.evidence_role === 'direct'
           ? { ...item, evidence_role: 'related' }
           : item
       ))
-    } else if (evidenceStatus === 'skipped' || evidenceStatus === 'error') {
+    } else if (candidatePolicy === 'clear') {
       // 未执行或执行失败没有可归属于本轮的候选。清空异常旧载荷，避免展示
       // 上一轮残留结果，同时让展示数量与实际列表保持一致。
       normalizedResults = []
@@ -244,12 +225,12 @@ export const useSearchStore = defineStore('search', () => {
     const directEvidenceCount = hasNoAnswerEvidence
       ? 0
       : (explicitDirectCount ?? derivedDirectCount)
-    const relatedReferenceCount = evidenceStatus === 'no_hit' || evidenceStatus === 'needs_clarification'
+    const relatedReferenceCount = candidatePolicy === 'related_only'
       ? Math.max(explicitRelatedCount ?? 0, derivedRelatedCount)
-      : (evidenceStatus === 'skipped' || evidenceStatus === 'error'
+      : (candidatePolicy === 'clear'
           ? 0
           : (explicitRelatedCount ?? derivedRelatedCount))
-    const displayedCandidateCount = evidenceStatus === 'skipped' || evidenceStatus === 'error'
+    const displayedCandidateCount = candidatePolicy === 'clear'
       ? 0
       : (nonNegativeCount(firstDefined(
           data.displayed_candidate_count,

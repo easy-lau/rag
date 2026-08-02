@@ -1940,7 +1940,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["total"], 1)
         self.assertEqual(event["results"][0]["score"], 0.02)
 
-    async def test_only_old_versions_are_related_even_when_rerank_is_disabled(self) -> None:
+    async def test_only_old_versions_become_scope_mismatch_when_rerank_is_disabled(self) -> None:
         old_results = [
             _candidate(
                 filename=f"云枢{version}配置",
@@ -1962,12 +1962,12 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         event = _search_event(chunks)
-        self.assertEqual(event["evidence_status"], "version_mismatch")
+        self.assertEqual(event["evidence_status"], "scope_mismatch")
         self.assertEqual(event["direct_evidence_count"], 0)
         self.assertEqual(event["related_reference_count"], 2)
         self.assertTrue(all(item["evidence_role"] == "related" for item in event["results"]))
         system_prompt = client.completions.calls[0]["messages"][0]["content"]
-        self.assertIn("没有目标版本的直接证据", system_prompt)
+        self.assertIn("没有可用于回答目标范围的直接证据", system_prompt)
 
     async def test_rerank_failure_still_applies_version_constraint(self) -> None:
         old = _candidate(
@@ -1991,7 +1991,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         event = _search_event(chunks)
-        self.assertEqual(event["evidence_status"], "version_mismatch")
+        self.assertEqual(event["evidence_status"], "scope_mismatch")
         self.assertEqual(event["results"][0]["constraint_status"], "mismatch")
         self.assertEqual(event["results"][0]["evidence_role"], "related")
 
@@ -2094,12 +2094,12 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         event = _search_event(chunks)
-        self.assertEqual(event["evidence_status"], "version_mismatch")
+        self.assertEqual(event["evidence_status"], "scope_mismatch")
         self.assertEqual(event["direct_evidence_count"], 0)
         self.assertEqual(event["results"][0]["constraint_status"], "mismatch")
         self.assertEqual(event["results"][0]["evidence_role"], "related")
         prompt = client.completions.calls[0]["messages"][0]["content"]
-        self.assertIn("没有目标版本的直接证据", prompt)
+        self.assertIn("没有可用于回答目标范围的直接证据", prompt)
 
     async def test_hard_constraint_disables_whole_document_expansion(self) -> None:
         result = _candidate(filename="云枢8.6配置", content="命中片段")
@@ -2185,7 +2185,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
             "evidence_role": "direct",
         }
         selected = _select_verified_evidence([mismatch], 5)
-        self.assertEqual(selected[2], "version_mismatch")
+        self.assertEqual(selected[2], "scope_mismatch")
         self.assertEqual(selected[0][0]["evidence_role"], "related")
 
         many = [
@@ -2218,7 +2218,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected[0], [])
         self.assertEqual(selected[1], [])
 
-    def test_product_only_constraint_mismatch_is_partial_not_version_mismatch(self) -> None:
+    def test_product_only_constraint_mismatch_is_scope_mismatch(self) -> None:
         mismatch = {
             **_candidate(content="其他产品配置"),
             "topic_relevance": 0.9,
@@ -2231,9 +2231,13 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         selected = _select_verified_evidence([mismatch], 5)
 
-        self.assertEqual(selected[2], "partial")
+        # Product, version and project are one applicability contract.  A
+        # product-only mismatch is therefore no longer a partial answer with
+        # a related fallback; it is a fail-closed scope mismatch.
+        self.assertEqual(selected[2], "scope_mismatch")
+        self.assertEqual(selected[1], [])
 
-    def test_productless_version_mismatch_is_diagnostic_only(self) -> None:
+    def test_productless_version_scope_mismatch_is_diagnostic_only(self) -> None:
         constraints = extract_query_constraints("版本8.6登录配置")
         results = annotate_deterministic_constraints(
             [
@@ -2245,7 +2249,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         selected = _select_unverified_evidence(results, 5, constraints)
 
-        self.assertEqual(selected[2], "version_mismatch")
+        self.assertEqual(selected[2], "scope_mismatch")
         self.assertEqual(len(selected[0]), 1)
         self.assertEqual(selected[0][0]["constraint_status"], "mismatch")
         self.assertEqual(selected[1], [])
@@ -2269,7 +2273,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected[1], [])
         self.assertEqual(selected[2], "no_hit")
 
-    def test_productless_version_mismatch_never_enters_verified_context(self) -> None:
+    def test_productless_version_scope_mismatch_never_enters_verified_context(self) -> None:
         mismatch = {
             **_candidate(filename="登录制度7版", content="旧版配置"),
             "topic_relevance": 0.99,
@@ -2284,7 +2288,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         selected = _select_verified_evidence([mismatch], 5)
 
-        self.assertEqual(selected[2], "version_mismatch")
+        self.assertEqual(selected[2], "scope_mismatch")
         self.assertEqual(len(selected[0]), 1)
         self.assertEqual(selected[0][0]["evidence_role"], "related")
         self.assertEqual(selected[1], [])
@@ -3687,7 +3691,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coverage["covered_requirement_count"], 1)
         self.assertEqual(coverage["missing_requirement_count"], 1)
 
-    async def test_version_mismatch_cannot_seed_document_expansion(self) -> None:
+    async def test_scope_mismatch_cannot_seed_document_expansion(self) -> None:
         old = {
             **_candidate(
                 filename="云枢7配置.md",
@@ -3730,7 +3734,7 @@ class RagPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         expansion_mock.assert_not_awaited()
         joint_mock.assert_not_awaited()
-        self.assertEqual(_search_event(chunks)["evidence_status"], "version_mismatch")
+        self.assertEqual(_search_event(chunks)["evidence_status"], "scope_mismatch")
 
     async def test_joint_failure_discards_new_chunks_and_fails_closed(self) -> None:
         document_id = uuid.uuid4()

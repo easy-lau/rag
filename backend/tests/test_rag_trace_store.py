@@ -25,6 +25,7 @@ from api.rag_traces import (
     router,
 )
 from core.permissions import LOG_READ, MENU_LOGIN_LOGS, MENU_RAG_TRACES, effective_permissions
+from core.rag_trace import trace_contains_business_content
 import core.rag_trace_store as trace_store
 from core.rag_trace_store import _bounded, _queue_safe_record, _summary_updates
 from models.db_models import RagTraceEvent, RagTraceRun
@@ -534,6 +535,300 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(snapshot, ensure_ascii=False))
         self.assertIn("v1、v2 还是 direct", payload["ai_analysis_guide"]["suggested_prompt"])
 
+    def test_query_execution_and_analysis_events_are_core_and_snapshot_is_content_free(self) -> None:
+        run, events, timestamp = _stored_trace(content_included=False)
+        secret = "普通员工属于D级，餐补100元"
+        events.extend([
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=3,
+                event="query.execution",
+                payload={
+                    "event": "query.execution",
+                    "schema_version": "rag_query_execution.v1",
+                    "pipeline_version": "v2",
+                    "execution_surface": "api_preflight",
+                    "state": "needs_clarification",
+                    "dispatch_authorized": False,
+                    "decision_reason": "execution_baseline_not_runnable",
+                    "unresolved_role": "query_execution",
+                    "unresolved_reason": "ambiguous",
+                    "baseline_runnable": False,
+                    "bundle_mode": "compatibility",
+                    # Imported/legacy events must not be allowed to make this
+                    # compact diagnostic summary leak arbitrary body text.
+                    "baseline": {"secret": secret},
+                },
+                created_at=timestamp,
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=4,
+                event="query.analysis.validated",
+                payload={
+                    "event": "query.analysis.validated",
+                    "query_analysis_validated": secret,
+                },
+                created_at=timestamp + timedelta(milliseconds=1),
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=5,
+                event="query.analysis.compiled",
+                payload={
+                    "event": "query.analysis.compiled",
+                    "query_analysis_execution_plan": secret,
+                },
+                created_at=timestamp + timedelta(milliseconds=2),
+            ),
+        ])
+        run.event_count = len(events)
+        run.observed_event_count = len(events)
+
+        for event_name in (
+            "query.execution",
+            "query.analysis.requested",
+            "query.analysis.completed",
+            "query.analysis.validated",
+            "query.analysis.execution_validated",
+            "query.analysis.compiled",
+            "query.analysis.execution_decision",
+            "query.analysis.fallback",
+            "query.analysis.skipped",
+            "query.analysis.cancelled",
+            "query.analysis.shadow_submitted",
+        ):
+            self.assertIn(event_name, _TRACE_CORE_EVENTS)
+        self.assertTrue(
+            trace_contains_business_content({
+                "query_analysis_execution_plan": secret,
+            })
+        )
+
+        snapshot = _rag_trace_export_payload(
+            run,
+            events,
+            exported_at=timestamp,
+        )["diagnostic_index"]["snapshot"]
+        self.assertEqual(
+            snapshot["query_execution"],
+            {
+                "schema_version": "rag_query_execution.v1",
+                "state": "needs_clarification",
+                "decision_reason": "execution_baseline_not_runnable",
+                "dispatch_authorized": False,
+                "unresolved_role": "query_execution",
+                "unresolved_reason": "ambiguous",
+                "pipeline_version": "v2",
+                "execution_surface": "api_preflight",
+                "baseline_runnable": False,
+                "bundle_mode": "compatibility",
+            },
+        )
+        self.assertNotIn(secret, json.dumps(snapshot, ensure_ascii=False))
+
+    def test_v3_understanding_trace_is_access_controlled_and_export_snapshot_is_content_free(self) -> None:
+        """V3 raw bodies must lock the run while the compact index stays safe.
+
+        The source-span catalog and raw model output are development diagnostics,
+        not production audit metrics.  This regression protects both halves of
+        that boundary: persistence must mark them as business content, while a
+        bounded export's diagnostic index may only retain allow-listed counts,
+        flags and enums.
+        """
+
+        run, events, timestamp = _stored_trace(content_included=False)
+        secret = "普通员工属于D级，餐补100元"
+        v3_events = [
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=3,
+                event="query.understanding.v3.requested",
+                payload={
+                    "event": "query.understanding.v3.requested",
+                    "schema_version": "query_understanding.v3",
+                    "mode": "active",
+                    "timeout_seconds": 8,
+                    "catalog_summary": {
+                        "schema_version": "source_span_catalog.v1",
+                        "span_count": 5,
+                        "current_span_count": 3,
+                        "route_context_span_count": 2,
+                        "authorised_context_turn_count": 1,
+                        "secret": secret,
+                    },
+                    "query_understanding_v3_catalog": secret,
+                },
+                created_at=timestamp,
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=4,
+                event="query.understanding.v3.completed",
+                payload={
+                    "event": "query.understanding.v3.completed",
+                    "schema_version": "query_understanding.v3",
+                    "mode": "active",
+                    "latency_ms": 42,
+                    "choice_count": 1,
+                    "prompt_tokens": 123,
+                    "completion_tokens": 45,
+                    "total_tokens": 168,
+                    "query_understanding_v3_raw_response": secret,
+                },
+                created_at=timestamp + timedelta(milliseconds=1),
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=5,
+                event="query.understanding.v3.validated",
+                payload={
+                    "event": "query.understanding.v3.validated",
+                    "schema_version": "query_understanding.v3",
+                    "mode": "active",
+                    "accepted": True,
+                    "analysis_summary": {
+                        "schema_version": "query_understanding.v3",
+                        "relation": "new",
+                        "self_contained": True,
+                        "answer_candidate_count": 3,
+                        "referenced_context_turn_count": 0,
+                        "confidence": 0.9,
+                        "secret": secret,
+                    },
+                    "query_understanding_v3_validated": secret,
+                },
+                created_at=timestamp + timedelta(milliseconds=2),
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=6,
+                event="query.understanding.v3.execution_validated",
+                payload={
+                    "event": "query.understanding.v3.execution_validated",
+                    "validation": {
+                        "accepted": True,
+                        "reason": "accepted",
+                        "current_target_count": 3,
+                        "candidate_target_count": 3,
+                        "explicit_scope_partition_count": 0,
+                        "projected_requirement_count": 3,
+                        "scope_binding_count": 0,
+                        "secret": secret,
+                    },
+                },
+                created_at=timestamp + timedelta(milliseconds=3),
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=7,
+                event="query.understanding.v3.compiled",
+                payload={
+                    "event": "query.understanding.v3.compiled",
+                    "compiler_decision": "compiled",
+                    "compilation": {
+                        "compiler_decision": "compiled",
+                        "used_fallback": False,
+                        "plan_schema_version": "query_plan.v2",
+                        "answer_shape": "multi_part",
+                        "requirement_count": 3,
+                        "description_provenance_count": 3,
+                        "secret": secret,
+                    },
+                    "query_understanding_v3_execution_plan": secret,
+                },
+                created_at=timestamp + timedelta(milliseconds=4),
+            ),
+            RagTraceEvent(
+                id=uuid.uuid4(),
+                trace_id=run.trace_id,
+                sequence=8,
+                event="query.understanding.v3.execution_decision",
+                payload={
+                    "event": "query.understanding.v3.execution_decision",
+                    "schema_version": "rag_query_understanding_execution.v1",
+                    "decision": "applied",
+                    "reason": secret,
+                    "analysis": {
+                        "schema_version": "query_understanding.v3",
+                        "relation": "new",
+                        "self_contained": True,
+                        "answer_candidate_count": 3,
+                        "referenced_context_turn_count": 0,
+                    },
+                    "validation": {
+                        "accepted": True,
+                        "current_target_count": 3,
+                        "candidate_target_count": 3,
+                        "explicit_scope_partition_count": 0,
+                        "projected_requirement_count": 3,
+                        "scope_binding_count": 0,
+                    },
+                    "compilation": {
+                        "compiler_decision": "compiled",
+                        "used_fallback": False,
+                        "plan_schema_version": "query_plan.v2",
+                        "answer_shape": "multi_part",
+                        "requirement_count": 3,
+                        "description_provenance_count": 3,
+                    },
+                },
+                created_at=timestamp + timedelta(milliseconds=5),
+            ),
+        ]
+        events.extend(v3_events)
+        run.event_count = len(events)
+        run.observed_event_count = len(events)
+
+        for event_name in (
+            "query.understanding.v3.requested",
+            "query.understanding.v3.completed",
+            "query.understanding.v3.validated",
+            "query.understanding.v3.execution_validated",
+            "query.understanding.v3.compiled",
+            "query.understanding.v3.execution_decision",
+            "query.understanding.v3.fallback",
+            "query.understanding.v3.cancelled",
+        ):
+            self.assertIn(event_name, _TRACE_CORE_EVENTS)
+        for body_key in (
+            "query_understanding_v3_catalog",
+            "query_understanding_v3_raw_response",
+            "query_understanding_v3_validated",
+            "query_understanding_v3_execution_plan",
+        ):
+            self.assertTrue(trace_contains_business_content({body_key: secret}))
+            self.assertTrue(_summary_updates({body_key: secret})["content_included"])
+
+        snapshot = _rag_trace_export_payload(
+            run,
+            events,
+            exported_at=timestamp,
+        )["diagnostic_index"]["snapshot"]
+        timeline = snapshot["query_understanding_v3"]
+        self.assertEqual(len(timeline), len(v3_events))
+        self.assertEqual(timeline[0]["catalog"], {
+            "schema_version": "source_span_catalog.v1",
+            "span_count": 5,
+            "current_span_count": 3,
+            "route_context_span_count": 2,
+            "authorised_context_turn_count": 1,
+        })
+        self.assertEqual(timeline[1]["total_tokens"], 168)
+        self.assertEqual(timeline[2]["analysis"]["answer_candidate_count"], 3)
+        self.assertEqual(timeline[3]["validation"]["scope_binding_count"], 0)
+        self.assertEqual(timeline[4]["compilation"]["requirement_count"], 3)
+        self.assertEqual(timeline[5]["decision"], "applied")
+        self.assertNotIn(secret, json.dumps(snapshot, ensure_ascii=False))
+
     def test_diagnostic_snapshot_keeps_algorithm_and_prompt_fingerprints(self) -> None:
         run, events, timestamp = _stored_trace(content_included=False)
         run.event_count = 5
@@ -965,6 +1260,61 @@ class RagTraceStoreTests(unittest.TestCase):
             "route_state_revision": 3,
         }])
         self.assertNotIn("clarification", lifecycle["events"][0])
+
+    def test_semantic_entry_gate_is_core_and_survives_bounded_export(self) -> None:
+        """The V3 hand-off decision must not disappear behind candidate rows."""
+
+        run, _events, timestamp = _stored_trace(content_included=False)
+        gate = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=1,
+            event="intent.semantic_entry_gate",
+            payload={
+                "event": "intent.semantic_entry_gate",
+                "disposition": "defer_to_v3",
+                "reason": "route_semantics_deferred_to_v3",
+                "route_dispatch_authorized": False,
+                "execution_dispatch_authorized": True,
+                "execution_contract_replaced": True,
+            },
+            created_at=timestamp,
+        )
+        verbose = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=2,
+            event="retrieval.candidate",
+            payload={"event": "retrieval.candidate", "candidate_content": "x" * 1000},
+            created_at=timestamp,
+        )
+        terminal = RagTraceEvent(
+            id=uuid.uuid4(),
+            trace_id=run.trace_id,
+            sequence=3,
+            event="chat.response",
+            payload={"event": "chat.response", "evidence_status": "hit"},
+            created_at=timestamp,
+        )
+        all_events = [gate, verbose, terminal]
+        metadata = [
+            (event.id, event.sequence, event.event, len(json.dumps(event.payload)))
+            for event in all_events
+        ]
+        db = SimpleNamespace(execute=AsyncMock(side_effect=[
+            _TraceRowsResult(metadata),
+            _TraceEventsResult([gate, terminal]),
+        ]))
+
+        self.assertIn("intent.semantic_entry_gate", _TRACE_CORE_EVENTS)
+        with patch("api.rag_traces.TRACE_EXPORT_MAX_EVENTS", 2):
+            selected, stats = asyncio.run(_load_bounded_export_events(db, run.trace_id))
+
+        self.assertEqual(
+            [event.event for event in selected],
+            ["intent.semantic_entry_gate", "chat.response"],
+        )
+        self.assertTrue(stats["truncated"])
 
     def test_trace_export_summarizes_evidence_clarification_lifecycle(self) -> None:
         events = [

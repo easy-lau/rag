@@ -1,6 +1,4 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import ChatLayout from '@/layout/ChatLayout.vue'
-import AdminLayout from '@/layout/AdminLayout.vue'
 import { useAuthStore } from '@/stores/auth'
 import { defaultWorkspaceRoute, firstAccessibleAdminRoute } from './menus'
 
@@ -20,20 +18,21 @@ const routes = [
   { path: '/', redirect: '/chat' },
   {
     path: '/',
-    component: ChatLayout,
+    component: () => import('@/layout/ChatLayout.vue'),
     children: [
       { path: 'chat', component: () => import('@/views/ChatView.vue'), name: 'chat', meta: { permission: 'menu:chat' } },
     ],
   },
   {
     path: '/admin',
-    component: AdminLayout,
+    component: () => import('@/layout/AdminLayout.vue'),
     children: [
       { path: '', redirect: '/admin/knowledge' },
       { path: 'knowledge', component: () => import('@/views/KnowledgeView.vue'), name: 'knowledge', meta: { permission: 'menu:knowledge' } },
       { path: 'documents', component: () => import('@/views/DocumentView.vue'), name: 'documents', meta: { permission: 'menu:documents' } },
       { path: 'search-test', component: () => import('@/views/SearchTestView.vue'), name: 'search-test', meta: { permission: 'menu:search_test' } },
       { path: 'intent-routing', component: () => import('@/views/admin/IntentRoutingView.vue'), name: 'intent-routing', meta: { permission: 'menu:intent_routing' } },
+      { path: 'terminology', component: () => import('@/views/admin/TerminologyView.vue'), name: 'terminology', meta: { permission: 'menu:terminology' } },
       { path: 'users', component: () => import('@/views/admin/UsersView.vue'), name: 'users', meta: { permission: 'menu:users' } },
       { path: 'roles', component: () => import('@/views/admin/RolesView.vue'), name: 'roles', meta: { permission: 'menu:roles' } },
       { path: 'audit-logs', component: () => import('@/views/admin/AuditLogsView.vue'), name: 'audit-logs', meta: { permission: 'menu:login_logs' } },
@@ -47,6 +46,7 @@ const routes = [
   { path: '/documents', redirect: legacyRedirect('documents') },
   { path: '/search-test', redirect: legacyRedirect('search-test') },
   { path: '/intent-routing', redirect: legacyRedirect('intent-routing') },
+  { path: '/terminology', redirect: legacyRedirect('terminology') },
   { path: '/users', redirect: legacyRedirect('users') },
   { path: '/roles', redirect: legacyRedirect('roles') },
   { path: '/audit-logs', redirect: legacyRedirect('audit-logs') },

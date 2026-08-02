@@ -1,8 +1,12 @@
-const NON_ANSWER_STATUSES = new Set(['skipped', 'needs_clarification', 'no_hit', 'error'])
+import {
+  isNonAnswerEvidenceStatus,
+  normalizeEvidenceStatus,
+} from './evidenceStatus.js'
+
 const EVIDENCE_ROLES = new Set(['direct', 'related', 'irrelevant'])
 
 function normalizedStatus(value) {
-  return typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return normalizeEvidenceStatus(value)
 }
 
 function normalizedRole(source) {
@@ -46,7 +50,7 @@ export function answerSourcesFromSearchEvent(data, limit = 20) {
 
   const evidenceStatus = eventEvidenceStatus(data)
   // 非回答状态即使错误地携带了候选，也没有任何知识库正文进入回答上下文。
-  if (NON_ANSWER_STATUSES.has(evidenceStatus)) return []
+  if (isNonAnswerEvidenceStatus(evidenceStatus)) return []
 
   if (Object.prototype.hasOwnProperty.call(data, 'answer_sources')) {
     return objectList(data.answer_sources, safeLimit)
@@ -88,12 +92,12 @@ export function persistedAnswerSources(message) {
   const messageStatus = normalizedStatus(
     message.evidence_status ?? message.search_meta?.evidence_status,
   )
-  if (NON_ANSWER_STATUSES.has(messageStatus)) return []
+  if (isNonAnswerEvidenceStatus(messageStatus)) return []
 
   return objectList(message.sources, Number.MAX_SAFE_INTEGER).filter(source => {
     const sourceStatus = normalizedStatus(
       source.evidence_status ?? source.search_meta?.evidence_status,
     )
-    return !NON_ANSWER_STATUSES.has(sourceStatus)
+    return !isNonAnswerEvidenceStatus(sourceStatus)
   })
 }

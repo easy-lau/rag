@@ -1,8 +1,16 @@
 import unittest
+from dataclasses import replace
+from itertools import product
 
-from core.query_constraints import extract_query_constraints
+from core.query_constraints import (
+    extract_applicability_scope,
+    extract_applicability_scopes,
+    extract_query_constraints,
+)
 from core.rag_v2.bridge_resolution import (
     ResolvedBridgeFact,
+    adjudicate_answer_claims,
+    answer_target_terms,
     bridge_fact_matches_candidate_scope,
     build_bridge_expansion_queries,
     candidate_supports_resolved_answer_set,
@@ -10,9 +18,17 @@ from core.rag_v2.bridge_resolution import (
     content_contains_positive_subject,
     content_matches_answer_target,
     extract_bridge_values,
+    extract_bridge_subject,
+    partition_bridge_facts,
+    resolve_bridge_facts,
 )
-from core.rag_v2.contracts import AnswerRequirementV2
-from core.rag_v2.evidence import assemble_evidence_bundle
+from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
+from core.rag_v2.evidence import (
+    assemble_evidence_bundle as _assemble_evidence_bundle,
+    finalize_visible_evidence_bundle,
+)
+from core.rag_v2.task_execution import BridgeResolution, TaskExecutionLedger
+from core.rag_v2.task_graph import compile_rag_execution_bundle
 
 
 def _candidate(
@@ -38,11 +54,20 @@ def _multi_hop_requirements(
     answer_description: str,
     bridge_description: str,
 ) -> tuple[AnswerRequirementV2, AnswerRequirementV2]:
+    """Build an explicitly declared proof fixture for join-specific tests.
+
+    This helper is intentionally for evidence tests that exercise a typed
+    proof edge.  It is not a model of ordinary implicit classification in a
+    user question; production planning represents that path as a separate
+    optional augmentation edge.
+    """
+
     return (
         AnswerRequirementV2(
             id="r1",
             description=answer_description,
             depends_on_requirement_ids=("r2",),
+            augmentation_requirement_ids=(),
         ),
         AnswerRequirementV2(
             id="r2",
@@ -50,8 +75,276 @@ def _multi_hop_requirements(
             role="bridge",
             importance="helpful",
             source="inferred",
+            bridge_subject=extract_bridge_subject(bridge_description),
+            bridge_kind="classification",
         ),
     )
+
+
+def _classification_augmentation_requirements(
+    answer_description: str,
+    bridge_description: str,
+    *,
+    subject: str,
+) -> tuple[AnswerRequirementV2, AnswerRequirementV2]:
+    """Build the production-shaped optional classification fixture.
+
+    A direct source claim may satisfy ``r1`` without resolving ``r2``.  The
+    bridge is still available to improve recall/precision in the execution
+    graph, but it must never become a proof precondition by test accident.
+    """
+
+    return (
+        AnswerRequirementV2(
+            id="r1",
+            description=answer_description,
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=("r2",),
+        ),
+        AnswerRequirementV2(
+            id="r2",
+            description=bridge_description,
+            role="bridge",
+            importance="helpful",
+            source="inferred",
+            bridge_subject=subject,
+            bridge_kind="classification",
+        ),
+    )
+
+
+def _explicit_test_requirements(
+    requirements: tuple[AnswerRequirementV2, ...],
+) -> tuple[AnswerRequirementV2, ...]:
+    """Reject legacy bridge fixtures and make answer-edge decisions explicit.
+
+    Production plans are required to carry explicit answer dependency choices.
+    Older evidence unit tests intentionally omitted ``()`` for independent
+    answers, so this test-only fixture makes that absence explicit without
+    inferring any bridge relation.  A bridge still has to declare its subject
+    and kind in the individual test data.
+    """
+
+    explicit: list[AnswerRequirementV2] = []
+    for requirement in requirements:
+        if requirement.role == "bridge":
+            if not requirement.bridge_subject or not requirement.bridge_kind:
+                raise AssertionError(
+                    "ledgered evidence fixtures require a typed bridge subject and kind"
+                )
+            explicit.append(requirement)
+            continue
+        explicit.append(replace(
+            requirement,
+            depends_on_requirement_ids=(
+                ()
+                if requirement.depends_on_requirement_ids is None
+                else requirement.depends_on_requirement_ids
+            ),
+            augmentation_requirement_ids=(
+                ()
+                if requirement.augmentation_requirement_ids is None
+                else requirement.augmentation_requirement_ids
+            ),
+        ))
+    return tuple(explicit)
+
+
+def _ledgered_evidence_bundle(*, return_execution_state: bool = False, **kwargs):
+    """Assemble valid V2 evidence through one request-local execution ledger.
+
+    The old tests attached task ids, support ids, or query indexes to candidate
+    metadata.  This fixture deliberately removes those fields through
+    ``observe_candidates`` and records every candidate under an actual task
+    execution.  Proof-bridge answers additionally receive a real
+    ``bridge_second_hop`` binding with the exact bridge parent source ids.
+    """
+
+    raw_requirements = tuple(kwargs.get("requirements") or ())
+    requirements = _explicit_test_requirements(raw_requirements)
+    query = str(kwargs.get("query") or "")
+    answer_shape = kwargs.get("answer_shape")
+    if answer_shape is None:
+        answer_shape = "multi_part" if sum(
+            item.role == "answer" for item in requirements
+        ) > 1 else "fact"
+    retrieval_queries = tuple(kwargs.get("retrieval_queries") or tuple(
+        item.description for item in requirements if item.role == "answer"
+    ))
+    plan = QueryPlanV2(
+        original_query=query,
+        answer_shape=answer_shape,
+        retrieval_queries=retrieval_queries,
+        requirements=requirements,
+        confidence=0.95,
+        source="local",
+    )
+    execution_bundle = compile_rag_execution_bundle(plan)
+    if (
+        not execution_bundle.uses_task_ledger
+        or execution_bundle.task_graph is None
+    ):
+        raise AssertionError("valid evidence fixture must compile a ledgered bundle")
+    graph = execution_bundle.task_graph
+    ledger = TaskExecutionLedger(graph, run_id="evidence-test-run")
+
+    raw_candidates = tuple(kwargs.get("candidates") or ())
+    raw_overview_candidates = tuple(kwargs.get("overview_candidates") or ())
+    # Candidates in this file are mappings.  Let the ledger own sanitisation;
+    # later observations use its safe copies, never raw task annotations.
+    all_candidates: list[dict] = []
+    for candidate in (*raw_candidates, *raw_overview_candidates):
+        if isinstance(candidate, dict):
+            all_candidates.append(dict(candidate))
+        else:
+            all_candidates.append(candidate.to_dict())
+
+    bridge_facts_by_task: dict[str, tuple[ResolvedBridgeFact, ...]] = {}
+    for task in graph.tasks:
+        if task.role != "bridge":
+            continue
+        execution_id = ledger.begin_execution(
+            kind="test_bridge_query",
+            query=task.query,
+            task_ids=(task.task_id,),
+        )
+        observed = ledger.observe_candidates(
+            all_candidates,
+            execution_id=execution_id,
+        )
+        ledger.finish_execution(
+            execution_id,
+            status="succeeded",
+            candidate_count=len(observed),
+        )
+        requirement = next(
+            item
+            for item in requirements
+            if item.id == task.target_requirement_ids[0]
+        )
+        facts, conflicts = partition_bridge_facts(
+            resolve_bridge_facts((requirement,), observed)
+        )
+        if conflicts:
+            resolution = BridgeResolution(
+                bridge_task_id=task.task_id,
+                status="conflict",
+                conflicts=conflicts,
+                source_execution_ids=(execution_id,),
+                source_chunk_ids=tuple(
+                    chunk_id
+                    for conflict in conflicts
+                    for chunk_id in conflict.source_chunk_ids
+                ),
+                reason="test_conflicting_bridge_facts",
+            )
+        elif facts:
+            resolution = BridgeResolution(
+                bridge_task_id=task.task_id,
+                status="resolved",
+                facts=facts,
+                source_execution_ids=(execution_id,),
+                source_chunk_ids=tuple(fact.source_chunk_id for fact in facts),
+            )
+            bridge_facts_by_task[task.task_id] = facts
+        else:
+            resolution = BridgeResolution(
+                bridge_task_id=task.task_id,
+                status="no_fact",
+                source_execution_ids=(execution_id,),
+                reason="test_bridge_no_fact",
+            )
+        ledger.record_bridge_resolution(resolution)
+
+    for task in graph.tasks:
+        if task.role != "answer":
+            continue
+        # Every answer has its literal first-wave retrieval.  It cannot close
+        # a proof route by itself, but keeping it in the ledger mirrors the
+        # production schedule and preserves direct/augmentation coverage.
+        execution_id = ledger.begin_execution(
+            kind="test_answer_query",
+            query=task.query,
+            task_ids=(task.task_id,),
+        )
+        ledger.observe_candidates(
+            all_candidates,
+            execution_id=execution_id,
+        )
+        ledger.finish_execution(
+            execution_id,
+            status="succeeded",
+            candidate_count=len(all_candidates),
+        )
+
+        paths = tuple(
+            path
+            for mode in ("proof", "augmentation")
+            for path in graph.answer_bridge_paths(mode=mode)
+            if path.answer_task_id == task.task_id
+        )
+        for path in paths:
+            parent_fact_sets = tuple(
+                bridge_facts_by_task.get(parent_task_id, ())
+                for parent_task_id in path.bridge_task_ids
+            )
+            if not parent_fact_sets or any(not facts for facts in parent_fact_sets):
+                continue
+            # A request may resolve distinct, scope-compatible bridge facts in
+            # different documents.  Bind every physical second-hop response to
+            # one exact fact combination; a flattened union would be the same
+            # provenance bug the production ledger is designed to reject.
+            for path_facts in product(*parent_fact_sets):
+                execution_id = ledger.begin_execution(
+                    kind="test_bridge_second_hop",
+                    query=task.query,
+                    task_ids=(task.task_id,),
+                    parent_task_ids=path.bridge_task_ids,
+                    parent_chunk_ids=tuple(
+                        fact.source_chunk_id for fact in path_facts
+                    ),
+                    route_kind="bridge_second_hop",
+                    bridge_edge_mode=path.edge_mode,
+                )
+                ledger.observe_candidates(
+                    all_candidates,
+                    execution_id=execution_id,
+                    parent_task_ids=path.bridge_task_ids,
+                    parent_chunk_ids=tuple(
+                        fact.source_chunk_id for fact in path_facts
+                    ),
+                )
+                ledger.finish_execution(
+                    execution_id,
+                    status="succeeded",
+                    candidate_count=len(all_candidates),
+                )
+
+    assembled_kwargs = dict(kwargs)
+    assembled_kwargs.update(
+        requirements=requirements,
+        task_graph=graph,
+        task_ledger=ledger,
+    )
+    bundle = _assemble_evidence_bundle(**assembled_kwargs)
+    if return_execution_state:
+        return bundle, graph, ledger
+    return bundle
+
+
+def assemble_evidence_bundle(**kwargs):
+    """Route every valid V2 evidence test through the ledgered fixture."""
+
+    requirements = tuple(kwargs.get("requirements") or ())
+    answer_shape = kwargs.get("answer_shape")
+    # These two tests intentionally validate malformed public input before a
+    # plan can exist, so a ledgered handoff would be nonsensical.
+    if not requirements or (
+        answer_shape == "multi_hop"
+        and not any(item.role == "bridge" for item in requirements)
+    ):
+        return _assemble_evidence_bundle(**kwargs)
+    return _ledgered_evidence_bundle(**kwargs)
 
 
 class EvidenceBundleAssemblyTests(unittest.TestCase):
@@ -98,26 +391,75 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(bundle.answer_source_ids, ())
         self.assertEqual(bundle.missing_requirement_ids, ("r1",))
 
-    def test_overview_maps_all_bounded_anchored_document_chunks(self) -> None:
-        requirement = AnswerRequirementV2(id="r1", description="制度概览")
-        bundle = assemble_evidence_bundle(
-            query="制度概览",
-            answer_shape="overview",
-            candidates=[
-                _candidate(
-                    "seed",
-                    content="制度标题",
-                    candidate_origins=["initial_retrieval"],
-                )
-            ],
-            overview_candidates=[
-                _candidate("section", chunk_index=1, content="具体章节内容")
-            ],
-            requirements=(requirement,),
-            retrieval_queries=("制度概览",),
-        )
+    def test_document_policy_overview_maps_only_a_complete_rooted_snapshot(self) -> None:
+        """A policy overview requires a real root plus every source chunk.
 
-        self.assertEqual(set(bundle.answer_source_ids), {"seed", "section"})
+        The historical version of this regression used ``制度标题`` and one
+        unrelated ``具体章节内容`` but expected both to support an overview.
+        That fixture could not prove either the governing policy or an
+        exhaustive source snapshot, and would reward exactly the unsafe
+        behaviour the V2 evidence graph is meant to reject.  Keep the
+        coverage test at the execution boundary instead: a current-query
+        title/classification seed roots one document, and each bounded member
+        carries the retriever-declared full-document cardinality.
+        """
+
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="普通岗位的管理标准是什么",
+            coverage_mode="collection",
+            coverage_contract="document_policy",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        filename = "公司管理标准.docx"
+        contents = (
+            "公司制度",
+            "一、总则：规范管理。",
+            "二、分类：普通岗位对应D级。",
+            "三、交通：D级乘坐经济舱和高铁二等座。",
+            "四、住宿：D级上限450元/天。",
+            "五、餐饮：D级补贴100元/天。",
+        )
+        candidates = [
+            _candidate(
+                f"policy-{index}",
+                chunk_index=index,
+                content=content,
+                filename=filename,
+                candidate_origins=(
+                    ["initial_retrieval"]
+                    if index in {0, 2}
+                    else ["small_document_full"]
+                ),
+                full_document_chunk_count=len(contents),
+            )
+            for index, content in enumerate(contents)
+        ]
+
+        provisional, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
+            query=requirement.description,
+            answer_shape="overview",
+            # Mirror the production boundary: only title/classification rows
+            # are first-wave retrieval anchors; the bounded full snapshot is
+            # admitted through the dedicated overview-expansion channel.
+            candidates=[candidates[0], candidates[2]],
+            overview_candidates=candidates,
+            requirements=(requirement,),
+            retrieval_queries=(requirement.description,),
+        )
+        bundle = finalize_visible_evidence_bundle(
+            provisional,
+            requirements=(requirement,),
+            task_graph=task_graph,
+            task_ledger=ledger,
+        ).bundle
+
+        expected_ids = {f"policy-{index}" for index in range(len(contents))}
+        self.assertEqual(set(bundle.answer_source_ids), expected_ids)
+        self.assertEqual(bundle.missing_requirement_ids, ())
+        self.assertEqual(bundle.state.completeness, "complete")
         self.assertTrue(all(
             item.supports_requirement_ids == ("r1",)
             for item in bundle.answer_sources
@@ -182,6 +524,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通员工",
+                bridge_kind="classification",
             ),
         )
         all_query_indexes = [0, 1, 2, 3]
@@ -280,6 +624,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通员工",
+                bridge_kind="classification",
             ),
         )
         all_query_indexes = [0, 1, 2, 3]
@@ -402,6 +748,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通岗位",
+                bridge_kind="classification",
             ),
         )
         bundle = assemble_evidence_bundle(
@@ -501,6 +849,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通岗位",
+                bridge_kind="classification",
             ),
         )
         bundle = assemble_evidence_bundle(
@@ -535,6 +885,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通岗位",
+                bridge_kind="classification",
             ),
         )
         bundle = assemble_evidence_bundle(
@@ -570,6 +922,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通岗位",
+                bridge_kind="classification",
             ),
         )
         bundle = assemble_evidence_bundle(
@@ -613,6 +967,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="普通岗位",
+                bridge_kind="classification",
             ),
         )
         bundle = assemble_evidence_bundle(
@@ -645,29 +1001,42 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         cases = (
             (
                 "合同工住宿标准",
+                "合同工",
                 "合同工属于L2类。",
                 "住宿标准：L2类为300元/天。",
+                {"answer", "bridge"},
             ),
             (
                 "试用期年假天数",
+                "试用期",
                 "试用期属于入职阶段P0。",
-                "年假天数：P0为0天。",
+                "试用期年假天数：P0为0天。",
+                {"answer", "bridge"},
             ),
             (
                 "外包人员的系统权限是什么",
+                "外包人员",
                 "外包人员归属于访客角色R1。",
                 "系统权限：R1仅可查看公开数据。",
+                {"answer", "bridge"},
             ),
         )
 
-        from core.rag_v2.query_plan import plan_query_locally
-
-        for question, bridge_content, answer_content in cases:
+        for (
+            question,
+            bridge_subject,
+            bridge_content,
+            answer_content,
+            expected_source_ids,
+        ) in cases:
             with self.subTest(question=question):
-                plan = plan_query_locally(question)
+                requirements = _multi_hop_requirements(
+                    question,
+                    f"确认{bridge_subject}对应的适用分类",
+                )
                 bundle = assemble_evidence_bundle(
                     query=question,
-                    answer_shape=plan.answer_shape,
+                    answer_shape="multi_hop",
                     candidates=[
                         _candidate(
                             "answer",
@@ -684,15 +1053,17 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                             content=bridge_content,
                         ),
                     ],
-                    requirements=plan.requirements,
-                    retrieval_queries=plan.retrieval_queries,
+                    requirements=requirements,
+                    retrieval_queries=tuple(
+                        item.description for item in requirements
+                    ),
                     completeness="complete",
                 )
 
                 self.assertEqual(bundle.missing_requirement_ids, ())
                 self.assertEqual(
                     set(bundle.answer_source_ids),
-                    {"answer", "bridge"},
+                    expected_source_ids,
                 )
 
     def test_table_bridge_uses_only_subject_row_and_ignores_leave_approval(self) -> None:
@@ -763,6 +1134,105 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         # partial ceiling once the complete bridge path is visible.
         self.assertEqual(bundle.missing_requirement_ids, ())
         self.assertEqual(bundle.state.completeness, "complete")
+
+    def test_classification_table_requires_an_explicit_applicable_entity_column(
+        self,
+    ) -> None:
+        description = "确认总经理对应的适用分类、等级、类别或阶段"
+        valid_tables = (
+            (
+                "| 职级 | 适用人员（含实习生） |\n"
+                "| --- | --- |\n"
+                "| A级 | 总经理 |"
+            ),
+            (
+                "| 适用对象 | 分类 |\n"
+                "| --- | --- |\n"
+                "| 总经理 | A级 |"
+            ),
+        )
+        for content in valid_tables:
+            with self.subTest(content=content):
+                self.assertEqual(
+                    extract_bridge_values(
+                        description,
+                        content,
+                        bridge_kind="classification",
+                    ),
+                    ("A级",),
+                )
+
+        for header in (
+            "审批人员",
+            "申请人员",
+            "审核人员",
+            "负责人",
+            "经办人员",
+            "适用审批人员",
+        ):
+            content = (
+                f"| 职级 | {header} |\n"
+                "| --- | --- |\n"
+                "| A级 | 总经理 |"
+            )
+            with self.subTest(header=header):
+                self.assertEqual(
+                    extract_bridge_values(
+                        description,
+                        content,
+                        bridge_kind="classification",
+                    ),
+                    (),
+                )
+
+        # An unlabeled two-cell row is not a verifiable classification schema.
+        self.assertEqual(
+            extract_bridge_values(
+                description,
+                "总经理 | A级",
+                bridge_kind="classification",
+            ),
+            (),
+        )
+
+    def test_mapping_bridge_does_not_borrow_the_classification_table_schema(
+        self,
+    ) -> None:
+        classification_table = (
+            "| 职级 | 适用人员 |\n"
+            "| --- | --- |\n"
+            "| A级 | 总经理 |"
+        )
+
+        # A generic mapping request must not inherit the typed
+        # ``applicable entity -> taxonomy`` shortcut merely because the source
+        # happens to be a classification table.
+        self.assertEqual(
+            extract_bridge_values(
+                "确认总经理对应关系",
+                classification_table,
+                bridge_kind="mapping",
+            ),
+            (),
+        )
+        # Mapping can still use an explicitly named source column, or a prose
+        # relation, through its own conservative resolver.
+        self.assertEqual(
+            extract_bridge_values(
+                "确认总经理对应职级",
+                classification_table,
+                bridge_kind="mapping",
+            ),
+            ("A级",),
+        )
+        self.assertEqual(
+            extract_bridge_values(
+                "确认总经理对应关系",
+                "总经理对应A级。",
+                bridge_kind="mapping",
+            ),
+            ("A级",),
+        )
 
     def test_manager_mentions_do_not_manufacture_a_grade_mapping(self) -> None:
         requirements = _multi_hop_requirements(
@@ -852,7 +1322,7 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 self.assertEqual(bundle.missing_requirement_ids, ())
                 self.assertEqual(bundle.state.completeness, "complete")
 
-    def test_local_plan_and_evidence_join_named_risk_taxonomy_end_to_end(
+    def test_local_plan_requires_direct_named_entity_claim_for_attribute_answer(
         self,
     ) -> None:
         from core.rag_v2.query_plan import plan_query_locally
@@ -861,24 +1331,31 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         plan = plan_query_locally(question)
         candidates = [
             _candidate(
-                "bridge",
-                content="风险评估：供应商甲认定为高风险。",
+                "direct",
+                content="供应商甲的风险处置措施为暂停准入并启动复核。",
                 candidate_origins=["small_document_full"],
-                full_document_chunk_count=3,
+                full_document_chunk_count=4,
             ),
             _candidate(
-                "answer",
+                "generic-high",
                 chunk_index=1,
                 content="风险处置措施：高风险供应商暂停准入并启动复核。",
                 candidate_origins=["small_document_full"],
-                full_document_chunk_count=3,
+                full_document_chunk_count=4,
             ),
             _candidate(
-                "wrong",
+                "generic-low",
                 chunk_index=2,
                 content="风险处置措施：低风险供应商保持常规监测。",
                 candidate_origins=["small_document_full"],
-                full_document_chunk_count=3,
+                full_document_chunk_count=4,
+            ),
+            _candidate(
+                "supplier-b",
+                chunk_index=3,
+                content="供应商乙的风险处置措施为保持常规监测。",
+                candidate_origins=["small_document_full"],
+                full_document_chunk_count=4,
             ),
         ]
 
@@ -892,8 +1369,72 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
 
         self.assertEqual(bundle.missing_requirement_ids, ())
         self.assertEqual(bundle.state.completeness, "complete")
-        self.assertEqual(set(bundle.answer_source_ids), {"bridge", "answer"})
-        self.assertNotIn("wrong", bundle.answer_source_ids)
+        self.assertEqual(bundle.answer_source_ids, ("direct",))
+        self.assertNotIn("generic-high", bundle.answer_source_ids)
+        self.assertNotIn("generic-low", bundle.answer_source_ids)
+        self.assertNotIn("supplier-b", bundle.answer_source_ids)
+
+    def test_direct_named_entity_guard_is_structural_and_not_a_topic_rule(self) -> None:
+        """Named direct attributes need a same-claim subject, nothing more.
+
+        This covers the guard's intended boundary: it isolates supplier A/B,
+        leaves ordinary category augmentation alone, does not tighten a
+        subject-free question, and cannot be bypassed by a document-root topic
+        anchor.
+        """
+
+        named_question = "供应商甲的风险处置措施是什么"
+        self.assertTrue(adjudicate_answer_claims(
+            named_question,
+            "供应商甲的风险处置措施为暂停准入并启动复核。",
+        ))
+        for content in (
+            "风险处置措施：高风险供应商暂停准入并启动复核。",
+            "供应商乙的风险处置措施为保持常规监测。",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(adjudicate_answer_claims(
+                    named_question,
+                    content,
+                ))
+                self.assertFalse(adjudicate_answer_claims(
+                    named_question,
+                    content,
+                    document_root_target_verified=True,
+                ))
+
+        # The constraint is tied to a syntactically stable named entity, not
+        # to a risk/disposition vocabulary.  A subject-free question remains
+        # eligible for a matching source claim.
+        self.assertTrue(adjudicate_answer_claims(
+            "风险处置措施是什么",
+            "风险处置措施：高风险供应商暂停准入并启动复核。",
+        ))
+        # A declared optional classification edge owns its applicability
+        # semantics; the direct named-entity guard must not interfere with it.
+        self.assertTrue(adjudicate_answer_claims(
+            "普通员工的餐饮补贴是多少",
+            "普通员工的餐饮补贴为100元/天。",
+            has_bridge_edge=True,
+        ))
+
+    def test_condition_requirement_question_uses_the_shared_surface_target(self) -> None:
+        """Question grammar and evidence matching must share one target head.
+
+        This is deliberately not a terminology alias for ``条件``.  The user
+        text itself supplies the noun after ``满足``; the common surface
+        parser reduces only the modal question shell, so a source authored as
+        ``报销条件`` remains a direct, auditable match.
+        """
+
+        self.assertTrue(adjudicate_answer_claims(
+            "报销需要满足什么条件",
+            "报销条件：需要正规发票和费用明细。",
+        ))
+        self.assertFalse(adjudicate_answer_claims(
+            "报销需要满足什么条件",
+            "采购条件：需要完成供应商准入。",
+        ))
 
     def test_bridge_extraction_rejects_negation_exclusion_and_cross_claims(self) -> None:
         cases = (
@@ -954,6 +1495,44 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             "北京",
         ))
 
+    def test_surface_normalization_preserves_condition_bound_answer_terms(self) -> None:
+        """A question shell must not turn a direct condition clause into a bridge."""
+
+        terms = answer_target_terms(
+            "偏远地区出差有什么补贴",
+            bridge_subjects=(),
+        )
+        self.assertIn("出差补贴", terms)
+        self.assertTrue(content_matches_answer_target(
+            "偏远地区出差有什么补贴",
+            "偏远地区或艰苦地区出差，可申请额外补贴，标准另行审批。",
+            bridge_subjects=(),
+        ))
+
+    def test_condition_coordination_is_a_positive_subject_boundary(self) -> None:
+        for content in (
+            "偏远地区或艰苦地区出差，可申请额外补贴。",
+            "偏远地区及艰苦地区出差，可申请额外补贴。",
+            "偏远地区和艰苦地区出差，可申请额外补贴。",
+            "偏远地区与艰苦地区出差，可申请额外补贴。",
+            "偏远地区以及艰苦地区出差，可申请额外补贴。",
+        ):
+            with self.subTest(content=content):
+                self.assertTrue(content_contains_positive_subject(
+                    content,
+                    "偏远地区",
+                ))
+        for content in (
+            "非偏远地区出差，可申请额外补贴。",
+            "偏远地区以外出差，可申请额外补贴。",
+            "偏远地区家属出差，可申请额外补贴。",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(content_contains_positive_subject(
+                    content,
+                    "偏远地区",
+                ))
+
     def test_uncanonicalized_bridge_never_falls_back_to_lexical_completion(
         self,
     ) -> None:
@@ -969,6 +1548,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="供应商甲",
+                bridge_kind="classification",
             ),
         )
         bundle = assemble_evidence_bundle(
@@ -1294,14 +1875,17 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(by_id["lodging-table"].supports_requirement_ids, ("r1",))
         self.assertNotIn("conflicting_active_answer_claims", bundle.state.reasons)
 
-    def test_direct_self_contained_answer_bypasses_only_its_inferred_bridge(self) -> None:
-        requirements = _multi_hop_requirements(
+    def test_direct_self_contained_answer_does_not_require_optional_classification(self) -> None:
+        """A direct policy sentence must not be blocked by an optional bridge."""
+
+        requirements = _classification_augmentation_requirements(
             "普通员工的餐饮补贴是多少",
             "确认普通员工对应的职级",
+            subject="普通员工",
         )
         direct = assemble_evidence_bundle(
             query="普通员工的餐饮补贴是多少",
-            answer_shape="multi_hop",
+            answer_shape="fact",
             candidates=[_candidate(
                 "direct",
                 content="普通员工的餐饮补贴为100元/天。",
@@ -1310,39 +1894,14 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             retrieval_queries=tuple(item.description for item in requirements),
             completeness="partial",
         )
-        split = assemble_evidence_bundle(
-            query="普通员工的餐饮补贴是多少",
-            answer_shape="multi_hop",
-            candidates=[_candidate(
-                "split",
-                content="普通员工信息如下。餐饮补贴为100元/天。",
-            )],
-            requirements=requirements,
-            retrieval_queries=tuple(item.description for item in requirements),
-            completeness="partial",
-        )
-
         self.assertEqual(direct.missing_requirement_ids, ())
         self.assertEqual(direct.answer_source_ids, ("direct",))
-        self.assertEqual(split.missing_requirement_ids, ("r1", "r2"))
-        self.assertEqual(split.answer_source_ids, ())
-        for content in (
-            "非普通员工的餐饮补贴为100元/天。",
-            "高级普通员工的餐饮补贴为100元/天。",
-            "普通员工家属的餐饮补贴为100元/天。",
-        ):
-            with self.subTest(content=content):
-                embedded = assemble_evidence_bundle(
-                    query="普通员工的餐饮补贴是多少",
-                    answer_shape="multi_hop",
-                    candidates=[_candidate("embedded", content=content)],
-                    requirements=requirements,
-                    retrieval_queries=tuple(
-                        item.description for item in requirements
-                    ),
-                    completeness="partial",
-                )
-                self.assertIn("r2", embedded.missing_requirement_ids)
+        self.assertEqual(direct.state.completeness, "complete")
+        self.assertEqual(
+            requirements[0].augmentation_requirement_ids,
+            ("r2",),
+        )
+        self.assertEqual(requirements[0].depends_on_requirement_ids, ())
 
     def test_bridge_subject_in_title_cannot_create_document_root_anchor(self) -> None:
         requirements = _multi_hop_requirements(
@@ -1471,9 +2030,97 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         by_id = {item.chunk_id: item for item in bundle.items}
         self.assertEqual(by_id["map-a"].role, "conflicting")
         self.assertEqual(by_id["map-d"].role, "conflicting")
+        self.assertEqual(by_id["map-a"].supports_requirement_ids, ())
+        self.assertEqual(by_id["map-d"].supports_requirement_ids, ())
+        self.assertEqual(
+            by_id["map-a"].metadata["bridge_resolution_statuses"]["r2"]["status"],
+            "conflict",
+        )
         self.assertEqual(bundle.answer_source_ids, ())
         self.assertEqual(bundle.missing_requirement_ids, ("r1", "r2"))
         self.assertEqual(bundle.state.completeness, "unknown")
+
+    def test_conflicting_bridge_cannot_reach_final_graph_or_generation(self) -> None:
+        """A rejected mapping remains diagnostic-only through finalization."""
+
+        requirements = _multi_hop_requirements(
+            "普通员工的住宿标准是多少",
+            "确认普通员工对应的职级",
+        )
+        candidates = [
+            _candidate("map-a", content="普通员工对应A级。"),
+            _candidate("map-d", content="普通员工对应D级。"),
+            _candidate(
+                "answer-a",
+                chunk_index=1,
+                content="住宿标准：A级为1200元/天。",
+            ),
+            _candidate(
+                "answer-d",
+                chunk_index=2,
+                content="住宿标准：D级为450元/天。",
+            ),
+        ]
+        bundle, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
+            query="普通员工的住宿标准是多少",
+            answer_shape="multi_hop",
+            candidates=candidates,
+            requirements=requirements,
+            retrieval_queries=tuple(item.description for item in requirements),
+            completeness="complete",
+        )
+
+        finalized = finalize_visible_evidence_bundle(
+            bundle,
+            requirements=_explicit_test_requirements(requirements),
+            task_graph=task_graph,
+            task_ledger=ledger,
+        )
+
+        self.assertEqual(bundle.context_item_ids, ())
+        self.assertEqual(bundle.answer_source_ids, ())
+        self.assertEqual(finalized.context.item_ids, ())
+        self.assertEqual(finalized.bundle.context_item_ids, ())
+        self.assertEqual(finalized.bundle.answer_source_ids, ())
+        self.assertFalse(finalized.generation_allowed)
+        self.assertEqual(finalized.bundle.missing_requirement_ids, ("r1",))
+        self.assertIsNotNone(finalized.bundle.coverage_graph)
+        self.assertFalse(any(
+            claim.requirement_id == "r2"
+            for claim in finalized.bundle.coverage_graph.claims
+        ))
+
+    def test_bridge_conflict_does_not_erase_an_independent_direct_claim(self) -> None:
+        """Conflict is edge-local; a same-source direct fact remains usable."""
+
+        requirements = _classification_augmentation_requirements(
+            "普通员工的餐饮补贴是多少",
+            "确认普通员工对应的职级",
+            subject="普通员工",
+        )
+        bundle = assemble_evidence_bundle(
+            query="普通员工的餐饮补贴是多少",
+            candidates=[
+                _candidate(
+                    "mixed-source",
+                    content=(
+                        "普通员工对应A级。普通员工对应D级。"
+                        "普通员工的餐饮补贴为100元/天。"
+                    ),
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=tuple(item.description for item in requirements),
+            completeness="complete",
+        )
+
+        item = bundle.items[0]
+        self.assertEqual(item.supports_requirement_ids, ("r1",))
+        self.assertIn(item.role, {"direct", "complement"})
+        self.assertIn("bridge_conflicts", item.metadata)
+        self.assertEqual(bundle.answer_source_ids, ("mixed-source",))
+        self.assertEqual(bundle.missing_requirement_ids, ())
 
     def test_different_documents_keep_independent_complete_bridge_graphs(self) -> None:
         requirements = _multi_hop_requirements(
@@ -1607,6 +2254,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="总经理",
+                bridge_kind="classification",
             ),
         )
         filename = "公司出差管理标准.docx"
@@ -1725,7 +2374,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             depends_on_requirement_ids=(),
             coverage_mode="collection",
         )
-        bundle = assemble_evidence_bundle(
+        provisional, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
             query="供应商管理要求是什么",
             answer_shape="overview",
             candidates=[
@@ -1739,8 +2389,16 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             retrieval_queries=(requirement.description,),
             completeness="complete",
         )
+        normalized_requirements = _explicit_test_requirements((requirement,))
+        bundle = finalize_visible_evidence_bundle(
+            provisional,
+            requirements=normalized_requirements,
+            task_graph=task_graph,
+            task_ledger=ledger,
+        ).bundle
 
-        self.assertEqual(bundle.answer_source_ids, ("single-clause",))
+        self.assertEqual(provisional.answer_source_ids, ("single-clause",))
+        self.assertEqual(bundle.answer_source_ids, ())
         self.assertEqual(bundle.missing_requirement_ids, ("r1",))
         self.assertEqual(bundle.state.completeness, "partial")
         self.assertIn("collection_snapshot_unproven", bundle.state.reasons)
@@ -1764,7 +2422,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                     description=query,
                     coverage_mode="collection",
                 )
-                bundle = assemble_evidence_bundle(
+                provisional, task_graph, ledger = _ledgered_evidence_bundle(
+                    return_execution_state=True,
                     query=query,
                     answer_shape="overview",
                     candidates=[
@@ -1778,8 +2437,16 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                     retrieval_queries=(query,),
                     completeness="complete",
                 )
+                normalized_requirements = _explicit_test_requirements((requirement,))
+                bundle = finalize_visible_evidence_bundle(
+                    provisional,
+                    requirements=normalized_requirements,
+                    task_graph=task_graph,
+                    task_ledger=ledger,
+                ).bundle
 
-                self.assertEqual(bundle.answer_source_ids, ("partial-list",))
+                self.assertEqual(provisional.answer_source_ids, ("partial-list",))
+                self.assertEqual(bundle.answer_source_ids, ())
                 self.assertEqual(bundle.missing_requirement_ids, ("r1",))
                 self.assertEqual(bundle.state.completeness, "partial")
                 self.assertIn(
@@ -1793,8 +2460,10 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             id="r1",
             description=query,
             coverage_mode="collection",
+            coverage_contract="structured_collection",
         )
-        bundle = assemble_evidence_bundle(
+        provisional, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
             query=query,
             answer_shape="overview",
             candidates=[
@@ -1811,6 +2480,12 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             retrieval_queries=(query,),
             completeness="partial",
         )
+        bundle = finalize_visible_evidence_bundle(
+            provisional,
+            requirements=_explicit_test_requirements((requirement,)),
+            task_graph=task_graph,
+            task_ledger=ledger,
+        ).bundle
 
         self.assertEqual(bundle.answer_source_ids, ("closed-list",))
         self.assertEqual(bundle.missing_requirement_ids, ())
@@ -1822,8 +2497,10 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             id="r1",
             description=query,
             coverage_mode="collection",
+            coverage_contract="ordered_steps",
         )
-        bundle = assemble_evidence_bundle(
+        provisional, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
             query=query,
             answer_shape="overview",
             candidates=[
@@ -1842,6 +2519,12 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             retrieval_queries=(query,),
             completeness="partial",
         )
+        bundle = finalize_visible_evidence_bundle(
+            provisional,
+            requirements=_explicit_test_requirements((requirement,)),
+            task_graph=task_graph,
+            task_ledger=ledger,
+        ).bundle
 
         self.assertEqual(bundle.answer_source_ids, ("closed-process",))
         self.assertEqual(bundle.missing_requirement_ids, ())
@@ -1878,7 +2561,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             ))
         ]
 
-        complete = assemble_evidence_bundle(
+        complete_provisional, complete_graph, complete_ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
             query=query,
             answer_shape="list",
             candidates=candidates,
@@ -1886,7 +2570,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             retrieval_queries=(query,),
             completeness="partial",
         )
-        incomplete = assemble_evidence_bundle(
+        incomplete_provisional, incomplete_graph, incomplete_ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
             query=query,
             answer_shape="list",
             candidates=candidates[:1],
@@ -1894,6 +2579,20 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             retrieval_queries=(query,),
             completeness="complete",
         )
+        complete_requirements = _explicit_test_requirements((requirement,))
+        incomplete_requirements = _explicit_test_requirements((requirement,))
+        complete = finalize_visible_evidence_bundle(
+            complete_provisional,
+            requirements=complete_requirements,
+            task_graph=complete_graph,
+            task_ledger=complete_ledger,
+        ).bundle
+        incomplete = finalize_visible_evidence_bundle(
+            incomplete_provisional,
+            requirements=incomplete_requirements,
+            task_graph=incomplete_graph,
+            task_ledger=incomplete_ledger,
+        ).bundle
 
         self.assertEqual(
             set(complete.answer_source_ids),
@@ -1904,42 +2603,62 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(incomplete.missing_requirement_ids, ("r1",))
         self.assertEqual(incomplete.state.completeness, "partial")
 
-    def test_collection_downgrades_when_context_budget_drops_one_clause(self) -> None:
+    def test_collection_downgrades_when_context_budget_drops_one_table_part(self) -> None:
         requirement = AnswerRequirementV2(
             id="r1",
-            description="供应商管理要求是什么",
+            description="系统支持的登录方式有哪些",
             depends_on_requirement_ids=(),
             coverage_mode="collection",
         )
         candidates = [
             _candidate(
-                "review",
+                "login-part-0",
                 chunk_index=0,
-                content="## 复审要求\n供应商管理要求：每年复审一次。",
-                filename="供应商管理要求.md",
-                candidate_origins=["initial_retrieval", "small_document_full"],
-                full_document_chunk_count=2,
+                content=(
+                    "| 系统支持的登录方式 | 说明 |\n"
+                    "| --- | --- |\n"
+                    "| 密码登录 | 使用账号密码 |"
+                ),
+                candidate_origins=["initial_retrieval"],
+                table_id="login-methods",
+                table_part_index=0,
+                table_part_count=2,
             ),
             _candidate(
-                "audit",
+                "login-part-1",
                 chunk_index=1,
-                content="## 审计要求\n供应商管理要求：必须保留审计记录三年。",
-                filename="供应商管理要求.md",
-                candidate_origins=["small_document_full"],
-                full_document_chunk_count=2,
+                content=(
+                    "| 系统支持的登录方式 | 说明 |\n"
+                    "| --- | --- |\n"
+                    "| 单点登录 | 使用企业身份源 |"
+                ),
+                candidate_origins=["same_section"],
+                table_id="login-methods",
+                table_part_index=1,
+                table_part_count=2,
             ),
         ]
-        bundle = assemble_evidence_bundle(
-            query="供应商管理要求是什么",
-            answer_shape="overview",
+        provisional, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
+            query="系统支持的登录方式有哪些",
+            answer_shape="list",
             candidates=candidates,
             requirements=(requirement,),
             retrieval_queries=(requirement.description,),
             completeness="complete",
             max_context_chunks=1,
         )
+        normalized_requirements = _explicit_test_requirements((requirement,))
+        bundle = finalize_visible_evidence_bundle(
+            provisional,
+            requirements=normalized_requirements,
+            task_graph=task_graph,
+            task_ledger=ledger,
+            max_context_chunks=1,
+        ).bundle
 
-        self.assertEqual(len(bundle.answer_source_ids), 1)
+        self.assertEqual(len(provisional.answer_source_ids), 1)
+        self.assertEqual(bundle.answer_source_ids, ())
         self.assertEqual(bundle.missing_requirement_ids, ("r1",))
         self.assertEqual(bundle.state.completeness, "partial")
         self.assertIn("collection_context_incomplete", bundle.state.reasons)
@@ -2057,6 +2776,8 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
                 role="bridge",
                 importance="helpful",
                 source="inferred",
+                bridge_subject="target",
+                bridge_kind="mapping",
             ),
         )
         values = dict(
@@ -2277,7 +2998,7 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertIn("overview_full_document", full.origins)
         self.assertIn("unanchored_overview_candidate_excluded", bundle.state.reasons)
 
-    def test_context_chunk_and_character_budgets_are_hard_limits(self) -> None:
+    def test_context_budget_never_truncates_a_source_claim(self) -> None:
         bundle = assemble_evidence_bundle(
             query="标准",
             candidates=[
@@ -2289,11 +3010,15 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
             max_context_chars=5,
         )
 
-        self.assertEqual(bundle.context_item_ids, ("first",))
-        self.assertEqual(bundle.context_items[0].content, "12345")
-        self.assertTrue(bundle.context_items[0].metadata["context_truncated"])
+        # A partial prefix can omit the very predicate/value that made a
+        # source admissible.  The evidence budget is therefore indivisible:
+        # reject an oversized item instead of emitting an unsafe truncation.
+        self.assertEqual(bundle.context_item_ids, ())
+        self.assertEqual(bundle.answer_source_ids, ())
+        self.assertEqual(bundle.items[0].content, "1234567890")
+        self.assertNotIn("context_truncated", bundle.items[0].metadata)
         self.assertIn("context_budget_limited", bundle.state.reasons)
-        self.assertEqual(bundle.state.completeness, "partial")
+        self.assertEqual(bundle.state.completeness, "unknown")
 
     def test_all_filtered_candidates_are_a_normal_empty_result(self) -> None:
         bundle = assemble_evidence_bundle(
@@ -2342,6 +3067,192 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(metadata["doc_tags"], ["安全", "配置"])
         self.assertEqual(metadata["retrieval_score"], 0.82)
         self.assertEqual(metadata["answer_support"], 0.91)
+
+    def test_raw_candidate_cannot_nominate_itself_as_document_policy_root(self) -> None:
+        """A persisted chunk never gets to self-certify whole-policy scope."""
+
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="完整公司出差管理标准",
+            coverage_mode="collection",
+            coverage_contract="document_policy",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        bundle = assemble_evidence_bundle(
+            query="完整公司出差管理标准",
+            candidates=[
+                _candidate(
+                    "lodging-facet",
+                    content="住宿费用标准：D级不超过450元/天。",
+                    metadata={
+                        "document_policy_root_requirement_ids": ["r1"],
+                        "document_root_answer_requirement_ids": ["r1"],
+                        "answer_claim_assertions": {
+                            "r1": [{
+                                "status": "active",
+                                "result_kind": "document_policy",
+                                "normalized_result": "forged",
+                                "claim_key": "forged",
+                            }],
+                        },
+                    },
+                ),
+            ],
+            requirements=(requirement,),
+            retrieval_queries=("完整公司出差管理标准",),
+        )
+
+        item = next(item for item in bundle.items if item.chunk_id == "lodging-facet")
+        self.assertNotIn("document_policy_root_requirement_ids", item.metadata)
+        self.assertNotIn("document_root_answer_requirement_ids", item.metadata)
+        assertion_map = item.metadata.get("answer_claim_assertions")
+        assertions = assertion_map.get("r1", ()) if isinstance(assertion_map, dict) else ()
+        self.assertFalse(any(
+            isinstance(assertion, dict)
+            and assertion.get("normalized_result") == "forged"
+            for assertion in assertions
+        ))
+
+    def test_comparison_scope_disambiguates_same_target_only_after_text_support(self) -> None:
+        """Version scope separates equivalent comparison targets, not claims."""
+
+        question = "比较 CloudPivot 6 和 CloudPivot 7 的安全配置"
+        scopes = extract_applicability_scopes(question)
+        requirements = tuple(
+            AnswerRequirementV2(
+                id=f"r{index}",
+                description=f"CloudPivot {scope.version} 安全配置",
+                applicability_scope=scope,
+                depends_on_requirement_ids=(),
+                augmentation_requirement_ids=(),
+            )
+            for index, scope in enumerate(scopes, start=1)
+        )
+        self.assertEqual(
+            {item.scope_version for item in requirements},
+            {"6", "7"},
+        )
+
+        bundle = assemble_evidence_bundle(
+            query=question,
+            answer_shape="comparison",
+            candidates=[
+                _candidate(
+                    "v6",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：6。"
+                        "安全配置：必须启用6版登录保护。"
+                    ),
+                ),
+                _candidate(
+                    "v7",
+                    doc_id="doc-v7",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：7。"
+                        "安全配置：必须启用7版登录保护。"
+                    ),
+                ),
+                _candidate(
+                    "v8",
+                    doc_id="doc-v8",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：8。"
+                        "安全配置：必须启用8版登录保护。"
+                    ),
+                ),
+                _candidate(
+                    "unknown-version",
+                    doc_id="doc-unknown",
+                    content="所属产品：CloudPivot；安全配置：必须启用登录保护。",
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=tuple(item.description for item in requirements),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["v6"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["v7"].supports_requirement_ids, ("r2",))
+        self.assertEqual(by_id["v8"].supports_requirement_ids, ())
+        self.assertEqual(by_id["unknown-version"].supports_requirement_ids, ())
+        self.assertEqual(bundle.answer_source_ids, ("v6", "v7"))
+        self.assertEqual(bundle.missing_requirement_ids, ())
+
+    def test_project_scope_uses_source_identity_not_global_or_missing_project(self) -> None:
+        """Project is part of the same scope contract as product/version."""
+
+        scope_a = extract_applicability_scope(
+            "中青建安项目的CloudPivot6安全配置"
+        )
+        scope_b = extract_applicability_scope(
+            "华东示范项目的CloudPivot6安全配置"
+        )
+        requirements = (
+            AnswerRequirementV2(
+                id="r1",
+                description="CloudPivot 6 安全配置",
+                applicability_scope=scope_a,
+                depends_on_requirement_ids=(),
+                augmentation_requirement_ids=(),
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description="CloudPivot 6 安全配置",
+                applicability_scope=scope_b,
+                depends_on_requirement_ids=(),
+                augmentation_requirement_ids=(),
+            ),
+        )
+
+        bundle = assemble_evidence_bundle(
+            query="比较中青建安项目和华东示范项目的CloudPivot6安全配置",
+            answer_shape="comparison",
+            candidates=[
+                _candidate(
+                    "project-a",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：6；"
+                        "所属项目：中青建安；安全配置：必须启用项目A登录保护。"
+                    ),
+                ),
+                _candidate(
+                    "project-b",
+                    doc_id="doc-project-b",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：6；"
+                        "所属项目：华东示范；安全配置：必须启用项目B登录保护。"
+                    ),
+                ),
+                _candidate(
+                    "project-unknown",
+                    doc_id="doc-project-unknown",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：6；"
+                        "安全配置：必须启用登录保护。"
+                    ),
+                ),
+                _candidate(
+                    "global-clause",
+                    doc_id="doc-global",
+                    content=(
+                        "所属产品：CloudPivot；产品版本：6；"
+                        "适用项目：全局；安全配置：必须启用统一登录保护。"
+                    ),
+                ),
+            ],
+            requirements=requirements,
+            retrieval_queries=tuple(item.description for item in requirements),
+            completeness="complete",
+        )
+
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["project-a"].supports_requirement_ids, ("r1",))
+        self.assertEqual(by_id["project-b"].supports_requirement_ids, ("r2",))
+        self.assertEqual(by_id["project-unknown"].supports_requirement_ids, ())
+        self.assertEqual(by_id["global-clause"].supports_requirement_ids, ())
+        self.assertEqual(bundle.answer_source_ids, ("project-a", "project-b"))
 
 
 if __name__ == "__main__":

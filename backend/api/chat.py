@@ -3,14 +3,15 @@ import uuid
 import logging
 import json
 import re
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Literal
+from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from database import get_db
+from database import AsyncSessionLocal as TaskReadSessionLocal, get_db
 from models.db_models import (
     ChatTurn,
     Conversation,
@@ -42,10 +43,30 @@ from core.chat_turns import (
 from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
 from core.rag_pipeline import run_rag_stream
 from core.rag_v2.pipeline import (
-    _plan_with_contract_requirements,
+    retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
 )
 from core.rag_v2.query_plan import plan_query_locally
+from core.rag_v2.task_graph import (
+    RagExecutionBundle,
+)
+from core.query_analysis_execution import (
+    ExecutionBaseline,
+    QUERY_EXECUTION_TRACE_EVENT,
+    QUERY_EXECUTION_UNRESOLVED_ROLE,
+    QueryExecutionGate,
+    build_execution_baseline,
+    evaluate_query_execution_gate,
+    get_query_analysis_execution_service,
+    should_attempt_active_analysis,
+)
+from core.query_understanding_v3_execution import (
+    QueryUnderstandingV3RevisionFence,
+    build_query_understanding_v3_baseline,
+    build_query_understanding_v3_fence_identity,
+    get_query_understanding_v3_execution_service,
+)
+from core.query_surface_structure import parse_contextual_ellipsis_target
 from core.direct_response import run_direct_response_stream
 from core.deps import get_accessible_kb_ids, require_permission
 from core.permissions import CHAT_USE
@@ -54,44 +75,51 @@ from core.intent_router import (
     classify_intent_result,
 )
 from core.conversation_context import (
+    ConversationContext,
     UNRESOLVED_REFERENCE_MESSAGE,
+    apply_resolved_turn_semantics,
+    apply_v3_catalog_context_selection,
+    build_current_turn_v2_execution_context,
+    build_resolved_v2_execution_context,
+    build_v3_catalog_candidate_context,
+    build_v3_catalog_v2_execution_context,
     prepare_conversation_context,
     resolve_routed_conversation_context,
     route_context_payloads,
 )
 from core.query_route_compiler import (
+    RagSemanticEntryGate,
     RagTaskContract,
-    rag_task_contract_gate_reason,
+    assess_rag_semantic_entry_gate,
 )
+from core.rag_dispatch import select_rag_runner as _select_rag_pipeline_version
 from core.query_route_contract import RouteClarification, RouteUnresolvedSlot
 from core.query_constraints import candidate_section_key
+from core.evidence_status import (
+    ANSWER_SOURCE_REQUIRED_EVIDENCE_STATUSES,
+    CANONICAL_EVIDENCE_STATUSES,
+    NON_ANSWER_EVIDENCE_STATUSES,
+    SUCCESSFUL_EVIDENCE_SCOPE_STATUSES,
+    canonical_evidence_status,
+)
 from core.rag_trace import content_fields, log_exception_safely, trace_event
 from core.logging_config import stream_in_conversation_log
+from core.read_sessions import ReadSessionFactory, isolated_read_session
 from config import get_settings
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
-_NON_ANSWER_SOURCE_STATUSES = {
-    "no_hit",
-    "skipped",
-    "error",
-    "needs_clarification",
-    "version_mismatch",
-}
-_ANSWER_SOURCE_REQUIRED_STATUSES = {"hit", "partial", "unverified"}
-_SUPPORTED_EVIDENCE_STATUSES = (
-    _NON_ANSWER_SOURCE_STATUSES | _ANSWER_SOURCE_REQUIRED_STATUSES
-)
+# Status semantics are centralized in ``core.evidence_status``.  Keep local
+# aliases only to avoid a large unrelated call-site rewrite; they are all
+# canonical values, and inbound legacy rows/streams are normalized before
+# these sets are consulted.
+_NON_ANSWER_SOURCE_STATUSES = NON_ANSWER_EVIDENCE_STATUSES
+_ANSWER_SOURCE_REQUIRED_STATUSES = ANSWER_SOURCE_REQUIRED_EVIDENCE_STATUSES
+_SUPPORTED_EVIDENCE_STATUSES = CANONICAL_EVIDENCE_STATUSES
 _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE = (
     "回答依据校验失败，无法可靠生成知识库答案。请稍后重试。"
 )
-_SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = {
-    "hit",
-    "partial",
-    "version_mismatch",
-    "no_hit",
-    "unverified",
-}
+_SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = SUCCESSFUL_EVIDENCE_SCOPE_STATUSES
 _EVIDENCE_PENDING_SCHEMA = "rag_pending_clarification.v2"
 _EVIDENCE_PENDING_KIND = "evidence_scope"
 _EVIDENCE_EVENT_SCHEMA = "rag_evidence_clarification.v1"
@@ -154,65 +182,18 @@ _EVIDENCE_REFINEMENT_HINT_RE = re.compile(
 )
 
 
-def _select_rag_pipeline_version(
-    *,
-    configured_version: Literal["v1", "v2"],
-    task_contract: object,
-    evidence_scope_filter: dict | None,
-    evidence_scope_refinement_active: bool,
-    is_followup: bool,
-    carryover_sources: tuple[dict, ...] | list[dict],
-    selected_kb_count: int | None = None,
-) -> tuple[Literal["v1", "v2", "direct", "reject"], str]:
-    """Choose exactly one runner; V2 never silently falls back to legacy RAG.
+def _semantic_entry(settings: object) -> Literal["legacy", "v3"]:
+    """Resolve the one semantic authority for this request.
 
-    ``v1`` remains an explicit deployment rollback switch.  Once a deployment
-    selects V2, however, a missing/invalid contract is a protocol failure, not
-    permission to execute the old heuristic pipeline.  Retrieval-dependent
-    QA/writing use V2, while verified non-retrieval contracts use the isolated
-    direct-response runner.
+    ``RAG_PIPELINE_VERSION`` chooses the evidence runner only.  Keeping this
+    decision in one small helper prevents a rolling settings object or a
+    future call site from accidentally running V3 and legacy query analysis
+    as two competing authorities.  Older test/rolling settings that predate
+    the explicit key retain legacy behaviour until their process is upgraded.
     """
 
-    if configured_version != "v2":
-        return "v1", "configured_v1"
-    if not isinstance(task_contract, RagTaskContract):
-        return "reject", "missing_or_invalid_task_contract"
-    if not task_contract.dispatch_authorized:
-        return "reject", "dispatch_not_authorized"
-    contract_gate_reason = rag_task_contract_gate_reason(
-        task_contract,
-        selected_kb_count=selected_kb_count,
-    )
-    if contract_gate_reason is not None:
-        return "reject", f"invalid_task_contract:{contract_gate_reason}"
-    if not task_contract.need_retrieval:
-        if (
-            task_contract.retrieval_policy == "skip"
-            and task_contract.response_mode
-            in {"general_chat", "writing", "platform_help"}
-        ):
-            return "direct", f"verified_{task_contract.response_mode}"
-        return "reject", "invalid_direct_task_contract"
-    if (
-        task_contract.retrieval_policy != "required"
-        or task_contract.response_mode not in {"grounded_qa", "writing"}
-    ):
-        return "reject", "invalid_retrieval_task_contract"
-    # V2 preserves the existing tag semantics as a soft ordering boost.  Tags
-    # neither widen authorization nor bypass the deterministic relevance gate,
-    # so they no longer require falling back to the slow model-rerank pipeline.
-    # A non-null filter is rebuilt server-side from a validated pending choice
-    # and carries an authorized KB/document allow-list.
-    evidence_scope_selection = evidence_scope_filter is not None
-    if evidence_scope_selection:
-        return "v2", "eligible_evidence_scope_selection"
-    if evidence_scope_refinement_active:
-        return "v2", "eligible_evidence_scope_refinement"
-    if is_followup or carryover_sources:
-        return "v2", "eligible_grounded_followup"
-    if task_contract.response_mode == "writing":
-        return "v2", "eligible_knowledge_writing"
-    return "v2", "eligible_grounded_qa"
+    value = str(getattr(settings, "rag_semantic_entry", "legacy") or "").strip().casefold()
+    return "v3" if value == "v3" else "legacy"
 
 
 @dataclass(frozen=True)
@@ -975,6 +956,43 @@ def _evidence_clarification_ack(
     }
 
 
+def _closed_query_execution_task_contract(
+    task_contract: RagTaskContract,
+    query_execution_gate: QueryExecutionGate,
+) -> RagTaskContract:
+    """Project a closed execution gate into the sole durable route contract.
+
+    A V3 attempt may temporarily defer this decision because it can turn an
+    otherwise non-runnable local floor into a compiled task graph.  Once that
+    semantic barrier has finished, a closed gate must take exactly the same
+    route-clarification path as a gate that was known before the first SSE.
+    Keeping the projection here prevents the two timing paths from persisting
+    different pending-state schemas or assigning different meanings to
+    ``needs_clarification``.
+    """
+
+    if not query_execution_gate.needs_clarification:
+        raise ValueError("only a closed query execution gate can block a task contract")
+    unresolved_reason = query_execution_gate.unresolved_reason
+    if unresolved_reason is None:
+        raise ValueError("a closed query execution gate requires an unresolved reason")
+    return replace(
+        task_contract,
+        readiness="needs_clarification",
+        dispatch_authorized=False,
+        decision_reason=query_execution_gate.decision_reason,
+        clarification=RouteClarification(
+            question=query_execution_gate.clarification_question,
+            unresolved=(
+                RouteUnresolvedSlot(
+                    role=QUERY_EXECUTION_UNRESOLVED_ROLE,
+                    reason=unresolved_reason,
+                ),
+            ),
+        ),
+    )
+
+
 async def _route_clarification_response(
     *,
     db: AsyncSession,
@@ -986,10 +1004,33 @@ async def _route_clarification_response(
     trace_id: str,
     selected_kb_ids: list[uuid.UUID],
     task_contract: RagTaskContract | None,
+    query_execution_gate: QueryExecutionGate | None = None,
     emit_clarification_event: bool = True,
     turn: ChatTurn | None = None,
+    existing_user_message: Message | None = None,
+    parent_stream_logging: bool = False,
 ) -> StreamingResponse:
-    """Persist a versioned, non-executable clarification and stream it."""
+    """Persist a versioned, non-executable clarification and stream it.
+
+    ``existing_user_message`` is used only by the bounded V3 post-first-SSE
+    barrier.  The user turn has already been durably accepted at that point,
+    but the terminal response must still use the exact same pending route
+    state, turn lifecycle, SSE contract and persistence retry logic as a
+    synchronous clarification.
+    """
+
+    if (
+        query_execution_gate is not None
+        and not query_execution_gate.needs_clarification
+    ):
+        raise ValueError(
+            "a route clarification response requires a closed query execution gate"
+        )
+    query_execution_payload = (
+        query_execution_gate.to_dict()
+        if query_execution_gate is not None
+        else None
+    )
 
     input_route_state_revision = (
         _stored_pending_request_identity(turn)[0]
@@ -1001,13 +1042,21 @@ async def _route_clarification_response(
     user_metadata = (
         message_turn_metadata(turn, status="generating") if turn is not None else {}
     )
-    user_msg = Message(
-        id=uuid.uuid4(),
-        conversation_id=conv.id,
-        role="user",
-        content=question,
-        **user_metadata,
-    )
+    if existing_user_message is not None:
+        if existing_user_message.conversation_id != conv.id:
+            raise ValueError("existing clarification user message belongs to another conversation")
+        user_msg = existing_user_message
+        user_msg.content = question
+        for key, value in user_metadata.items():
+            setattr(user_msg, key, value)
+    else:
+        user_msg = Message(
+            id=uuid.uuid4(),
+            conversation_id=conv.id,
+            role="user",
+            content=question,
+            **user_metadata,
+        )
     if turn is not None:
         turn.user_message_id = user_msg.id
         transition_turn(
@@ -1076,7 +1125,14 @@ async def _route_clarification_response(
         "dispatch_authorized": False,
     }
     conv.route_state_revision = int(getattr(conv, "route_state_revision", 0) or 0) + 1
-    db.add_all([user_msg, assistant_msg])
+    if existing_user_message is None:
+        db.add_all([user_msg, assistant_msg])
+    else:
+        # The user message was committed immediately before the V3 barrier.
+        # Only the assistant message is new; re-adding the persistent user
+        # instance would make lightweight transaction fakes observe a second
+        # synthetic user message and obscures the actual one-turn lifecycle.
+        db.add(assistant_msg)
     final_pending_route_state = json.loads(
         json.dumps(conv.pending_route_state, ensure_ascii=False)
     )
@@ -1195,26 +1251,27 @@ async def _route_clarification_response(
             # not include the model's raw route/rationale; the deterministic
             # contract projection is sufficient for the client to show that
             # clarification is required and dispatch is forbidden.
-            events.append(
-                {
-                    "type": "intent",
-                    "decision": {
-                        "intent_code": task_contract.intent_code,
-                        "intent_name": task_contract.intent_name,
-                        "action": task_contract.action,
-                        "confidence": task_contract.confidence,
-                        "source": task_contract.source,
-                        "relation": task_contract.relation,
-                        "readiness": task_contract.readiness,
-                        "response_mode": task_contract.response_mode,
-                        "retrieval_policy": task_contract.retrieval_policy,
-                        "need_retrieval": task_contract.need_retrieval,
-                        "dispatch_authorized": task_contract.dispatch_authorized,
-                        "decision_reason": task_contract.decision_reason,
-                        "task_contract": task_contract.to_dict(),
-                    },
-                }
-            )
+            intent_decision = {
+                "intent_code": task_contract.intent_code,
+                "intent_name": task_contract.intent_name,
+                "action": task_contract.action,
+                "confidence": task_contract.confidence,
+                "source": task_contract.source,
+                "relation": task_contract.relation,
+                "readiness": task_contract.readiness,
+                "response_mode": task_contract.response_mode,
+                "retrieval_policy": task_contract.retrieval_policy,
+                "need_retrieval": task_contract.need_retrieval,
+                "dispatch_authorized": task_contract.dispatch_authorized,
+                "decision_reason": task_contract.decision_reason,
+                "task_contract": task_contract.to_dict(),
+            }
+            if query_execution_payload is not None:
+                # The durable contract remains the authorization source; this
+                # versioned projection exposes why V2 stopped before retrieval
+                # without misrepresenting it as a planner-level clarification.
+                intent_decision["query_execution"] = query_execution_payload
+            events.append({"type": "intent", "decision": intent_decision})
         events.extend(
             [
                 {"type": "search_step", "step": "analyze", "status": "done"},
@@ -1243,10 +1300,13 @@ async def _route_clarification_response(
         for event in events:
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
+    clarification_stream = generate_clarification()
+    if not parent_stream_logging:
+        clarification_stream = stream_in_conversation_log(
+            clarification_stream, conversation_id=conv.id
+        )
     return StreamingResponse(
-        stream_in_conversation_log(
-            generate_clarification(), conversation_id=conv.id
-        ),
+        clarification_stream,
         media_type="text/event-stream",
         headers=_turn_response_headers(
             conversation_id=conv.id, trace_id=trace_id, turn=turn
@@ -1733,6 +1793,7 @@ async def _validate_stream_answer_sources(
     raw_sources: object,
     raw_results: object,
     selected_kb_ids: list[uuid.UUID],
+    read_session_factory: ReadSessionFactory | None = None,
 ) -> tuple[list[dict], set[tuple[uuid.UUID, uuid.UUID]], str | None]:
     """Validate and refresh producer-provided answer evidence.
 
@@ -1808,6 +1869,14 @@ async def _validate_stream_answer_sources(
         return [], set(), "answer_source_not_in_results"
 
     chunk_ids = {identity[2] for _, identity in parsed_sources}
+    # ``isolated_read_session`` always rolls back its owned read transaction
+    # before closing it.  SQLAlchemy consequently expires ORM instances on
+    # that boundary, even when the session factory normally uses
+    # ``expire_on_commit=False``.  Export every field needed by the answer
+    # snapshot *inside* that boundary; retaining ORM rows for projection below
+    # would turn an otherwise successful validation into a detached-instance
+    # failure after the request has already generated an answer.
+    current: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], dict[str, object]] = {}
     try:
         statement = (
             select(DocumentChunk, Document)
@@ -1823,8 +1892,45 @@ async def _validate_stream_answer_sources(
                 Document.status == "ready",
             )
         )
-        result = await db.execute(statement)
-        rows = result.all() if hasattr(result, "all") else []
+        # This defensive validation is allowed to fail closed, but it must not
+        # inherit an aborted transaction from an unrelated optional read (for
+        # example a rolling registry migration).  The request session still
+        # owns turn/message persistence and is intentionally never rolled back
+        # by validation code.
+        async with isolated_read_session(
+            request_db=db,
+            session_factory=read_session_factory,
+        ) as read_db:
+            result = await read_db.execute(statement)
+            rows = result.all() if hasattr(result, "all") else []
+            for row in rows or ():
+                try:
+                    chunk, document = row
+                    if (
+                        document is None
+                        or document.is_active is not True
+                        or str(document.status or "").strip().casefold() != "ready"
+                        or document.id != chunk.doc_id
+                        or document.kb_id != chunk.kb_id
+                    ):
+                        continue
+                    identity = (chunk.kb_id, chunk.doc_id, chunk.id)
+                    current[identity] = {
+                        "id": str(chunk.id),
+                        "chunk_id": str(chunk.id),
+                        "doc_id": str(chunk.doc_id),
+                        "kb_id": str(chunk.kb_id),
+                        "content": chunk.content,
+                        "chunk_index": chunk.chunk_index,
+                        "metadata": dict(chunk.metadata_ or {}),
+                        "filename": document.filename,
+                        "file_type": document.file_type,
+                        "source_url": document.source_url,
+                        "image_url": document.image_url,
+                        "doc_tags": list(document.tags or []),
+                    }
+                except (TypeError, ValueError, AttributeError):
+                    continue
     except Exception as exc:
         # Do not expose producer content or clear a pending scope when the
         # authorization refresh itself is unavailable.  The caller records a
@@ -1835,48 +1941,20 @@ async def _validate_stream_answer_sources(
         )
         return [], set(), f"source_refresh_failed:{type(exc).__name__}"
 
-    current: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], tuple[DocumentChunk, Document]] = {}
-    for row in rows or ():
-        try:
-            chunk, document = row
-            if (
-                document is None
-                or document.is_active is not True
-                or str(document.status or "").strip().casefold() != "ready"
-                or document.id != chunk.doc_id
-                or document.kb_id != chunk.kb_id
-            ):
-                continue
-            identity = (chunk.kb_id, chunk.doc_id, chunk.id)
-        except (TypeError, ValueError, AttributeError):
-            continue
-        current[identity] = (chunk, document)
-
     if any(identity not in current for _, identity in parsed_sources):
         return [], set(), "answer_source_not_current"
 
     refreshed: list[dict] = []
     answer_pairs: set[tuple[uuid.UUID, uuid.UUID]] = set()
     for source, identity in parsed_sources:
-        chunk, document = current[identity]
+        refreshed_snapshot = current[identity]
         refreshed.append(
             {
                 **source,
-                "id": str(chunk.id),
-                "chunk_id": str(chunk.id),
-                "doc_id": str(chunk.doc_id),
-                "kb_id": str(chunk.kb_id),
-                "content": chunk.content,
-                "chunk_index": chunk.chunk_index,
-                "metadata": chunk.metadata_ or {},
-                "filename": document.filename,
-                "file_type": document.file_type,
-                "source_url": document.source_url,
-                "image_url": document.image_url,
-                "doc_tags": document.tags or [],
+                **refreshed_snapshot,
             }
         )
-        answer_pairs.add((chunk.kb_id, chunk.doc_id))
+        answer_pairs.add((identity[0], identity[1]))
     return refreshed, answer_pairs, None
 
 
@@ -2053,8 +2131,23 @@ def _source_snapshot_is_answer_evidence(source: object) -> bool:
 
     if not isinstance(source, dict):
         return False
-    status = str(source.get("evidence_status") or "").strip().casefold()
-    return status not in _NON_ANSWER_SOURCE_STATUSES
+    raw_status = source.get("evidence_status")
+    # Snapshots created before the status marker retain the documented
+    # backwards-compatible behaviour.  Once a marker exists, unknown values
+    # fail closed rather than becoming citations by virtue of not appearing in
+    # a local deny-list.
+    if raw_status in (None, ""):
+        return True
+    status = canonical_evidence_status(raw_status)
+    return status in _ANSWER_SOURCE_REQUIRED_STATUSES
+
+
+def _read_evidence_status(value: object) -> str | None:
+    """Project persisted legacy statuses to the canonical public protocol."""
+
+    if value in (None, ""):
+        return None
+    return canonical_evidence_status(value) or "error"
 
 
 async def _historical_evidence_clarification(
@@ -2263,6 +2356,8 @@ async def _messages_with_current_source_scope(
                 ):
                     value = counters.get(key)
                     if isinstance(value, (str, int, float, bool)) or value is None:
+                        if key == "evidence_status":
+                            value = _read_evidence_status(value)
                         safe_counters[key] = value
 
             def refreshed_snapshot_items(key: str) -> list[dict]:
@@ -2311,7 +2406,9 @@ async def _messages_with_current_source_scope(
             status=getattr(row, "turn_status", None),
             turn_status=getattr(row, "turn_status", None),
             trace_id=getattr(row, "trace_id", None),
-            evidence_status=getattr(row, "evidence_status", None),
+            evidence_status=_read_evidence_status(
+                getattr(row, "evidence_status", None)
+            ),
             retrieval_executed=getattr(row, "retrieval_executed", None),
             error_code=getattr(row, "error_code", None),
             delivery_status=getattr(row, "delivery_status", None),
@@ -2484,7 +2581,7 @@ def _turn_state_event(turn: ChatTurn, *, replayed: bool = False) -> dict:
         "request_id": turn.request_id,
         "status": turn.status,
         "trace_id": turn.trace_id,
-        "evidence_status": turn.evidence_status,
+        "evidence_status": _read_evidence_status(turn.evidence_status),
         "retrieval_executed": turn.retrieval_executed,
         "error_code": turn.error_code,
         "duration_ms": turn_duration_ms(turn),
@@ -2863,6 +2960,11 @@ async def _stage_generated_turn(
 ) -> ChatTurn:
     """Durably stage the answer before the assistant message transaction."""
 
+    # This path writes a few fields directly for idempotent retry semantics,
+    # bypassing ``transition_turn`` after the first state transition.  Apply
+    # the same canonical protocol here so a legacy/custom stream cannot leave
+    # ``version_mismatch`` (or an unknown status) in durable chat history.
+    canonical_status = _read_evidence_status(evidence_status)
     from database import AsyncSessionLocal
 
     last_error: BaseException | None = None
@@ -2886,7 +2988,7 @@ async def _stage_generated_turn(
                 persisted.answer_sources = list(sources or [])
                 persisted.search_snapshot = search_snapshot
                 persisted.tokens = tokens
-                persisted.evidence_status = evidence_status
+                persisted.evidence_status = canonical_status
                 persisted.retrieval_executed = retrieval_executed
                 persisted.trace_id = trace_id
                 persisted.error_code = None
@@ -2987,6 +3089,29 @@ async def _existing_turn_response(
         status_code=status_code,
         replayed=True,
     )
+
+
+def _query_analysis_route_context(
+    context: ConversationContext,
+) -> tuple[dict[str, Any], ...]:
+    """Expose bounded historical candidates to source-anchored analysis.
+
+    The route contract decides intent/category and permission policy, but it
+    cannot be a second owner of referential semantics.  A short question such
+    as ``餐补呢`` is often locally indistinguishable from a standalone query;
+    withholding every candidate before the source-anchored analyzer sees it
+    forces the old system to concatenate historical text and parse it again.
+
+    Giving the analyzer candidates does *not* grant it history: the strict
+    schema requires each selected ``t*`` to be cited by exact user-text spans,
+    and the backend later reloads sources under current RBAC/KB scope.
+    """
+
+    return tuple({
+        "candidate_key": candidate.candidate_key,
+        "user_input": candidate.user_question,
+        "assistant_answer": candidate.assistant_answer or "",
+    } for candidate in context.route_turn_candidates)
 
 
 @router.post("/send")
@@ -3352,6 +3477,7 @@ async def send_message(
     # 是“接收请求”。此前这里等意图模型返回后才写 chat.request，导致模型
     # 事件排在请求之前；路由校验失败时也会留下没有起点的 running 记录。
     settings = get_settings()
+    semantic_entry = _semantic_entry(settings)
     trace_include_content = settings.rag_trace_include_content
     search_config = payload.search_config.model_dump()
     trace_event(
@@ -3371,6 +3497,7 @@ async def send_message(
                 else "pending_intent_routing"
             )
         ),
+        semantic_entry=semantic_entry,
         is_followup=conversation_context.is_followup,
         followup_reason=conversation_context.followup_reason,
         history_message_count=len(conversation_context.history_messages),
@@ -3483,12 +3610,11 @@ async def send_message(
             )
         return response
 
-    # 普通请求由语义合同判断是否需要改写。服务端已验证的证据选择/补充范围
-    # 不包含新的路由语义，直接构造 continuation 合同，避免为“2”之类的短回复
-    # 再等待一次外部意图模型。
-    routing_question = evidence_routing_query or (
-        payload.question if route_candidates else conversation_context.standalone_query
-    )
+    # 路由只理解用户本轮原文；历史候选以 request-local ``t*`` 单独传入。
+    # 不再把 ``当前问题。上一轮问题`` 作为新的路由输入，否则路由、局部规划
+    # 和后续检索会对同一问题分别猜一次语义。待源锚定理解完成后，才生成仅供
+    # 检索使用的 canonical rendering。
+    routing_question = evidence_routing_query or payload.question
     if evidence_pending_execution:
         try:
             routing_result = build_verified_evidence_scope_result(
@@ -3601,28 +3727,78 @@ async def send_message(
     decision = routing_result.decision
     route_decision = getattr(routing_result, "route_decision", None)
     task_contract = getattr(routing_result, "task_contract", None)
-    if route_decision is not None and task_contract is not None:
-        conversation_context = await resolve_routed_conversation_context(
-            db,
-            context=conversation_context,
-            question=routing_question,
-            kb_ids=payload.knowledge_base_ids,
-            route_decision=route_decision,
+    # Preserve the route contract for audit and legacy clarification state.
+    # With the active V3 semantic entry, only a route-owned semantic
+    # clarification may be deferred.  The hand-off contract is rebuilt from
+    # current request state, so route requirements/relation/history are never
+    # silently promoted into V3/V2 execution semantics.
+    route_task_contract = task_contract
+    semantic_entry_gate: RagSemanticEntryGate | None = None
+    configured_v3_mode = str(
+        getattr(settings, "rag_query_understanding_v3_mode", "off") or "off"
+    ).strip().casefold()
+    v3_semantic_compilation_active = (
+        semantic_entry == "v3"
+        and settings.rag_pipeline_version == "v2"
+        and configured_v3_mode == "active"
+        and not evidence_pending_execution
+    )
+    if (
+        v3_semantic_compilation_active
+        and isinstance(route_task_contract, RagTaskContract)
+    ):
+        semantic_entry_gate = assess_rag_semantic_entry_gate(
+            route_task_contract,
+            question=payload.question,
+            selected_kb_count=len(set(payload.knowledge_base_ids)),
         )
-        if pipeline_base_query is not None:
-            conversation_context = replace(
-                conversation_context,
-                standalone_query=pipeline_base_query,
+        trace_event(
+            "intent.semantic_entry_gate",
+            trace_id=trace_id,
+            conversation_id=conv.id,
+            user_id=user.id,
+            semantic_entry=semantic_entry,
+            configured_v3_mode=configured_v3_mode,
+            **semantic_entry_gate.safe_summary(),
+        )
+        if semantic_entry_gate.may_enter_v3:
+            task_contract = semantic_entry_gate.execution_contract
+    if route_decision is not None and task_contract is not None:
+        # Request RBAC/KB scope and every remaining strict contract invariant
+        # are hard gates in both entries.  A V3-deferred route clarification
+        # has already been rebuilt into a current-turn policy shell above.
+        # The route's historical turn prediction remains executable only in
+        # the explicit legacy entry; V3 receives the same authorised candidate
+        # pool but is the sole component allowed to choose a source span and
+        # trigger a history/source reload.
+        if semantic_entry == "legacy":
+            conversation_context = await resolve_routed_conversation_context(
+                db,
+                context=conversation_context,
+                question=routing_question,
+                kb_ids=payload.knowledge_base_ids,
+                route_decision=route_decision,
             )
+            if pipeline_base_query is not None:
+                conversation_context = replace(
+                    conversation_context,
+                    standalone_query=pipeline_base_query,
+                )
         trace_event(
             "conversation.context_resolved",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
             relation=(route_decision.relation if route_decision is not None else "legacy"),
-            readiness=task_contract.readiness,
+            readiness=route_task_contract.readiness,
             query_mode=task_contract.query_mode,
-            context_turn_count=len(task_contract.context_turn_keys),
+            context_turn_count=len(route_task_contract.context_turn_keys),
+            semantic_entry=semantic_entry,
+            context_projection=(
+                "legacy_route_projection"
+                if semantic_entry == "legacy"
+                else "v3_catalog_candidate_pool"
+            ),
             is_followup=conversation_context.is_followup,
             followup_reason=conversation_context.followup_reason,
             unresolved_reference=conversation_context.unresolved_reference,
@@ -3637,20 +3813,26 @@ async def send_message(
             user_id=user.id,
             intent=decision.to_dict(),
             route_schema_version=route_decision.schema_version,
-            contract_schema_version=task_contract.schema_version,
+            contract_schema_version=route_task_contract.schema_version,
             relation=(route_decision.relation if route_decision is not None else "legacy"),
-            readiness=task_contract.readiness,
+            readiness=route_task_contract.readiness,
             evidence_scope=route_decision.evidence_scope,
             query_mode=task_contract.query_mode,
-            context_turn_count=len(task_contract.context_turn_keys),
-            requirement_count=len(task_contract.requirements),
-            dispatch_authorized=task_contract.dispatch_authorized,
+            context_turn_count=len(route_task_contract.context_turn_keys),
+            requirement_count=len(route_task_contract.requirements),
+            dispatch_authorized=route_task_contract.dispatch_authorized,
+            execution_dispatch_authorized=task_contract.dispatch_authorized,
+            semantic_entry_gate=(
+                semantic_entry_gate.safe_summary()
+                if semantic_entry_gate is not None
+                else None
+            ),
             selected_kb_count=len(payload.knowledge_base_ids),
             decision_reason=decision.decision_reason,
         )
         if not task_contract.dispatch_authorized:
             clarification_message = (
-                task_contract.clarification.question.strip()
+                route_task_contract.clarification.question.strip()
                 or UNRESOLVED_REFERENCE_MESSAGE
             )
             response = await _route_clarification_response(
@@ -3659,10 +3841,10 @@ async def send_message(
                 user=user,
                 question=payload.question,
                 clarification_message=clarification_message,
-                decision_reason=task_contract.decision_reason,
+                decision_reason=route_task_contract.decision_reason,
                 trace_id=trace_id,
                 selected_kb_ids=payload.knowledge_base_ids,
-                task_contract=task_contract,
+                task_contract=route_task_contract,
                 turn=durable_turn,
             )
             if cleared_evidence_state_id is not None:
@@ -3680,6 +3862,16 @@ async def send_message(
             **decision.to_dict(),
             "route_decision": route_decision.to_dict(),
             "task_contract": task_contract.to_dict(),
+            "route_task_contract": (
+                route_task_contract.to_dict()
+                if route_task_contract != task_contract
+                else None
+            ),
+            "semantic_entry_gate": (
+                semantic_entry_gate.safe_summary()
+                if semantic_entry_gate is not None
+                else None
+            ),
             "diagnostics": getattr(routing_result, "diagnostics", {}),
         }
     else:
@@ -3769,34 +3961,143 @@ async def send_message(
         reason=pipeline_reason,
     )
 
+    execution_bundle: RagExecutionBundle | None = None
+    execution_baseline: ExecutionBaseline | None = None
+    query_execution_gate: QueryExecutionGate | None = None
+    # A route-selected ConversationContext is an analysis candidate pool, not
+    # V2 execution state.  Until an immutable semantic contract is applied,
+    # V2 must receive this current-turn-only context even if the route layer
+    # had tentatively found a historical turn.
+    v2_execution_context = None
+    semantic_context_applied = False
+    # V3 is the production semantic authority.  It selects only server-issued
+    # source spans and compiles into the same V2 task graph; the local surface
+    # plan below is a fallback floor, never an early semantic veto.
+    v3_mode = "off"
+    v3_active_pending = False
+    v3_shadow_pending = False
+    v3_baseline = None
+    v3_route_context: tuple[dict[str, Any], ...] = ()
+    v3_revision_fence: QueryUnderstandingV3RevisionFence | None = None
+    v3_anchor_prefetch_revision: str | None = None
+    v3_anchor_prefetch_enabled = False
+    v3_anchor_snapshot = None
+    v3_anchor_snapshot_revision: str | None = None
+    analyzer_mode = "off"
+    deterministic_analysis_pending = False
+    active_analysis_pending = False
+    shadow_analysis_pending = False
+    # This value is intentionally distinct from the raw user question.  It
+    # starts as the current turn and may later be replaced by the terminal,
+    # source-only rendering of ResolvedTurnSemantics.  It is never fed back
+    # into route/planning/model analysis.
+    effective_retrieval_query = (pipeline_base_query or payload.question).strip()
     if pipeline_version == "v2" and isinstance(task_contract, RagTaskContract):
-        # The semantic router can be ready while the deterministic local plan
-        # still cannot identify a safe relationship/bridge query.  Promote
-        # that uncertainty into the durable route-clarification path before
-        # saving a generating user turn or opening any retrieval/model call.
-        execution_plan = _plan_with_contract_requirements(
-            plan_query_locally(conversation_context.standalone_query),
-            task_contract,
-        )
-        if execution_plan.needs_clarification:
-            clarification_question = (
-                execution_plan.clarification_question
-                or "请补充需要查询或了解的具体问题。"
+        if semantic_entry == "v3" and not evidence_pending_execution:
+            # Strip every heuristic/route-selected projection before V3 sees
+            # the request.  Route candidates remain available as a bounded
+            # source catalog, but V2 starts from the literal user question
+            # until a catalog-bound selection has been validated and reloaded.
+            conversation_context = build_v3_catalog_candidate_context(
+                context=conversation_context,
+                current_question=payload.question,
             )
-            blocked_contract = replace(
+            effective_retrieval_query = payload.question.strip()
+        v2_execution_context = build_current_turn_v2_execution_context(
+            retrieval_query=effective_retrieval_query,
+        )
+        # The deterministic baseline may inspect only the current user text.
+        # Historical qualifiers are represented later by a validated
+        # ``ResolvedTurnSemantics`` object, never by reparsing a concatenated
+        # standalone query.  The route contract remains the authority for
+        # category/policy/dispatch, but its free-text requirements are not a
+        # second semantic plan.
+        local_surface_plan = plan_query_locally(payload.question)
+        contextual_plan = local_surface_plan
+        execution_plan = local_surface_plan
+        analysis_route_context = _query_analysis_route_context(
+            conversation_context,
+        )
+        v3_route_context = analysis_route_context
+        execution_baseline = build_execution_baseline(
+            plan=execution_plan,
+            local_surface_plan=local_surface_plan,
+            contextual_plan=contextual_plan,
+            question=payload.question,
+            standalone_query=payload.question,
+            route_context=analysis_route_context,
+            deterministic_is_followup=conversation_context.is_followup,
+        )
+        execution_bundle = execution_baseline.execution_bundle
+        query_execution_gate = evaluate_query_execution_gate(execution_baseline)
+        v3_mode = (
+            str(getattr(settings, "rag_query_understanding_v3_mode", "off"))
+            .strip()
+            .casefold()
+            if semantic_entry == "v3"
+            else "off"
+        )
+        if v3_mode not in {"off", "shadow", "active"}:
+            v3_mode = "off"
+        if not evidence_pending_execution and v3_mode in {"shadow", "active"}:
+            v3_baseline = build_query_understanding_v3_baseline(
+                fallback=execution_baseline,
+            )
+            # A strict contextual reference whose immediate prior user turn
+            # carries a scope/condition cannot fall back to a bare current
+            # phrase.  The V3 baseline has already converted that case into
+            # the ordinary closed execution gate, so do not spend a model
+            # timeout trying to reinterpret the same unsafe history.
+            if v3_baseline.execution_preflight_blocked:
+                execution_baseline = v3_baseline.fallback
+                execution_bundle = execution_baseline.execution_bundle
+                query_execution_gate = evaluate_query_execution_gate(
+                    execution_baseline
+                )
+                trace_event(
+                    "query.understanding.v3.context_preflight",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    decision="clarification",
+                    reason="contextual_ellipsis_history_not_inheritable",
+                    baseline=v3_baseline.safe_summary(),
+                )
+            elif v3_mode == "active":
+                v3_active_pending = True
+                v3_anchor_prefetch_enabled = bool(getattr(
+                    settings,
+                    "rag_query_understanding_v3_anchor_prefetch_enabled",
+                    True,
+                ))
+            else:
+                v3_shadow_pending = True
+        # `intent` is the client-visible routing envelope.  Keep the final V2
+        # execution decision next to the task contract so a client can tell a
+        # planning result from a closed execution gate without parsing trace
+        # event names or inferring state from an assistant sentence.
+        intent_payload = {
+            **intent_payload,
+            "query_execution": {
+                **query_execution_gate.to_dict(),
+                "semantic_compilation_pending": v3_active_pending,
+            },
+        }
+        trace_event(
+            QUERY_EXECUTION_TRACE_EVENT,
+            trace_id=trace_id,
+            conversation_id=conv.id,
+            user_id=user.id,
+            pipeline_version="v2",
+            execution_surface="api_preflight",
+            semantic_compilation_mode=(v3_mode if v3_baseline is not None else "off"),
+            semantic_compilation_pending=v3_active_pending,
+            **query_execution_gate.trace_summary(),
+        )
+        if query_execution_gate.needs_clarification and not v3_active_pending:
+            blocked_contract = _closed_query_execution_task_contract(
                 task_contract,
-                readiness="needs_clarification",
-                dispatch_authorized=False,
-                decision_reason="query_plan_requires_clarification",
-                clarification=RouteClarification(
-                    question=clarification_question,
-                    unresolved=(
-                        RouteUnresolvedSlot(
-                            role="query_plan",
-                            reason="missing",
-                        ),
-                    ),
-                ),
+                query_execution_gate,
             )
             trace_event(
                 "query.plan",
@@ -3804,18 +4105,25 @@ async def send_message(
                 pipeline_version="v2",
                 execution_surface="api_clarification_gate",
                 plan=(
-                    execution_plan.to_dict()
+                    execution_baseline.plan.to_dict()
                     if settings.rag_trace_include_content
                     else {
-                        "schema_version": execution_plan.schema_version,
-                        "answer_shape": execution_plan.answer_shape,
-                        "query_count": len(execution_plan.retrieval_queries),
-                        "requirement_count": len(execution_plan.requirements),
-                        "confidence": execution_plan.confidence,
-                        "source": execution_plan.source,
-                        "needs_clarification": True,
+                        "schema_version": execution_baseline.plan.schema_version,
+                        "answer_shape": execution_baseline.plan.answer_shape,
+                        "query_count": len(execution_baseline.plan.retrieval_queries),
+                        "requirement_count": len(execution_baseline.plan.requirements),
+                        "confidence": execution_baseline.plan.confidence,
+                        "source": execution_baseline.plan.source,
+                        # A plan is not rewritten just because the following
+                        # execution gate is closed.  Operators need this exact
+                        # value to distinguish planner ambiguity from a
+                        # non-runnable compatibility bundle.
+                        "needs_clarification": (
+                            execution_baseline.plan.needs_clarification
+                        ),
                     }
                 ),
+                execution_baseline=execution_baseline.safe_summary(),
                 **content_fields(
                     "query",
                     conversation_context.standalone_query,
@@ -3826,11 +4134,12 @@ async def send_message(
                 conv=conv,
                 user=user,
                 question=payload.question,
-                clarification_message=clarification_question,
-                decision_reason="query_plan_requires_clarification",
+                clarification_message=query_execution_gate.clarification_question,
+                decision_reason=query_execution_gate.decision_reason,
                 trace_id=trace_id,
                 selected_kb_ids=payload.knowledge_base_ids,
                 task_contract=blocked_contract,
+                query_execution_gate=query_execution_gate,
                 turn=durable_turn,
             )
             if cleared_evidence_state_id is not None:
@@ -3844,6 +4153,99 @@ async def send_message(
                     route_state_revision=conv.route_state_revision,
                 )
             return response
+
+        # A narrowly proven ``那/那么 + 明确目标 + 呢`` form can be resolved
+        # locally from the prior user-source span.  It is queued until the
+        # first SSE event just like optional model refinement, so durable turn
+        # state is committed before any contextual source reload occurs.  The
+        # service still validates and compiles the same query_analysis.v2
+        # contract; this flag grants no history or retrieval authority itself.
+        deterministic_analysis_pending = bool(
+            not evidence_pending_execution
+            and v3_baseline is None
+            and parse_contextual_ellipsis_target(payload.question) is not None
+        )
+        if deterministic_analysis_pending:
+            trace_event(
+                "query.analysis.execution_decision",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode="deterministic",
+                decision="deferred",
+                reason="awaiting_first_sse_event",
+                baseline=execution_baseline.safe_summary(),
+            )
+
+        # Older test/rolling settings objects may predate the analyzer keys;
+        # the real ``Settings`` schema declares them formally.  Missing values
+        # disable optional analysis rather than changing retrieval semantics.
+        analyzer_mode = (
+            "off"
+            if v3_baseline is not None
+            else str(
+                getattr(settings, "rag_query_analyzer_mode", "off")
+            ).strip().casefold()
+        )
+        if not evidence_pending_execution and analyzer_mode == "shadow":
+            # Submit only after the durable user turn commits and the first
+            # SSE event has been yielded; see the generator below.
+            shadow_analysis_pending = True
+        elif (
+            not evidence_pending_execution
+            and analyzer_mode == "active"
+            and should_attempt_active_analysis(
+                question=payload.question,
+                local_surface_plan=local_surface_plan,
+                query_mode=task_contract.query_mode,
+            )
+        ):
+            # Delay only this bounded optional refinement until the SSE
+            # generator has emitted ``conversation_started``.  The baseline
+            # deterministic bundle is already complete and remains the safe
+            # fallback for timeout/rejection/failure.
+            active_analysis_pending = True
+            trace_event(
+                "query.analysis.execution_decision",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode="active",
+                decision="deferred",
+                reason="awaiting_first_sse_event",
+                baseline=execution_baseline.safe_summary(),
+            )
+        elif analyzer_mode == "active" and not evidence_pending_execution:
+            trace_event(
+                "query.analysis.skipped",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode="active",
+                reason="simple_local_structure",
+            )
+        if v3_active_pending and v3_baseline is not None:
+            trace_event(
+                "query.understanding.v3.execution_decision",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode="active",
+                decision="deferred",
+                reason="awaiting_first_sse_event",
+                baseline=v3_baseline.safe_summary(),
+            )
+        elif v3_shadow_pending and v3_baseline is not None:
+            trace_event(
+                "query.understanding.v3.execution_decision",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode="shadow",
+                decision="deferred",
+                reason="awaiting_first_sse_event",
+                baseline=v3_baseline.safe_summary(),
+            )
 
     # 保存用户消息并把 durable turn 推进到 generating。用户消息和状态在
     # RAG 流启动前一起提交，因此断线/进程退出后仍能判断该 request_id 已被
@@ -3918,9 +4320,148 @@ async def send_message(
     expected_route_state_revision = int(
         getattr(conv, "route_state_revision", 0) or 0
     )
+    if v3_active_pending and v3_baseline is not None:
+        try:
+            fence_identity = build_query_understanding_v3_fence_identity(
+                conversation_id=conv.id,
+                turn_id=(durable_turn.id if durable_turn is not None else None),
+                request_id=request_id,
+                question=v3_baseline.fallback.question,
+                kb_ids=payload.knowledge_base_ids,
+                evidence_scope_filter=evidence_filter,
+                route_context=v3_route_context,
+                route_state_revision=expected_route_state_revision,
+                task_contract=task_contract.to_dict(),
+            )
+            v3_revision_fence = QueryUnderstandingV3RevisionFence(
+                baseline_fingerprint=v3_baseline.fallback.fingerprint,
+                identity=fence_identity,
+            )
+            v3_anchor_prefetch_revision = fence_identity.fingerprint
+            trace_event(
+                "query.understanding.v3.fence_created",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                fence=v3_revision_fence.safe_summary(),
+            )
+            trace_event(
+                "query.understanding.v3.revision_fence",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                phase="created",
+                status="open",
+                fence=v3_revision_fence.safe_summary(),
+            )
+        except Exception as exc:
+            # Failing to construct a fence must never leave an unbound model
+            # result eligible for adoption.  Keep the local baseline and make
+            # the degradation visible; the V2 runner will still execute it.
+            v3_active_pending = False
+            if query_execution_gate is not None:
+                intent_payload["query_execution"] = {
+                    **query_execution_gate.to_dict(),
+                    "semantic_compilation_pending": False,
+                    "semantic_compilation_mode": "v3_fallback",
+                    "semantic_compilation_decision": "fence_identity_unavailable",
+                }
+            trace_event(
+                "query.understanding.v3.fallback",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                reason="fence_identity_unavailable",
+                error=exc,
+            )
+
+    async def _apply_compiled_turn_semantics(decision: Any) -> bool:
+        """Atomically project one compiled semantic contract into V2 inputs.
+
+        Model and deterministic source-anchored analyses share this hand-off.
+        In particular, the previous turn's displayed evidence is not trusted:
+        ``apply_resolved_turn_semantics`` reloads it under this request's
+        current KB/RBAC scope before the compiled retrieval bundle is adopted.
+        """
+
+        nonlocal conversation_context, execution_bundle
+        nonlocal effective_retrieval_query, semantic_context_applied
+        nonlocal v2_execution_context
+        semantics = getattr(decision, "semantics", None)
+        mode = str(getattr(decision, "mode", "unknown"))
+        if semantics is None:
+            trace_event(
+                "query.semantics.rejected",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode=mode,
+                reason="compiled_analysis_missing_resolved_semantics",
+            )
+            return False
+        if getattr(decision, "execution_bundle", None) is None:
+            trace_event(
+                "query.semantics.rejected",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode=mode,
+                reason="compiled_analysis_missing_execution_bundle",
+            )
+            return False
+        try:
+            resolved_context = await apply_resolved_turn_semantics(
+                db,
+                context=conversation_context,
+                semantics=semantics,
+                kb_ids=payload.knowledge_base_ids,
+            )
+            resolved_execution_context = build_resolved_v2_execution_context(
+                context=resolved_context,
+                semantics=semantics,
+            )
+        except Exception as exc:
+            # Do not execute a history-bound plan if the selected turns/sources
+            # cannot be reloaded in the current authorization scope.  The raw
+            # current-turn baseline remains conservative and safe to run.
+            trace_event(
+                "query.semantics.rejected",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                mode=mode,
+                reason="resolved_context_reload_failed",
+                error=exc,
+            )
+            return False
+        conversation_context = resolved_context
+        v2_execution_context = resolved_execution_context
+        semantic_context_applied = True
+        execution_bundle = decision.execution_bundle
+        effective_retrieval_query = v2_execution_context.retrieval_query
+        trace_event(
+            "query.semantics.resolved",
+            trace_id=trace_id,
+            conversation_id=conv.id,
+            user_id=user.id,
+            mode=mode,
+            semantics=semantics.safe_summary(),
+            **content_fields(
+                "resolved_turn_semantics",
+                json.dumps(
+                    semantics.to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        return True
 
     async def generate():
-        nonlocal durable_turn
+        nonlocal durable_turn, execution_bundle, conversation_context
+        nonlocal effective_retrieval_query, semantic_context_applied
+        nonlocal v2_execution_context, execution_baseline, query_execution_gate
+        nonlocal v3_anchor_snapshot, v3_anchor_snapshot_revision
         full_response = []
         sources = []
         tokens = None
@@ -3963,32 +4504,635 @@ async def send_message(
             },
             ensure_ascii=False,
         ) + "\n\n"
+        # The request transaction committed before this generator is created,
+        # and this code resumes only after the first SSE event is delivered.
+        # Optional model analysis therefore cannot race durable turn creation
+        # or keep an invisible background queue ahead of the user response.
+        if shadow_analysis_pending and execution_baseline is not None:
+            get_query_analysis_execution_service().submit_shadow(
+                baseline=execution_baseline,
+                trace_id=trace_id,
+                conversation_id=str(conv.id),
+                user_id=str(user.id),
+                timeout_seconds=settings.rag_query_analyzer_shadow_timeout_seconds,
+                maximum_inflight=settings.rag_query_analyzer_shadow_max_inflight,
+                sample_rate=settings.rag_query_analyzer_shadow_sample_rate,
+                submission_phase="post_commit_post_first_sse",
+            )
+        if deterministic_analysis_pending and execution_baseline is not None:
+            deterministic_gate_started = time.perf_counter()
+            deterministic_decision = await get_query_analysis_execution_service().run_deterministic_contextual_ellipsis(
+                baseline=execution_baseline,
+                trace_id=trace_id,
+                conversation_id=str(conv.id),
+                user_id=str(user.id),
+            )
+            trace_event(
+                "query.analysis.deterministic_gate_completed",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                first_sse_already_emitted=True,
+                gate_wait_ms=max(
+                    0,
+                    round((time.perf_counter() - deterministic_gate_started) * 1000),
+                ),
+                decision=deterministic_decision.decision,
+                reason=deterministic_decision.reason,
+                analysis_latency_ms=deterministic_decision.analysis_latency_ms,
+            )
+            if deterministic_decision.applied:
+                await _apply_compiled_turn_semantics(deterministic_decision)
+        if (
+            active_analysis_pending
+            and not semantic_context_applied
+            and execution_baseline is not None
+        ):
+            active_gate_started = time.perf_counter()
+            active_decision = await get_query_analysis_execution_service().run_active(
+                baseline=execution_baseline,
+                trace_id=trace_id,
+                conversation_id=str(conv.id),
+                user_id=str(user.id),
+                timeout_seconds=settings.rag_query_analyzer_active_timeout_seconds,
+                maximum_inflight=settings.rag_query_analyzer_active_max_inflight,
+            )
+            # The conversation id has already reached the browser at this
+            # point.  Make the bounded active-analysis gate visible in the
+            # trace so operators can distinguish its intentional latency from
+            # retrieval/rerank time; the analyzer itself enforces the absolute
+            # timeout passed above and any failure retains the baseline bundle.
+            trace_event(
+                "query.analysis.active_gate_completed",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                first_sse_already_emitted=True,
+                configured_timeout_seconds=settings.rag_query_analyzer_active_timeout_seconds,
+                gate_wait_ms=max(0, round((time.perf_counter() - active_gate_started) * 1000)),
+                decision=active_decision.decision,
+                reason=active_decision.reason,
+                analysis_latency_ms=active_decision.analysis_latency_ms,
+            )
+            if active_decision.applied:
+                await _apply_compiled_turn_semantics(active_decision)
+
+        # V3 analysis and the immutable original-question anchor retrieval are
+        # deliberately started together only after the first SSE has reached
+        # the browser.  The prefetch has no task lineage and cannot change a
+        # plan; it is merely an optional cache for the finally selected graph.
+        if v3_shadow_pending and v3_baseline is not None:
+            async def _observe_v3_shadow() -> None:
+                try:
+                    result = await get_query_understanding_v3_execution_service().run_active(
+                        baseline=v3_baseline,
+                        trace_id=trace_id,
+                        conversation_id=str(conv.id),
+                        user_id=str(user.id),
+                        timeout_seconds=float(getattr(
+                            settings,
+                            "rag_query_understanding_v3_active_timeout_seconds",
+                            2.5,
+                        )),
+                        maximum_inflight=int(getattr(
+                            settings,
+                            "rag_query_understanding_v3_active_max_inflight",
+                            2,
+                        )),
+                    )
+                    trace_event(
+                        "query.understanding.v3.shadow_completed",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        result=result.safe_summary(),
+                    )
+                except Exception as exc:
+                    trace_event(
+                        "query.understanding.v3.shadow_failed",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        error=exc,
+                    )
+
+            asyncio.create_task(_observe_v3_shadow())
+
+        if (
+            v3_active_pending
+            and v3_baseline is not None
+            and v3_revision_fence is not None
+            and v3_anchor_prefetch_revision is not None
+        ):
+            v3_gate_started = time.perf_counter()
+            prefetch_method = str(search_config.get("method") or "hybrid").strip().casefold()
+            if prefetch_method not in {"hybrid", "vector", "keyword"}:
+                prefetch_method = "hybrid"
+            v3_decision_task = asyncio.create_task(
+                get_query_understanding_v3_execution_service().run_active(
+                    baseline=v3_baseline,
+                    trace_id=trace_id,
+                    conversation_id=str(conv.id),
+                    user_id=str(user.id),
+                    timeout_seconds=float(getattr(
+                        settings,
+                        "rag_query_understanding_v3_active_timeout_seconds",
+                        2.5,
+                    )),
+                    maximum_inflight=int(getattr(
+                        settings,
+                        "rag_query_understanding_v3_active_max_inflight",
+                        2,
+                    )),
+                )
+            )
+            v3_anchor_task = None
+            if v3_anchor_prefetch_enabled:
+                v3_anchor_task = asyncio.create_task(
+                    retrieve_anchor_retrieval_snapshot(
+                        db=db,
+                        revision=v3_anchor_prefetch_revision,
+                        query=v3_baseline.fallback.question,
+                        kb_ids=payload.knowledge_base_ids,
+                        method=prefetch_method,
+                        candidate_limit=6,
+                        timeout_seconds=float(getattr(
+                            settings,
+                            "rag_query_understanding_v3_anchor_prefetch_timeout_seconds",
+                            2.5,
+                        )),
+                        trace_id=trace_id,
+                        task_read_session_factory=TaskReadSessionLocal,
+                    )
+                )
+                trace_event(
+                    "retrieval.anchor_prefetch.started",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    revision=v3_anchor_prefetch_revision,
+                    method=prefetch_method,
+                    candidate_limit=6,
+                    fence=v3_revision_fence.safe_summary(),
+                )
+            else:
+                trace_event(
+                    "retrieval.anchor_prefetch.discarded",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    reason="disabled_by_configuration",
+            )
+            v3_decision = None
+            v3_adopted = False
+            try:
+                v3_decision = await v3_decision_task
+            except asyncio.CancelledError:
+                if v3_anchor_task is not None:
+                    v3_anchor_task.cancel()
+                raise
+            except Exception as exc:
+                # ``run_active`` normally converts failures to an atomic
+                # fallback, but retain this boundary so an unexpected service
+                # regression cannot make an unbound result executable.
+                trace_event(
+                    "query.understanding.v3.fallback",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    reason="execution_task_failed",
+                    error=exc,
+                )
+                v3_decision = None
+
+            if v3_decision is not None:
+                observed_identity = build_query_understanding_v3_fence_identity(
+                    conversation_id=conv.id,
+                    turn_id=(durable_turn.id if durable_turn is not None else None),
+                    request_id=request_id,
+                    question=v3_baseline.fallback.question,
+                    kb_ids=payload.knowledge_base_ids,
+                    evidence_scope_filter=evidence_filter,
+                    route_context=v3_route_context,
+                    route_state_revision=int(
+                        getattr(conv, "route_state_revision", 0) or 0
+                    ),
+                    task_contract=task_contract.to_dict(),
+                )
+                adoption_reason = v3_revision_fence.adoption_reason(
+                    v3_decision,
+                    observed_identity=observed_identity,
+                )
+                # A normal V3 fallback retains the immutable current-turn
+                # baseline.  A compiler-proven unsafe historical selection is
+                # different: it returns a closed execution gate that must be
+                # adopted before the standard post-semantic clarification
+                # path runs.  Do not let either a model timeout or an
+                # arbitrary ``clarification`` result alter execution.
+                v3_contextual_clarification = bool(
+                    v3_decision.decision == "clarification"
+                    and v3_decision.validation is not None
+                    and v3_decision.validation.requires_clarification
+                    and v3_decision.query_execution_gate.needs_clarification
+                )
+                if (
+                    adoption_reason == "adoptable"
+                    and not v3_decision.applied
+                    and not v3_contextual_clarification
+                ):
+                    # A fallback/clarification result is valid diagnostic
+                    # output, but it cannot revise the immutable execution
+                    # baseline.  Do not label that normal fallback as an
+                    # "adoptable" fence outcome in the call chain.
+                    adoption_reason = "candidate_not_applied"
+                if (
+                    adoption_reason == "adoptable"
+                    and v3_decision.execution_bundle.plan.original_query
+                    != v3_baseline.fallback.question
+                ):
+                    # The V3 compiler promises this invariant, but preserve a
+                    # final API boundary before an async result can enter V2:
+                    # a history qualifier may enrich tasks, never rewrite the
+                    # immutable anchor that the concurrent prefetch used.
+                    adoption_reason = "immutable_anchor_query_mismatch"
+                resolved_v3_context = None
+                resolved_v3_execution_context = None
+                if adoption_reason == "adoptable" and v3_decision.applied:
+                    try:
+                        if v3_decision.context_selection is None:
+                            raise ValueError("accepted V3 decision lacks context selection")
+                        resolved_v3_context = await apply_v3_catalog_context_selection(
+                            db,
+                            context=conversation_context,
+                            current_question=v3_decision.context_selection.current_question,
+                            selected_context_turn_keys=(
+                                v3_decision.context_selection.selected_context_turn_keys
+                            ),
+                            kb_ids=payload.knowledge_base_ids,
+                            read_session_factory=TaskReadSessionLocal,
+                        )
+                        resolved_v3_execution_context = (
+                            build_v3_catalog_v2_execution_context(
+                                context=resolved_v3_context,
+                                current_question=v3_decision.context_selection.current_question,
+                            )
+                        )
+                    except Exception as exc:
+                        adoption_reason = "context_selection_reload_failed"
+                        trace_event(
+                            "query.understanding.v3.context_rejected",
+                            trace_id=trace_id,
+                            conversation_id=conv.id,
+                            user_id=user.id,
+                            reason=adoption_reason,
+                            error=exc,
+                        )
+
+                if (
+                    adoption_reason == "adoptable"
+                    and (v3_decision.applied or v3_contextual_clarification)
+                    and v3_revision_fence.adopt(
+                        v3_decision,
+                        observed_identity=observed_identity,
+                    )
+                ):
+                    v3_adopted = v3_decision.applied
+                    execution_baseline = v3_decision.selected_baseline
+                    execution_bundle = v3_decision.execution_bundle
+                    query_execution_gate = v3_decision.query_execution_gate
+                    if resolved_v3_context is not None and resolved_v3_execution_context is not None:
+                        conversation_context = resolved_v3_context
+                        v2_execution_context = resolved_v3_execution_context
+                        semantic_context_applied = True
+                        effective_retrieval_query = v2_execution_context.retrieval_query
+                    intent_payload["query_execution"] = {
+                        **query_execution_gate.to_dict(),
+                        "semantic_compilation_pending": False,
+                        "semantic_compilation_mode": "v3",
+                        "semantic_compilation_decision": v3_decision.decision,
+                    }
+                    trace_event(
+                        "query.understanding.v3.adopted",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        fence=v3_revision_fence.safe_summary(),
+                        result=v3_decision.safe_summary(),
+                        first_sse_already_emitted=True,
+                        gate_wait_ms=max(
+                            0,
+                            round((time.perf_counter() - v3_gate_started) * 1000),
+                        ),
+                    )
+                    trace_event(
+                        "query.understanding.v3.revision_fence",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        phase="adopted",
+                        status="open",
+                        fence=v3_revision_fence.safe_summary(),
+                    )
+                else:
+                    if query_execution_gate is not None:
+                        intent_payload["query_execution"] = {
+                            **query_execution_gate.to_dict(),
+                            "semantic_compilation_pending": False,
+                            "semantic_compilation_mode": "v3_fallback",
+                            "semantic_compilation_decision": adoption_reason,
+                        }
+                    trace_event(
+                        "query.understanding.v3.fence_rejected",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        reason=adoption_reason,
+                        fence=v3_revision_fence.safe_summary(),
+                        result=v3_decision.safe_summary(),
+                    )
+                    trace_event(
+                        "query.understanding.v3.revision_fence",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        phase="rejected",
+                        status="open",
+                        reason=adoption_reason,
+                        fence=v3_revision_fence.safe_summary(),
+                    )
+            else:
+                if query_execution_gate is not None:
+                    intent_payload["query_execution"] = {
+                        **query_execution_gate.to_dict(),
+                        "semantic_compilation_pending": False,
+                        "semantic_compilation_mode": "v3_fallback",
+                        "semantic_compilation_decision": "execution_task_failed",
+                    }
+                trace_event(
+                    "query.understanding.v3.revision_fence",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    phase="rejected",
+                    status="open",
+                    reason="execution_task_failed",
+                    fence=v3_revision_fence.safe_summary(),
+                )
+            # Only a finished prefetch can be reused.  Waiting after the
+            # semantic barrier would recreate the old "thinking" stall; a
+            # late cache is cancelled and V2 performs its ordinary anchor read.
+            if v3_adopted:
+                if v3_anchor_task is not None and v3_anchor_task.done():
+                    try:
+                        v3_anchor_snapshot = await v3_anchor_task
+                        v3_anchor_snapshot_revision = v3_anchor_prefetch_revision
+                        trace_event(
+                            "retrieval.anchor_prefetch.attached",
+                            trace_id=trace_id,
+                            conversation_id=conv.id,
+                            user_id=user.id,
+                            revision=v3_anchor_prefetch_revision,
+                            snapshot=(
+                                v3_anchor_snapshot.safe_summary()
+                                if v3_anchor_snapshot is not None
+                                else {"present": False}
+                            ),
+                        )
+                    except Exception as exc:
+                        trace_event(
+                            "retrieval.anchor_prefetch.discarded",
+                            trace_id=trace_id,
+                            conversation_id=conv.id,
+                            user_id=user.id,
+                            reason="prefetch_result_failed",
+                            error=exc,
+                        )
+                elif v3_anchor_task is not None:
+                    v3_anchor_task.cancel()
+                    try:
+                        await v3_anchor_task
+                    except asyncio.CancelledError:
+                        pass
+                    trace_event(
+                        "retrieval.anchor_prefetch.discarded",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        reason="not_finished_at_semantic_barrier",
+                    )
+            elif v3_anchor_task is not None:
+                v3_anchor_task.cancel()
+                try:
+                    await v3_anchor_task
+                except asyncio.CancelledError:
+                    pass
+                trace_event(
+                    "retrieval.anchor_prefetch.discarded",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    reason="semantic_decision_not_adopted",
+                )
+            v3_revision_fence.seal()
+            trace_event(
+                "query.understanding.v3.fence_sealed",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                fence=v3_revision_fence.safe_summary(),
+            )
+            trace_event(
+                "query.understanding.v3.revision_fence",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                phase="sealed",
+                status="sealed",
+                fence=v3_revision_fence.safe_summary(),
+            )
+
+        # V3 intentionally delays a closed local gate because a valid
+        # catalog-bound compilation may make it executable.  Once the V3
+        # barrier is sealed, however, there is no remaining semantic authority
+        # that can reopen it.  Do not hand a ``not_ready`` bundle to the V2
+        # runner: that would reinterpret a task-semantics clarification as an
+        # evidence-scope clarification and create a different pending state
+        # solely because V3 happened to time out or reject its catalog.
+        if (
+            pipeline_version == "v2"
+            and query_execution_gate is not None
+            and query_execution_gate.needs_clarification
+        ):
+            if not isinstance(task_contract, RagTaskContract):
+                raise ValueError("closed V2 query execution gate requires a task contract")
+            if execution_baseline is None:
+                raise ValueError("closed V2 query execution gate requires an execution baseline")
+            blocked_contract = _closed_query_execution_task_contract(
+                task_contract,
+                query_execution_gate,
+            )
+            plan_trace = (
+                execution_baseline.plan.to_dict()
+                if trace_include_content
+                else {
+                    "schema_version": execution_baseline.plan.schema_version,
+                    "answer_shape": execution_baseline.plan.answer_shape,
+                    "query_count": len(execution_baseline.plan.retrieval_queries),
+                    "requirement_count": len(execution_baseline.plan.requirements),
+                    "confidence": execution_baseline.plan.confidence,
+                    "source": execution_baseline.plan.source,
+                    "needs_clarification": execution_baseline.plan.needs_clarification,
+                }
+            )
+            trace_event(
+                "query.plan",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                pipeline_version="v2",
+                execution_surface="api_post_semantic_gate",
+                plan=plan_trace,
+                execution_baseline=execution_baseline.safe_summary(),
+                **content_fields("query", conversation_context.standalone_query),
+            )
+            trace_event(
+                QUERY_EXECUTION_TRACE_EVENT,
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                pipeline_version="v2",
+                execution_surface="api_post_semantic_gate",
+                semantic_compilation_mode=(
+                    str(
+                        intent_payload.get("query_execution", {}).get(
+                            "semantic_compilation_mode", "off"
+                        )
+                    )
+                    if isinstance(intent_payload.get("query_execution"), dict)
+                    else "off"
+                ),
+                semantic_compilation_pending=False,
+                **query_execution_gate.trace_summary(),
+            )
+            clarification_response = await _route_clarification_response(
+                db=db,
+                conv=conv,
+                user=user,
+                question=payload.question,
+                clarification_message=query_execution_gate.clarification_question,
+                decision_reason=query_execution_gate.decision_reason,
+                trace_id=trace_id,
+                selected_kb_ids=payload.knowledge_base_ids,
+                task_contract=blocked_contract,
+                query_execution_gate=query_execution_gate,
+                turn=durable_turn,
+                existing_user_message=user_msg,
+                parent_stream_logging=True,
+            )
+            async for clarification_chunk in clarification_response.body_iterator:
+                clarification_text = (
+                    clarification_chunk.decode()
+                    if isinstance(clarification_chunk, bytes)
+                    else clarification_chunk
+                )
+                clarification_event = _parse_sse_payload(clarification_text)
+                if (
+                    clarification_event is not None
+                    and clarification_event.get("type") == "conversation_started"
+                ):
+                    # This generator already published the durable conversation
+                    # identity before the bounded V3 barrier began.
+                    continue
+                yield clarification_text
+            return
         if durable_turn is not None:
             yield "data: " + json.dumps(
                 _turn_state_event(durable_turn), ensure_ascii=False
             ) + "\n\n"
         try:
-            rag_stream = rag_stream_runner(
-                question=pipeline_base_query or payload.question,
-                kb_ids=payload.knowledge_base_ids,
-                search_config=search_config,
-                conversation_id=str(conv.id),
-                db=db,
-                intent=intent_payload,
-                task_contract=task_contract,
-                trace_id=trace_id,
-                standalone_query=conversation_context.standalone_query,
-                # 独立新问题不把旧轮正文发送给外部模型，避免无关历史污染回答并
-                # 遵循最小披露；只有本地规则确认是追问时才提供有界历史帮助消解。
-                conversation_history=(
-                    list(conversation_context.history_messages)
-                    if conversation_context.is_followup
-                    else []
+            if pipeline_version == "v2":
+                if v2_execution_context is None:
+                    raise ValueError("V2 pipeline is missing an execution context")
+                if (
+                    v2_execution_context.semantic_context_applied
+                    != semantic_context_applied
+                ):
+                    raise ValueError("V2 semantic context state is inconsistent")
+                trace_event(
+                    "query.semantics.execution_context",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    pipeline_version="v2",
+                    **v2_execution_context.safe_summary(),
+                )
+            rag_stream_kwargs = {
+                "question": pipeline_base_query or payload.question,
+                "kb_ids": payload.knowledge_base_ids,
+                "search_config": search_config,
+                "conversation_id": str(conv.id),
+                "db": db,
+                "intent": intent_payload,
+                "task_contract": task_contract,
+                "trace_id": trace_id,
+                # V2 receives only the source-anchored canonical retrieval
+                # rendering.  V1 keeps its legacy rewritten query during the
+                # rollout, but no V2 planning/model stage consumes it.
+                "standalone_query": (
+                    v2_execution_context.retrieval_query
+                    if pipeline_version == "v2" and v2_execution_context is not None
+                    else conversation_context.standalone_query
                 ),
-                carryover_sources=list(conversation_context.carryover_sources),
-                is_followup=conversation_context.is_followup,
-                followup_reason=conversation_context.followup_reason,
-                evidence_scope_filter=evidence_filter,
+                # V2 can receive historical material only through the
+                # immutable ResolvedTurnSemantics projection.  The route
+                # candidate context is deliberately unavailable here on
+                # analysis timeout/rejection/capacity fallback.
+                "conversation_history": (
+                    list(v2_execution_context.conversation_history)
+                    if pipeline_version == "v2" and v2_execution_context is not None
+                    else (
+                        list(conversation_context.history_messages)
+                        if conversation_context.is_followup
+                        else []
+                    )
+                ),
+                "carryover_sources": (
+                    list(v2_execution_context.carryover_sources)
+                    if pipeline_version == "v2" and v2_execution_context is not None
+                    else list(conversation_context.carryover_sources)
+                ),
+                "is_followup": (
+                    v2_execution_context.is_followup
+                    if pipeline_version == "v2" and v2_execution_context is not None
+                    else conversation_context.is_followup
+                ),
+                "followup_reason": (
+                    v2_execution_context.followup_reason
+                    if pipeline_version == "v2" and v2_execution_context is not None
+                    else conversation_context.followup_reason
+                ),
+                "evidence_scope_filter": evidence_filter,
+            }
+            if pipeline_version == "v2" and execution_bundle is not None:
+                # This single immutable handoff makes the compiled DAG the
+                # production execution authority.  V1/direct callers retain
+                # their historical signatures during the rollout.
+                rag_stream_kwargs["execution_bundle"] = execution_bundle
+                # The request session owns turn/message state and must never be
+                # shared by concurrent DAG retrieval workers.  V2 receives a
+                # factory for short-lived read sessions; V1/direct signatures
+                # remain unchanged during the rollout.
+                rag_stream_kwargs["task_read_session_factory"] = TaskReadSessionLocal
+                if (
+                    v3_anchor_snapshot is not None
+                    and v3_anchor_snapshot_revision is not None
+                ):
+                    rag_stream_kwargs["anchor_retrieval_snapshot"] = v3_anchor_snapshot
+                    rag_stream_kwargs["anchor_retrieval_revision"] = (
+                        v3_anchor_snapshot_revision
+                    )
+            rag_stream = rag_stream_runner(
+                **rag_stream_kwargs,
             )
             async for chunk in rag_stream:
                 data = _parse_sse_payload(chunk)
@@ -4067,10 +5211,19 @@ async def send_message(
                         if isinstance(raw_anchor_doc_ids, list)
                         else []
                     )
-                    evidence_status = data.get("evidence_status")
-                    normalized_evidence_status = str(
-                        evidence_status or ""
-                    ).strip().casefold()
+                    raw_evidence_status = data.get("evidence_status")
+                    # A rolling V1/custom producer may still emit the legacy
+                    # ``version_mismatch`` spelling.  Normalize once at the
+                    # stream trust boundary so SSE, turn/message persistence
+                    # and traces converge on canonical ``scope_mismatch``.
+                    normalized_evidence_status = canonical_evidence_status(
+                        raw_evidence_status
+                    )
+                    evidence_status = (
+                        normalized_evidence_status
+                        if normalized_evidence_status is not None
+                        else str(raw_evidence_status or "").strip().casefold()
+                    )
                     direct_evidence_count = data.get("direct_evidence_count")
                     if (
                         isinstance(direct_evidence_count, bool)
@@ -4090,10 +5243,7 @@ async def send_message(
                         normalized_evidence_status
                         in _ANSWER_SOURCE_REQUIRED_STATUSES
                     )
-                    evidence_status_invalid = (
-                        normalized_evidence_status
-                        not in _SUPPORTED_EVIDENCE_STATUSES
-                    )
+                    evidence_status_invalid = normalized_evidence_status is None
                     non_answer_source_status = (
                         normalized_evidence_status in _NON_ANSWER_SOURCE_STATUSES
                     )
@@ -4140,6 +5290,7 @@ async def send_message(
                             raw_sources=raw_answer_sources,
                             raw_results=display_results,
                             selected_kb_ids=payload.knowledge_base_ids,
+                            read_session_factory=TaskReadSessionLocal,
                         )
                         if (
                             evidence_filter is not None

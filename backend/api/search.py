@@ -253,8 +253,15 @@ async def search_test(
     constraint_statuses = {item.constraint_status for item in items if item.constraint_status}
     if direct_count:
         evidence_status = "partial" if related_count else "hit"
-    elif related_count and constraints.has_hard_constraint and constraint_statuses == {"mismatch"}:
-        evidence_status = "version_mismatch"
+    elif (
+        related_count
+        and constraints.has_scope_constraint
+        and constraint_statuses == {"mismatch"}
+    ):
+        # Applicability is one product/version/project boundary.  The old
+        # spelling is retained only for reads of historical rows, never for a
+        # newly generated search response.
+        evidence_status = "scope_mismatch"
     elif related_count:
         evidence_status = "partial"
     elif items:

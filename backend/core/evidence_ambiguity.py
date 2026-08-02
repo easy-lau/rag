@@ -244,6 +244,18 @@ class DocumentEvidenceAssessment:
     chunk_ids: tuple[str, ...] = ()
     section_keys: tuple[str, ...] = ()
     companion_scope_slices: tuple[EvidenceScopeSlice, ...] = ()
+    # Opaque semantic identity of one *closed answer claim*.  It is produced
+    # only by the final evidence graph projection, never from a filename,
+    # chunk rank or displayed text.  Keeping it here lets the ambiguity layer
+    # distinguish two alternative answers inside one physical document from
+    # ordinary complementary sections of that document.  It is intentionally
+    # internal and is never exposed as a user-selectable scope.
+    answer_route_key: str | None = None
+    # Opaque identities of source structures that prove the route's answer
+    # propositions are jointly presentable.  The final evidence graph emits
+    # these only for a complete, parser-identified table; a same-document
+    # section name or a retrieval neighbourhood cannot manufacture one.
+    composable_answer_group_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1354,6 +1366,113 @@ def _scope_slice_tokens(
     return tuple(sorted(tokens))
 
 
+def _declared_applicability_identity(
+    assessment: DocumentEvidenceAssessment,
+) -> tuple[tuple[str, ...], ...]:
+    """Return the source-declared applicability identity of an answer route.
+
+    An exact chunk or section is a *lineage selector*, not proof that two
+    clauses have different applicability.  Using it as the grouping identity
+    made two unattributed clauses in the same legacy document look like two
+    different documents, which then yielded duplicate, non-actionable
+    clarification buttons.  Only values explicitly attached to the closed
+    route (product, version or project) may divide answer alternatives.
+
+    Section/chunk lineage remains in ``scope_slices`` for a choice that has a
+    proven identity; it simply cannot manufacture such an identity here.
+    """
+
+    products = assessment.canonical_products or assessment.products
+    dimensions = (
+        (
+            "product",
+            tuple(sorted({
+                str(value).strip().casefold()
+                for value in products or ()
+                if str(value).strip()
+            })),
+        ),
+        (
+            "version",
+            tuple(sorted({
+                str(value).strip()
+                for value in assessment.versions or ()
+                if str(value).strip()
+            }, key=_version_key)),
+        ),
+        (
+            "project",
+            tuple(sorted({
+                project
+                for value in assessment.projects or ()
+                if (project := _meaningful_project(value)) is not None
+            }, key=str.casefold)),
+        ),
+    )
+    return tuple(
+        (name, *values)
+        for name, values in dimensions
+        if values
+    )
+
+
+def _answer_route_key(assessment: DocumentEvidenceAssessment) -> str | None:
+    """Normalize the graph-projected answer identity for local comparison."""
+
+    value = re.sub(r"\s+", " ", str(assessment.answer_route_key or "")).strip()
+    return value[:600] or None
+
+
+def _same_document_answer_scope_is_unresolved(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    required_answer_ids: set[str],
+) -> bool:
+    """Whether one physical scope contains distinct closed answer routes.
+
+    This is deliberately narrower than a generic same-document duplicate:
+    complementary chapters and repeated evidence retain no route identity (or
+    the same identity) and remain one answer source.  A positive result means
+    the final graph proved more than one answer proposition for the same
+    required answer, but the source did not prove an applicability dimension
+    capable of separating them.  The only safe UX is a free-text refinement,
+    never two copies of the same document choice.
+    """
+
+    for row in rows:
+        route_keys_by_requirement = row.get("answer_route_keys_by_requirement")
+        if not isinstance(route_keys_by_requirement, Mapping):
+            continue
+        composable_groups_by_requirement = row.get(
+            "composable_answer_route_keys_by_requirement",
+        )
+        if not isinstance(composable_groups_by_requirement, Mapping):
+            composable_groups_by_requirement = {}
+        for requirement_id in required_answer_ids:
+            values = route_keys_by_requirement.get(requirement_id)
+            if not isinstance(values, (set, frozenset, tuple, list)):
+                continue
+            route_keys = set(values)
+            if len(route_keys) <= 1:
+                continue
+
+            # A verified complete table is a single source-authored answer
+            # structure. Its rows may differ by city, region, date or any
+            # other table dimension, but the user must be able to read those
+            # values together rather than being forced to choose a fabricated
+            # scope. This exception is source-structural: rows merely sharing
+            # a document, heading or retrieval rank do not qualify.
+            route_groups = composable_groups_by_requirement.get(requirement_id)
+            if isinstance(route_groups, Mapping) and any(
+                route_keys.issubset(set(group_route_keys))
+                for group_route_keys in route_groups.values()
+                if isinstance(group_route_keys, (set, frozenset, tuple, list))
+            ):
+                continue
+            return True
+    return False
+
+
 def _merge_interdependent_answer_graph_rows(
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -1382,7 +1501,7 @@ def _merge_interdependent_answer_graph_rows(
             (
                 str(row["kb_id"]),
                 str(row["doc_id"]),
-                tuple(row.get("anchor_scope_tokens") or ()),
+                tuple(row.get("applicability_scope_identity") or ()),
             ),
             [],
         ).append(index)
@@ -1487,16 +1606,75 @@ def _merge_interdependent_answer_graph_rows(
                 for index in component
                 for value in rows[index][field]
             }
+        merged_route_keys_by_requirement: dict[str, set[str]] = {}
+        for index in component:
+            raw_route_keys = rows[index].get(
+                "answer_route_keys_by_requirement",
+                {},
+            )
+            if not isinstance(raw_route_keys, Mapping):
+                continue
+            for requirement_id, values in raw_route_keys.items():
+                if not isinstance(values, (set, frozenset, tuple, list)):
+                    continue
+                merged_route_keys_by_requirement.setdefault(
+                    str(requirement_id),
+                    set(),
+                ).update(
+                    str(value)
+                    for value in values
+                    if str(value)
+                )
+        merged["answer_route_keys_by_requirement"] = (
+            merged_route_keys_by_requirement
+        )
+        # The composition certificate belongs to the closed source route, not
+        # to the particular companion-document set through which that route
+        # reached the final graph.  A route can legitimately have different
+        # bridge/condition companions from its table sibling.  Preserve the
+        # complete-table membership while collapsing those interdependent
+        # rows; otherwise a later same-document check would see the route
+        # identities but lose the proof that their values are jointly
+        # presentable.
+        merged_composable_groups: dict[str, dict[str, set[str]]] = {}
+        for index in component:
+            raw_groups = rows[index].get(
+                "composable_answer_route_keys_by_requirement",
+                {},
+            )
+            if not isinstance(raw_groups, Mapping):
+                continue
+            for requirement_id, groups in raw_groups.items():
+                if not isinstance(groups, Mapping):
+                    continue
+                requirement_groups = merged_composable_groups.setdefault(
+                    str(requirement_id),
+                    {},
+                )
+                for group_id, values in groups.items():
+                    if not isinstance(values, (set, frozenset, tuple, list)):
+                        continue
+                    requirement_groups.setdefault(str(group_id), set()).update(
+                        str(value)
+                        for value in values
+                        if str(value)
+                    )
+        merged["composable_answer_route_keys_by_requirement"] = (
+            merged_composable_groups
+        )
         merged_scope_slices: dict[tuple[str, ...], EvidenceScopeSlice] = {}
         for index in component:
             for value in rows[index].get("scope_slices", ()):
                 for token in _scope_slice_tokens((value,)):
                     merged_scope_slices[token] = value
         merged["scope_slices"] = tuple(merged_scope_slices.values())
-        merged["anchor_scope_tokens"] = _scope_slice_tokens(
-            merged["scope_slices"],
-            anchors_only=True,
-        )
+        merged["applicability_scope_identity"] = tuple(sorted({
+            scope_identity
+            for index in component
+            for scope_identity in (
+                tuple(rows[index].get("applicability_scope_identity") or ()),
+            )
+        }))
         merged["position"] = min(
             int(rows[index]["position"]) for index in component
         )
@@ -1739,30 +1917,6 @@ def detect_post_evidence_document_ambiguity(
         )
     required_answer_id_set = set(required_answer_ids)
 
-    def applicability_slice_identity(
-        assessment: DocumentEvidenceAssessment,
-        scope_slices: tuple[EvidenceScopeSlice, ...],
-    ) -> tuple[tuple[str, ...], ...]:
-        """Return a slice identity only when it carries applicability data.
-
-        A section boundary is evidence lineage, not an alternative answer
-        scope.  Treating every ``section_key`` as a document identity turns a
-        single policy's table of contents into many competing documents.  The
-        boundary matters only after ingestion has associated the section with
-        a product, version or project; then it prevents a selected scope from
-        leaking a sibling section back into the answer graph.
-        """
-
-        has_applicability_identity = bool(
-            assessment.products
-            or assessment.canonical_products
-            or assessment.versions
-            or assessment.projects
-        )
-        if not has_applicability_identity:
-            return ()
-        return _scope_slice_tokens(scope_slices, anchors_only=True)
-
     grouped: dict[
         tuple[
             str,
@@ -1791,13 +1945,12 @@ def detect_post_evidence_document_ambiguity(
             and str(value or "").strip() != doc_id
         }))
         scope_slices = _assessment_scope_slices(assessment)
-        anchor_scope_tokens = applicability_slice_identity(
+        applicability_scope_identity = _declared_applicability_identity(
             assessment,
-            scope_slices,
         )
         supported_ids, topic_relevance, answer_support = eligible
         row = grouped.setdefault(
-            (kb_id, doc_id, companion_doc_ids, anchor_scope_tokens),
+            (kb_id, doc_id, companion_doc_ids, applicability_scope_identity),
             {
                 "kb_id": kb_id,
                 "doc_id": doc_id,
@@ -1814,7 +1967,14 @@ def detect_post_evidence_document_ambiguity(
                 "chunk_ids": set(),
                 "section_keys": set(),
                 "scope_slices": (),
-                "anchor_scope_tokens": anchor_scope_tokens,
+                # This is the semantic identity used to group answer
+                # alternatives.  Exact chunk/section selectors remain in
+                # scope_slices and are intentionally not a grouping key.
+                "applicability_scope_identity": applicability_scope_identity,
+                "answer_route_keys_by_requirement": {},
+                # A complete source table is a composition certificate, not
+                # an applicability scope, and must never become a user choice.
+                "composable_answer_route_keys_by_requirement": {},
             },
         )
         row["filenames"].add(filename)
@@ -1850,6 +2010,23 @@ def detect_post_evidence_document_ambiguity(
         )
         row["chunk_ids"].update(assessment.chunk_ids or ())
         row["section_keys"].update(assessment.section_keys or ())
+        answer_route_key = _answer_route_key(assessment)
+        if answer_route_key is not None:
+            for requirement_id in supported_ids:
+                row["answer_route_keys_by_requirement"].setdefault(
+                    requirement_id,
+                    set(),
+                ).add(answer_route_key)
+                for group_id in _bounded_unique(
+                    assessment.composable_answer_group_ids,
+                    max_chars=300,
+                ):
+                    row[
+                        "composable_answer_route_keys_by_requirement"
+                    ].setdefault(requirement_id, {}).setdefault(
+                        group_id,
+                        set(),
+                    ).add(answer_route_key)
         merged_scope_slices = {
             token: value
             for value in row.get("scope_slices", ())
@@ -1865,6 +2042,24 @@ def detect_post_evidence_document_ambiguity(
         row["filename"] = sorted(row["filenames"], key=str.casefold)[0]
     rows.sort(key=lambda row: (row["position"], row["filename"].casefold()))
     rows = _merge_interdependent_answer_graph_rows(rows)
+    if _same_document_answer_scope_is_unresolved(
+        rows,
+        required_answer_ids=required_answer_id_set,
+    ):
+        return EvidenceAmbiguityDecision(
+            needs_clarification=True,
+            dimension="scope",
+            question=(
+                "同一份资料中存在多个可能的规则，但现有证据无法可靠判断"
+                "它们分别适用于什么范围。请补充产品、版本、项目、章节或"
+                "制度范围后再查询。"
+            ),
+            reason="same_document_answer_scope_unresolved",
+            relevant_document_count=len({
+                (str(row["kb_id"]), str(row["doc_id"]))
+                for row in rows
+            }),
+        )
     if len(rows) < 2:
         return EvidenceAmbiguityDecision(
             needs_clarification=False,
@@ -1889,7 +2084,7 @@ def detect_post_evidence_document_ambiguity(
                 str(row["kb_id"]),
                 str(row["doc_id"]),
                 tuple(sorted(row["companion_doc_ids"])),
-                tuple(row.get("anchor_scope_tokens") or ()),
+                tuple(row.get("applicability_scope_identity") or ()),
             )
             for row in rows
             if requirement_id in row["supported_required_answer_ids"]
@@ -1930,7 +2125,7 @@ def detect_post_evidence_document_ambiguity(
             str(row["kb_id"]),
             str(row["doc_id"]),
             tuple(sorted(row["companion_doc_ids"])),
-            tuple(row.get("anchor_scope_tokens") or ()),
+            tuple(row.get("applicability_scope_identity") or ()),
         ) in competing_keys
     ]
     scope_dimension, scope_choices = _post_evidence_scope_choices(

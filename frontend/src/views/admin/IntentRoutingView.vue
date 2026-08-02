@@ -243,7 +243,7 @@
                 <div v-if="testClarificationQuestion" class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
                   澄清问题：{{ testClarificationQuestion }}
                   <div v-if="testRouteDecision.clarification?.unresolved?.length" class="mt-1.5 text-amber-700 dark:text-amber-300">
-                    未解决项：{{ testRouteDecision.clarification.unresolved.map(item => `${item.role || '未命名'}（${item.reason || '未说明'}）`).join('、') }}
+                    未解决项：{{ testRouteDecision.clarification.unresolved.map(unresolvedSlotLabel).join('、') }}
                   </div>
                 </div>
               </section>
@@ -265,6 +265,9 @@
                 </div>
                 <div v-if="testTaskContract.clarification?.question" class="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
                   合同澄清：{{ testTaskContract.clarification.question }}
+                  <div v-if="testTaskContract.clarification?.unresolved?.length" class="mt-1.5 text-amber-700 dark:text-amber-300">
+                    未解决项：{{ testTaskContract.clarification.unresolved.map(unresolvedSlotLabel).join('、') }}
+                  </div>
                 </div>
               </section>
 
@@ -438,6 +441,11 @@ import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import RowActions from '@/components/ui/RowActions.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'
 import AppModal from '@/components/ui/AppModal.vue'
+import {
+  evidenceStatusLabel as evidenceStatusContractLabel,
+  evidenceStatusTagType as evidenceStatusContractTagType,
+  normalizeEvidenceStatus,
+} from '@/utils/evidenceStatus'
 
 const msg = useMessage()
 const authStore = useAuthStore()
@@ -1110,6 +1118,25 @@ function requirementRoleLabel(role) {
   }[role] || role || '未分类'
 }
 
+function unresolvedSlotLabel(item) {
+  const role = item?.role
+  const reason = item?.reason
+  const roleLabel = {
+    query_execution: '查询执行条件',
+    knowledge_base: '知识库范围',
+    context_object: '追问对象',
+    context_turn: '上下文轮次',
+    subject: '查询对象',
+    user_grade: '适用职级',
+  }[role] || role || '未命名项'
+  const reasonLabel = {
+    missing: '缺少信息',
+    ambiguous: '存在歧义',
+    unavailable: '暂不可用',
+  }[reason] || reason || '未说明'
+  return `${roleLabel}（${reasonLabel}）`
+}
+
 function responseModeFor(result) {
   if (!result) return ''
   const contract = taskContractFor(result)
@@ -1201,8 +1228,8 @@ function decisionReasonLabel(reason) {
 }
 
 function evidenceStatusFor(result) {
-  const status = result?.evidence_status
-  if (['skipped', 'hit', 'partial', 'version_mismatch', 'no_hit', 'unverified', 'error'].includes(status)) return status
+  const status = normalizeEvidenceStatus(result?.evidence_status)
+  if (status) return status
   if (result?.retrieval_executed === false) return 'skipped'
   if (result?.retrieval_executed === true && Number(result?.hit_count) > 0) return 'hit'
   if (result?.retrieval_executed === true && result?.hit_count !== undefined && result?.hit_count !== null) return 'no_hit'
@@ -1212,27 +1239,11 @@ function evidenceStatusFor(result) {
 
 function evidenceStatusLabel(status, simulation = false) {
   if (!status && simulation) return '未执行（仅测试路由策略）'
-  return {
-    skipped: '已跳过检索',
-    hit: '已命中证据',
-    partial: '部分证据可用',
-    version_mismatch: '仅命中其他版本',
-    no_hit: '已检索但无命中',
-    unverified: '状态未验证',
-    error: '检索失败',
-  }[status] || status || '未记录'
+  return evidenceStatusContractLabel(status, status || '未记录')
 }
 
 function evidenceStatusTagType(status) {
-  return {
-    skipped: 'default',
-    hit: 'success',
-    partial: 'warning',
-    version_mismatch: 'warning',
-    no_hit: 'warning',
-    unverified: 'default',
-    error: 'error',
-  }[status] || 'default'
+  return evidenceStatusContractTagType(status)
 }
 
 function retrievalExecutionLabel(result, simulation = false) {

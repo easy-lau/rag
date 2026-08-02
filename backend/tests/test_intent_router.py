@@ -646,6 +646,8 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         questions = (
             "总经理的住宿标准",
             "普通员工住宿标准",
+            "普通员工的餐补是多少",
+            "普通员工的出差津贴是多少",
             "供应商A风险处置要求",
             "供应商甲的风险处置措施是什么",
             "客户A的服务策略是什么",
@@ -1189,6 +1191,8 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
             "某项目的执行规则如何适用",
             "公司制度对报销有什么要求？",
             "总经理的住宿标准",
+            "普通员工的餐补是多少",
+            "普通员工的出差津贴是多少",
             "客户A的审批额度",
         )
         for question in lookup_questions:

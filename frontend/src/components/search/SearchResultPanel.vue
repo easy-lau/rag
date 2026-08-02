@@ -135,6 +135,7 @@ import { groupEvidenceByDocument } from '@/utils/evidenceDocuments'
 import SearchProcess from './SearchProcess.vue'
 import { normalizeTraceId } from '@/utils/chatRequest'
 import { normalizeEvidenceClarification } from '@/utils/chatClarification'
+import { evidenceStatusMeta as getEvidenceStatusMeta } from '@/utils/evidenceStatus'
 
 const searchStore = useSearchStore()
 const authStore = useAuthStore()
@@ -167,6 +168,7 @@ const retrievalPolicyLabel = computed(() => ({
 })[searchStore.intentDecision?.retrieval_policy] || (searchStore.intentDecision?.need_retrieval ? '需要检索' : '无需检索'))
 
 const evidenceStatus = computed(() => searchStore.searchMeta.evidence_status || '')
+const evidenceStatusContract = computed(() => getEvidenceStatusMeta(evidenceStatus.value))
 const clarification = computed(() => normalizeEvidenceClarification(
   searchStore.searchMeta.clarification,
 ))
@@ -227,11 +229,16 @@ const retrievalState = computed(() => ({
     type: 'warning',
   },
   version_mismatch: { label: '仅相近版本', type: 'warning' },
+  scope_mismatch: {
+    label: evidenceStatusContract.value?.label || '适用范围不匹配',
+    type: evidenceStatusContract.value?.tagType || 'warning',
+  },
   needs_clarification: {
     label: clarificationRequiresRefinement.value ? '等待补充范围' : '等待选择范围',
     type: 'warning',
   },
   no_hit: { label: '未命中', type: 'warning' },
+  insufficient_evidence: { label: '证据不足', type: 'warning' },
   unverified: {
     label: displayedCandidateCount.value ? `${displayedCandidateCount.value} 个待验证片段` : '状态未验证',
     type: 'default',
@@ -247,6 +254,12 @@ const evidenceNotice = computed(() => {
   }
   if (evidenceStatus.value === 'version_mismatch') {
     return '已找到主题相关资料，但没有符合目标版本的直接依据。相近版本内容仅供参考。'
+  }
+  if (evidenceStatus.value === 'scope_mismatch') {
+    return '已检索到资料，但它们均不符合问题中明确指定的产品、版本或项目范围；这些资料不会展示或作为回答依据。'
+  }
+  if (evidenceStatus.value === 'insufficient_evidence') {
+    return '已检索到主题相关资料，但无法形成可核验的完整答案链；这些片段仅供定位制度，不会作为回答依据。'
   }
   if (evidenceStatus.value === 'partial') {
     if (coverageStatus.value === 'partial' && partialAdoptedCount.value > 0) {
@@ -321,10 +334,12 @@ const emptyResultText = computed(() => {
     skipped: '本次已跳过知识库检索',
     partial: '仅找到部分可用资料',
     version_mismatch: '未找到符合目标版本的回答依据',
+    scope_mismatch: '未找到符合明确适用范围的回答依据',
     needs_clarification: clarificationRequiresRefinement.value
       ? '已找到多个可能范围，等待补充'
       : '已找到多个适用范围，等待选择',
     no_hit: '已完成检索，但没有找到相关内容',
+    insufficient_evidence: '已找到相关资料，但证据不足以回答',
     unverified: '检索状态暂未确认',
     error: '知识库检索失败',
   })[evidenceStatus.value] || (searchStore.intentDecision?.need_retrieval
@@ -336,10 +351,12 @@ const emptyResultHint = computed(() => ({
   skipped: '这是后端策略的最终执行结果，并非“检索后无命中”。',
   partial: '可以查看相近资料，但回答时只应采用已标记为“回答依据”的内容。',
   version_mismatch: '相近版本资料不能直接证明目标版本可用，建议补充对应版本文档。',
+  scope_mismatch: '请确认问题中的产品、版本或项目名称，并录入与该范围一致的资料。',
   needs_clarification: clarificationRequiresRefinement.value
     ? '请在输入框补充具体产品、版本、项目或制度名称；补充前不会生成知识库答案。'
     : '请在对话中回复序号、版本或“都对比”；选择前不会生成知识库答案。',
   no_hit: '可以调整问法、检索标签，或确认知识库中已录入相关文档。',
+  insufficient_evidence: '请补充适用对象、范围或制度名称；当前相近资料不能证明完整结论。',
   unverified: '服务端未返回完整证据状态，结果可能来自旧版本接口或请求已中断。',
   error: '请稍后重试；若持续失败，可联系管理员检查检索服务。',
 })[evidenceStatus.value] || '')

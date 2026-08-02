@@ -48,8 +48,8 @@ test('no_hit 即使携带 results 或异常 answer_sources 也不展示为回答
   }), [])
 })
 
-test('skipped、needs_clarification 和 error 即使携带异常 answer_sources 也不展示为回答依据', () => {
-  for (const evidenceStatus of ['skipped', 'needs_clarification', 'error']) {
+test('所有 V2 非回答状态即使携带异常 answer_sources 也不展示为回答依据', () => {
+  for (const evidenceStatus of ['skipped', 'needs_clarification', 'insufficient_evidence', 'scope_mismatch', 'error']) {
     assert.deepEqual(answerSourcesFromSearchEvent({
       evidence_status: evidenceStatus,
       results: [direct],
@@ -95,6 +95,20 @@ test('消息级 no_hit 会隐藏所有旧来源', () => {
   assert.deepEqual(persistedAnswerSources({
     evidence_status: 'no_hit',
     sources: [related],
+  }), [])
+})
+
+test('消息级 insufficient_evidence 会隐藏所有旧来源', () => {
+  assert.deepEqual(persistedAnswerSources({
+    evidence_status: 'insufficient_evidence',
+    sources: [related],
+  }), [])
+})
+
+test('消息级 scope_mismatch 会隐藏所有来源，不能把范围外文档恢复为引用', () => {
+  assert.deepEqual(persistedAnswerSources({
+    evidence_status: 'scope_mismatch',
+    sources: [direct],
   }), [])
 })
 

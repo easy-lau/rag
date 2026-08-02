@@ -1,17 +1,28 @@
+import json
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from core.conversation_context import (
+    ConversationContext,
+    RouteTurnCandidate,
     UNRESOLVED_REFERENCE_MESSAGE,
+    apply_resolved_turn_semantics,
+    apply_v3_catalog_context_selection,
+    build_current_turn_v2_execution_context,
+    build_resolved_v2_execution_context,
+    build_v3_catalog_candidate_context,
+    build_v3_catalog_v2_execution_context,
     build_standalone_query,
     detect_followup,
     prepare_conversation_context,
     resolve_routed_conversation_context,
     route_context_payloads,
 )
+from core.query_analysis_contract import QUERY_ANALYSIS_SCHEMA_VERSION, parse_query_analysis
 from core.query_constraints import extract_query_constraints
 from core.query_route_contract import parse_rag_route_decision
+from core.query_semantics import resolve_turn_semantics
 from models.db_models import Document, DocumentChunk, Message
 
 
@@ -48,6 +59,187 @@ class _FakeDB:
 
 
 class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_v2_current_turn_execution_context_is_fail_closed(self) -> None:
+        execution_context = build_current_turn_v2_execution_context(
+            retrieval_query="餐补呢",
+        )
+
+        self.assertEqual(execution_context.mode, "current_turn_baseline")
+        self.assertFalse(execution_context.semantic_context_applied)
+        self.assertFalse(execution_context.is_followup)
+        self.assertEqual(execution_context.conversation_history, ())
+        self.assertEqual(execution_context.carryover_sources, ())
+        self.assertEqual(execution_context.context_turn_keys, ())
+
+    def test_v3_candidate_context_clears_legacy_projection_but_keeps_authorised_catalog(self) -> None:
+        candidate = RouteTurnCandidate(
+            candidate_key="t1",
+            user_question="普通员工的住宿标准是多少",
+            assistant_answer="上一轮回答",
+            raw_sources=({"id": str(uuid.uuid4())},),
+        )
+        legacy = ConversationContext(
+            is_followup=True,
+            followup_reason="route_contextualized",
+            standalone_query="餐补呢。普通员工的住宿标准是多少",
+            history_messages=(
+                {"role": "user", "content": candidate.user_question},
+                {"role": "assistant", "content": candidate.assistant_answer},
+            ),
+            carryover_sources=({"id": str(uuid.uuid4())},),
+            route_turn_candidates=(candidate,),
+            relation="followup",
+            query_resolution_mode="contextualize",
+            context_turn_keys=("t1",),
+        )
+
+        current = build_v3_catalog_candidate_context(
+            context=legacy,
+            current_question="那餐补呢",
+        )
+
+        self.assertEqual(current.standalone_query, "那餐补呢")
+        self.assertFalse(current.is_followup)
+        self.assertEqual(current.history_messages, ())
+        self.assertEqual(current.carryover_sources, ())
+        self.assertEqual(current.context_turn_keys, ())
+        self.assertEqual(current.route_turn_candidates, (candidate,))
+
+    async def test_resolved_semantics_reloads_only_selected_history_without_text_join(self) -> None:
+        conversation_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        previous_user = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="user",
+            content="普通员工的住宿标准是多少",
+            created_at=now - timedelta(seconds=2),
+        )
+        previous_assistant = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="assistant",
+            content="按职级和城市核验住宿标准。",
+            sources=[],
+            created_at=now - timedelta(seconds=1),
+        )
+        # Database query is newest-first; _FakeDB mirrors that ordering.
+        db = _FakeDB([previous_assistant, previous_user], [])
+        prepared = await prepare_conversation_context(
+            db,
+            conversation_id=conversation_id,
+            question="餐补呢",
+            kb_ids=[],
+        )
+        previous = previous_user.content
+        current = "餐补呢"
+        target_start = current.index("餐补")
+        qualifier_start = previous.index("普通员工")
+        analysis = parse_query_analysis(
+            json.dumps({
+                "schema_version": QUERY_ANALYSIS_SCHEMA_VERSION,
+                "relation": "followup",
+                "self_contained": False,
+                "context_turn_keys": ["t1"],
+                "answer_candidates": [{
+                    "id": "a1",
+                    "target_source_ref": {
+                        "turn_key": "current",
+                        "start": target_start,
+                        "end": target_start + len("餐补"),
+                        "span": "餐补",
+                    },
+                    "qualifier_source_refs": [{
+                        "turn_key": "t1",
+                        "start": qualifier_start,
+                        "end": qualifier_start + len("普通员工"),
+                        "span": "普通员工",
+                    }],
+                    "bridge_candidate_ids": [],
+                }],
+                "bridge_candidates": [],
+                "confidence": 0.95,
+                "diagnostic": "继承上一轮主体。",
+            }, ensure_ascii=False),
+            current_question=current,
+            context_user_inputs={"t1": previous},
+        )
+        resolved = await apply_resolved_turn_semantics(
+            db,
+            context=prepared,
+            semantics=resolve_turn_semantics(analysis, current_question=current),
+            kb_ids=[],
+        )
+
+        self.assertTrue(resolved.is_followup)
+        self.assertEqual(resolved.context_turn_keys, ("t1",))
+        self.assertEqual(resolved.standalone_query, "普通员工 餐补")
+        self.assertNotIn("住宿标准", resolved.standalone_query)
+        self.assertEqual(
+            [message["role"] for message in resolved.history_messages],
+            ["user", "assistant"],
+        )
+        execution_context = build_resolved_v2_execution_context(
+            context=resolved,
+            semantics=resolve_turn_semantics(analysis, current_question=current),
+        )
+        self.assertTrue(execution_context.semantic_context_applied)
+        self.assertEqual(execution_context.context_turn_keys, ("t1",))
+        self.assertEqual(
+            execution_context.retrieval_query,
+            "普通员工 餐补",
+        )
+
+    async def test_v3_catalog_context_keeps_current_question_as_retrieval_anchor(self) -> None:
+        conversation_id = uuid.uuid4()
+        now = datetime.now(timezone.utc)
+        previous_user = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="user",
+            content="普通员工的住宿标准是多少",
+            created_at=now - timedelta(seconds=2),
+        )
+        previous_assistant = Message(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            role="assistant",
+            content="按职级和城市核验住宿标准。",
+            sources=[],
+            created_at=now - timedelta(seconds=1),
+        )
+        db = _FakeDB([previous_assistant, previous_user], [])
+        current = "餐补呢"
+        prepared = await prepare_conversation_context(
+            db,
+            conversation_id=conversation_id,
+            question=current,
+            kb_ids=[],
+        )
+
+        resolved = await apply_v3_catalog_context_selection(
+            db,
+            context=prepared,
+            current_question=current,
+            selected_context_turn_keys=("t1",),
+            kb_ids=[],
+        )
+        execution_context = build_v3_catalog_v2_execution_context(
+            context=resolved,
+            current_question=current,
+        )
+
+        self.assertTrue(resolved.is_followup)
+        self.assertEqual(resolved.context_turn_keys, ("t1",))
+        self.assertEqual(resolved.standalone_query, current)
+        self.assertEqual(execution_context.mode, "v3_catalog_context")
+        self.assertEqual(execution_context.retrieval_query, current)
+        self.assertTrue(execution_context.semantic_context_applied)
+        self.assertEqual(
+            [message["role"] for message in execution_context.conversation_history],
+            ["user", "assistant"],
+        )
+
     async def test_semantic_followup_can_use_current_query_and_reuse_evidence(self) -> None:
         conversation_id = uuid.uuid4()
         kb_id = uuid.uuid4()
@@ -222,6 +414,24 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
                 has_previous_turn=False,
             )[0]
         )
+
+    def test_current_turn_enumeration_with_these_is_not_a_historical_followup(self) -> None:
+        is_followup, reason = detect_followup(
+            "普通员工的住宿标准和餐补还有出差补贴这些分别是多少",
+            has_previous_turn=True,
+            previous_user_question="普通员工的住宿标准是多少",
+        )
+        self.assertFalse(is_followup)
+        self.assertEqual(reason, "local_anaphora_antecedent:这些")
+
+    def test_these_without_a_current_enumeration_remains_followup(self) -> None:
+        is_followup, reason = detect_followup(
+            "这些配置分别如何处理",
+            has_previous_turn=True,
+            previous_user_question="登录用户名枚举如何配置",
+        )
+        self.assertTrue(is_followup)
+        self.assertEqual(reason, "anaphora:这些")
 
     def test_complete_conditional_question_does_not_inherit_previous_topic(self) -> None:
         questions = (

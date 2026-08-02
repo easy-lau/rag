@@ -18,6 +18,7 @@ from api import (
     roles,
     search,
     settings,
+    terminology,
     uploads,
     users,
 )
@@ -25,7 +26,12 @@ from config import get_settings
 from core.logging_config import configure_application_logging
 from core.settings_crypto import SettingsEncryptionError
 from core.login_security import login_log_cleanup_loop
+from core.document_jobs import run_document_worker
 from core.rag_trace_store import start_rag_trace_store, stop_rag_trace_store
+from core.query_analysis_execution import (
+    start_query_analysis_execution_runtime,
+    stop_query_analysis_execution_runtime,
+)
 from database import engine
 
 _settings = get_settings()
@@ -55,16 +61,24 @@ async def lifespan(app: FastAPI):
             type(exc).__name__,
         )
         raise
-    # 重置上次进程退出时卡在『处理中』的文档（其后台任务已随进程丢失）
-    try:
-        await document.reset_stuck_processing()
-    except Exception as e:
-        print(f"[startup] 重置卡死文档失败: {e}")
+    document_worker_task: asyncio.Task | None = None
+    if _settings.document_job_runs_embedded_worker:
+        logging.getLogger(__name__).info("[startup] 开发环境启动内嵌文档 worker")
+        document_worker_task = asyncio.create_task(
+            run_document_worker(),
+            name="embedded-document-worker",
+        )
     login_log_cleanup_task = asyncio.create_task(login_log_cleanup_loop())
     await start_rag_trace_store()
+    await start_query_analysis_execution_runtime()
     try:
         yield
     finally:
+        if document_worker_task is not None:
+            document_worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await document_worker_task
+        await stop_query_analysis_execution_runtime()
         await stop_rag_trace_store()
         login_log_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -101,6 +115,7 @@ app.include_router(document.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(intent_routing.router, prefix="/api")
+app.include_router(terminology.router, prefix="/api")
 app.include_router(uploads.router, prefix="/api")
 
 # 品牌图需要在登录页公开显示；文档原图由 uploads 路由鉴权后返回，不能

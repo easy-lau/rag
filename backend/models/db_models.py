@@ -6,11 +6,13 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
@@ -40,6 +42,14 @@ class KnowledgeBase(Base):
 
 class Document(Base):
     __tablename__ = "documents"
+    # ``terminology_scope_bindings`` may bind an approved term to one document
+    # inside one knowledge base.  ``id`` is already globally unique, but the
+    # composite unique constraint is required by PostgreSQL before a composite
+    # foreign key can prove that ``document_id`` and ``kb_id`` belong together.
+    # It is a data-integrity constraint, not an application-level convention.
+    __table_args__ = (
+        UniqueConstraint("id", "kb_id", name="uq_documents_id_kb_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     kb_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"))
@@ -50,6 +60,12 @@ class Document(Base):
     image_url: Mapped[str | None] = mapped_column(Text)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="processing")
+    # Every enqueue captures this revision.  A worker may spend minutes
+    # parsing/embedding, so it must prove this is still the document revision
+    # the user asked it to process before it replaces chunks.
+    processing_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     tags: Mapped[list] = mapped_column(JSONB, default=list)  # 文档级标签，用于管理、展示与产品/版本约束识别
     created_by: Mapped[uuid.UUID | None] = mapped_column(
@@ -67,6 +83,64 @@ class Document(Base):
     updater: Mapped["User | None"] = relationship(foreign_keys=[updated_by])
 
 
+class DocumentProcessingJob(Base):
+    """Durable, lease-based document ingestion work owned by one revision."""
+
+    __tablename__ = "document_processing_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "job_type IN ('file', 'text', 'image')",
+            name="ck_document_processing_jobs_type",
+        ),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'completed', 'failed', 'superseded')",
+            name="ck_document_processing_jobs_status",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_document_processing_jobs_attempts"),
+        UniqueConstraint(
+            "document_id", "document_revision",
+            name="uq_document_processing_jobs_document_revision",
+        ),
+        Index(
+            "ix_document_processing_jobs_claim",
+            "status", "available_at", "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    document_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    job_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc, onupdate=now_utc
+    )
+
+    document: Mapped["Document"] = relationship()
+
+
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
 
@@ -80,6 +154,261 @@ class DocumentChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+class TerminologyConcept(Base):
+    """A stable, human-reviewed business concept.
+
+    A concept is intentionally distinct from its spellings and where those
+    spellings apply.  This keeps a canonical business meaning immutable even
+    when individual aliases or knowledge-base bindings are changed later.
+    """
+
+    __tablename__ = "terminology_concepts"
+    __table_args__ = (
+        CheckConstraint("char_length(code) > 0", name="ck_terminology_concepts_code_nonempty"),
+        CheckConstraint(
+            "char_length(btrim(canonical_term)) > 0",
+            name="ck_terminology_concepts_canonical_term_nonempty",
+        ),
+        # This redundant composite key is the FK target proving that terms and
+        # bindings belong to the concept's own knowledge base.
+        UniqueConstraint("id", "kb_id", name="uq_terminology_concepts_id_kb_id"),
+        UniqueConstraint("kb_id", "code", name="uq_terminology_concepts_kb_code"),
+        Index("ix_terminology_concepts_kb_active", "kb_id", "is_active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    # A concept is KB-owned rather than globally reusable.  ``code`` remains
+    # stable within that KB but two independent KBs can use the same code.
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    code: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_term: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc, onupdate=now_utc
+    )
+
+    terms: Mapped[list["TerminologyTerm"]] = relationship(
+        back_populates="concept", cascade="all, delete-orphan", passive_deletes=True
+    )
+    scope_bindings: Mapped[list["TerminologyScopeBinding"]] = relationship(
+        back_populates="concept", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class TerminologyTerm(Base):
+    """One approved spelling, composite-FK bound to its concept's KB."""
+
+    __tablename__ = "terminology_terms"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["concept_id", "kb_id"],
+            ["terminology_concepts.id", "terminology_concepts.kb_id"],
+            name="fk_terminology_terms_concept_kb",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "match_mode IN ('strict_equivalent', 'retrieval_only')",
+            name="ck_terminology_terms_match_mode",
+        ),
+        CheckConstraint(
+            "char_length(btrim(term)) > 0",
+            name="ck_terminology_terms_term_nonempty",
+        ),
+        CheckConstraint(
+            "char_length(normalized_term) > 0",
+            name="ck_terminology_terms_normalized_term_nonempty",
+        ),
+        UniqueConstraint(
+            "concept_id", "kb_id", "normalized_term",
+            name="uq_terminology_terms_concept_kb_normalized",
+        ),
+        Index(
+            "ix_terminology_terms_kb_normalized_active",
+            "kb_id", "normalized_term", "is_active",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    concept_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    term: Mapped[str] = mapped_column(String(120), nullable=False)
+    # NFKC/case/whitespace-normalized unique key.  Never use it as a fuzzy
+    # matcher: runtime proof still relies on the approved literal form.
+    normalized_term: Mapped[str] = mapped_column(String(120), nullable=False)
+    match_mode: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="strict_equivalent"
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc, onupdate=now_utc
+    )
+
+    concept: Mapped["TerminologyConcept"] = relationship(back_populates="terms")
+
+
+class TerminologyScopeBinding(Base):
+    """A KB-local scope where one concept may affect retrieval semantics."""
+
+    __tablename__ = "terminology_scope_bindings"
+    __table_args__ = (
+        # Both composite keys are ownership proofs: neither a concept nor a
+        # document from another KB can be attached to this binding.
+        ForeignKeyConstraint(
+            ["concept_id", "kb_id"],
+            ["terminology_concepts.id", "terminology_concepts.kb_id"],
+            name="fk_terminology_scope_bindings_concept_kb",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "kb_id"],
+            ["documents.id", "documents.kb_id"],
+            name="fk_terminology_scope_bindings_document_kb",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint(
+            "scope_product_key IS NULL OR char_length(btrim(scope_product_key)) > 0",
+            name="ck_terminology_scope_bindings_product_key_nonempty",
+        ),
+        CheckConstraint(
+            "scope_version_key IS NULL OR char_length(btrim(scope_version_key)) > 0",
+            name="ck_terminology_scope_bindings_version_key_nonempty",
+        ),
+        CheckConstraint(
+            "scope_project_key IS NULL OR char_length(btrim(scope_project_key)) > 0",
+            name="ck_terminology_scope_bindings_project_key_nonempty",
+        ),
+        ForeignKeyConstraint(
+            ["kb_id"],
+            ["knowledge_bases.id"],
+            name="fk_terminology_scope_bindings_kb",
+            ondelete="CASCADE",
+        ),
+        # PostgreSQL treats NULL values as distinct in a normal UNIQUE index.
+        # Coalescing optional selectors makes equivalent global/document/product
+        # bindings genuinely unique instead of allowing duplicate active rules.
+        Index(
+            "uq_terminology_scope_bindings_identity",
+            "concept_id",
+            "kb_id",
+            text("COALESCE(document_id, '00000000-0000-0000-0000-000000000000'::uuid)"),
+            text("COALESCE(scope_product_key, '')"),
+            text("COALESCE(scope_version_key, '')"),
+            text("COALESCE(scope_project_key, '')"),
+            unique=True,
+        ),
+        Index("ix_terminology_scope_bindings_kb_active", "kb_id", "is_active"),
+        Index("ix_terminology_scope_bindings_document_active", "document_id", "is_active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    concept_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    kb_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    scope_product_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    scope_version_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    scope_project_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc, onupdate=now_utc
+    )
+
+    concept: Mapped["TerminologyConcept"] = relationship(back_populates="scope_bindings")
+
+
+class TerminologyRegistryState(Base):
+    """One monotonic revision state per KB, never a global side channel."""
+
+    __tablename__ = "terminology_registry_state"
+    __table_args__ = (
+        CheckConstraint("revision >= 0", name="ck_terminology_registry_state_revision"),
+    )
+
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc, onupdate=now_utc
+    )
+
+
+class TerminologyRegistryRevision(Base):
+    """Append-only, KB-partitioned event paired with every registry mutation."""
+
+    __tablename__ = "terminology_registry_revisions"
+    __table_args__ = (
+        CheckConstraint("revision > 0", name="ck_terminology_registry_revisions_revision"),
+        UniqueConstraint("kb_id", "revision", name="uq_terminology_registry_revisions_kb_revision"),
+        Index("ix_terminology_registry_revisions_kb_created_at", "kb_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    object_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Complete before/after graph for the affected concept, rather than an
+    # endpoint-written summary.  It is sufficient to replay one KB's event
+    # stream deterministically without a global registry revision.
+    change_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
 
 
 class Conversation(Base):

@@ -19,6 +19,11 @@
 | `APP_VERSION` / `APP_REVISION` | `dev` / 空 | 发布版本和 Git revision，由镜像构建自动注入 |
 | `LOG_LEVEL` | `INFO` | Python 日志级别 |
 | `DEVELOPMENT_LOG_DIR` | `<项目根>/logs/development` | 开发环境每个后端进程的独立日志文件目录；生产环境不写本地文件 |
+| `RAG_PIPELINE_VERSION` | `v2` | 选择证据执行器；仅设为 `v1` 才整体回滚旧检索主链 |
+| `RAG_SEMANTIC_ENTRY` | `v3` | 选择语义理解 authority；`v3` 只允许模型选择服务器签发的原文 span，`legacy` 才启用旧 `query_analysis.v2` |
+| `RAG_QUERY_UNDERSTANDING_V3_MODE` | `active` | V3 的 `off / shadow / active` 模式；`active` 的失败只回退当前轮本地基线，不重跑旧语义模型 |
+| `RAG_QUERY_UNDERSTANDING_V3_ACTIVE_TIMEOUT_SECONDS` / `...MAX_INFLIGHT` | `2.5` / `2` | V3 首次 SSE 后的绝对等待预算和并发上限 |
+| `RAG_QUERY_UNDERSTANDING_V3_ANCHOR_PREFETCH_ENABLED` / `...TIMEOUT_SECONDS` | `true` / `2.5` | 是否与 V3 并发预取原问题 anchor；超时或未通过围栏时丢弃，正常 V2 DAG 会自行召回 |
 
 本地以 `uvicorn main:app --reload --port 8000` 启动时，后端会在
 `logs/development/` 自动创建 `backend-日期-pid.log`。控制台输出仍会保留；
@@ -39,10 +44,18 @@
 | `conversation.reference_unresolved` | 追问缺少可消解对象，直接要求用户补充信息且不盲目检索 |
 | `intent.model_result` / `intent.model_error` | 意图模型原始分类是否被接受、精确拒绝原因、模型与 Prompt 版本；空响应同时记录 `finish_reason`、choice 数、推理内容长度和 token 用量，但不记录模型推理正文 |
 | `intent.routing_decision` | 规则、模型和安全策略合并后的最终响应模式与检索策略 |
+| `intent.semantic_entry_gate` | V3 语义入口三态判定：`dispatch` 直接执行、`defer_to_v3` 仅把路由层的语义未决交给 V3、`blocked` 保留知识库/权限/合同等硬性拦截；该阶段属于有界导出的核心因果链 |
 | `chat.pipeline_selected` | 本轮唯一执行器：显式回滚 `v1`、知识检索 `v2` 或无检索 `direct`；V2 合同异常不会静默回退 V1 |
 | `chat.turn_reclaimed` | 同一 `request_id` 的 `accepted/generating` 执行租约已过期，由当前请求安全接管并重新执行 |
 | `direct.plan` | 已验证的通用交流、平台帮助或内联写作直答计划；该链路明确不执行检索 |
-| `query.plan` | V2 本地查询形状、检索子问题、answer/bridge requirement 与是否需要澄清 |
+| `query.plan` | V2 本地查询形状、检索子问题、answer/bridge requirement 与**规划本身**是否需要澄清；不会因为执行层拒绝而被改写 |
+| `query.execution` | `rag_query_execution.v1` 的最终 plan/bundle 执行闸门。`ready` 才可进入检索；`needs_clarification` 固定使用 `query_execution` 未解决项，区分“计划不明确”与“计划存在但不可安全执行” |
+| `query.understanding.v3.requested` / `completed` / `validated` | 请求、收到并校验 V3 **source-span catalog 选择**；模型只能返回服务器签发的 span ID，不能生成检索词、事实、权限或范围。开发正文追踪开启时可展开 catalog、原始 JSON 和已校验选择 |
+| `query.understanding.v3.deterministic_contextual_ellipsis` / `context_preflight` | 严格本地追问 Span 选择与预检：仅接受“那/那么 + 明确单一目标 + 呢”，并只绑定重新授权的上一轮唯一用户实体。历史轮若带产品/版本/项目、地点或其他条件，或主体不唯一，预检会直接关闭执行并要求本轮重申，不会把裸目标交给模型或检索 |
+| `query.understanding.v3.execution_validated` / `compiled` / `execution_decision` / `fallback` | 后端核验 catalog 选择是否可编译，并以可信编译器生成 V2 任务图；超时、容量不足、协议拒绝或编译拒绝均原子回退本轮本地基线，不会再调用旧语义模型 |
+| `query.understanding.v3.revision_fence` | V3 结果的 created / adopted / rejected / sealed 生命周期。只有问题、会话、KB/doc 范围、路由候选和 revision 全部匹配，已编译结果才能进入 V2 |
+| `retrieval.anchor_prefetch.*` / `retrieval.anchor_preflight.*` | 与 V3 并发的原问题 anchor 预取及 V2 的复用校验。预取不是最终证据；只有围栏匹配、查询/范围/方法一致且 V2 再次准入后才可复用 |
+| `query.analysis.*` | 仅在显式 `RAG_SEMANTIC_ENTRY=legacy` 时出现的旧 `query_analysis.v2` 调用链，不能与 V3 视为同一 semantic authority |
 | `retrieval.plan` | 是否检索、检索策略、候选数、Top K 和查询硬约束 |
 | `retrieval.candidate` | 每个召回片段的向量、关键词、三元组、RRF 排名和分数 |
 | `retrieval.completed` | 召回是否成功、候选数、激活通道与耗时 |
@@ -74,15 +87,18 @@
 - `context_evidence_count`：实际注入生成模型的片段数，正常情况下等于 `answer_source_count`；单独保留该指标便于检查生成上下文是否与持久化来源一致。
 - `hit_count` / `direct_evidence_count`：通过直接证据门控的数量。Trace schema `v2` 中两者语义一致；历史 `v1.hit_count` 曾表示前端候选数，只能按旧口径解释。
 
-## 当前 V2 检索与证据链路
+## 当前 V3 语义理解与 V2 检索证据链路
 
-1. 后端先编译并校验 `rag_task_contract.v1`。知识问答和“依据知识库写作”进入 V2；问候、平台帮助和已附原文写作进入独立 `direct` runner。只有部署显式配置 `RAG_PIPELINE_VERSION=v1` 才使用旧主链，V2 合同缺失、漂移或越权一律拒绝执行。
-2. V2 本地规划器只按问题结构拆分 `fact / process / list / comparison / multi_part / multi_hop`。诸如“普通员工的餐补”会生成最终 answer requirement 和身份到等级的 bridge requirement，不在代码中猜测 D 级、金额或其它业务值。
-3. 向量、PostgreSQL FTS 和 `pg_trgm` 并行召回，使用 RRF 做稳定排序。文档准入只接受真实词面得分或达到绝对门槛且接近本轮最佳值的原始向量分；RRF 名次本身不能冒充相关性。
-4. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
-5. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
-6. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
-7. V2 不调用旧的生成式 reranker；`rerank.completed` 会明确记录 `attempted=false`。最终回答模型最多调用一次，并且只看到预算内的已授权 evidence bundle。`error / no_hit / version_mismatch` 等无上下文终态由本地固定文案直接返回，避免再花时间让模型改写失败信息。
+1. 后端先编译并校验 `rag_task_contract.v1`。知识问答和“依据知识库写作”进入 V2；问候、平台帮助和已附原文写作进入独立 `direct` runner。`RAG_PIPELINE_VERSION` 只选择证据执行器，默认 `v2`；只有显式设为 `v1` 才使用旧主链，V2 合同缺失、漂移或越权一律拒绝执行。
+2. V2 本地规划器只按问题结构拆分 `fact / process / list / comparison / multi_part / multi_hop`。诸如“普通员工的餐补”会生成最终 answer requirement 和身份到等级的 bridge requirement，不在代码中猜测 D 级、金额或其它业务值。规划完成后，`rag_query_execution.v1` 以不可变 plan/bundle 对单独判定能否执行；`query.plan` 的语义不会被该闸门覆盖。
+3. 默认语义入口是 `RAG_SEMANTIC_ENTRY=v3`。V3 模型只从服务器签发的 source-span catalog 中选择当前问题的答案目标、限定词及必要历史上下文 span；它不能编造检索词、别名、职级/金额等事实、KB/文档/权限、产品版本范围、coverage 或 DAG 边。可信编译器才可把已验证选择编译为多个 answer task，原问题始终保留为 `anchor_root`。已有显式 answer/proof 不会被模型降级，桥接最多经后端独立规则成为 optional augmentation，绝不成为 proof。
+4. V3 运行前会清空路由层和启发式层预选的历史投影；路由候选只作为可选 catalog。对于严格满足“那/那么 + 明确单一目标 + 呢”的追问，服务器会先选择当前目标和上一轮唯一用户实体的**精确原文 Span**，再把它绑定回同一 V3 catalog、可信编译器和 V2 证据任务图；此路径不读取 assistant 回答、不重写/拼接问题，也不继承产品版本、项目、条件或多个主体。若该显式追问的上一轮含范围/条件或主体不唯一，预检直接进入标准澄清，不能因模型超时或容量不足而退化成裸目标检索。未命中严格语法时，模型仍只能选择来源于“纯单实体”历史轮的精确实体 span；一旦选择了带范围/条件、多个主体或非实体历史片段，可信编译器会将其作为终态范围澄清，而非回退到可执行的裸当前轮。其他历史 span 才会由独立只读会话按当前 RBAC、KB 和文档状态重新加载，并重新投影进 V2。模型超时、容量不足、协议拒绝、普通编译失败或 revision fence 不匹配时，整轮只执行当前问题的安全基线，不携带未经验证的 history/carryover，也不调用 legacy 语义器。
+5. V3 与不可变的原问题 anchor 预取并发开始。预取结果没有任务谱系或证据权限，只有最终 V3 结果被 revision fence 接受且 snapshot 的 revision、query、KB/doc scope 和检索方法都匹配时才传给 V2；V2 仍会按本轮任务图重做证据准入。预取未及时完成即取消，不能造成“思考中”卡住。
+6. 向量、PostgreSQL FTS 和 `pg_trgm` 并行召回，使用 RRF 做稳定排序。文档准入只接受真实词面得分或达到绝对门槛且接近本轮最佳值的原始向量分；RRF 名次本身不能冒充相关性。
+7. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
+8. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
+9. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
+10. V2 不调用旧的生成式 reranker；`rerank.completed` 会明确记录 `attempted=false`。最终回答模型最多调用一次，并且只看到预算内的已授权 evidence bundle。`error / no_hit / scope_mismatch` 等无上下文终态由本地固定文案直接返回，避免再花时间让模型改写失败信息。正常聊天路径会在 V3 语义 barrier 后把 `not_ready` 统一转成 route clarification，禁止派发 V2；V2 保留的 `not_ready` SSE 分支只是供 direct/兼容调用者防御性终止，避免在流尾抛出 500。
 
 旧 V1 仍保留作为显式紧急回滚路径，其 `rerank.candidate`、`topic_relevance` 和 `answer_support` 字段仅用于 V1 Trace；不能与 V2 的确定性证据口径混算。
 
@@ -135,7 +151,7 @@
 - 事件经有界内存队列批量写库，不等待 PostgreSQL 才向用户发送 SSE；队列为成功、失败和中断终止事件预留容量，队列满时优先驱逐最旧的非终止明细。队列或数据库不可用只影响追踪，不影响问答。
 - `success` / `error` 只表示整次请求的最终结果。可恢复的 `retrieval.error` 会在时间线中标红，但最终已成功返回答案时不会把整条调用链误记为失败。
 - 主动停止或连接取消会立即标记为 `interrupted`；异常退出且没有终止事件的 `running` 调用在 15 分钟后兜底标记为 `interrupted`。调用链默认保留 30 天，后台详情每次按执行顺序加载 50 个事件，避免候选较多时一次返回过大 JSON。
-- 生产环境默认不保存问题、回答、文件名和候选正文；后台只显示哈希、字符数、指标和对象 ID。正文开关同时约束容器日志与数据库事件。
+- 生产环境默认不保存问题、回答、文件名、候选正文、模型结构化理解 JSON 或后端编译后的执行计划 JSON；后台只显示哈希、字符数、指标、稳定状态码和对象 ID。正文开关同时约束容器日志与数据库事件。开发环境显式开启正文追踪时，这些正文事件会把整条调用链标记为含业务内容，详情和导出仍仅向超级管理员开放。
 - 详情中的“下载 AI 分析文件”会导出 `rag-trace-{trace_id}.json`，包含已经入库的摘要、事件时间线、阶段索引、固定诊断快照、版本、完整性检查和 AI 分析说明。接口要求 `log:read`；若调用链含开发环境业务正文，详情和导出还必须是超级管理员。不回查聊天消息、文档正文、模型设置或密钥，也不会绕过正文关闭策略；每次下载会写入 `rag_trace.export` 操作审计，但审计详情不记录正文。单次文件最多选取 500 个事件，最终编码文件硬限制为 24 MiB，优先保留请求、上下文、路由、阶段汇总和最新终止状态，再采样候选明细；若被截断，响应头和 `diagnostic_index.integrity` 都会记录省略数量。
 - 下载前后会再次递归清理 API Key、Token、Cookie、密码以及 HTTP、PostgreSQL、Redis、AMQP 等连接串中的 userinfo、query 和 fragment。脱敏不能替代业务数据审批：开发 Trace 仍可能含问题、回答和文档正文，上传外部 AI 前必须检查。
 
@@ -147,7 +163,7 @@
 docker compose logs app | rg 'rag.trace' | rg '你的-trace-id'
 ```
 
-后台下载的 JSON 可以直接交给 AI 分析。`diagnostic_index.snapshot` 汇总了上下文、主/备用分类、执行器选择、V2 查询规划或 direct 计划、召回、证据和生成结论；V1 调用链还会保留重排模型与阈值，V2 则明确记录未执行模型重排。快照同时保留 RRF、三元组门槛、候选池、Prompt 版本、生成参数和 system prompt 指纹，便于跨版本复现；`ai_analysis_guide` 提供按 `v1 / v2 / direct` 分支分析的提示及不可信数据边界；`diagnostic_index.recommended_checks` 给出检查顺序。`diagnostic_index.integrity` 只检查已入库行与导出选择：队列在写库前丢弃的事件尚未分配 sequence，因此连续编号不能证明原始链路零丢失。`data_policy.content_included=false` 表示生产环境未保存正文，AI 只能基于哈希、指标和对象 ID 判断链路，不能从导出接口恢复原文。
+后台下载的 JSON 可以直接交给 AI 分析。`diagnostic_index.snapshot` 汇总了上下文、主/备用分类、执行器选择、V2 查询规划、`query_execution` 最终执行闸门或 direct 计划、V3 catalog/validated selection/compiler plan/revision fence、anchor prefetch/preflight、召回、证据和生成结论；V1 调用链还会保留重排模型与阈值，V2 则明确记录未执行模型重排。`snapshot.query_execution` 是严格白名单摘要，只包含版本、`ready / needs_clarification`、是否允许派发、bundle 模式和未解决项代码，不能携带模型或业务正文。开发环境排查 V3 时，可展开 `query.understanding.v3.validated` 查看“模型选择的 span JSON（已通过协议校验）”，并展开 `query.understanding.v3.compiled` 查看后端接受后的 V2 任务图；两者都只是可观测输入/产物，执行授权始终以 revision fence、`query.execution` 和后端执行合同为准。快照同时保留 RRF、三元组门槛、候选池、Prompt 版本、生成参数和 system prompt 指纹，便于跨版本复现；`ai_analysis_guide` 提供按 `v1 / v2 / direct` 分支分析的提示及不可信数据边界；`diagnostic_index.recommended_checks` 给出检查顺序。`diagnostic_index.integrity` 只检查已入库行与导出选择：队列在写库前丢弃的事件尚未分配 sequence，因此连续编号不能证明原始链路零丢失。`data_policy.content_included=false` 表示生产环境未保存正文，AI 只能基于哈希、指标和对象 ID 判断链路，不能从导出接口恢复原文。
 
 导出 JSONL（日志前缀在第一个 `{` 前被移除）：
 

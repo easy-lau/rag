@@ -105,6 +105,25 @@ test('历史失败状态与 Trace 保留，供回答卡片复制诊断', () => {
   assert.equal(restored.persistence_status, 'failed')
 })
 
+test('历史快照保留完整证据状态合同，避免 evidence_status 在恢复时被丢弃', () => {
+  for (const status of ['insufficient_evidence', 'scope_mismatch']) {
+    const restored = restoreHistoryMessageState({
+      id: `assistant-${status}`,
+      role: 'assistant',
+      content: '确定性状态提示',
+      evidence_status: status,
+      retrieval_executed: true,
+      search_snapshot: {
+        schema_version: 'rag_search_snapshot.v1',
+        counters: { evidence_status: status, retrieval_executed: true },
+      },
+    })
+
+    assert.equal(restored.evidence_status, status)
+    assert.equal(restored.search_snapshot.evidence_status, status)
+  }
+})
+
 test('choices=[] 的已授权历史澄清同步进入检索快照，供面板提示自由补充', () => {
   const restored = restoreHistoryMessageState({
     id: 'assistant-refinement',

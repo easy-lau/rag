@@ -7,13 +7,214 @@ LLM 的高语义相关度覆盖已经确定的版本冲突。规则有意保持�
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass
-from typing import Any, Literal, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 
 ConstraintStatus = Literal["exact", "compatible", "unknown", "mismatch", "neutral"]
+ScopeDimension = Literal["product", "version", "project"]
+
+
+@dataclass(frozen=True)
+class ScopeSourceSpan:
+    """A strictly source-authored applicability value.
+
+    The analyzer never emits an applicability value.  A project in particular
+    is useful only when this contract can point back to the exact span in the
+    current user question (or a trusted requirement derived from it).  Keeping
+    the source separately from the display value makes a later model rewrite
+    unable to manufacture a project boundary.
+    """
+
+    dimension: ScopeDimension
+    start: int
+    end: int
+    span: str
+    origin: Literal["current_query", "trusted_requirement"] = "current_query"
+
+    def __post_init__(self) -> None:
+        if self.dimension not in {"product", "version", "project"}:
+            raise ValueError("unsupported scope source dimension")
+        if isinstance(self.start, bool) or not isinstance(self.start, int):
+            raise ValueError("scope source start must be an integer")
+        if isinstance(self.end, bool) or not isinstance(self.end, int):
+            raise ValueError("scope source end must be an integer")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError("scope source range is invalid")
+        span = re.sub(r"\s+", " ", str(self.span or "")).strip()
+        if not span or len(span) > 200:
+            raise ValueError("scope source span is invalid")
+        if self.origin not in {"current_query", "trusted_requirement"}:
+            raise ValueError("scope source origin is invalid")
+        object.__setattr__(self, "span", span)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "dimension": self.dimension,
+            "start": self.start,
+            "end": self.end,
+            "span": self.span,
+            "origin": self.origin,
+        }
+
+
+@dataclass(frozen=True)
+class ApplicabilityScope:
+    """Canonical applicability boundary for one answer requirement/task.
+
+    Product, version and project are one conjunctive contract.  Values may be
+    absent, but a project becomes a hard query boundary only when it has a
+    source-verified span.  The historical ``QueryConstraints`` name remains a
+    compatibility alias below so old call sites cannot accidentally retain a
+    divergent product/version-only representation.
+    """
+
+    product: str | None = None
+    version: str | None = None
+    project: str | None = None
+    explicit_version: bool = False
+    explicit_project: bool = False
+    product_source: ScopeSourceSpan | None = None
+    version_source: ScopeSourceSpan | None = None
+    project_source: ScopeSourceSpan | None = None
+    # Retained for compatibility with existing traces and callers.  It is a
+    # diagnostic summary only; source spans are the actual authority.
+    matched_text: str | None = None
+    extraction_reason: str = "未发现显式适用范围约束"
+
+    def __post_init__(self) -> None:
+        def normalized(value: object) -> str | None:
+            text = re.sub(r"\s+", " ", str(value or "")).strip()
+            return text or None
+
+        product = normalized(self.product)
+        version = normalized(self.version)
+        project = normalized(self.project)
+        product_source = self.product_source
+        version_source = self.version_source
+        project_source = self.project_source
+        for expected, source in (
+            ("product", product_source),
+            ("version", version_source),
+            ("project", project_source),
+        ):
+            if source is not None:
+                if not isinstance(source, ScopeSourceSpan):
+                    raise ValueError("scope source must be a ScopeSourceSpan")
+                if source.dimension != expected:
+                    raise ValueError("scope source dimension does not match value")
+        if product is None and product_source is not None:
+            raise ValueError("product source requires product value")
+        if version is None and version_source is not None:
+            raise ValueError("version source requires version value")
+        if project is None and project_source is not None:
+            raise ValueError("project source requires project value")
+        explicit_version = bool(self.explicit_version or version is not None)
+        # An unproven project string can exist in a legacy/caller-provided
+        # object for diagnostics, but it is never a hard scope.  This is the
+        # key model-safety invariant: only a trusted source span grants the
+        # project dimension execution authority.
+        explicit_project = bool(
+            self.explicit_project and project is not None and project_source is not None
+        )
+        matched_text = normalized(self.matched_text)
+        reason = re.sub(r"\s+", " ", str(self.extraction_reason or "")).strip()
+        if len(reason) > 500:
+            raise ValueError("scope extraction reason exceeds 500 characters")
+        object.__setattr__(self, "product", product)
+        object.__setattr__(self, "version", version)
+        object.__setattr__(self, "project", project)
+        object.__setattr__(self, "explicit_version", explicit_version)
+        object.__setattr__(self, "explicit_project", explicit_project)
+        object.__setattr__(self, "matched_text", matched_text)
+        object.__setattr__(self, "extraction_reason", reason)
+
+    @property
+    def has_hard_constraint(self) -> bool:
+        """Historical product+version hard-boundary projection."""
+
+        return bool(self.product and self.version and self.explicit_version)
+
+    @property
+    def has_product_constraint(self) -> bool:
+        return bool(self.product)
+
+    @property
+    def has_version_constraint(self) -> bool:
+        return bool(self.version and self.explicit_version)
+
+    @property
+    def has_project_constraint(self) -> bool:
+        return bool(self.project and self.explicit_project and self.project_source)
+
+    @property
+    def has_scope_constraint(self) -> bool:
+        return bool(
+            self.has_product_constraint
+            or self.has_version_constraint
+            or self.has_project_constraint
+        )
+
+    @property
+    def source_spans(self) -> tuple[ScopeSourceSpan, ...]:
+        return tuple(
+            item
+            for item in (
+                self.product_source,
+                self.version_source,
+                self.project_source,
+            )
+            if item is not None
+        )
+
+    @property
+    def terms(self) -> tuple[str, ...]:
+        return tuple(
+            value
+            for value in (self.product, self.version, self.project)
+            if value
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "product": self.product,
+            "version": self.version,
+            "project": self.project,
+            "explicit_version": self.explicit_version,
+            "explicit_project": self.explicit_project,
+            "sources": [item.to_dict() for item in self.source_spans],
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "product": self.product,
+            "version": self.version,
+            "project": self.project,
+            "explicit_version": self.explicit_version,
+            "explicit_project": self.explicit_project,
+            "has_scope_constraint": self.has_scope_constraint,
+            "source_spans": [item.to_dict() for item in self.source_spans],
+            "matched_text": self.matched_text,
+            "extraction_reason": self.extraction_reason,
+            "fingerprint": self.fingerprint,
+        }
+
+
+# Kept intentionally as an alias rather than a second dataclass.  Every
+# existing ``QueryConstraints`` consumer now receives the canonical scope
+# shape, including project/source provenance, without a compatibility fork.
+QueryConstraints = ApplicabilityScope
 
 
 # 版本号允许单段（产品 6/7、制度 2024）和多段（8.6/8.6.1），但所有
@@ -129,12 +330,70 @@ _DOCUMENT_PRODUCT_FIELD_RE = re.compile(
     re.IGNORECASE,
 )
 _DOCUMENT_VERSION_FIELD_RE = re.compile(
-    r"产品版本\s*[：:]\s*([^\n\r>,，;；]+)",
+    r"产品版本\s*[：:]\s*",
+    re.IGNORECASE,
+)
+_GENERIC_DOCUMENT_VERSION_FIELD_RE = re.compile(
+    r"(?<!产品)版本\s*[：:]\s*",
     re.IGNORECASE,
 )
 _DOCUMENT_PROJECT_FIELD_RE = re.compile(
     r"(?:所属项目|项目名称|项目(?!版本))\s*[：:]\s*([^\n\r>,，;；]+)",
     re.IGNORECASE,
+)
+# A version declaration is a small, typed grammar rather than an arbitrary
+# stretch of prose after ``产品版本：``.  In particular, a sentence such as
+# ``产品版本：6。住宿上限为 1200 元/天`` has exactly one declared version.  The
+# old field regex captured the entire sentence and later extracted both ``6``
+# and ``1200`` as versions, turning valid version-6 evidence into a false
+# conflict.  Keep lists deliberately narrow: a list separator must be
+# followed immediately by another declaration entry; normal prose does not
+# qualify as a second version.
+_DECLARED_VERSION_ENTRY_RE = re.compile(
+    rf"""
+    [ \t]*
+    (?:
+        (?:版本[ \t]*|[vV][ \t]*)
+        |
+        (?P<product_prefix>
+            (?:[A-Za-z][A-Za-z0-9_.\- \t]{{0,60}}|[㐀-鿿][A-Za-z0-9_\-\u3400-鿿 \t]{{0,60}})
+        )[ \t]*
+        |
+        [ \t]*
+    )
+    (?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}
+    [ \t]*(?:版(?:本)?|全系|系列)?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_DECLARED_VERSION_LIST_SEPARATOR_RE = re.compile(
+    r"[ \t]*(?:[、,/，|]|(?:和|及|或)[ \t]*)[ \t]*",
+    re.IGNORECASE,
+)
+# These are sentence/grammar words, not product identities.  The parser only
+# permits a product prefix to preserve common forms like ``云枢6全系`` and
+# ``CloudPivot 8.2.75``; rejecting these markers prevents a malformed prose
+# value such as ``当前版本为 6`` from gaining scope authority.
+_NON_IDENTITY_VERSION_PREFIX_MARKERS = (
+    "当前",
+    "本次",
+    "本系统",
+    "系统",
+    "组件",
+    "浏览器",
+    "数据库",
+    "运行时",
+    "使用",
+    "采用",
+    "升级",
+    "支持",
+    "兼容",
+    "适用",
+    "对应",
+    "为",
+    "是",
+    "有",
+    "含",
 )
 # File names and ingestion headings are often the only source-anchored
 # applicability signal available for a chunk (for example ``云枢7配置`` or
@@ -242,56 +501,103 @@ def match_known_enterprise_product(query: str) -> str | None:
 
 
 @dataclass(frozen=True)
-class QueryConstraints:
-    """从查询原文中提取出的可解释硬约束。"""
-
-    product: str | None = None
-    version: str | None = None
-    explicit_version: bool = False
-    matched_text: str | None = None
-    extraction_reason: str = "未发现显式产品版本约束"
-
-    @property
-    def has_hard_constraint(self) -> bool:
-        return bool(self.product and self.version and self.explicit_version)
-
-    @property
-    def has_product_constraint(self) -> bool:
-        """查询至少明确指定了一个产品名。
-
-        版本硬约束仍由 ``has_hard_constraint`` 表示；产品-only 查询也需要
-        拦截其它产品的同主题资料，否则“云枢默认密码”可能被其它平台文档污染。
-        """
-
-        return bool(self.product)
-
-    @property
-    def has_version_constraint(self) -> bool:
-        """查询明确指定了版本，即使没有绑定到产品。
-
-        ``has_hard_constraint`` intentionally keeps its historical meaning of
-        product *and* version.  A standalone label such as ``版本8.6`` still
-        needs a separate scope gate so a 7.x document cannot answer it.
-        """
-
-        return bool(self.version and self.explicit_version)
-
-    @property
-    def has_scope_constraint(self) -> bool:
-        """查询包含必须由文档身份确认的产品或版本适用范围。"""
-
-        return self.has_product_constraint or self.has_version_constraint
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
 class ConstraintEvaluation:
     status: ConstraintStatus
     reason: str
     candidate_products: tuple[str, ...] = ()
     candidate_versions: tuple[str, ...] = ()
+    candidate_projects: tuple[str, ...] = ()
+    # A rejected candidate can explain *which dimensions* conflict without
+    # carrying its body text into a trace, ledger or client payload.
+    mismatch_dimensions: tuple[ScopeDimension, ...] = ()
+    # ``global_compatible`` is deliberately distinct from exact scope match.
+    # Generation can then say that a source is a global clause rather than
+    # falsely presenting it as project-specific policy.
+    scope_applicability: Literal[
+        "exact",
+        "global_compatible",
+        "unscoped",
+        "unknown",
+    ] = "unknown"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason": self.reason,
+            "candidate_products": list(self.candidate_products),
+            "candidate_versions": list(self.candidate_versions),
+            "candidate_projects": list(self.candidate_projects),
+            "mismatch_dimensions": list(self.mismatch_dimensions),
+            "scope_applicability": self.scope_applicability,
+        }
+
+
+@dataclass(frozen=True)
+class ScopeCandidateRejection:
+    """Content-free rejection handoff from scope admission to the ledger."""
+
+    kb_id: str
+    doc_id: str
+    chunk_id: str
+    expected_scope_fingerprint: str
+    actual_identity_fingerprint: str
+    mismatch_dimensions: tuple[ScopeDimension, ...]
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("kb_id", "doc_id", "chunk_id"):
+            value = re.sub(r"\s+", " ", str(getattr(self, field_name) or "")).strip()
+            object.__setattr__(self, field_name, value)
+        for field_name in (
+            "expected_scope_fingerprint",
+            "actual_identity_fingerprint",
+        ):
+            value = str(getattr(self, field_name) or "").strip().casefold()
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"{field_name} must be a sha256 fingerprint")
+            object.__setattr__(self, field_name, value)
+        dimensions = tuple(dict.fromkeys(self.mismatch_dimensions))
+        if not dimensions or any(
+            value not in {"product", "version", "project"}
+            for value in dimensions
+        ):
+            raise ValueError("scope rejection requires mismatch dimensions")
+        object.__setattr__(self, "mismatch_dimensions", dimensions)
+        reason = re.sub(r"\s+", "_", str(self.reason_code or "")).strip("_").casefold()
+        if not reason or len(reason) > 120:
+            raise ValueError("scope rejection reason is invalid")
+        object.__setattr__(self, "reason_code", reason)
+
+    def to_dict(self) -> dict[str, Any]:
+        # Intentionally omit candidate content, filename and arbitrary
+        # metadata.  Identity/fingerprint diagnostics are sufficient to audit
+        # the decision without leaking rejected business text.
+        return {
+            "kb_id": self.kb_id,
+            "doc_id": self.doc_id,
+            "chunk_id": self.chunk_id,
+            "expected_scope_fingerprint": self.expected_scope_fingerprint,
+            "actual_identity_fingerprint": self.actual_identity_fingerprint,
+            "mismatch_dimensions": list(self.mismatch_dimensions),
+            "reason_code": self.reason_code,
+        }
+
+
+@dataclass(frozen=True)
+class ScopeAdmission:
+    """Typed candidate admission outcome with no rejected-body retention."""
+
+    candidates: tuple[dict[str, Any], ...] = ()
+    rejections: tuple[ScopeCandidateRejection, ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(item, Mapping) for item in self.candidates):
+            raise ValueError("scope admission candidates must be mappings")
+        if any(
+            not isinstance(item, ScopeCandidateRejection)
+            for item in self.rejections
+        ):
+            raise ValueError("scope admission rejections are invalid")
 
 
 @dataclass(frozen=True)
@@ -305,6 +611,23 @@ class DocumentConstraintIdentity:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _canonical_project(value: object) -> str:
+    """Normalize a project identity without fuzzy/substring matching.
+
+    Project names are tenant-like applicability boundaries.  Matching a
+    prefix (for example ``中青建安`` to ``中青建安二期``) would silently broaden a
+    request, so this helper deliberately permits only a narrow cosmetic
+    normalisation: punctuation/whitespace and one trailing ``项目``/``工程``.
+    """
+
+    normalized = _normalize_product(str(value or ""))
+    for suffix in ("项目", "工程"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized
 
 
 def _normalize_version(value: str) -> str:
@@ -376,7 +699,7 @@ def _valid_query_match(text: str, match: re.Match[str]) -> bool:
     return True
 
 
-def extract_query_constraints(query: str) -> QueryConstraints:
+def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope:
     """提取相邻的产品名和显式版本号。
 
     优先识别“我是/使用/针对 + 产品 + 版本”这类强提示，再识别
@@ -385,7 +708,7 @@ def extract_query_constraints(query: str) -> QueryConstraints:
 
     text = str(query or "").strip()
     if not text:
-        return QueryConstraints()
+        return ApplicabilityScope()
 
     match: re.Match[str] | None = None
     # 先处理系统已知别名，避免通用中文分组把“登录用户名枚举云枢8.6”整段
@@ -446,7 +769,7 @@ def extract_query_constraints(query: str) -> QueryConstraints:
             for candidate in matches
         }
         if len(identities) > 1:
-            return QueryConstraints(
+            return ApplicabilityScope(
                 extraction_reason=(
                     "查询包含多个独立的正向产品或版本范围，"
                     "不生成会污染兄弟需求的全局约束"
@@ -462,12 +785,12 @@ def extract_query_constraints(query: str) -> QueryConstraints:
         if known_product is not None:
             _, product_match = known_product
             matched_text = product_match.group(0)
-            return QueryConstraints(
+            return ApplicabilityScope(
                 product=matched_text,
                 matched_text=matched_text,
                 extraction_reason=f"由查询片段“{matched_text}”识别出产品约束，未指定显式版本",
             )
-        return QueryConstraints()
+        return ApplicabilityScope()
 
     raw_product = match.groupdict().get("product") or ""
     raw_version = (
@@ -482,7 +805,7 @@ def extract_query_constraints(query: str) -> QueryConstraints:
 
     matched_text = match.group(0).strip()
     if not product:
-        return QueryConstraints(
+        return ApplicabilityScope(
             product=None,
             version=version,
             explicit_version=True,
@@ -492,7 +815,7 @@ def extract_query_constraints(query: str) -> QueryConstraints:
                 "未指定产品"
             ),
         )
-    return QueryConstraints(
+    return ApplicabilityScope(
         product=product,
         version=version,
         explicit_version=True,
@@ -501,6 +824,310 @@ def extract_query_constraints(query: str) -> QueryConstraints:
             f"由查询片段“{matched_text}”识别出产品“{product}”和显式版本“{version}”"
         ),
     )
+
+
+# Project detection is intentionally narrow.  A plain proper noun is not a
+# project merely because a model says so; it must appear in an explicit source
+# construction such as ``中青建安项目`` / ``项目：中青建安`` or an immediately
+# preceding named scope before a registered product (``中青建安的云枢8.2``).
+_PROJECT_LABEL_PREFIX_RE = re.compile(
+    r"(?:项目名称|所属项目|项目)\s*[：:]\s*"
+    r"(?P<project>[A-Za-z0-9_\-\u3400-\u9fff]{2,48})",
+    re.IGNORECASE,
+)
+_PROJECT_LABEL_SUFFIX_RE = re.compile(
+    r"(?P<project>[A-Za-z0-9_\-\u3400-\u9fff]{2,48}?)"
+    # A bare ``项目`` is not enough: in ``项目等级`` / ``项目经理`` it is an
+    # ordinary noun inside the asked fact, not a named applicability scope.
+    # Require either an explicit scope suffix or a punctuation/whitespace/end
+    # boundary after 项目/工程.  This keeps project detection source-owned and
+    # prevents the greedy text before ``项目`` from becoming a fabricated
+    # tenant constraint.
+    r"(?:项目|工程)(?:(?:的|中|内|下|里|范围内)|(?=$|[\s，,。；;：:！!？?]))",
+    re.IGNORECASE,
+)
+_PROJECT_GENERIC_VALUES = frozenset({
+    "项目", "工程", "公司", "企业", "系统", "平台", "产品", "版本", "当前项目",
+})
+
+
+def _scope_source(
+    *,
+    dimension: ScopeDimension,
+    query: str,
+    start: int,
+    end: int,
+) -> ScopeSourceSpan | None:
+    if start < 0 or end <= start or end > len(query):
+        return None
+    span = query[start:end]
+    if not span.strip():
+        return None
+    return ScopeSourceSpan(
+        dimension=dimension,
+        start=start,
+        end=end,
+        span=span,
+        origin="current_query",
+    )
+
+
+def _project_source_spans(query: str) -> tuple[ScopeSourceSpan, ...]:
+    source = str(query or "")
+    values: list[ScopeSourceSpan] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add(match: re.Match[str]) -> None:
+        start, end = match.span("project")
+        value = source[start:end].strip()
+        # The possessive-prefix fallback can greedily include the literal
+        # ``项目`` in ``中青建安项目的云枢8.2``.  Preserve the actual project
+        # name span rather than silently changing its value after the fact.
+        for suffix in ("项目", "工程"):
+            if value.endswith(suffix) and len(value) > len(suffix):
+                end -= len(suffix)
+                value = source[start:end].strip()
+                break
+        if (
+            not value
+            or value.casefold() in _PROJECT_GENERIC_VALUES
+            or any(marker in value for marker in ("什么", "哪些", "如何", "怎么"))
+            or (start, end) in seen
+            or query_span_is_negated(source, start, end)
+        ):
+            return
+        item = _scope_source(
+            dimension="project",
+            query=source,
+            start=start,
+            end=end,
+        )
+        if item is not None:
+            seen.add((start, end))
+            values.append(item)
+
+    for pattern in (_PROJECT_LABEL_PREFIX_RE, _PROJECT_LABEL_SUFFIX_RE):
+        for match in pattern.finditer(source):
+            add(match)
+
+    # ``中青建安的云枢8.2`` is a source-authored named applicability prefix.
+    # Limit it to registered products so a generic possessive phrase cannot
+    # silently become a project dimension.
+    aliases = sorted(
+        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
+        key=len,
+        reverse=True,
+    )
+    if aliases:
+        product_pattern = "|".join(re.escape(alias) for alias in aliases)
+        prefix_pattern = re.compile(
+            rf"(?P<project>[\u3400-\u9fffA-Za-z0-9_\-]{{2,48}}?)的"
+            rf"(?:{product_pattern})\s*(?:版本\s*|[vV]\s*)?"
+            rf"{_VERSION_PATTERN}{_VERSION_BOUNDARY}",
+            re.IGNORECASE,
+        )
+        for match in prefix_pattern.finditer(source):
+            add(match)
+    return tuple(values)
+
+
+def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ...]:
+    """Return every independently source-anchored product/version scope.
+
+    This does not decide which answer unit owns a scope; it simply preserves
+    all literal alternatives so the planner can compile comparison units
+    without a global-product/version shortcut.
+    """
+
+    source = str(query or "")
+    if not source.strip():
+        return ()
+    aliases = sorted(
+        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
+        key=len,
+        reverse=True,
+    )
+    known_pattern = re.compile(
+        rf"(?P<product>{'|'.join(re.escape(alias) for alias in aliases)})"
+        rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
+        re.IGNORECASE,
+    )
+    # Prefer registered-product pairs.  Generic patterns remain a conservative
+    # fallback for product-less policies/years and never overwrite a pair.
+    patterns = (
+        known_pattern,
+        _QUERY_CUE_RE,
+        _QUERY_VERSION_LABEL_RE,
+        _QUERY_ADJACENT_RE,
+        _QUERY_STANDALONE_VERSION_RE,
+    )
+    raw: list[tuple[re.Match[str], str | None, str]] = []
+    seen_ranges: set[tuple[int, int, str | None, str]] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(source):
+            if (
+                not _valid_query_match(source, match)
+                or query_span_is_negated(source, match.start(), match.end())
+            ):
+                continue
+            groups = match.groupdict()
+            raw_product = groups.get("product") or ""
+            raw_version = groups.get("version") or groups.get("suffix_version") or ""
+            version = _normalize_version(raw_version)
+            if not version:
+                continue
+            product = _clean_product(raw_product) if raw_product else None
+            # ``版本8.6`` is a product-less edition constraint.  The generic
+            # adjacent-product pattern can otherwise misread the literal
+            # label ``版本`` as a product and prevent the following standalone
+            # edition matcher from producing the correct source-anchored
+            # scope.  This is a grammar boundary, not a product allow-list.
+            if product and _normalize_product(product) in {"版本", "version"}:
+                continue
+            key = (match.start(), match.end(), product, version)
+            if key in seen_ranges:
+                continue
+            # A generic full sentence capture must not duplicate a stronger
+            # registered product match occupying the same version token.
+            if any(
+                existing_product is not None
+                and existing_version == version
+                and existing_start <= match.start() < existing_end
+                for (existing_start, existing_end, existing_product, existing_version)
+                in seen_ranges
+            ):
+                continue
+            seen_ranges.add(key)
+            raw.append((match, product, version))
+        if raw:
+            # Registered product pairs are enough to enumerate a comparison;
+            # later weaker regexes must not turn their surrounding question
+            # shell into a second pseudo-product.
+            if pattern is known_pattern:
+                break
+
+    projects = _project_source_spans(source)
+    scopes: list[ApplicabilityScope] = []
+    for match, product, version in raw:
+        product_source = (
+            _scope_source(
+                dimension="product",
+                query=source,
+                start=match.start("product"),
+                end=match.end("product"),
+            )
+            if product and "product" in match.groupdict() and match.group("product")
+            else None
+        )
+        version_group = "version" if match.groupdict().get("version") else "suffix_version"
+        version_source = _scope_source(
+            dimension="version",
+            query=source,
+            start=match.start(version_group),
+            end=match.end(version_group),
+        )
+        # A labelled project preceding all product/version alternatives applies
+        # to each scope; a possessive prefix applies to its immediately
+        # following product.  No candidate/document identity is consulted.
+        project_source = next(
+            (
+                item
+                for item in reversed(projects)
+                if item.end <= match.start()
+                and len(source[item.end:match.start()].strip(" ，,：:；;的")) <= 8
+            ),
+            None,
+        )
+        scopes.append(ApplicabilityScope(
+            product=product,
+            version=version,
+            project=(project_source.span if project_source is not None else None),
+            explicit_version=True,
+            explicit_project=project_source is not None,
+            product_source=product_source,
+            version_source=version_source,
+            project_source=project_source,
+            matched_text=match.group(0).strip(),
+            extraction_reason="由当前问题的产品/显式版本原文跨度识别适用范围",
+        ))
+    if scopes:
+        return tuple(scopes)
+    # A project-only request still has a strict applicability boundary.
+    if len(projects) == 1:
+        project_source = projects[0]
+        return (ApplicabilityScope(
+            project=project_source.span,
+            explicit_project=True,
+            project_source=project_source,
+            matched_text=project_source.span,
+            extraction_reason="由当前问题的项目原文跨度识别适用范围",
+        ),)
+    return ()
+
+
+def extract_applicability_scopes(query: str) -> tuple[ApplicabilityScope, ...]:
+    """Return all source-anchored applicability alternatives in a query."""
+
+    return _positive_product_version_scopes(str(query or ""))
+
+
+def extract_applicability_scope(query: str) -> ApplicabilityScope:
+    """Return one safe scope, never collapsing independent alternatives."""
+
+    source = str(query or "")
+    scopes = extract_applicability_scopes(source)
+    if len(scopes) == 1:
+        return scopes[0]
+    if len(scopes) > 1:
+        return ApplicabilityScope(
+            extraction_reason=(
+                "查询包含多个独立的正向适用范围，"
+                "不生成会污染兄弟需求的全局约束"
+            ),
+        )
+
+    legacy = _extract_product_version_constraint_legacy(source)
+    if legacy.has_scope_constraint:
+        # Product-only constraints have no version match to enumerate above.
+        product_source = None
+        if legacy.product:
+            match = _alias_search_pattern(legacy.product).search(source)
+            if match is not None:
+                product_source = _scope_source(
+                    dimension="product",
+                    query=source,
+                    start=match.start(),
+                    end=match.end(),
+                )
+        projects = _project_source_spans(source)
+        project_source = next(
+            (
+                item
+                for item in reversed(projects)
+                if product_source is not None
+                and item.end <= product_source.start
+                and len(source[item.end:product_source.start].strip(" ，,：:；;的")) <= 8
+            ),
+            None,
+        )
+        return ApplicabilityScope(
+            product=legacy.product,
+            version=legacy.version,
+            project=(project_source.span if project_source is not None else None),
+            explicit_version=legacy.explicit_version,
+            explicit_project=project_source is not None,
+            product_source=product_source,
+            project_source=project_source,
+            matched_text=legacy.matched_text,
+            extraction_reason=legacy.extraction_reason,
+        )
+    return legacy
+
+
+def extract_query_constraints(query: str) -> ApplicabilityScope:
+    """Compatibility entry point returning the canonical scope contract."""
+
+    return extract_applicability_scope(query)
 
 
 def _flatten_metadata(metadata: Any) -> list[tuple[str, Any]]:
@@ -534,6 +1161,87 @@ def _versions_from_value(value: Any) -> set[str]:
             raw,
         )
     }
+
+
+def _is_declared_version_product_prefix(prefix: str) -> bool:
+    """Return whether a field-local prefix can safely name a product.
+
+    ``产品版本`` is authoritative only when the version token is directly
+    declared.  A known product alias (``云枢6``), or an identifier containing
+    an ASCII product token (``产品A1.0``), is safe enough.  A free-form Chinese
+    phrase is intentionally *not* promoted to product identity: otherwise
+    ``住宿标准1200`` after a comma can masquerade as another version-list item.
+    This conservative choice may leave an unusual, unregistered all-Chinese
+    product prefix as unknown, but never turns a business amount into an
+    incompatible version boundary.
+    """
+
+    compact = re.sub(r"\s+", "", str(prefix or ""))
+    if not compact:
+        return False
+    normalized = _normalize_product(compact)
+    if not normalized:
+        return False
+    if any(marker in compact for marker in _NON_IDENTITY_VERSION_PREFIX_MARKERS):
+        return False
+    known_aliases = {
+        _normalize_product(alias)
+        for group in _PRODUCT_ALIAS_GROUPS
+        for alias in group
+    }
+    if normalized in known_aliases:
+        return True
+    # Unregistered identifiers are allowed only when their token grammar is
+    # explicit enough to be an identity (for example ``产品A``/``PlatformX``),
+    # rather than ordinary Chinese prose following a list separator.
+    return bool(re.search(r"[A-Za-z]", compact))
+
+
+def _declared_versions_after_field_label(
+    text: str,
+    start: int,
+) -> tuple[set[str], int]:
+    """Parse the controlled version list immediately after a field label.
+
+    The returned offset is the end of the last accepted list entry.  Callers
+    can use that bounded slice to decide whether a generic ``版本：`` field
+    explicitly names the queried product, without examining unrelated body
+    text later in the sentence.
+    """
+
+    source = str(text or "")
+    cursor = max(0, min(int(start), len(source)))
+    declared: set[str] = set()
+    end = cursor
+    for _ in range(16):
+        match = _DECLARED_VERSION_ENTRY_RE.match(source, cursor)
+        if match is None:
+            break
+        prefix = match.group("product_prefix") or ""
+        if prefix and not _is_declared_version_product_prefix(prefix):
+            break
+        version = match.group("version") or ""
+        if not version:
+            break
+        declared.add(_normalize_version(version))
+        end = match.end()
+
+        separator = _DECLARED_VERSION_LIST_SEPARATOR_RE.match(source, end)
+        if separator is None:
+            break
+        cursor = separator.end()
+    return declared, end
+
+
+def _declared_versions_from_document_fields(text: str) -> set[str]:
+    """Extract only values governed by explicit ``产品版本：`` declarations."""
+
+    source = str(text or "")
+    versions: set[str] = set()
+    for match in _DOCUMENT_VERSION_FIELD_RE.finditer(source):
+        declared, _ = _declared_versions_after_field_label(source, match.end())
+        versions.update(declared)
+    return versions
 
 
 def _source_identity_texts(candidate: Mapping[str, Any]) -> tuple[str, ...]:
@@ -664,8 +1372,7 @@ def _declared_document_identity(
         value = match.group(1).strip()
         if value:
             products.add(value)
-    for match in _DOCUMENT_VERSION_FIELD_RE.finditer(content):
-        versions.update(_versions_from_value(match.group(1)))
+    versions.update(_declared_versions_from_document_fields(content))
     for match in _DOCUMENT_PROJECT_FIELD_RE.finditer(content):
         value = match.group(1).strip()
         if value:
@@ -743,7 +1450,9 @@ def candidate_section_key(candidate: Mapping[str, Any]) -> str | None:
 
 
 def inherit_document_constraint_metadata(
-    candidates: Sequence[dict[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    identity_sources: Sequence[Mapping[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     """Copy only unambiguous document identity to otherwise unscoped chunks.
 
@@ -764,6 +1473,46 @@ def inherit_document_constraint_metadata(
     Grouping includes both knowledge-base and document ids so unrelated
     documents cannot contaminate one another.  Existing derived inheritance
     markers are stripped before recomputation, making this function idempotent.
+
+    ``identity_sources`` is a deliberately narrow, content-free provenance
+    boundary for bounded expansion.  A small-document or structural-neighbor
+    adapter may return a headless sibling while the already-admitted first-pass
+    seed contains the document header.  In that case the source header may be
+    used *only* to recompute document identity for a candidate in the same
+    ``(kb_id, doc_id)`` group; it never supplies task lineage, relevance, an
+    answer claim, or an applicability decision by itself.  Callers must pass
+    only candidates that have already passed their request's authorization,
+    scope, and relevance gates.  The returned sequence always contains only
+    ``candidates`` in its original order, never the source rows.
+    """
+
+    target_rows = [
+        dict(candidate)
+        for candidate in candidates
+        if isinstance(candidate, Mapping)
+    ]
+    source_rows = [
+        dict(candidate)
+        for candidate in identity_sources
+        if isinstance(candidate, Mapping)
+    ]
+    if not source_rows:
+        return _inherit_document_constraint_metadata_rows(target_rows)
+    enriched = _inherit_document_constraint_metadata_rows([
+        *source_rows,
+        *target_rows,
+    ])
+    return enriched[len(source_rows):]
+
+
+def _inherit_document_constraint_metadata_rows(
+    candidates: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Implementation for document-identity inheritance over one trusted pool.
+
+    Keeping this private helper separate means the public wrapper can safely
+    include already-admitted source rows during expansion without returning
+    those rows or changing the long-standing no-source behaviour.
     """
 
     def local_identity(
@@ -1023,16 +1772,26 @@ def _collect_compatibility_versions(
     return compatible, unsupported, referenced_products
 
 
-def evaluate_candidate_constraints(
+def _evaluate_product_version_constraints(
     constraints: QueryConstraints,
     candidate: dict[str, Any],
 ) -> ConstraintEvaluation:
-    """使用候选的文件名、标签、metadata 和正文校验显式产品版本约束。"""
+    """Evaluate only product/version applicability for one candidate.
 
-    if not constraints.has_scope_constraint:
+    This is intentionally kept as a private compatibility implementation.
+    The public evaluator below composes this result with the project boundary
+    and is the only API that callers should use.  Keeping the old logic in a
+    named leaf avoids two partially-overlapping product/version evaluators.
+    """
+
+    if not (
+        constraints.has_product_constraint
+        or constraints.has_version_constraint
+    ):
         return ConstraintEvaluation(
             status="neutral",
-            reason="查询没有可确定的显式产品约束",
+            reason="查询没有可确定的产品或版本适用范围约束",
+            scope_applicability="unscoped",
         )
 
     product = constraints.product or ""
@@ -1111,20 +1870,20 @@ def evaluate_candidate_constraints(
         value = match.group(1).strip()
         if value:
             candidate_products.add(value)
-    for match in _DOCUMENT_VERSION_FIELD_RE.finditer(searchable):
-        declared_versions.update(_versions_from_value(match.group(1)))
+    declared_versions.update(_declared_versions_from_document_fields(searchable))
     # 兼容“版本：云枢6”，但裸的“Java版本：8.6”/“数据库版本：8.6”
     # 不能被当成目标产品版本。
-    for value in re.findall(
-        rf"(?<!产品)版本\s*[：:]\s*([^\n\r,，;；]+)",
-        searchable,
-        flags=re.IGNORECASE,
-    ):
+    for match in _GENERIC_DOCUMENT_VERSION_FIELD_RE.finditer(searchable):
+        versions_after_label, end = _declared_versions_after_field_label(
+            searchable,
+            match.end(),
+        )
+        declaration_text = searchable[match.end():end]
         if any(
-            re.search(re.escape(alias), value, flags=re.IGNORECASE)
+            re.search(re.escape(alias), declaration_text, flags=re.IGNORECASE)
             for alias in _product_aliases(product)
         ):
-            declared_versions.update(_versions_from_value(value))
+            declared_versions.update(versions_after_label)
 
     # 普通正文提及只做观测，不参与 exact；兼容/不支持语句有明确语义，单独收集。
     for match in product_version_re.finditer(content):
@@ -1294,4 +2053,409 @@ def evaluate_candidate_constraints(
         reason=f"候选未标注明确版本，无法确认是否适用于“{product} {target_version}”",
         candidate_products=sorted_products,
         candidate_versions=sorted_versions,
+    )
+
+
+# Only source-owned, explicit labels may make a project-less chunk usable for
+# a project-scoped question.  A missing project label is *not* shorthand for
+# global applicability: it is unknown and must fail closed.
+_GLOBAL_SCOPE_METADATA_KEYS = frozenset({
+    "scope_applicability",
+    "applicability_scope",
+    "scope",
+    "project_scope",
+    "project_applicability",
+    "适用范围",
+    "适用项目",
+    "项目范围",
+})
+_NORMALIZED_GLOBAL_SCOPE_METADATA_KEYS = frozenset(
+    _normalize_product(value) for value in _GLOBAL_SCOPE_METADATA_KEYS
+)
+_GLOBAL_SCOPE_VALUES = frozenset({
+    "global",
+    "globalcompatible",
+    "allprojects",
+    "allproject",
+    "全局",
+    "通用",
+    "所有项目",
+    "全项目",
+    "公司统一",
+})
+_NORMALIZED_GLOBAL_SCOPE_VALUES = frozenset(
+    _normalize_product(value) for value in _GLOBAL_SCOPE_VALUES
+)
+_GLOBAL_SCOPE_CONTENT_RE = re.compile(
+    r"(?:适用范围|适用项目|项目范围|所属项目)\s*[：:]\s*"
+    r"(?:全局|通用|所有项目|全项目|公司统一)\b",
+    re.IGNORECASE,
+)
+
+
+def _candidate_declares_global_scope(candidate: Mapping[str, Any]) -> bool:
+    """Whether a candidate explicitly declares a non-project-specific clause.
+
+    This is intentionally stricter than normal relevance extraction.  It
+    accepts a bounded metadata vocabulary or a labelled source sentence, but
+    never infers global scope merely because the candidate has no project
+    identity.
+    """
+
+    raw_metadata = candidate.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, Mapping) else {}
+    for key, value in _flatten_metadata(metadata):
+        if _normalize_product(key) not in _NORMALIZED_GLOBAL_SCOPE_METADATA_KEYS:
+            continue
+        if _normalize_product(value) in _NORMALIZED_GLOBAL_SCOPE_VALUES:
+            return True
+    return bool(_GLOBAL_SCOPE_CONTENT_RE.search(str(candidate.get("content") or "")))
+
+
+def _identity_fingerprint(identity: DocumentConstraintIdentity) -> str:
+    """Hash source identity facts for safe scope-rejection diagnostics."""
+
+    payload = {
+        "products": sorted(identity.canonical_products),
+        "versions": sorted(identity.versions),
+        "projects": sorted(
+            {
+                _canonical_project(value)
+                for value in identity.projects
+                if _canonical_project(value)
+            }
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _product_version_mismatch_dimensions(
+    scope: ApplicabilityScope,
+    evaluation: ConstraintEvaluation,
+    identity: DocumentConstraintIdentity,
+) -> tuple[ScopeDimension, ...]:
+    """Produce deterministic, content-free mismatch dimensions.
+
+    The historical evaluator returns human-readable reasons.  Re-parsing those
+    reasons would turn UI wording into execution semantics, so this helper
+    derives dimension codes only from the canonical scope and source identity.
+    """
+
+    dimensions: list[ScopeDimension] = []
+    expected_product = _canonical_product(scope.product or "")
+    candidate_products = set(identity.canonical_products)
+    if (
+        scope.has_product_constraint
+        and candidate_products
+        and expected_product not in candidate_products
+    ):
+        dimensions.append("product")
+
+    candidate_versions = set(identity.versions) | set(evaluation.candidate_versions)
+    if (
+        scope.has_version_constraint
+        and scope.version
+        and candidate_versions
+        and scope.version not in candidate_versions
+    ):
+        dimensions.append("version")
+
+    # Explicit incompatibility such as “不支持云枢8.6” can be a mismatch even
+    # when the source identity lists the requested version.  It is still a
+    # version dimension; do not expose the source sentence in diagnostics.
+    if evaluation.status == "mismatch" and not dimensions:
+        if scope.has_version_constraint:
+            dimensions.append("version")
+        elif scope.has_product_constraint:
+            dimensions.append("product")
+    return tuple(dict.fromkeys(dimensions))
+
+
+def _project_scope_outcome(
+    scope: ApplicabilityScope,
+    candidate: Mapping[str, Any],
+    identity: DocumentConstraintIdentity,
+) -> Literal["not_requested", "exact", "global_compatible", "unknown", "mismatch"]:
+    if not scope.has_project_constraint:
+        return "not_requested"
+    if _candidate_declares_global_scope(candidate):
+        return "global_compatible"
+    expected_project = _canonical_project(scope.project or "")
+    candidate_projects = {
+        _canonical_project(value)
+        for value in identity.projects
+        if _canonical_project(value)
+    }
+    if not candidate_projects:
+        return "unknown"
+    if expected_project in candidate_projects:
+        return "exact"
+    return "mismatch"
+
+
+def evaluate_candidate_constraints(
+    constraints: QueryConstraints,
+    candidate: dict[str, Any],
+) -> ConstraintEvaluation:
+    """Evaluate the canonical product/version/project applicability contract.
+
+    ``ApplicabilityScope`` has a conjunctive meaning: a candidate must satisfy
+    every explicit dimension of the scope, except an explicitly-declared
+    global clause may satisfy the project dimension.  Unknown project identity
+    is deliberately not promoted to global applicability.
+    """
+
+    if not isinstance(constraints, ApplicabilityScope):
+        raise TypeError("constraints must be an ApplicabilityScope")
+    item = dict(candidate) if isinstance(candidate, Mapping) else {}
+    identity = extract_document_constraint_identity(item)
+    product_version = _evaluate_product_version_constraints(constraints, item)
+    mismatch_dimensions = list(
+        _product_version_mismatch_dimensions(
+            constraints,
+            product_version,
+            identity,
+        )
+    )
+    project_outcome = _project_scope_outcome(constraints, item, identity)
+
+    if project_outcome == "mismatch":
+        mismatch_dimensions.append("project")
+    elif project_outcome == "unknown":
+        # ``mismatch_dimensions`` doubles as the fail-closed dimension list
+        # for rejection diagnostics.  The status remains ``unknown`` so
+        # callers can distinguish absent identity from a contradictory one.
+        mismatch_dimensions.append("project")
+
+    mismatch_dimensions = list(dict.fromkeys(mismatch_dimensions))
+    candidate_projects = tuple(sorted(identity.projects, key=str.casefold))
+
+    # A product/version contradiction remains a contradiction even when the
+    # candidate declares itself global.  Global only relaxes the project
+    # dimension, never a product or version boundary.
+    if product_version.status == "mismatch" or project_outcome == "mismatch":
+        reason = product_version.reason
+        if project_outcome == "mismatch":
+            expected = scope_project = constraints.project or ""
+            actual = "、".join(candidate_projects) or "未标注"
+            project_reason = f"查询项目为“{expected}”，候选明确项目为“{actual}”，项目冲突"
+            reason = (
+                f"{reason}；{project_reason}"
+                if product_version.status == "mismatch"
+                else project_reason
+            )
+        return ConstraintEvaluation(
+            status="mismatch",
+            reason=reason,
+            candidate_products=product_version.candidate_products,
+            candidate_versions=product_version.candidate_versions,
+            candidate_projects=candidate_projects,
+            mismatch_dimensions=tuple(mismatch_dimensions),
+            scope_applicability="unknown",
+        )
+
+    # With a project boundary, absence of an identity is a closed gate even
+    # if the product/version part is otherwise exact.  Similarly, an unknown
+    # product/version must not become admissible merely because the project
+    # label matches.
+    if product_version.status == "unknown" or project_outcome == "unknown":
+        reason = product_version.reason
+        if project_outcome == "unknown":
+            project_reason = (
+                f"查询限定项目“{constraints.project}”，候选未标注项目身份，"
+                "无法确认适用范围"
+            )
+            reason = (
+                f"{reason}；{project_reason}"
+                if product_version.status == "unknown"
+                else project_reason
+            )
+        return ConstraintEvaluation(
+            status="unknown",
+            reason=reason,
+            candidate_products=product_version.candidate_products,
+            candidate_versions=product_version.candidate_versions,
+            candidate_projects=candidate_projects,
+            mismatch_dimensions=tuple(mismatch_dimensions),
+            scope_applicability="unknown",
+        )
+
+    if project_outcome == "global_compatible":
+        return ConstraintEvaluation(
+            status="compatible",
+            reason=(
+                f"{product_version.reason}；候选明确声明为全局条款，"
+                f"可兼容项目“{constraints.project}”"
+            ),
+            candidate_products=product_version.candidate_products,
+            candidate_versions=product_version.candidate_versions,
+            candidate_projects=candidate_projects,
+            mismatch_dimensions=(),
+            scope_applicability="global_compatible",
+        )
+
+    if not constraints.has_scope_constraint:
+        applicability: Literal["exact", "global_compatible", "unscoped", "unknown"] = "unscoped"
+    else:
+        applicability = "exact"
+    return replace(
+        product_version,
+        candidate_projects=candidate_projects,
+        mismatch_dimensions=tuple(mismatch_dimensions),
+        scope_applicability=applicability,
+    )
+
+
+def _scope_rejection_reason_code(evaluation: ConstraintEvaluation) -> str:
+    dimensions = tuple(dict.fromkeys(evaluation.mismatch_dimensions))
+    suffix = "_".join(dimensions) if dimensions else "identity"
+    if evaluation.status == "unknown":
+        return f"scope_unknown_{suffix}"
+    return f"scope_mismatch_{suffix}"
+
+
+def _scope_rejection_for(
+    candidate: Mapping[str, Any],
+    *,
+    scope: ApplicabilityScope,
+    evaluation: ConstraintEvaluation,
+    actual_identity_fingerprint: str,
+) -> ScopeCandidateRejection:
+    """Create a content-free rejection record for one failed scope."""
+
+    dimensions = evaluation.mismatch_dimensions
+    if not dimensions:
+        # This branch is intentionally defensive.  A constrained candidate
+        # must never be rejected without a dimension that can be inspected in
+        # the trace/ledger, and scope admission cannot derive a body-dependent
+        # fallback at this point.
+        if scope.has_project_constraint:
+            dimensions = ("project",)
+        elif scope.has_version_constraint:
+            dimensions = ("version",)
+        else:
+            dimensions = ("product",)
+    return ScopeCandidateRejection(
+        kb_id=str(candidate.get("kb_id") or "").strip(),
+        doc_id=str(candidate.get("doc_id") or "").strip(),
+        chunk_id=str(candidate.get("chunk_id") or candidate.get("id") or "").strip(),
+        expected_scope_fingerprint=scope.fingerprint,
+        actual_identity_fingerprint=actual_identity_fingerprint,
+        mismatch_dimensions=dimensions,
+        reason_code=_scope_rejection_reason_code(evaluation),
+    )
+
+
+def _admission_priority(
+    evaluation: ConstraintEvaluation,
+) -> tuple[int, int]:
+    """Rank successful scope matches without using retrieval score/content."""
+
+    status_rank = {"exact": 3, "compatible": 2, "neutral": 1}.get(
+        evaluation.status,
+        0,
+    )
+    applicability_rank = {
+        "exact": 2,
+        "global_compatible": 1,
+        "unscoped": 0,
+        "unknown": -1,
+    }.get(evaluation.scope_applicability, -1)
+    return status_rank, applicability_rank
+
+
+def admit_candidates_for_scopes(
+    candidates: Sequence[Mapping[str, Any]],
+    scopes: Sequence[ApplicabilityScope],
+    *,
+    identity_sources: Sequence[Mapping[str, Any]] = (),
+) -> ScopeAdmission:
+    """Admit candidates against one or more canonical applicability scopes.
+
+    The function is deliberately a pure boundary: it neither creates a
+    clarification nor selects answer evidence.  A caller running a comparison
+    may use a scope union for root recall, but answer tasks must later call it
+    with their own single scope before evidence assembly.  A candidate is
+    rejected only when it fails every constrained scope; then one safe record
+    is emitted for each failed scope so a ledger can attribute the rejection
+    without retaining rejected body text.
+    """
+
+    source_scopes = tuple(scopes)
+    normalized_scopes = tuple(
+        scope for scope in source_scopes if isinstance(scope, ApplicabilityScope)
+    )
+    if len(normalized_scopes) != len(source_scopes):
+        raise TypeError("scopes must contain ApplicabilityScope values")
+    constrained_scopes = tuple(
+        scope for scope in normalized_scopes if scope.has_scope_constraint
+    )
+    enriched = inherit_document_constraint_metadata(
+        [dict(candidate) for candidate in candidates if isinstance(candidate, Mapping)],
+        identity_sources=identity_sources,
+    )
+    if not constrained_scopes:
+        return ScopeAdmission(candidates=tuple(enriched))
+
+    accepted: list[dict[str, Any]] = []
+    rejections: list[ScopeCandidateRejection] = []
+    seen_rejections: set[tuple[str, str, str, str, str, tuple[ScopeDimension, ...], str]] = set()
+    for candidate in enriched:
+        evaluations = tuple(
+            (scope, evaluate_candidate_constraints(scope, candidate))
+            for scope in constrained_scopes
+        )
+        matched = tuple(
+            (scope, evaluation)
+            for scope, evaluation in evaluations
+            if evaluation.status in {"exact", "compatible", "neutral"}
+        )
+        if matched:
+            scope, evaluation = max(
+                matched,
+                key=lambda item: (_admission_priority(item[1]), item[0].fingerprint),
+            )
+            item = dict(candidate)
+            raw_metadata = item.get("metadata")
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+            metadata["scope_applicability"] = evaluation.scope_applicability
+            metadata["scope_fingerprint"] = scope.fingerprint
+            metadata["scope_match_status"] = evaluation.status
+            item["metadata"] = metadata
+            item["constraint_status"] = evaluation.status
+            accepted.append(item)
+            continue
+
+        identity_fingerprint = _identity_fingerprint(
+            extract_document_constraint_identity(candidate)
+        )
+        for scope, evaluation in evaluations:
+            rejection = _scope_rejection_for(
+                candidate,
+                scope=scope,
+                evaluation=evaluation,
+                actual_identity_fingerprint=identity_fingerprint,
+            )
+            key = (
+                rejection.kb_id,
+                rejection.doc_id,
+                rejection.chunk_id,
+                rejection.expected_scope_fingerprint,
+                rejection.actual_identity_fingerprint,
+                rejection.mismatch_dimensions,
+                rejection.reason_code,
+            )
+            if key not in seen_rejections:
+                seen_rejections.add(key)
+                rejections.append(rejection)
+    return ScopeAdmission(
+        candidates=tuple(accepted),
+        rejections=tuple(rejections),
     )

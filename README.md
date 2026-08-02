@@ -197,6 +197,15 @@ alembic upgrade head
 uvicorn main:app --reload --port 8000
 ```
 
+再开一个终端启动文档入库 worker。上传接口只负责写入文档和任务；解析、图片识别和向量化由该 worker 执行，重启后会从任务表继续领取未完成工作：
+
+```bash
+cd backend
+source .venv/bin/activate
+export DATABASE_URL='postgresql+asyncpg://rag:<你的POSTGRES_PASSWORD>@127.0.0.1:5433/rag_prod'
+python -m core.document_jobs
+```
+
 另一个终端启动前端：
 
 ```bash

@@ -45,6 +45,144 @@ class DocumentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Controlled terminology registry ─────────────────────────────
+#
+# A terminology rule is deliberately modeled as concept + spelling + scope.
+# These request/response models mirror that boundary rather than accepting a
+# free-form JSON blob, so callers cannot accidentally create an unscoped alias
+# or promote a retrieval-only spelling into a strict equivalence.
+TerminologyMatchMode = Literal["strict_equivalent", "retrieval_only"]
+
+
+class TerminologyTermCreate(BaseModel):
+    term: str = Field(..., min_length=1, max_length=120)
+    match_mode: TerminologyMatchMode = "strict_equivalent"
+    is_active: bool = True
+
+
+class TerminologyTermUpdate(BaseModel):
+    term: str | None = Field(default=None, min_length=1, max_length=120)
+    match_mode: TerminologyMatchMode | None = None
+    is_active: bool | None = None
+
+
+class TerminologyTermOut(BaseModel):
+    id: uuid.UUID
+    concept_id: uuid.UUID
+    kb_id: uuid.UUID
+    term: str
+    normalized_term: str
+    match_mode: TerminologyMatchMode
+    is_active: bool
+    created_by: uuid.UUID | None = None
+    updated_by: uuid.UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class TerminologyScopeBindingCreate(BaseModel):
+    concept_id: uuid.UUID
+    document_id: uuid.UUID | None = None
+    # Values are normalized by the management service with the same contract
+    # function reserved for future runtime snapshot resolution.  Omitting all
+    # three means the whole KB.
+    scope_product_key: str | None = Field(default=None, max_length=160)
+    scope_version_key: str | None = Field(default=None, max_length=160)
+    scope_project_key: str | None = Field(default=None, max_length=160)
+    is_active: bool = True
+
+
+class TerminologyScopeBindingDraft(BaseModel):
+    """Initial scope sent together with a newly created concept."""
+
+    document_id: uuid.UUID | None = None
+    scope_product_key: str | None = Field(default=None, max_length=160)
+    scope_version_key: str | None = Field(default=None, max_length=160)
+    scope_project_key: str | None = Field(default=None, max_length=160)
+    is_active: bool = True
+
+
+class TerminologyScopeBindingUpdate(BaseModel):
+    # ``model_fields_set`` distinguishes omitted fields from explicit null,
+    # allowing an administrator to intentionally widen a document/product
+    # binding back to the containing knowledge base.
+    document_id: uuid.UUID | None = None
+    scope_product_key: str | None = Field(default=None, max_length=160)
+    scope_version_key: str | None = Field(default=None, max_length=160)
+    scope_project_key: str | None = Field(default=None, max_length=160)
+    is_active: bool | None = None
+
+
+class TerminologyConceptCreate(BaseModel):
+    code: str = Field(..., min_length=1, max_length=64)
+    canonical_term: str = Field(..., min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    terms: list[TerminologyTermCreate] = Field(default_factory=list, max_length=20)
+    initial_binding: TerminologyScopeBindingDraft = Field(
+        default_factory=TerminologyScopeBindingDraft
+    )
+
+
+class TerminologyConceptUpdate(BaseModel):
+    # ``code`` is intentionally absent: it is a stable registry identity.
+    canonical_term: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    is_active: bool | None = None
+
+
+class TerminologyConceptOut(BaseModel):
+    id: uuid.UUID
+    kb_id: uuid.UUID
+    code: str
+    canonical_term: str
+    description: str | None = None
+    is_active: bool
+    created_by: uuid.UUID | None = None
+    updated_by: uuid.UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+    terms: list[TerminologyTermOut] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
+class TerminologyScopeBindingOut(BaseModel):
+    id: uuid.UUID
+    concept_id: uuid.UUID
+    kb_id: uuid.UUID
+    document_id: uuid.UUID | None = None
+    scope_product_key: str | None = None
+    scope_version_key: str | None = None
+    scope_project_key: str | None = None
+    is_active: bool
+    created_by: uuid.UUID | None = None
+    updated_by: uuid.UUID | None = None
+    created_at: datetime
+    updated_at: datetime
+    concept: TerminologyConceptOut | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class TerminologyRegistryOut(BaseModel):
+    kb_id: uuid.UUID
+    registry_revision: int
+    # A graph response is explicit rather than inferred by callers from a
+    # mutation's one changed row.  It is the exact graph at this revision.
+    concepts: list[TerminologyConceptOut] = Field(default_factory=list)
+    bindings: list[TerminologyScopeBindingOut] = Field(default_factory=list)
+
+
+class TerminologyMutationOut(BaseModel):
+    registry_revision: int
+    registry: TerminologyRegistryOut
+    concept: TerminologyConceptOut | None = None
+    term: TerminologyTermOut | None = None
+    binding: TerminologyScopeBindingOut | None = None
+
+
 # ── Chat ─────────────────────────────────────────────────────────
 class SearchConfig(BaseModel):
     method: Literal["hybrid", "vector", "keyword"] = "hybrid"
@@ -341,8 +479,12 @@ IntentEvidenceStatus = Literal[
     "skipped",
     "hit",
     "partial",
+    # Canonical producer/output spelling.  ``version_mismatch`` remains in
+    # the read schema only for rolling upgrades of persisted route logs.
+    "scope_mismatch",
     "version_mismatch",
     "no_hit",
+    "insufficient_evidence",
     "unverified",
     "needs_clarification",
     "error",

@@ -20,7 +20,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from itertools import product
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from core.query_constraints import (
     QueryConstraints,
@@ -28,7 +28,13 @@ from core.query_constraints import (
     extract_document_constraint_identity,
     extract_query_constraints,
 )
+from core.query_surface_structure import (
+    QuerySurfaceFrame,
+    is_stable_entity_qualifier,
+    parse_query_surface_frame,
+)
 from core.rag_v2.contracts import AnswerRequirementV2, EvidenceItem
+from core.rag_v2.task_graph import AnswerBridgePath
 
 
 _BRIDGE_SUBJECT_RE = re.compile(
@@ -270,6 +276,34 @@ _TAXONOMY_HEADER_TERMS = (
     "层级",
     "序列",
 )
+# A classification table is a relation schema, not a bag of query words.  The
+# right side may be called ``职级`` while the planner/model display text merely
+# says ``适用分类``.  Its left side must nevertheless be an explicit
+# applicability/entity column.  Matching a substring such as ``人员`` would
+# make an operational role (``审批人员``) look like an applicable population,
+# so header *roles* are classified from complete normalized labels below.
+_APPLICABILITY_ENTITY_HEADERS = frozenset({
+    "适用",
+    "适用人员",
+    "适用员工",
+    "适用用户",
+    "适用成员",
+    "适用对象",
+    "适用主体",
+    "适用人群",
+    "适用范围",
+    "人员",
+    "员工",
+    "用户",
+    "成员",
+    "对象",
+    "主体",
+    "人群",
+})
+_OPERATIONAL_ROLE_HEADER_RE = re.compile(
+    r"(?:审批|审核|申请|负责人|经办|办理|操作|维护|签署|联系人|发布)",
+    re.IGNORECASE,
+)
 _NON_MAPPING_HEADER_RE = re.compile(
     r"(?:时长|日期|时间|天数|次数|金额|数量|额度|上限|下限|"
     r"审批|审核|流程|标准|补贴|费用|权限|措施|处置|交通|住宿)",
@@ -323,6 +357,73 @@ class BridgeFactConflict:
     scope_projects: tuple[str, ...]
     values: tuple[str, ...]
     source_chunk_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BridgeScopeAlternative:
+    """One source-grounded applicability slice for a bridge relation.
+
+    This is intentionally not a value conflict.  Two versions may map a
+    subject to the same grade, yet still require different second-hop policy
+    lookups.  Keeping the applicability alternative separate from
+    :class:`BridgeFactConflict` prevents a scheduler from treating a
+    cross-version choice as a contradictory source assertion.
+    """
+
+    requirement_id: str
+    subject: str
+    scope_products: tuple[str, ...]
+    scope_versions: tuple[str, ...]
+    scope_projects: tuple[str, ...]
+    source_kb_ids: tuple[str, ...]
+    source_doc_ids: tuple[str, ...]
+    source_chunk_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class BridgeScopeAmbiguity:
+    """Mutually exclusive applicability alternatives for one bridge task.
+
+    A bridge task may retrieve source-grounded mappings from several versions
+    or projects.  Without a task-local scope contract, those mappings are not
+    interchangeable inputs to a dynamic answer query.  The ambiguity is
+    therefore a terminal bridge result, not a late UI-only decision.
+    """
+
+    requirement_id: str
+    subject: str
+    alternatives: tuple[BridgeScopeAlternative, ...]
+
+
+@dataclass(frozen=True)
+class ResolvedBridgeExpansionSpec:
+    """One source-resolved second-hop retrieval request.
+
+    The resolved value is still not an answer.  It is a bounded retrieval
+    refinement tied to one answer requirement and the exact source chunks that
+    supplied every bridge fact.  The pipeline uses this contract to preserve
+    dynamic second-hop provenance rather than inferring it from a query index.
+    """
+
+    answer_requirement_id: str
+    bridge_requirement_ids: tuple[str, ...]
+    bridge_facts: tuple[ResolvedBridgeFact, ...]
+    query: str
+    edge_mode: Literal["proof", "augmentation"] = "proof"
+
+    def __post_init__(self) -> None:
+        if not str(self.answer_requirement_id or "").strip():
+            raise ValueError("bridge expansion requires an answer requirement id")
+        if not self.bridge_requirement_ids:
+            raise ValueError("bridge expansion requires bridge requirement ids")
+        if not self.bridge_facts:
+            raise ValueError("bridge expansion requires resolved bridge facts")
+        if not str(self.query or "").strip():
+            raise ValueError("bridge expansion requires a query")
+        edge_mode = str(self.edge_mode or "").strip().casefold()
+        if edge_mode not in {"proof", "augmentation"}:
+            raise ValueError("bridge expansion requires a valid edge mode")
+        object.__setattr__(self, "edge_mode", edge_mode)
 
 
 @dataclass(frozen=True)
@@ -628,18 +729,23 @@ def bridge_subject_for_requirement(
     return subject or extract_bridge_subject(requirement.description)
 
 
-def bridge_dependency_ids_for_answer(
+def bridge_requirement_ids_for_answer(
     answer: AnswerRequirementV2,
     requirements: Sequence[AnswerRequirementV2],
+    *,
+    mode: Literal["proof", "augmentation"],
 ) -> tuple[str, ...]:
-    """Resolve machine-readable answer-to-bridge edges, failing closed.
+    """Resolve one declared answer-to-bridge edge family.
 
-    Explicit plan edges are authoritative, including an explicit empty tuple.
-    Older plans may infer an edge only from a positive, exact subject occurrence
-    in the answer wording.  There is deliberately no "all bridges" fallback:
-    that behavior attached independent siblings in mixed questions to an
-    unrelated classification mapping.
+    Executable plans must call this with an explicit mode.  Proof retains its
+    narrow legacy fallback only for non-ledger compatibility callers;
+    augmentation is never inferred from wording because that would turn a
+    recall optimisation into an undocumented semantic route.
     """
+
+    normalized_mode = str(mode or "").strip().casefold()
+    if normalized_mode not in {"proof", "augmentation"}:
+        raise ValueError("bridge requirement mode must be proof or augmentation")
 
     bridge_requirements = tuple(
         item for item in requirements if item.role == "bridge"
@@ -647,6 +753,14 @@ def bridge_dependency_ids_for_answer(
     if not bridge_requirements:
         return ()
     bridge_ids = {item.id for item in bridge_requirements}
+    if normalized_mode == "augmentation":
+        if answer.augmentation_requirement_ids is None:
+            return ()
+        return tuple(
+            dependency_id
+            for dependency_id in answer.augmentation_requirement_ids
+            if dependency_id in bridge_ids
+        )
     if answer.depends_on_requirement_ids is not None:
         return tuple(
             dependency_id
@@ -662,6 +776,25 @@ def bridge_dependency_ids_for_answer(
         )
     )
     return matched
+
+
+def bridge_dependency_ids_for_answer(
+    answer: AnswerRequirementV2,
+    requirements: Sequence[AnswerRequirementV2],
+) -> tuple[str, ...]:
+    """Compatibility wrapper for the proof-only edge selector.
+
+    New scheduling/evidence code must use
+    :func:`bridge_requirement_ids_for_answer` with an explicit mode.  Keeping
+    this wrapper prevents old diagnostic callers from silently changing
+    semantics while making the proof-only meaning unambiguous at call sites.
+    """
+
+    return bridge_requirement_ids_for_answer(
+        answer,
+        requirements,
+        mode="proof",
+    )
 
 
 def _clean_bridge_value(value: Any, *, subject: str) -> str | None:
@@ -852,15 +985,90 @@ def _header_descriptor_score(header: str, description: Any) -> int:
     return 0
 
 
+def _is_taxonomy_header(header: str) -> bool:
+    """Whether a table column explicitly names a stable classification axis."""
+
+    normalized = re.sub(r"\s+", "", str(header or "")).casefold()
+    return bool(
+        normalized
+        and any(term in normalized for term in _TAXONOMY_HEADER_TERMS)
+        and not _NON_MAPPING_HEADER_RE.search(normalized)
+    )
+
+
+def _normalized_header_label(header: str) -> str:
+    """Normalize a column label while retaining only its semantic role.
+
+    Parenthetical notes in a table header qualify a column (for example,
+    ``适用人员（含实习生）``); they do not change a column from an applicability
+    dimension into an operational actor.  Removing them before exact role
+    matching lets valid source tables retain that harmless annotation without
+    reopening substring matching.
+    """
+
+    normalized = str(header or "")
+    normalized = re.sub(r"[（(][^（）()]{0,80}[）)]", "", normalized)
+    return re.sub(r"[\s:：_\-—]+", "", normalized).casefold()
+
+
+def _is_applicability_entity_header(header: str) -> bool:
+    """Whether a table column declares the entities a row applies to.
+
+    An actor of an action is not an applicability population.  We therefore
+    reject operational labels before accepting only complete, normalized
+    entity-column labels.  This stops ``审批人员`` / ``申请人员`` from creating
+    a false ``person -> grade`` bridge merely because another column is named
+    ``职级``.
+    """
+
+    normalized = _normalized_header_label(header)
+    return bool(
+        normalized
+        and not _OPERATIONAL_ROLE_HEADER_RE.search(normalized)
+        and normalized in _APPLICABILITY_ENTITY_HEADERS
+    )
+
+
+def _classification_table_value_indexes(
+    *,
+    header_cells: tuple[str, ...],
+    subject_indexes: set[int],
+    other_indexes: Sequence[int],
+) -> list[int]:
+    """Resolve ``applicable entity -> taxonomy`` only from a table schema.
+
+    This is deliberately stricter than query-word overlap: the subject must
+    appear in a column whose header identifies applicable entities, and there
+    must be exactly one other column whose header names a taxonomy.  That
+    relation is independent of whether an LLM happened to phrase the bridge as
+    ``分类`` or ``职级``.
+    """
+
+    if not header_cells or not any(
+        _is_applicability_entity_header(header_cells[index])
+        for index in subject_indexes
+        if index < len(header_cells)
+    ):
+        return []
+    candidates = [
+        index
+        for index in other_indexes
+        if index < len(header_cells) and _is_taxonomy_header(header_cells[index])
+    ]
+    return candidates if len(candidates) == 1 else []
+
+
 def extract_bridge_values(
     description: Any,
     content: Any,
     *,
     subject: str | None = None,
+    bridge_kind: str | None = None,
 ) -> tuple[str, ...]:
     """Extract subject-anchored relation values from one evidence chunk."""
 
     subject = str(subject or "").strip() or extract_bridge_subject(description)
+    normalized_bridge_kind = str(bridge_kind or "").strip().casefold() or None
     text = str(content or "")
     if subject is None or subject.casefold() not in text.casefold():
         return ()
@@ -889,14 +1097,30 @@ def extract_bridge_values(
         ]
         selected_indexes: list[int] = []
         if header_cells and len(header_cells) == len(cells):
-            scored = [
-                (_header_descriptor_score(header_cells[index], description), index)
-                for index in other_indexes
-            ]
-            best_score = max((score for score, _ in scored), default=0)
-            best_indexes = [index for score, index in scored if score == best_score]
-            if best_score > 0 and len(best_indexes) == 1:
-                selected_indexes = best_indexes
+            if normalized_bridge_kind == "classification":
+                # Classification is a typed table relation: do not fall back
+                # to description/header word overlap after its explicit
+                # applicability-column check fails.  Such a fallback would
+                # reintroduce the exact error this type exists to prevent
+                # (for example ``审批人员 | 职级`` -> ``总经理 | A级``).
+                selected_indexes = _classification_table_value_indexes(
+                    header_cells=header_cells,
+                    subject_indexes=subject_indexes,
+                    other_indexes=other_indexes,
+                )
+            else:
+                # Mapping and legacy bridges retain the prior conservative
+                # descriptor-based rule: a source header must be explicitly
+                # described by the request, or prose must state the relation.
+                # They never inherit the classification-table schema shortcut.
+                scored = [
+                    (_header_descriptor_score(header_cells[index], description), index)
+                    for index in other_indexes
+                ]
+                best_score = max((score for score, _ in scored), default=0)
+                best_indexes = [index for score, index in scored if score == best_score]
+                if best_score > 0 and len(best_indexes) == 1:
+                    selected_indexes = best_indexes
         # Header-bearing tables must prove that the other column describes the
         # requested taxonomy.  Without this gate a leave table such as
         # ``5天以上 | 总经理`` becomes the false fact ``总经理 -> 5天以上``.
@@ -905,6 +1129,7 @@ def extract_bridge_values(
             not selected_indexes
             and not header_cells
             and len(other_indexes) == 1
+            and normalized_bridge_kind != "classification"
         ):
             selected_indexes = other_indexes
         # A row with several unrelated value columns is not a safe mapping
@@ -1027,6 +1252,7 @@ def resolve_bridge_facts(
                 requirement.description,
                 _candidate_content(candidate),
                 subject=subject,
+                bridge_kind=requirement.bridge_kind,
             ):
                 key = (requirement.id, value.casefold(), chunk_id)
                 if key in seen:
@@ -1136,6 +1362,93 @@ def partition_bridge_facts(
     return tuple(accepted), tuple(conflicts)
 
 
+def detect_bridge_scope_ambiguities(
+    facts: Sequence[ResolvedBridgeFact],
+) -> tuple[BridgeScopeAmbiguity, ...]:
+    """Find bridge facts that need a scope choice before a second-hop query.
+
+    ``partition_bridge_facts`` answers a narrower integrity question: did one
+    document assert two incompatible values for the same relation?  It must
+    keep independently applicable documents intact so final evidence can later
+    compare complete answer routes.  Dynamic bridge materialisation has a
+    stronger precondition, however: when a *single bridge task* exposes
+    mutually exclusive version/product/project slices and the task itself did
+    not select one, it cannot safely choose a query to run next.
+
+    The result is deliberately based only on explicit source applicability
+    identities.  Different KBs or unscoped duplicates alone are not treated as
+    alternatives; neither proves a semantic conflict.  Conversely, equal
+    bridge values across CloudPivot 6 and 7 still form an ambiguity because the
+    value does not prove that their downstream policy clauses are equivalent.
+    """
+
+    grouped: dict[tuple[str, str], dict[
+        tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+        list[ResolvedBridgeFact],
+    ]] = defaultdict(lambda: defaultdict(list))
+    for fact in facts:
+        grouped[(fact.requirement_id, fact.subject.casefold())][
+            (
+                fact.scope_products,
+                fact.scope_versions,
+                fact.scope_projects,
+            )
+        ].append(fact)
+
+    ambiguities: list[BridgeScopeAmbiguity] = []
+    for (requirement_id, normalized_subject), by_scope in grouped.items():
+        if len(by_scope) < 2:
+            continue
+        scope_keys = tuple(sorted(by_scope))
+        has_incompatible_pair = any(
+            _scope_keys_explicitly_conflict(left, right)
+            for index, left in enumerate(scope_keys)
+            for right in scope_keys[index + 1:]
+        )
+        if not has_incompatible_pair:
+            continue
+
+        alternatives: list[BridgeScopeAlternative] = []
+        for scope_key in scope_keys:
+            scoped_facts = by_scope[scope_key]
+            sample = scoped_facts[0]
+            alternatives.append(BridgeScopeAlternative(
+                requirement_id=sample.requirement_id,
+                subject=sample.subject,
+                scope_products=scope_key[0],
+                scope_versions=scope_key[1],
+                scope_projects=scope_key[2],
+                source_kb_ids=tuple(sorted({
+                    fact.source_kb_id for fact in scoped_facts if fact.source_kb_id
+                })),
+                source_doc_ids=tuple(sorted({
+                    fact.source_doc_id for fact in scoped_facts if fact.source_doc_id
+                })),
+                source_chunk_ids=tuple(sorted({
+                    fact.source_chunk_id for fact in scoped_facts if fact.source_chunk_id
+                })),
+            ))
+        # The original subject preserves user-facing diagnostic readability;
+        # its normalized form is only the grouping key.
+        _ = normalized_subject
+        ambiguities.append(BridgeScopeAmbiguity(
+            requirement_id=requirement_id,
+            subject=alternatives[0].subject,
+            alternatives=tuple(alternatives),
+        ))
+    return tuple(ambiguities)
+
+
+def _scope_keys_explicitly_conflict(
+    left: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+    right: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> bool:
+    return any(
+        _scopes_explicitly_conflict(left_values, right_values)
+        for left_values, right_values in zip(left, right)
+    )
+
+
 def _scopes_overlap(left: Sequence[str], right: Sequence[str]) -> bool:
     return not left or not right or bool(set(left) & set(right))
 
@@ -1174,7 +1487,16 @@ def bridge_fact_matches_candidate_scope(
     )
 
 
-def _target_text(answer_description: str, subjects: Sequence[str]) -> str:
+def _answer_surface_source(answer_description: str) -> str:
+    """Return the answer-facing current-turn text without bridge rewriting.
+
+    Older resolution code deleted every bridge subject from the question before
+    identifying the target.  In CJK text that changes word boundaries and can
+    turn a direct condition (for example ``偏远地区出差``) into an unrelated
+    noun.  Keep the source phrase intact and delegate its grammatical split to
+    the shared current-turn frame instead.
+    """
+
     value = str(answer_description or "")
     clauses = [
         clause.strip()
@@ -1196,32 +1518,63 @@ def _target_text(answer_description: str, subjects: Sequence[str]) -> str:
         value = clauses[0]
     value = _LEADING_GROUNDED_WRITING_RE.sub("", value).strip()
     value = _LEADING_POLICY_LOOKUP_ACTION_RE.sub("", value).strip()
-    constraints = extract_query_constraints(value)
-    matched_scope = str(constraints.matched_text or "").strip()
-    if matched_scope:
-        value = re.sub(
-            re.escape(matched_scope),
-            " ",
-            value,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-    for subject in sorted(set(subjects), key=len, reverse=True):
-        value = re.sub(re.escape(subject), " ", value, flags=re.IGNORECASE)
-    # Subject removal can leave grammatical particles as isolated tokens. Only
-    # remove those newly exposed boundaries; never delete the same characters
-    # inside a business noun such as ``目的地`` or ``在途订单``.
-    value = re.sub(
-        r"(?<![A-Za-z0-9_\u3400-\u9fff])的(?=[\s\u3400-\u9fff])",
-        " ",
-        value,
-    )
-    value = re.sub(
-        r"(?<![A-Za-z0-9_\u3400-\u9fff])(?:在|于|和|与|及)(?=\s)",
-        " ",
-        value,
-    )
-    value = value.strip(" \t：:,，。；;?？")
+    return value.strip(" \t：:,，。；;?？")
+
+
+def _answer_surface_frame(answer_description: str) -> QuerySurfaceFrame | None:
+    """Parse the answer head once through the shared sentence layer."""
+
+    return parse_query_surface_frame(_answer_surface_source(answer_description))
+
+
+def _direct_stable_entity_subjects(
+    answer_description: str,
+    *,
+    bridge_subjects: Sequence[str],
+    has_bridge_edge: bool,
+) -> tuple[str, ...]:
+    """Return direct-claim applicability subjects without inventing a bridge.
+
+    A stable named entity (for example ``供应商甲`` or ``客户A``) is an
+    attribute scope, not a population that the planner may silently classify.
+    When such an answer has no declared proof *or* augmentation edge, a
+    generic class policy such as ``高风险供应商暂停准入`` cannot establish what
+    applies to that named entity.  The source claim must name the entity.
+
+    This intentionally uses only the shared syntactic frame and stable-name
+    classifier.  It does not contain domain vocabulary, inspect a registry,
+    infer a risk/grade value, or turn a direct attribute lookup into a bridge.
+    Any declared bridge owns its own applicability semantics, so this direct
+    guard must not compete with it.
+    """
+
+    if bridge_subjects or has_bridge_edge:
+        return ()
+    frame = _answer_surface_frame(answer_description)
+    if frame is None:
+        return ()
+    return tuple(dict.fromkeys(
+        qualifier.text
+        for qualifier in frame.qualifiers
+        if qualifier.kind == "entity"
+        and is_stable_entity_qualifier(qualifier.text)
+    ))
+
+
+def _target_text(answer_description: str, subjects: Sequence[str]) -> str:
+    """Return a source-preserving answer target.
+
+    ``subjects`` remains in the public helper signature for compatibility with
+    callers, but it is deliberately not used to rewrite the question.  Bridge
+    facts constrain applicability elsewhere; the current-turn surface frame
+    alone owns target and qualifier boundaries.
+    """
+
+    del subjects
+    frame = _answer_surface_frame(answer_description)
+    if frame is not None:
+        return frame.answer_target
+    value = _answer_surface_source(answer_description)
     value = _TARGET_CONDITION_QUESTION_RE.sub(
         lambda match: match.group("target"),
         value,
@@ -1253,23 +1606,17 @@ def _target_text(answer_description: str, subjects: Sequence[str]) -> str:
     return value
 
 
-def answer_target_terms(
-    answer_description: str,
-    *,
-    bridge_subjects: Sequence[str],
-) -> tuple[str, ...]:
-    """Return domain-neutral answer terms after removing bridge subjects."""
+def _target_terms_from_text(value: str) -> tuple[str, ...]:
+    """Tokenize one already-normalized answer head without changing meaning."""
 
     terms: list[str] = []
-    for match in _TEXT_TOKEN_RE.finditer(
-        _target_text(answer_description, bridge_subjects).casefold()
-    ):
+    for match in _TEXT_TOKEN_RE.finditer(value.casefold()):
         token = match.group(0)
         if not re.fullmatch(r"[\u3400-\u9fff]+", token) or 2 <= len(token) <= 24:
             terms.append(token)
-        # Split a grammatical possessive only when both sides are substantial
-        # phrases. This yields ``出差`` + ``住宿`` from ``出差的住宿`` without
-        # globally deleting the same character inside ``目的地``.
+        # Split an explicit grammatical possessive only when both sides are
+        # substantial phrases.  This yields ``出差`` + ``住宿`` from ``出差的
+        # 住宿`` without mechanically deleting a bridge subject.
         if re.fullmatch(r"[\u3400-\u9fff]{5,}", token) and "的" in token:
             for left, right in re.findall(
                 r"([\u3400-\u9fff]{2,})的([\u3400-\u9fff]{2,})",
@@ -1283,10 +1630,67 @@ def answer_target_terms(
                 and _ACTION_QUALIFIED_TARGET_SUFFIX_RE.search(token)
             ):
                 terms.append(without_action)
+        # Preserve the full target as the primary anchor, but retain one
+        # outer answer-shape-free form (``餐补金额`` -> ``餐补``).  This is a
+        # grammar-level projection, not a synonym table, and keeps existing
+        # compact-vs-expanded source wording evidence-compatible.
+        reduced = _TARGET_SHAPE_SUFFIX_RE.sub("", token).strip()
+        if 2 <= len(reduced) < len(token):
+            terms.append(reduced)
     return tuple(dict.fromkeys(
-        term
-        for term in terms
-        if term not in _GENERIC_TARGET_TERMS
+        term for term in terms if term not in _GENERIC_TARGET_TERMS
+    ))[:32]
+
+
+def _context_is_bound_by_bridge_subject(
+    context: str,
+    bridge_subjects: Sequence[str],
+) -> bool:
+    """Whether a frame condition is exactly represented by a bridge edge.
+
+    This is deliberately an equality check over independently parsed spans,
+    not textual subject deletion.  A source-resolved ``北京 -> 一线城市``
+    bridge may replace the literal condition in a second-hop clause, while an
+    unrelated residual phrase must still remain evidence-critical.
+    """
+
+    normalized_context = _compact_text(context)
+    normalized_context = re.sub(
+        r"^(?:在|于|针对|面向|按|对)",
+        "",
+        normalized_context,
+    )
+    if not normalized_context:
+        return False
+    return any(
+        normalized_context == _compact_text(subject)
+        for subject in bridge_subjects
+        if _compact_text(subject)
+    )
+
+
+def answer_target_terms(
+    answer_description: str,
+    *,
+    bridge_subjects: Sequence[str],
+) -> tuple[str, ...]:
+    """Return domain-neutral answer terms after removing bridge subjects."""
+
+    frame = _answer_surface_frame(answer_description)
+    target = _target_text(answer_description, bridge_subjects)
+    terms = list(_target_terms_from_text(target))
+    if frame is not None:
+        # A condition+scene frame may retain the scene in the composed target
+        # (``出差补贴``) while source prose separates it from the result
+        # predicate.  The scene is required through ``context_terms`` below,
+        # so adding only the residual result head (``补贴``) remains strict.
+        for context in frame.context_terms:
+            if target.casefold().startswith(context.casefold()):
+                residual = target[len(context):].strip()
+                if len(residual) >= 2:
+                    terms.extend(_target_terms_from_text(residual))
+    return tuple(dict.fromkeys(
+        term for term in terms if term not in _GENERIC_TARGET_TERMS
     ))[:32]
 
 
@@ -1310,6 +1714,33 @@ def _answer_target_semantic_parts(
     structural rule; it does not enumerate business entities or activities.
     """
 
+    frame = _answer_surface_frame(answer_description)
+    if frame is not None:
+        target = _target_text(answer_description, bridge_subjects)
+        context_terms = [
+            context
+            for context in frame.context_terms
+            if not _context_is_bound_by_bridge_subject(context, bridge_subjects)
+        ]
+        head_terms = list(_target_terms_from_text(target))
+        # See ``answer_target_terms`` for why the residual suffix is safe: it
+        # is only added when the omitted prefix is independently required as
+        # current-turn context, never as a loose synonym expansion.
+        for context in frame.context_terms:
+            if target.casefold().startswith(context.casefold()):
+                residual = target[len(context):].strip()
+                if len(residual) >= 2:
+                    head_terms.extend(_target_terms_from_text(residual))
+        return (
+            tuple(dict.fromkeys(context_terms))[:16],
+            tuple(dict.fromkeys(
+                term for term in head_terms if term not in _GENERIC_TARGET_TERMS
+            ))[:32],
+        )
+
+    # This fallback applies only to malformed/legacy text that cannot form a
+    # sentence frame.  It retains the old possessive split, but still never
+    # deletes a caller-supplied bridge subject.
     target_text = _target_text(answer_description, bridge_subjects).casefold()
     context_terms: list[str] = []
     head_terms: list[str] = []
@@ -1508,13 +1939,36 @@ def content_contains_bridge_value(content: Any, value: str) -> bool:
     return False
 
 
-def content_contains_positive_subject(content: Any, subject: str) -> bool:
-    """Match a positive, non-embedded subject occurrence in one claim."""
+def content_contains_positive_subject(
+    content: Any,
+    subject: str,
+    *,
+    target_terms: Sequence[str] = (),
+) -> bool:
+    """Match a positive subject without confusing a target noun for a suffix.
+
+    A generic subject matcher must reject ``普通员工家属`` as evidence about
+    ``普通员工``.  Chinese policy clauses also commonly omit a separator
+    between the applicable subject and the answer target, however:
+    ``普通员工餐补标准为100元``.  Treating every following CJK character as an
+    entity suffix made a direct, source-grounded answer disappear whenever an
+    optional classification bridge existed.
+
+    ``target_terms`` supplies the already parsed answer target only at the
+    answer-claim boundary.  A target may open the suffix; arbitrary text may
+    not.  Bridge-fact extraction keeps the default empty tuple and therefore
+    retains its stricter relation-only behavior.
+    """
 
     normalized = _compact_text(content)
     needle = _compact_text(subject)
     if len(needle) < 2 or not normalized:
         return False
+    normalized_targets = tuple(
+        target
+        for value in target_terms
+        if len(target := _compact_text(value)) >= 2
+    )
     for match in re.finditer(re.escape(needle), normalized, re.IGNORECASE):
         if _occurrence_is_excluded(normalized, match.start(), match.end()):
             continue
@@ -1529,11 +1983,17 @@ def content_contains_positive_subject(content: Any, subject: str) -> bool:
         first = suffix[0]
         if not re.match(r"[A-Za-z0-9_\u3400-\u9fff]", first):
             return True
+        if any(suffix.startswith(target) for target in normalized_targets):
+            return True
         # Chinese has no universal word boundary. Fail closed on arbitrary
         # entity suffixes, while permitting only grammatical/predicate starts.
+        # Coordinated conditions are an explicit positive boundary too:
+        # ``偏远地区或/及/和/与/以及艰苦地区`` names the same subject set rather
+        # than extending it into a new entity name.  Negated/excluded matches
+        # were already rejected above by ``_occurrence_is_excluded``.
         if re.match(
             r"(?:的|在|对应|属于|归属|映射|适用|享受|"
-            r"可|应|需|须|为|是|有|无|不)",
+            r"可|应|需|须|为|是|有|无|不|以及|或|及|和|与)",
             suffix,
         ):
             return True
@@ -1546,12 +2006,15 @@ def content_matches_answer_target(
     *,
     bridge_subjects: Sequence[str],
 ) -> bool:
-    terms = answer_target_terms(
+    context_terms, terms = _answer_target_semantic_parts(
         answer_description,
         bridge_subjects=bridge_subjects,
     )
     normalized_content = _normalized_text(content)
-    return bool(terms) and any(
+    return bool(terms) and all(
+        _target_anchor_matches(term, normalized_content)
+        for term in context_terms
+    ) and any(
         _target_anchor_matches(term, normalized_content) for term in terms
     )
 
@@ -1794,9 +2257,16 @@ def adjudicate_answer_claims(
     bridge_subjects: Sequence[str] = (),
     bridge_values: Sequence[str] = (),
     required_subjects: Sequence[str] = (),
+    has_bridge_edge: bool = False,
     document_root_target_verified: bool = False,
 ) -> tuple[ClaimAssertion, ...]:
-    """Return active, concrete claims that can support one answer target."""
+    """Return active, concrete claims that can support one answer target.
+
+    ``document_root_target_verified`` may relax only document-topic matching.
+    It never removes an explicit direct-entity applicability requirement: a
+    filename or sibling heading is not a statement about ``供应商甲`` /
+    ``客户A``.
+    """
 
     target_terms = answer_target_terms(
         answer_description,
@@ -1804,11 +2274,24 @@ def adjudicate_answer_claims(
     )
     if not target_terms:
         return ()
+    effective_required_subjects = tuple(dict.fromkeys(
+        str(subject).strip()
+        for subject in required_subjects
+        if str(subject).strip()
+    )) or _direct_stable_entity_subjects(
+        answer_description,
+        bridge_subjects=bridge_subjects,
+        has_bridge_edge=has_bridge_edge,
+    )
     assertions: list[ClaimAssertion] = []
     for claim in _iter_claim_units(content):
-        if required_subjects and not all(
-            content_contains_positive_subject(claim.semantic_text, subject)
-            for subject in required_subjects
+        if effective_required_subjects and not all(
+            content_contains_positive_subject(
+                claim.semantic_text,
+                subject,
+                target_terms=target_terms,
+            )
+            for subject in effective_required_subjects
         ):
             continue
         # Once a dependent answer has resolved its bridge (for example
@@ -2015,12 +2498,14 @@ def candidate_supports_resolved_answer(
     fact: ResolvedBridgeFact,
     *,
     bridge_subjects: Sequence[str],
+    bridge_requirement_ids: Sequence[str] | None = None,
 ) -> bool:
     return candidate_supports_resolved_answer_set(
         answer_requirement,
         candidate,
         (fact,),
         bridge_subjects=bridge_subjects,
+        bridge_requirement_ids=bridge_requirement_ids,
     )
 
 
@@ -2031,6 +2516,7 @@ def candidate_supports_resolved_answer_set(
     *,
     bridge_subjects: Sequence[str],
     document_root_target_verified: bool = False,
+    bridge_requirement_ids: Sequence[str] | None = None,
 ) -> bool:
     """Require every bridge dependency in one answer-bearing claim.
 
@@ -2046,7 +2532,14 @@ def candidate_supports_resolved_answer_set(
     if not _bridge_facts_are_scope_compatible(facts):
         return False
     content = _candidate_content(candidate)
-    if answer_requirement.depends_on_requirement_ids is not None:
+    if bridge_requirement_ids is not None:
+        dependency_ids = {
+            str(value or "").strip() for value in bridge_requirement_ids
+        }
+        fact_ids = {fact.requirement_id for fact in facts}
+        if not dependency_ids or fact_ids != dependency_ids:
+            return False
+    elif answer_requirement.depends_on_requirement_ids is not None:
         dependency_ids = set(answer_requirement.depends_on_requirement_ids)
         if not dependency_ids or not all(
             fact.requirement_id in dependency_ids for fact in facts
@@ -2191,26 +2684,118 @@ def _resolved_query_set(
     return re.sub(r"\s+", " ", replaced).strip()[:500]
 
 
-def build_bridge_expansion_queries(
+def build_bridge_expansion_specs(
     requirements: Sequence[AnswerRequirementV2],
     candidates: Sequence[Mapping[str, Any] | EvidenceItem],
-) -> tuple[str, ...]:
-    """Build only still-missing, source-resolved second-hop queries."""
+    *,
+    limit: int = 4,
+) -> tuple[ResolvedBridgeExpansionSpec, ...]:
+    """Build source-linked second-hop retrieval requests for missing answers."""
 
     facts, _ = partition_bridge_facts(resolve_bridge_facts(requirements, candidates))
+    # Compatibility-only helper: executable DAG callers must pass the typed
+    # paths compiled by RetrievalTaskGraph to the fact-driven API below.
+    paths = tuple(
+        AnswerBridgePath(
+            answer_task_id=f"answer_{answer.id}",
+            answer_requirement_id=answer.id,
+            bridge_task_ids=tuple(
+                f"bridge_{dependency_id}"
+                for dependency_id in bridge_dependency_ids_for_answer(
+                    answer,
+                    requirements,
+                )
+            ),
+            bridge_requirement_ids=bridge_dependency_ids_for_answer(
+                answer,
+                requirements,
+            ),
+            edge_mode="proof",
+            bridge_edge_modes={
+                f"bridge_{dependency_id}": "proof"
+                for dependency_id in bridge_dependency_ids_for_answer(
+                    answer,
+                    requirements,
+                )
+            },
+        )
+        for answer in requirements
+        if answer.role == "answer"
+        and bridge_dependency_ids_for_answer(answer, requirements)
+    )
+    return build_bridge_expansion_specs_from_facts(
+        requirements,
+        facts,
+        candidates,
+        paths=paths,
+        limit=limit,
+    )
+
+
+def build_bridge_expansion_specs_from_facts(
+    requirements: Sequence[AnswerRequirementV2],
+    facts: Sequence[ResolvedBridgeFact],
+    candidates: Sequence[Mapping[str, Any] | EvidenceItem],
+    *,
+    paths: Sequence[AnswerBridgePath],
+    limit: int = 4,
+) -> tuple[ResolvedBridgeExpansionSpec, ...]:
+    """Build second-hop specs from already-authorized bridge facts.
+
+    ``build_bridge_expansion_specs`` is convenient for compatibility callers
+    that have one homogeneous candidate set.  A DAG executor must be stricter:
+    it resolves each bridge only from that bridge task's own retrieval lineage,
+    then passes the resulting facts here.  Keeping this fact-driven entry point
+    prevents a mapping incidentally found by an anchor or sibling bridge query
+    from being retroactively attributed to the wrong prerequisite.
+    """
+
+    facts = tuple(facts)
     if not facts:
         return ()
-    queries: list[str] = []
-    answer_requirements = tuple(
-        requirement for requirement in requirements if requirement.role == "answer"
-    )
-    for answer in answer_requirements:
-        dependency_ids = set(bridge_dependency_ids_for_answer(
-            answer,
-            requirements,
-        ))
-        if not dependency_ids:
-            continue
+    bounded_limit = max(1, min(int(limit), 32))
+    specs: list[ResolvedBridgeExpansionSpec] = []
+    seen: set[
+        tuple[
+            str,
+            str,
+            tuple[tuple[str, str, str], ...],
+        ]
+    ] = set()
+    requirement_by_id = {item.id: item for item in requirements}
+    for path in paths:
+        if not isinstance(path, AnswerBridgePath):
+            raise ValueError("bridge expansion paths must be AnswerBridgePath values")
+        answer = requirement_by_id.get(path.answer_requirement_id)
+        if answer is None or answer.role != "answer":
+            raise ValueError("bridge expansion path references an unknown answer")
+        dependency_ids = tuple(path.bridge_requirement_ids)
+        # An augmentation path intentionally carries the answer's proof
+        # parents as well.  The optional edge may refine recall, but it must
+        # never create a route that bypasses a hard classification/condition
+        # prerequisite.  Comparing it only with the augmentation subset made
+        # every mixed path fail as "does not match declared edge" before its
+        # second-hop query could run.
+        declared_ids = (
+            bridge_requirement_ids_for_answer(
+                answer,
+                requirements,
+                mode="proof",
+            )
+            + bridge_requirement_ids_for_answer(
+                answer,
+                requirements,
+                mode="augmentation",
+            )
+            if path.edge_mode == "augmentation"
+            else bridge_requirement_ids_for_answer(
+                answer,
+                requirements,
+                mode="proof",
+            )
+        )
+        if dependency_ids != declared_ids:
+            raise ValueError("bridge expansion path does not match declared edge")
         facts_by_dependency: list[tuple[ResolvedBridgeFact, ...]] = []
         for dependency_id in dependency_ids:
             unique_scoped_facts: dict[
@@ -2257,33 +2842,69 @@ def build_bridge_expansion_queries(
                     candidate,
                     fact_set,
                     bridge_subjects=bridge_subjects,
+                    bridge_requirement_ids=dependency_ids,
                 )
                 for candidate in candidates
             ):
                 continue
             query = _resolved_query_set(answer.description, fact_set)
-            if query and query not in queries:
-                queries.append(query)
-            if len(queries) >= 4:
-                return tuple(queries)
-    return tuple(queries)
+            fact_identity = tuple(sorted(
+                (
+                    fact.requirement_id,
+                    _normalized_fact_value(fact.value),
+                    fact.source_chunk_id,
+                )
+                for fact in fact_set
+            ))
+            key = (answer.id, query.casefold(), fact_identity)
+            if not query or key in seen:
+                continue
+            seen.add(key)
+            specs.append(ResolvedBridgeExpansionSpec(
+                answer_requirement_id=answer.id,
+                bridge_requirement_ids=dependency_ids,
+                bridge_facts=tuple(fact_set),
+                query=query,
+                edge_mode=path.edge_mode,
+            ))
+            if len(specs) >= bounded_limit:
+                return tuple(specs)
+    return tuple(specs)
+
+
+def build_bridge_expansion_queries(
+    requirements: Sequence[AnswerRequirementV2],
+    candidates: Sequence[Mapping[str, Any] | EvidenceItem],
+) -> tuple[str, ...]:
+    """Compatibility projection of :func:`build_bridge_expansion_specs`."""
+
+    return tuple(dict.fromkeys(
+        spec.query for spec in build_bridge_expansion_specs(requirements, candidates)
+    ))
 
 
 __all__ = [
     "BridgeFactConflict",
+    "BridgeScopeAlternative",
+    "BridgeScopeAmbiguity",
     "ClaimAssertion",
+    "ResolvedBridgeExpansionSpec",
     "ResolvedBridgeFact",
     "adjudicate_answer_claims",
     "answer_target_terms",
     "bridge_dependency_ids_for_answer",
+    "bridge_requirement_ids_for_answer",
     "bridge_fact_matches_candidate_scope",
     "bridge_subject_for_requirement",
     "build_bridge_expansion_queries",
+    "build_bridge_expansion_specs",
+    "build_bridge_expansion_specs_from_facts",
     "candidate_supports_resolved_answer",
     "candidate_supports_resolved_answer_set",
     "content_contains_positive_subject",
     "content_matches_complete_answer_target",
     "content_matches_answer_target",
+    "detect_bridge_scope_ambiguities",
     "extract_bridge_subject",
     "extract_bridge_values",
     "partition_bridge_facts",

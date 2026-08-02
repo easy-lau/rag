@@ -2342,11 +2342,10 @@ def _select_verified_evidence(
             for item in supported_related
         }
         evidence_status = (
-            "version_mismatch"
+            "scope_mismatch"
             if statuses == {"mismatch"}
             and all(
-                item.get("query_has_version_constraint")
-                or item.get("query_has_hard_constraint")
+                item.get("query_has_constraint")
                 for item in supported_related
             )
             else "partial"
@@ -2354,15 +2353,10 @@ def _select_verified_evidence(
         # optional 通常来自“已选择知识库的通用聊天”。只有相近资料而没有
         # direct 时，把 related 注入模型会让一次误召回劫持原本可独立回答的
         # 闲聊；required 检索才允许在明确警告下使用 supported related。
-        productless_version_mismatch = all(
-            item.get("constraint_status") == "mismatch"
-            and item.get("query_has_version_constraint")
-            and not item.get("query_has_product_constraint")
-            for item in supported_related
-        )
+        scope_mismatch = evidence_status == "scope_mismatch"
         context_results = (
             supported_related
-            if allow_related_context and not productless_version_mismatch
+            if allow_related_context and not scope_mismatch
             else []
         )
     else:
@@ -2458,11 +2452,7 @@ def _select_unverified_evidence(
         status = "unverified"
     elif constraints.has_scope_constraint and mismatch:
         primary = mismatch
-        status = (
-            "version_mismatch"
-            if constraints.has_version_constraint
-            else "partial"
-        )
+        status = "scope_mismatch"
     elif constraints.has_scope_constraint:
         # An explicit product/version query must fail closed when deterministic
         # metadata cannot establish candidate scope.  In particular, generic
@@ -2487,18 +2477,14 @@ def _select_unverified_evidence(
         return _safe_score(previous_support) > 0
 
     context = [item for item in primary if can_enter_context(item)][:limit]
-    if (
-        constraints.has_version_constraint
-        and not constraints.has_product_constraint
-        and status == "version_mismatch"
-    ):
-        # A version without a product can safely select an exact source label,
-        # but a conflicting label does not identify which product's nearby
-        # material the user intended. Keep it visible as diagnostic retrieval
-        # only; never ask the generator to reinterpret it as an answer.
+    if status == "scope_mismatch":
+        # A candidate rejected by any explicit applicability dimension is a
+        # diagnostic retrieval artifact, not context.  This covers product,
+        # version and project uniformly; allowing one subtype into generation
+        # would make the terminal status merely cosmetic.
         context = []
     if primary and not context:
-        if status != "version_mismatch":
+        if status != "scope_mismatch":
             status = "no_hit"
 
     display: list[dict] = []
@@ -2558,11 +2544,11 @@ def _grounded_prompt(response_mode: str, evidence_status: str) -> str:
     else:
         role = "你是一个专业的企业知识库问答助手。请根据检索到的文档内容回答用户问题。"
 
-    if evidence_status == "version_mismatch":
+    if evidence_status == "scope_mismatch":
         evidence_rule = (
-            "本次只有与主题相关但产品版本或其他硬约束不匹配的相近资料。"
-            "必须先明确说明知识库没有目标版本的直接证据；可以分版本列出相近资料，"
-            "但必须逐项标注仅供参考，禁止断言这些参数适用于用户指定版本。"
+            "本次只有与主题相关但产品、版本或项目适用范围不匹配的相近资料。"
+            "必须先明确说明知识库没有目标范围的直接证据；可以按范围列出相近资料，"
+            "但必须逐项标注仅供参考，禁止断言这些内容适用于用户指定范围。"
         )
     elif evidence_status == "partial":
         evidence_rule = (
@@ -2609,11 +2595,11 @@ def _build_system_prompt(
                 "无法获得可靠资料。请简洁告知用户检索或验证服务暂时不可用并建议稍后重试；"
                 "禁止声称知识库中没有相关内容，也禁止用自己的知识猜测企业事实。"
             )
-        elif evidence_status == "version_mismatch":
+        elif evidence_status == "scope_mismatch":
             prompt = (
-                "你是企业知识库问答助手。本次只检索到明确属于其他版本的资料，"
-                "这些资料没有进入回答上下文。请简洁说明知识库没有可用于回答目标版本的"
-                "直接证据，并建议用户确认产品名称或版本；禁止转述其他版本的配置，"
+                "你是企业知识库问答助手。本次只检索到明确属于其他适用范围的资料，"
+                "这些资料没有进入回答上下文。请简洁说明知识库没有可用于回答目标范围的"
+                "直接证据，并建议用户确认产品、版本或项目；禁止转述其它范围的配置，"
                 "也禁止用自己的知识猜测企业事实。"
             )
         else:

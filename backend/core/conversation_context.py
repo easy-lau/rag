@@ -11,14 +11,24 @@ from __future__ import annotations
 
 import re
 import uuid
+import logging
 from dataclasses import dataclass, replace
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.query_constraints import extract_query_constraints
+from core.query_surface_structure import (
+    has_current_turn_local_enumeration_antecedent,
+    parse_distributive_enumeration,
+)
+from core.query_semantics import ResolvedTurnSemantics
+from core.read_sessions import ReadSessionFactory, isolated_read_session
 from models.db_models import Document, DocumentChunk, Message
+
+
+logger = logging.getLogger(__name__)
 
 
 HISTORY_MESSAGE_LIMIT = 6
@@ -308,6 +318,37 @@ def _unresolved_reason_without_history(question: str) -> str | None:
     return None
 
 
+def _has_local_anaphora_antecedent(
+    question: str,
+    match: re.Match[str],
+) -> bool:
+    """Whether ``这些/那些`` resolves to an explicit list in this sentence.
+
+    The test is intentionally syntactic and domain-neutral.  It does not try
+    to infer what a list item means; it only recognizes a sequence of at least
+    two non-empty units before the demonstrative plus a distributive question
+    tail.  That distinction prevents ``这些配置有什么影响`` from losing its
+    genuine historical reference while keeping a self-contained question such
+    as ``住宿、餐补还有出差补贴这些分别是多少`` out of stale context rewriting.
+    """
+
+    marker = str(match.group(0) or "").strip()
+    if marker not in {"这些", "那些"}:
+        return False
+    # The context resolver and the query planner must share this boundary.
+    # Do not reconstruct it with an independent regular expression here: that
+    # was the root cause of one module treating a current enumeration as a
+    # history-follow-up while the other split it into three questions.
+    structure = parse_distributive_enumeration(question)
+    if (
+        structure is not None
+        and structure.local_anaphora == marker
+        and structure.has_local_anaphora_antecedent
+    ):
+        return True
+    return has_current_turn_local_enumeration_antecedent(question)
+
+
 @dataclass(frozen=True)
 class ConversationContext:
     """Prepared context passed from the API layer into the RAG pipeline."""
@@ -328,6 +369,196 @@ class ConversationContext:
     query_resolution_mode: str = "current"
     context_turn_keys: tuple[str, ...] = ()
     pending_route_state: dict[str, Any] | None = None
+
+
+V2ExecutionContextMode = Literal[
+    "current_turn_baseline",
+    "resolved_turn_semantics",
+    "v3_catalog_context",
+]
+
+
+@dataclass(frozen=True)
+class V2ExecutionContext:
+    """The only conversation data V2 is allowed to receive for execution.
+
+    ``ConversationContext`` deliberately keeps a candidate pool while routing
+    and source-anchored analysis are in progress.  That pool may contain
+    legacy route-selected history, but it is *not* executable semantic state.
+    Passing the same object to V2 used to let that candidate history reach the
+    answer model whenever analysis timed out or was rejected.
+
+    This narrower hand-off makes the boundary explicit: the initial execution
+    context is always current-turn-only; history and carry-over evidence may
+    appear only after ``ResolvedTurnSemantics`` has been applied and verified.
+    """
+
+    mode: V2ExecutionContextMode
+    retrieval_query: str
+    conversation_history: tuple[dict[str, str], ...]
+    carryover_sources: tuple[dict[str, Any], ...]
+    is_followup: bool
+    followup_reason: str
+    context_turn_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        query = str(self.retrieval_query or "").strip()
+        if not query:
+            raise ValueError("V2 execution context requires a retrieval query")
+        if self.mode == "current_turn_baseline":
+            if (
+                self.conversation_history
+                or self.carryover_sources
+                or self.is_followup
+                or self.context_turn_keys
+            ):
+                raise ValueError(
+                    "current-turn V2 execution context cannot contain history"
+                )
+        elif self.mode not in {"resolved_turn_semantics", "v3_catalog_context"}:
+            raise ValueError("unsupported V2 execution context mode")
+        object.__setattr__(self, "retrieval_query", query)
+
+    @property
+    def semantic_context_applied(self) -> bool:
+        return self.mode != "current_turn_baseline"
+
+    def safe_summary(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "semantic_context_applied": self.semantic_context_applied,
+            "is_followup": self.is_followup,
+            "context_turn_count": len(self.context_turn_keys),
+            "history_message_count": len(self.conversation_history),
+            "carryover_source_count": len(self.carryover_sources),
+        }
+
+
+def build_current_turn_v2_execution_context(
+    *,
+    retrieval_query: str,
+) -> V2ExecutionContext:
+    """Build the fail-closed V2 baseline before semantic analysis succeeds.
+
+    The caller supplies the exact current-turn (or a server-authorized pending
+    evidence-selection) retrieval query.  There is intentionally no
+    ``ConversationContext`` argument: a route candidate context must not be
+    copied into the execution baseline by accident.
+    """
+
+    return V2ExecutionContext(
+        mode="current_turn_baseline",
+        retrieval_query=retrieval_query,
+        conversation_history=(),
+        carryover_sources=(),
+        is_followup=False,
+        followup_reason="v2_current_turn_baseline",
+        context_turn_keys=(),
+    )
+
+
+def build_v3_catalog_candidate_context(
+    *,
+    context: ConversationContext,
+    current_question: str,
+) -> ConversationContext:
+    """Clear provisional history before V3 selects a catalog-bound span.
+
+    ``prepare_conversation_context`` retains a legacy heuristic projection for
+    the explicit compatibility entry.  V3 must never treat that projection as
+    execution state: route candidates are only a bounded, authorised source
+    catalog and the literal current question remains the immutable anchor
+    until ``apply_v3_catalog_context_selection`` has validated a selection and
+    reloaded its evidence under the current request scope.
+    """
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    query = str(current_question or "").strip()
+    if not query:
+        raise ValueError("V3 catalog candidate context requires current question")
+    return replace(
+        context,
+        is_followup=False,
+        followup_reason="v3_catalog_candidate_pool",
+        standalone_query=query,
+        history_messages=(),
+        carryover_sources=(),
+        unresolved_reference=False,
+        relation="new",
+        query_resolution_mode="v3_catalog_candidate_pool",
+        context_turn_keys=(),
+    )
+
+
+def build_resolved_v2_execution_context(
+    *,
+    context: ConversationContext,
+    semantics: ResolvedTurnSemantics,
+) -> V2ExecutionContext:
+    """Project a successfully applied semantic contract into V2 inputs.
+
+    ``apply_resolved_turn_semantics`` reloads selected sources under current
+    RBAC/KB scope.  This function performs a second structural equality check
+    before handing the result to V2, preventing a stale route context from
+    being paired with a newly compiled semantic plan.
+    """
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    if not isinstance(semantics, ResolvedTurnSemantics):
+        raise ValueError("semantics must be a ResolvedTurnSemantics")
+    if context.standalone_query != semantics.canonical_retrieval_query:
+        raise ValueError("resolved V2 context query does not match semantics")
+    if context.context_turn_keys != semantics.selected_context_turn_keys:
+        raise ValueError("resolved V2 context keys do not match semantics")
+    expected_followup = not semantics.self_contained
+    if context.is_followup != expected_followup:
+        raise ValueError("resolved V2 context follow-up state does not match semantics")
+    return V2ExecutionContext(
+        mode="resolved_turn_semantics",
+        retrieval_query=context.standalone_query,
+        conversation_history=tuple(context.history_messages),
+        carryover_sources=tuple(context.carryover_sources),
+        is_followup=context.is_followup,
+        followup_reason=context.followup_reason,
+        context_turn_keys=context.context_turn_keys,
+    )
+
+
+def build_v3_catalog_v2_execution_context(
+    *,
+    context: ConversationContext,
+    current_question: str,
+) -> V2ExecutionContext:
+    """Project a trusted V3 catalog selection into V2 execution inputs.
+
+    The V3 compiler already carries historical qualifier text in its answer
+    task descriptions.  The retrieval anchor must nevertheless remain the
+    literal current question, rather than the old history-concatenated
+    standalone query.  Selected history is available only as bounded dialogue
+    context and freshly reloaded carry-over evidence.
+    """
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    query = str(current_question or "").strip()
+    if not query:
+        raise ValueError("V3 catalog execution requires the current question")
+    if context.standalone_query != query:
+        raise ValueError("V3 catalog context must retain the current question")
+    expected_followup = bool(context.context_turn_keys)
+    if context.is_followup != expected_followup:
+        raise ValueError("V3 catalog context follow-up state does not match keys")
+    return V2ExecutionContext(
+        mode="v3_catalog_context",
+        retrieval_query=query,
+        conversation_history=tuple(context.history_messages),
+        carryover_sources=tuple(context.carryover_sources),
+        is_followup=context.is_followup,
+        followup_reason=context.followup_reason,
+        context_turn_keys=context.context_turn_keys,
+    )
 
 
 @dataclass(frozen=True)
@@ -383,12 +614,18 @@ def detect_followup(
         return False, "explicit_new_topic"
     if _has_explicit_postfix_object(normalized):
         return False, "explicit_postfix_object"
+    reference_matches = tuple(_REFERENCE_RE.finditer(normalized))
+    if (
+        len(reference_matches) == 1
+        and _has_local_anaphora_antecedent(normalized, reference_matches[0])
+    ):
+        return False, f"local_anaphora_antecedent:{reference_matches[0].group(0)}"
     if not has_previous_turn:
         unresolved = _unresolved_reason_without_history(normalized)
         if unresolved is not None:
             return False, unresolved
         return False, "no_previous_turn"
-    match = _REFERENCE_RE.search(normalized)
+    match = reference_matches[0] if reference_matches else None
     if match:
         return True, f"anaphora:{match.group(0)}"
     if _ELLIPTICAL_ENTITY_FOLLOWUP_RE.fullmatch(normalized):
@@ -720,8 +957,18 @@ async def _reload_carryover_sources(
     db: AsyncSession,
     raw_sources: Iterable[dict[str, Any]],
     kb_ids: Iterable[uuid.UUID],
+    *,
+    read_session_factory: ReadSessionFactory | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Reload prior chunks under the current KB scope and document state."""
+    """Reload prior chunks under the current KB scope and document state.
+
+    Carry-over is a bounded recall enhancement, not part of turn/message
+    persistence.  In production it therefore runs in an owned read session:
+    a missing optional table or a stale document row cannot abort the request
+    transaction that owns the current conversation turn.  Scalar snapshots
+    are projected before the owned session rolls back, so no detached ORM
+    object can escape this boundary.
+    """
 
     allowed_kb_ids = tuple(dict.fromkeys(kb_ids))
     if not allowed_kb_ids:
@@ -759,28 +1006,39 @@ async def _reload_carryover_sources(
             Document.status == "ready",
         )
     )
-    rows = (await db.execute(statement)).all()
     valid: dict[uuid.UUID, dict[str, Any]] = {}
-    for chunk, document in rows:
-        snapshot = snapshots.get(chunk.id, {})
-        valid[chunk.id] = {
-            "id": chunk.id,
-            "doc_id": chunk.doc_id,
-            "kb_id": chunk.kb_id,
-            "content": chunk.content,
-            "chunk_index": chunk.chunk_index,
-            "metadata": chunk.metadata_ or {},
-            "filename": document.filename,
-            "file_type": document.file_type,
-            "source_url": document.source_url,
-            "doc_tags": document.tags or [],
-            # Old ranking scores are intentionally not reused for a new query.
-            "retrieval_score": 0.0,
-            "score": 0.0,
-            "candidate_origin": "carryover_previous_turn",
-            "carryover_previous_role": snapshot.get("evidence_role"),
-            "carryover_previous_support": snapshot.get("answer_support"),
-        }
+    try:
+        async with isolated_read_session(
+            request_db=db,
+            session_factory=read_session_factory,
+        ) as read_db:
+            rows = (await read_db.execute(statement)).all()
+            for chunk, document in rows:
+                snapshot = snapshots.get(chunk.id, {})
+                valid[chunk.id] = {
+                    "id": chunk.id,
+                    "doc_id": chunk.doc_id,
+                    "kb_id": chunk.kb_id,
+                    "content": chunk.content,
+                    "chunk_index": chunk.chunk_index,
+                    "metadata": dict(chunk.metadata_ or {}),
+                    "filename": document.filename,
+                    "file_type": document.file_type,
+                    "source_url": document.source_url,
+                    "doc_tags": list(document.tags or []),
+                    # Old ranking scores are intentionally not reused for a new query.
+                    "retrieval_score": 0.0,
+                    "score": 0.0,
+                    "candidate_origin": "carryover_previous_turn",
+                    "carryover_previous_role": snapshot.get("evidence_role"),
+                    "carryover_previous_support": snapshot.get("answer_support"),
+                }
+    except Exception as exc:
+        logger.warning(
+            "[conversation context] carry-over source reload degraded error=%s",
+            type(exc).__name__,
+        )
+        return ()
     return tuple(valid[chunk_id] for chunk_id in ordered_ids if chunk_id in valid)
 
 
@@ -791,6 +1049,7 @@ async def prepare_conversation_context(
     question: str,
     kb_ids: Iterable[uuid.UUID],
     pending_route_state: dict[str, Any] | None = None,
+    read_session_factory: ReadSessionFactory | None = None,
 ) -> ConversationContext:
     """Load recent dialogue, resolve follow-up references and validate sources."""
 
@@ -864,6 +1123,7 @@ async def prepare_conversation_context(
             db,
             previous_assistant.sources or [],
             kb_ids,
+            read_session_factory=read_session_factory,
         )
 
     if clarification_slot_answer and previous_user is not None:
@@ -906,6 +1166,7 @@ async def resolve_routed_conversation_context(
     question: str,
     kb_ids: Iterable[uuid.UUID],
     route_decision: Any,
+    read_session_factory: ReadSessionFactory | None = None,
 ) -> ConversationContext:
     """Apply a validated semantic route to the local conversation context.
 
@@ -956,7 +1217,12 @@ async def resolve_routed_conversation_context(
         raw_sources: list[dict[str, Any]] = []
         for candidate in selected:
             raw_sources.extend(candidate.raw_sources)
-        carryover_sources = await _reload_carryover_sources(db, raw_sources, kb_ids)
+        carryover_sources = await _reload_carryover_sources(
+            db,
+            raw_sources,
+            kb_ids,
+            read_session_factory=read_session_factory,
+        )
 
     previous_candidate = selected[0] if selected else None
     pending_slot_answer = bool(
@@ -1026,6 +1292,181 @@ async def resolve_routed_conversation_context(
         unresolved_reference=unresolved,
         relation=relation,
         query_resolution_mode=mode,
+        context_turn_keys=tuple(candidate.candidate_key for candidate in selected),
+    )
+
+
+async def apply_resolved_turn_semantics(
+    db: AsyncSession,
+    *,
+    context: ConversationContext,
+    semantics: ResolvedTurnSemantics,
+    kb_ids: Iterable[uuid.UUID],
+    read_session_factory: ReadSessionFactory | None = None,
+) -> ConversationContext:
+    """Apply the one validated semantic context selection to a conversation.
+
+    This is deliberately separate from :func:`resolve_routed_conversation_context`.
+    The route contract classifies a request and applies permission policy;
+    source-anchored turn semantics select literal historical qualifiers.  The
+    old implementation joined prior text into ``standalone_query`` and made a
+    later planner guess again.  Here selected history is retained as typed
+    source references and only the canonical retrieval rendering is updated.
+
+    Prior evidence is always reloaded under the *current* KB scope.  A model
+    supplied turn key can therefore never replay a stale document snapshot or
+    widen access to a previous source.
+    """
+
+    if not isinstance(semantics, ResolvedTurnSemantics):
+        raise ValueError("semantics must be a ResolvedTurnSemantics")
+    candidate_by_key = {
+        item.candidate_key: item for item in context.route_turn_candidates
+    }
+    selected: list[RouteTurnCandidate] = []
+    for key in semantics.selected_context_turn_keys:
+        candidate = candidate_by_key.get(key)
+        if candidate is None:
+            # The strict model parser normally prevents this.  Fail closed for
+            # direct callers too: silently substituting t1 would be a stale
+            # context leak.
+            raise ValueError("resolved semantics references unavailable context turn")
+        selected.append(candidate)
+
+    raw_sources: list[dict[str, Any]] = []
+    for candidate in selected:
+        raw_sources.extend(candidate.raw_sources)
+    carryover_sources = await _reload_carryover_sources(
+        db,
+        raw_sources,
+        kb_ids,
+        read_session_factory=read_session_factory,
+    ) if selected else ()
+
+    history_messages: tuple[dict[str, str], ...] = ()
+    if selected:
+        prepared: list[_SyntheticMessage] = []
+        for candidate in reversed(selected):
+            if candidate.user_question:
+                prepared.append(_SyntheticMessage(
+                    role="user",
+                    content=candidate.user_question[:HISTORY_MESSAGE_CHARS],
+                ))
+            if candidate.assistant_answer:
+                prepared.append(_SyntheticMessage(
+                    role="assistant",
+                    content=candidate.assistant_answer[:HISTORY_MESSAGE_CHARS],
+                ))
+        history_messages = _bounded_history(prepared)
+
+    is_contextual = not semantics.self_contained
+    previous_candidate = selected[0] if selected else None
+    return replace(
+        context,
+        is_followup=is_contextual,
+        followup_reason=(
+            "resolved_turn_semantics_contextual"
+            if is_contextual
+            else "resolved_turn_semantics_current"
+        ),
+        # This is a terminal retrieval rendering only.  No planner/analyzer
+        # may consume it as a replacement source sentence.
+        standalone_query=semantics.canonical_retrieval_query,
+        history_messages=history_messages,
+        carryover_sources=carryover_sources,
+        previous_user_question=(
+            previous_candidate.user_question
+            if previous_candidate is not None
+            else context.previous_user_question
+        ),
+        unresolved_reference=False,
+        relation=semantics.relation,
+        query_resolution_mode=("contextualize" if is_contextual else "current"),
+        context_turn_keys=semantics.selected_context_turn_keys,
+    )
+
+
+async def apply_v3_catalog_context_selection(
+    db: AsyncSession,
+    *,
+    context: ConversationContext,
+    current_question: str,
+    selected_context_turn_keys: Iterable[str],
+    kb_ids: Iterable[uuid.UUID],
+    read_session_factory: ReadSessionFactory | None = None,
+) -> ConversationContext:
+    """Apply only V3 catalog-selected history under current authorisation.
+
+    A V3 model cannot name a database message, document or source.  It can
+    only select a ``tN`` span from the route-authorised catalog.  This adapter
+    re-resolves those keys against the request-local candidates, reloads any
+    reusable evidence inside an owned read transaction, and retains the raw
+    *current* question as the retrieval anchor.  It deliberately does not
+    concatenate historical user text into a new query or fabricate a
+    ``ResolvedTurnSemantics`` object from V3 data.
+    """
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    query = str(current_question or "").strip()
+    if not query:
+        raise ValueError("V3 catalog context selection requires current question")
+    requested = tuple(str(key or "").strip() for key in selected_context_turn_keys)
+    if len(requested) > 3 or len(set(requested)) != len(requested):
+        raise ValueError("V3 catalog context keys are invalid")
+    candidate_by_key = {
+        item.candidate_key: item for item in context.route_turn_candidates
+    }
+    selected: list[RouteTurnCandidate] = []
+    for key in requested:
+        candidate = candidate_by_key.get(key)
+        if candidate is None:
+            raise ValueError("V3 catalog references unavailable context turn")
+        selected.append(candidate)
+
+    raw_sources: list[dict[str, Any]] = []
+    for candidate in selected:
+        raw_sources.extend(candidate.raw_sources)
+    carryover_sources = await _reload_carryover_sources(
+        db,
+        raw_sources,
+        kb_ids,
+        read_session_factory=read_session_factory,
+    ) if selected else ()
+
+    history_messages: tuple[dict[str, str], ...] = ()
+    if selected:
+        prepared: list[_SyntheticMessage] = []
+        for candidate in reversed(selected):
+            if candidate.user_question:
+                prepared.append(_SyntheticMessage(
+                    role="user",
+                    content=candidate.user_question[:HISTORY_MESSAGE_CHARS],
+                ))
+            if candidate.assistant_answer:
+                prepared.append(_SyntheticMessage(
+                    role="assistant",
+                    content=candidate.assistant_answer[:HISTORY_MESSAGE_CHARS],
+                ))
+        history_messages = _bounded_history(prepared)
+
+    return replace(
+        context,
+        is_followup=bool(selected),
+        followup_reason=(
+            "query_understanding_v3_contextual"
+            if selected
+            else "query_understanding_v3_current"
+        ),
+        standalone_query=query,
+        history_messages=history_messages,
+        carryover_sources=carryover_sources,
+        previous_user_question=(
+            selected[0].user_question if selected else context.previous_user_question
+        ),
+        unresolved_reference=False,
+        relation="followup" if selected else "new",
+        query_resolution_mode="v3_catalog",
         context_turn_keys=tuple(candidate.candidate_key for candidate in selected),
     )
 

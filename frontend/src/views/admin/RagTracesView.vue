@@ -143,7 +143,7 @@
           <ol class="trace-event-list">
             <li v-for="event in detail.events" :key="event.id" class="trace-event">
               <span class="trace-event__line" aria-hidden="true"></span>
-              <span class="trace-event__dot" :class="eventTone(event.event)" aria-hidden="true"></span>
+              <span class="trace-event__dot" :class="eventTone(event)" aria-hidden="true"></span>
               <button
                 type="button"
                 class="trace-event__trigger"
@@ -158,7 +158,12 @@
                 <span v-if="eventDuration(event)" class="trace-event__duration">{{ eventDuration(event) }}</span>
                 <span class="trace-event__chevron" :class="{ 'is-open': expandedEvents.has(event.sequence) }">⌄</span>
               </button>
-              <pre v-if="expandedEvents.has(event.sequence)" class="trace-event__payload">{{ prettyPayload(event.payload) }}</pre>
+              <template v-if="expandedEvents.has(event.sequence)">
+                <p v-if="eventPayloadLabel(event)" class="trace-event__payload-label">
+                  {{ eventPayloadLabel(event) }}
+                </p>
+                <pre class="trace-event__payload">{{ prettyPayload(event.payload) }}</pre>
+              </template>
             </li>
           </ol>
           <div v-if="detail.events.length < detail.event_count" class="trace-event-more">
@@ -220,6 +225,7 @@ import AuditDetailDrawer from '@/components/ui/AuditDetailDrawer.vue'
 import AppModal from '@/components/ui/AppModal.vue'
 import { downloadRagTrace, getRagTraceDetail, getRagTraces } from '@/api/ragTraces'
 import { useAuthStore } from '@/stores/auth'
+import { evidenceStatusLabel } from '@/utils/evidenceStatus'
 
 const message = useMessage()
 const authStore = useAuthStore()
@@ -263,11 +269,33 @@ const EVENT_LABELS = {
   'intent.model_error': '意图模型调用失败',
   'intent.contract_compiled': '编译路由执行合同',
   'intent.routing_decision': '确定智能路由策略',
+  'intent.semantic_entry_gate': '校验 V3 语义入口闸门',
   'intent.clarification_created': '保存待澄清任务',
   'intent.clarification_resolved': '完成待澄清任务',
   'intent.clarification_expired': '待澄清任务已过期',
   'direct.plan': '制定直答计划',
   'query.plan': '制定查询与证据计划',
+  'query.execution': '校验查询执行基线',
+  'query.analysis.requested': '请求大模型结构化理解',
+  'query.analysis.completed': '收到大模型结构化理解',
+  'query.analysis.validated': '校验大模型结构化理解',
+  'query.analysis.execution_validated': '校验结构化理解执行边界',
+  'query.analysis.compiled': '编译结构化检索计划',
+  'query.analysis.execution_decision': '确定结构化理解执行结果',
+  'query.analysis.fallback': '回退到确定性执行计划',
+  'query.analysis.skipped': '跳过大模型结构化理解',
+  'query.analysis.cancelled': '取消大模型结构化理解',
+  'query.analysis.shadow_submitted': '提交影子结构化理解评测',
+  'query.understanding.v3.requested': '请求 V3 受限 Span 结构理解',
+  'query.understanding.v3.completed': '收到 V3 结构理解结果',
+  'query.understanding.v3.validated': '校验 V3 Span 选择协议',
+  'query.understanding.v3.deterministic_contextual_ellipsis': '解析严格本地追问 Span',
+  'query.understanding.v3.execution_validated': '校验 V3 可信编译边界',
+  'query.understanding.v3.compiled': '编译 V3 可信执行计划',
+  'query.understanding.v3.execution_decision': '确定 V3 执行结果',
+  'query.understanding.v3.revision_fence': '校验 V3 请求版本围栏',
+  'query.understanding.v3.fallback': 'V3 回退确定性计划',
+  'query.understanding.v3.cancelled': '取消 V3 结构理解',
   'evidence.ambiguity_assessed': '检查证据适用范围',
   'evidence.clarification_required': '要求选择证据范围',
   'evidence.clarification_created': '保存证据范围选项',
@@ -294,6 +322,9 @@ const EVENT_LABELS = {
   'retrieval.plan_query_error': '补充查询召回失败',
   'retrieval.small_document_candidates_completed': '完成小文档候选装配',
   'retrieval.carryover_anchor': '复验历史证据锚点',
+  'retrieval.anchor_preflight.completed': '完成原问题锚点预取',
+  'retrieval.anchor_preflight.reused': '复用原问题锚点预取',
+  'retrieval.anchor_preflight.rejected': '拒绝不匹配的原问题锚点预取',
   'rerank.candidate': '评估候选证据',
   'rerank.completed': '完成重排',
   'rerank.fast_path_skipped': '跳过模型重排',
@@ -312,12 +343,6 @@ const EVENT_LABELS = {
   'search_test.completed': '完成检索测试',
   'search_test.error': '检索测试失败',
 }
-const EVIDENCE_LABELS = {
-  hit: '直接命中', partial: '部分支撑', version_mismatch: '版本不匹配',
-  needs_clarification: '等待选择范围', no_hit: '无有效证据',
-  unverified: '未验证', skipped: '未检索', error: '检索异常',
-}
-
 const dateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
   year: 'numeric', month: '2-digit', day: '2-digit',
   hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
@@ -338,7 +363,7 @@ const statusLabel = value => ({ running: '执行中', success: '成功', error: 
 const statusType = value => ({ running: 'info', success: 'success', error: 'error', interrupted: 'warning' }[value] || 'default')
 const requestLabel = value => ({ chat: '问答请求', search_test: '检索测试', unknown: '其他调用' }[value] || value || '—')
 const requestType = value => ({ chat: 'info', search_test: 'warning', unknown: 'default' }[value] || 'default')
-const evidenceLabel = value => EVIDENCE_LABELS[value] || value || '—'
+const evidenceLabel = value => evidenceStatusLabel(value, value || '—')
 const eventLabel = event => {
   const value = typeof event === 'string' ? event : event?.event
   if (value === 'intent.model_result' || value === 'intent.model_error') {
@@ -489,21 +514,187 @@ function toggleEvent(sequence) {
   expandedEvents.value = next
 }
 
+function anchorPreflightStatus(event) {
+  const payload = event?.payload
+  if (!payload || typeof payload !== 'object') return ''
+  return payload?.snapshot?.status || payload.status || ''
+}
+
+function isV3FenceRejected(event) {
+  const payload = event?.payload
+  if (!payload || typeof payload !== 'object') return false
+  const fence = payload.fence && typeof payload.fence === 'object' ? payload.fence : null
+  return payload.adopted === false
+    || payload.accepted === false
+    || ['fence_sealed', 'baseline_fingerprint_mismatch', 'request_identity_mismatch'].includes(payload.reason)
+    || Boolean(payload.last_rejection_reason || fence?.last_rejection_reason)
+}
+
+function semanticEntryDisposition(event) {
+  const disposition = event?.payload?.disposition
+  return ['dispatch', 'defer_to_v3', 'blocked'].includes(disposition)
+    ? disposition
+    : ''
+}
+
+function deterministicContextualApplied(event) {
+  return event?.payload?.applied === true
+}
+
+function deterministicContextualStatus(event) {
+  const status = event?.payload?.status
+  return [
+    'selected',
+    'skipped',
+    'bound',
+    'binding_rejected',
+    'binding_failed',
+    'selection_failed',
+  ].includes(status)
+    ? status
+    : ''
+}
+
 function eventTone(event) {
-  if (event.includes('error')) return 'is-error'
+  const name = typeof event === 'string' ? event : event?.event || ''
+  if (name.includes('error')) return 'is-error'
   if (
-    event === 'chat.cancelled'
-    || event === 'intent.clarification_expired'
-    || event === 'evidence.clarification_required'
-    || event === 'evidence.clarification_repeated'
+    (
+      name === 'intent.semantic_entry_gate'
+      && semanticEntryDisposition(event) === 'blocked'
+    )
+    || name === 'retrieval.anchor_preflight.rejected'
+    || (
+      name === 'retrieval.anchor_preflight.completed'
+      && ['timeout', 'unavailable'].includes(anchorPreflightStatus(event))
+    )
+    || (
+      name === 'query.understanding.v3.revision_fence'
+      && isV3FenceRejected(event)
+    )
+    || (
+      name === 'query.understanding.v3.deterministic_contextual_ellipsis'
+      && ['selection_failed', 'binding_rejected', 'binding_failed'].includes(
+        deterministicContextualStatus(event),
+      )
+    )
   ) return 'is-warning'
   if (
-    event.endsWith('completed')
-    || event === 'chat.response'
-    || event === 'intent.clarification_resolved'
-    || event === 'evidence.clarification_resolved'
+    name === 'query.understanding.v3.fallback'
+    || name === 'query.understanding.v3.cancelled'
+    || (
+      name === 'query.understanding.v3.execution_decision'
+      && ['fallback', 'clarification', 'skipped'].includes(event?.payload?.decision)
+    )
+  ) return 'is-warning'
+  if (
+    name === 'query.execution'
+    && event?.payload?.state === 'needs_clarification'
+  ) return 'is-warning'
+  if (
+    name === 'chat.cancelled'
+    || name === 'intent.clarification_expired'
+    || name === 'evidence.clarification_required'
+    || name === 'evidence.clarification_repeated'
+  ) return 'is-warning'
+  if (
+    name.endsWith('completed')
+    || (
+      name === 'intent.semantic_entry_gate'
+      && ['dispatch', 'defer_to_v3'].includes(semanticEntryDisposition(event))
+    )
+    || name === 'retrieval.anchor_preflight.reused'
+    || name === 'query.understanding.v3.compiled'
+    || name === 'query.understanding.v3.revision_fence'
+    || (
+      name === 'query.understanding.v3.deterministic_contextual_ellipsis'
+      && deterministicContextualApplied(event)
+    )
+    || (
+      name === 'query.understanding.v3.execution_decision'
+      && event?.payload?.decision === 'applied'
+    )
+    || name === 'chat.response'
+    || name === 'intent.clarification_resolved'
+    || name === 'evidence.clarification_resolved'
   ) return 'is-success'
   return 'is-info'
+}
+
+function eventPayloadLabel(event) {
+  if (event?.event === 'intent.semantic_entry_gate') {
+    const disposition = semanticEntryDisposition(event)
+    if (disposition === 'defer_to_v3') {
+      return '路由只缺少模型语义判断；后端已重建当前轮的受限执行合同，交由 V3 选择可信片段。'
+    }
+    if (disposition === 'dispatch') {
+      return '路由执行合同已满足语义入口的硬性约束，可按既定受权范围继续执行。'
+    }
+    if (disposition === 'blocked') {
+      return '存在知识库、权限或执行合同等硬性约束，V3 不会绕过该入口闸门。'
+    }
+    return 'V3 语义入口闸门摘要。'
+  }
+  if (event?.event === 'query.understanding.v3.requested') {
+    return event?.payload?.query_understanding_v3_catalog
+      ? '服务器签发的 V3 Span 目录 JSON（开发正文）'
+      : 'V3 Span 目录摘要（生产环境未记录正文）'
+  }
+  if (event?.event === 'query.understanding.v3.completed') {
+    return event?.payload?.query_understanding_v3_raw_response
+      ? 'V3 模型原始结构化响应 JSON（开发正文）'
+      : 'V3 模型响应摘要（生产环境未记录正文）'
+  }
+  if (event?.event === 'query.understanding.v3.validated') {
+    return event?.payload?.query_understanding_v3_validated
+      ? 'V3 模型 Span 选择 JSON（已通过目录协议校验）'
+      : 'V3 Span 选择摘要（生产环境未记录正文）'
+  }
+  if (event?.event === 'query.understanding.v3.deterministic_contextual_ellipsis') {
+    if (deterministicContextualApplied(event)) {
+      return '服务器仅绑定当前轮明确目标与上一轮唯一用户实体的原文 Span；未读取助手回答、未拼接历史问题，后续仍须通过 V3 编译和 V2 证据闭合。'
+    }
+    const status = deterministicContextualStatus(event)
+    if (status === 'selected') {
+      return '已选出严格的原文 Span，正在绑定当前请求的 V3 目录；尚未成为可执行计划。'
+    }
+    if (['selection_failed', 'binding_rejected', 'binding_failed'].includes(status)) {
+      return '严格本地追问解析无法建立可验证 Span，已保守地保持安全基线，绝不猜测或扩大历史主体。'
+    }
+    return '当前追问未满足严格继承条件，系统不会猜测历史主体，继续走受限 V3 模型或既有安全基线。'
+  }
+  if (event?.event === 'query.understanding.v3.compiled') {
+    return event?.payload?.query_understanding_v3_execution_plan
+      ? '后端可信编译后的 V3 执行计划 JSON'
+      : '后端可信编译摘要（生产环境未记录正文）'
+  }
+  if (event?.event === 'query.understanding.v3.revision_fence') {
+    return isV3FenceRejected(event)
+      ? 'V3 结果未通过请求版本围栏，已保持既有安全执行计划。'
+      : 'V3 结果通过请求版本围栏后才允许进入后续 V2 证据任务图。'
+  }
+  if (event?.event === 'retrieval.anchor_preflight.completed') {
+    return anchorPreflightStatus(event) === 'ready'
+      ? '原问题锚点预取快照；尚未成为证据，最终任务图仍会重新校验授权、范围和相关性。'
+      : '原问题锚点预取未可用；最终任务图会自动改走常规检索，不会使用该快照。'
+  }
+  if (event?.event === 'retrieval.anchor_preflight.reused') {
+    return '预取快照已通过请求版本、范围和检索条件校验；候选仍会在最终任务图中重新准入。'
+  }
+  if (event?.event === 'retrieval.anchor_preflight.rejected') {
+    return '预取快照与当前请求版本、范围或检索条件不一致，已安全丢弃并回退到常规检索。'
+  }
+  if (event?.event === 'query.analysis.validated') {
+    return event?.payload?.query_analysis_validated
+      ? '模型结构化理解 JSON（已通过协议校验）'
+      : '模型结构化理解摘要（当前环境未记录正文）'
+  }
+  if (event?.event === 'query.analysis.compiled') {
+    return event?.payload?.query_analysis_execution_plan
+      ? '后端编译后的执行计划 JSON（模型理解仅在通过边界校验后生效）'
+      : '后端编译后的执行计划摘要（当前环境未记录正文）'
+  }
+  return ''
 }
 
 function eventDuration(event) {
@@ -681,6 +872,7 @@ onMounted(loadRuns)
 .trace-event__duration { color: var(--ui-text-secondary); font-size: 11px; white-space: nowrap; }
 .trace-event__chevron { color: var(--ui-icon); font-size: 16px; transition: transform .16s ease; }
 .trace-event__chevron.is-open { transform: rotate(180deg); }
+.trace-event__payload-label { margin: 8px 0 0; color: var(--ui-text-secondary); font-size: 12px; line-height: 1.5; }
 .trace-event__payload {
   max-height: 360px;
   margin: 6px 0 4px;

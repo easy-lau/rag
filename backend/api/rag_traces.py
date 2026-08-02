@@ -63,6 +63,40 @@ _TRACE_TERMINAL_EVENTS = {
     "search_test.completed",
     "search_test.error",
 }
+_TRACE_QUERY_ANALYSIS_EVENTS = {
+    # ``query.execution`` is the deterministic plan/bundle gate.  The
+    # ``query.analysis.*`` sequence is optional model-assisted refinement and
+    # must remain separately observable so it cannot be mistaken for the
+    # source of execution authority.
+    "query.execution",
+    "query.analysis.requested",
+    "query.analysis.completed",
+    "query.analysis.validated",
+    "query.analysis.execution_validated",
+    "query.analysis.compiled",
+    "query.analysis.execution_decision",
+    "query.analysis.fallback",
+    "query.analysis.skipped",
+    "query.analysis.cancelled",
+    "query.analysis.shadow_submitted",
+}
+_TRACE_QUERY_UNDERSTANDING_V3_EVENTS = {
+    # V3 is a catalog-span selector plus a trusted backend compiler.  Keep
+    # every phase in bounded exports so a candidate response cannot disappear
+    # under candidate/rerank event pressure and make a fallback look like an
+    # unexplained route decision.
+    "query.understanding.v3.requested",
+    "query.understanding.v3.completed",
+    "query.understanding.v3.validated",
+    "query.understanding.v3.execution_validated",
+    "query.understanding.v3.compiled",
+    "query.understanding.v3.execution_decision",
+    "query.understanding.v3.deterministic_contextual_ellipsis",
+    "query.understanding.v3.context_preflight",
+    "query.understanding.v3.revision_fence",
+    "query.understanding.v3.fallback",
+    "query.understanding.v3.cancelled",
+}
 _TRACE_CORE_EVENTS = {
     "chat.request",
     "chat.pipeline_selected",
@@ -74,12 +108,18 @@ _TRACE_CORE_EVENTS = {
     "intent.model_result",
     "intent.model_error",
     "intent.contract_compiled",
+    # The semantic-entry gate decides whether a route-owned clarification may
+    # be deferred to V3 or whether a KB/RBAC/contract invariant blocks the
+    # request.  It is part of the causal spine, not optional diagnostics.
+    "intent.semantic_entry_gate",
     "intent.routing_decision",
     "intent.clarification_created",
     "intent.clarification_resolved",
     "intent.clarification_expired",
     "direct.plan",
     "query.plan",
+    *_TRACE_QUERY_ANALYSIS_EVENTS,
+    *_TRACE_QUERY_UNDERSTANDING_V3_EVENTS,
     "evidence.ambiguity_assessed",
     "evidence.explicit_comparison_resolved",
     "evidence.clarification_required",
@@ -94,6 +134,12 @@ _TRACE_CORE_EVENTS = {
     "retrieval.plan",
     "retrieval.plan_query_completed",
     "retrieval.plan_query_error",
+    # V3 may prefetch only the immutable anchor while source-span analysis is
+    # pending.  Preserve both cache use and strict rejection events so an
+    # operator can distinguish latency optimisation from final evidence.
+    "retrieval.anchor_preflight.completed",
+    "retrieval.anchor_preflight.reused",
+    "retrieval.anchor_preflight.rejected",
     "retrieval.completed",
     "retrieval.error",
     "retrieval.expansion_error",
@@ -593,6 +639,269 @@ def _query_plan_snapshot(payload: dict[str, Any] | None) -> dict[str, Any] | Non
     return output or None
 
 
+def _query_execution_snapshot(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the content-free result of the V2 execution gate.
+
+    This is intentionally distinct from :func:`_query_plan_snapshot`: a
+    planner's ``needs_clarification`` field describes the plan itself, while
+    this snapshot describes whether the normalized plan/bundle pair could be
+    dispatched.  The narrow enum allow-list also keeps old/imported trace rows
+    from smuggling arbitrary prose into a compact export summary.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("schema_version") != "rag_query_execution.v1":
+        return None
+    state = payload.get("state")
+    decision_reason = payload.get("decision_reason")
+    if state not in {"ready", "needs_clarification"}:
+        return None
+    if decision_reason not in {
+        "execution_baseline_runnable",
+        "execution_baseline_not_runnable",
+    }:
+        return None
+    output: dict[str, Any] = {
+        "schema_version": "rag_query_execution.v1",
+        "state": state,
+        "decision_reason": decision_reason,
+    }
+    dispatch_authorized = payload.get("dispatch_authorized")
+    if isinstance(dispatch_authorized, bool):
+        output["dispatch_authorized"] = dispatch_authorized
+    unresolved_role = payload.get("unresolved_role")
+    if unresolved_role == "query_execution":
+        output["unresolved_role"] = unresolved_role
+    unresolved_reason = payload.get("unresolved_reason")
+    if unresolved_reason in {"missing", "ambiguous"}:
+        output["unresolved_reason"] = unresolved_reason
+    pipeline_version = payload.get("pipeline_version")
+    if pipeline_version == "v2":
+        output["pipeline_version"] = pipeline_version
+    execution_surface = payload.get("execution_surface")
+    if execution_surface == "api_preflight":
+        output["execution_surface"] = execution_surface
+    baseline_runnable = payload.get("baseline_runnable")
+    if isinstance(baseline_runnable, bool):
+        output["baseline_runnable"] = baseline_runnable
+    bundle_mode = payload.get("bundle_mode")
+    if bundle_mode in {"ledgered", "compatibility", "not_ready"}:
+        output["bundle_mode"] = bundle_mode
+    return output
+
+
+_V3_TRACE_SCHEMA_VERSIONS = {
+    "query_understanding.v3",
+    "rag_query_understanding_execution.v1",
+}
+_V3_CATALOG_SCHEMA_VERSIONS = {"source_span_catalog.v1"}
+_V3_RELATIONS = {"new", "followup", "correction", "continuation"}
+_V3_MODES = {"off", "shadow", "active"}
+_V3_ORIGINS = {"model", "deterministic"}
+_V3_DECISIONS = {"applied", "fallback", "clarification", "skipped"}
+_V3_COMPILER_DECISIONS = {"compiled", "fallback"}
+_V3_FENCE_PHASES = {"created", "adopted", "rejected", "sealed"}
+_V3_FENCE_STATUSES = {"open", "sealed"}
+
+
+def _safe_nonnegative_metric(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(float(value)) or value < 0:
+        return None
+    return value
+
+
+def _v3_catalog_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    if value.get("schema_version") in _V3_CATALOG_SCHEMA_VERSIONS:
+        output["schema_version"] = value["schema_version"]
+    for key in (
+        "span_count",
+        "current_span_count",
+        "route_context_span_count",
+        "authorised_context_turn_count",
+    ):
+        metric = _safe_nonnegative_metric(value.get(key))
+        if metric is not None:
+            output[key] = metric
+    return output or None
+
+
+def _v3_analysis_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    if value.get("schema_version") == "query_understanding.v3":
+        output["schema_version"] = value["schema_version"]
+    if value.get("relation") in _V3_RELATIONS:
+        output["relation"] = value["relation"]
+    for key in ("self_contained",):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    for key in ("answer_candidate_count", "referenced_context_turn_count"):
+        metric = _safe_nonnegative_metric(value.get(key))
+        if metric is not None:
+            output[key] = metric
+    confidence = value.get("confidence")
+    if (
+        not isinstance(confidence, bool)
+        and isinstance(confidence, (int, float))
+        and math.isfinite(float(confidence))
+        and 0 <= confidence <= 1
+    ):
+        output["confidence"] = confidence
+    return output or None
+
+
+def _v3_validation_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    if isinstance(value.get("accepted"), bool):
+        output["accepted"] = value["accepted"]
+    for key in (
+        "current_target_count",
+        "candidate_target_count",
+        "explicit_scope_partition_count",
+        "projected_requirement_count",
+        "scope_binding_count",
+    ):
+        metric = _safe_nonnegative_metric(value.get(key))
+        if metric is not None:
+            output[key] = metric
+    return output or None
+
+
+def _v3_compilation_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    if value.get("compiler_decision") in _V3_COMPILER_DECISIONS:
+        output["compiler_decision"] = value["compiler_decision"]
+    if value.get("plan_schema_version") == "query_plan.v2":
+        output["plan_schema_version"] = value["plan_schema_version"]
+    if value.get("answer_shape") in {
+        "fact", "overview", "list", "process", "comparison", "judgement",
+        "multi_hop", "multi_part", "unknown",
+    }:
+        output["answer_shape"] = value["answer_shape"]
+    for key in ("used_fallback",):
+        if isinstance(value.get(key), bool):
+            output[key] = value[key]
+    for key in ("requirement_count", "description_provenance_count"):
+        metric = _safe_nonnegative_metric(value.get(key))
+        if metric is not None:
+            output[key] = metric
+    return output or None
+
+
+def _v3_fence_summary(value: Any) -> dict[str, Any] | None:
+    """Project an identity-free revision-fence state for trace exports."""
+
+    if not isinstance(value, dict):
+        return None
+    output: dict[str, Any] = {}
+    revision = _safe_nonnegative_metric(value.get("revision"))
+    if revision is not None:
+        output["revision"] = revision
+    if isinstance(value.get("sealed"), bool):
+        output["sealed"] = value["sealed"]
+    if isinstance(value.get("identity"), dict):
+        identity = value["identity"]
+        for key in ("conversation_bound", "turn_bound", "request_bound"):
+            if isinstance(identity.get(key), bool):
+                output[key] = identity[key]
+        state_revision = _safe_nonnegative_metric(identity.get("route_state_revision"))
+        if state_revision is not None:
+            output["route_state_revision"] = state_revision
+    return output or None
+
+
+def _query_understanding_v3_snapshot(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a content-free V3 understanding timeline for bounded exports.
+
+    The raw catalog, model response, validated selection and compiled plan are
+    deliberately excluded even when an old/imported payload happens to carry
+    them.  Development detail/export access remains governed by the run's
+    ``content_included`` flag; this compact index stays safe for production
+    diagnostic exports in either case.
+    """
+
+    history: list[dict[str, Any]] = []
+    for event in events:
+        event_name = str(event.get("event") or "")
+        if event_name not in _TRACE_QUERY_UNDERSTANDING_V3_EVENTS:
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        output: dict[str, Any] = {"event": event_name}
+        if payload.get("schema_version") in _V3_TRACE_SCHEMA_VERSIONS:
+            output["schema_version"] = payload["schema_version"]
+        if payload.get("mode") in _V3_MODES:
+            output["mode"] = payload["mode"]
+        if payload.get("origin") in _V3_ORIGINS:
+            output["origin"] = payload["origin"]
+        if payload.get("compiler_decision") in _V3_COMPILER_DECISIONS:
+            output["compiler_decision"] = payload["compiler_decision"]
+        if payload.get("decision") in _V3_DECISIONS:
+            output["decision"] = payload["decision"]
+        if payload.get("phase") in _V3_FENCE_PHASES:
+            output["phase"] = payload["phase"]
+        if payload.get("status") in _V3_FENCE_STATUSES:
+            output["status"] = payload["status"]
+        if event_name in {
+            "query.understanding.v3.revision_fence",
+            "query.understanding.v3.context_preflight",
+        }:
+            reason = str(payload.get("reason") or "").strip()
+            if reason and len(reason) <= 120:
+                output["reason"] = reason
+        for key in (
+            "accepted",
+            "strict_schema_used",
+            "json_object_fallback_used",
+        ):
+            if isinstance(payload.get(key), bool):
+                output[key] = payload[key]
+        for key in (
+            "latency_ms",
+            "timeout_seconds",
+            "choice_count",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "query_understanding_v3_catalog_chars",
+            "query_understanding_v3_raw_response_chars",
+            "query_understanding_v3_validated_chars",
+            "query_understanding_v3_execution_plan_chars",
+        ):
+            metric = _safe_nonnegative_metric(payload.get(key))
+            if metric is not None:
+                output[key] = metric
+        for source_key, target_key, extractor in (
+            ("catalog_summary", "catalog", _v3_catalog_summary),
+            ("analysis_summary", "analysis", _v3_analysis_summary),
+            ("analysis", "analysis", _v3_analysis_summary),
+            ("validation", "validation", _v3_validation_summary),
+            ("compilation", "compilation", _v3_compilation_summary),
+            ("fence", "fence", _v3_fence_summary),
+        ):
+            if target_key in output:
+                continue
+            summary = extractor(payload.get(source_key))
+            if summary is not None:
+                output[target_key] = summary
+        history.append(output)
+    return history
+
+
 def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Extract a compact phase summary without duplicating business content."""
 
@@ -685,6 +994,28 @@ def _trace_diagnostic_snapshot(events: list[dict[str, Any]]) -> dict[str, Any]:
         ),
         "query_plan": _query_plan_snapshot(
             _trace_event_payload(events, "query.plan"),
+        ),
+        "query_execution": _query_execution_snapshot(
+            _trace_event_payload(events, "query.execution"),
+        ),
+        "query_understanding_v3": _query_understanding_v3_snapshot(events),
+        "anchor_prefetch": _pick_trace_fields(
+            _trace_event_payload(events, "retrieval.anchor_preflight.completed"),
+            "schema_version",
+            "status",
+            "method",
+            "candidate_limit",
+            "candidate_count",
+            "kb_count",
+            "document_scope_count",
+            "elapsed_ms",
+            "failure_reason",
+        ),
+        "anchor_prefetch_reuse": _pick_trace_fields(
+            _trace_event_payload(events, "retrieval.anchor_preflight.reused"),
+            "reason",
+            "candidate_count",
+            "elapsed_ms",
         ),
         "conversation_context": _pick_trace_fields(
             _trace_event_payload(events, "conversation.context_resolved"),
