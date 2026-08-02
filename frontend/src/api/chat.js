@@ -5,6 +5,9 @@ export const getChatHistory = (params) => http.get('/chat/history', { params })
 export const getMessages = (convId) => http.get(`/chat/${convId}/messages`)
 export const renameConversation = (convId, title) => http.patch(`/chat/${convId}`, { title })
 export const deleteConversation = (convId) => http.delete(`/chat/${convId}`)
+export const deleteConversations = (conversationIds) => http.post('/chat/batch-delete', {
+  conversation_ids: conversationIds,
+})
 
 export function createChatStream(payload, options = {}) {
   const ctrl = new AbortController()

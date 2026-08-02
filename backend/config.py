@@ -48,6 +48,16 @@ class Settings(BaseSettings):
         ge=1.0,
         le=180.0,
     )
+    # 确定性证据图无法闭合时，才在已授权且限量的检索候选中使用结构化模型
+    # 判断哪些片段真正支撑原问题。模型无权扩大 KB/文档范围、重写原问题或
+    # 绕过最终证据校验；异常和超时保留确定性候选链。该开关用于在不回滚 V2
+    # 的情况下快速降级为纯确定性模式。
+    rag_v2_model_evidence_adjudication_enabled: bool = True
+    rag_v2_model_evidence_adjudication_timeout_seconds: float = Field(
+        12.0,
+        ge=0.5,
+        le=60.0,
+    )
     # 任务图同一 wave 内的检索并发数。每个任务使用独立只读会话，避免并发
     # 复用请求事务；范围限制在连接池和单次工作流期限可承受的边界内。
     rag_v2_task_query_parallelism: int = Field(3, ge=1, le=8)

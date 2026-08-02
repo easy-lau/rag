@@ -42,7 +42,50 @@
 
       <div class="flex items-center justify-between mt-5 mb-2 shrink-0">
         <span class="text-xs font-medium text-gray-500 dark:text-gray-400">对话历史</span>
-        <span v-if="chatStore.conversations.length" class="text-xs text-gray-400">{{ chatStore.conversations.length }}</span>
+        <div v-if="chatStore.conversations.length" class="flex items-center gap-1.5">
+          <span class="text-xs text-gray-400">{{ chatStore.conversations.length }}</span>
+          <n-button
+            v-if="!isSelectionMode"
+            quaternary
+            size="tiny"
+            class="chat-sidebar__manage"
+            :disabled="chatStore.isStreaming"
+            aria-label="批量管理对话历史"
+            @click="enterSelectionMode"
+          >
+            管理
+          </n-button>
+        </div>
+      </div>
+
+      <div v-if="isSelectionMode" class="chat-sidebar__batch-toolbar" aria-label="批量管理对话">
+        <n-checkbox
+          :checked="allConversationsSelected"
+          :indeterminate="someConversationsSelected"
+          :disabled="chatStore.isStreaming || isBatchDeleting"
+          aria-label="全选对话"
+          @update:checked="toggleAllConversations"
+        >
+          全选
+        </n-checkbox>
+        <span class="chat-sidebar__batch-count">已选 {{ selectedConversationCount }} 项</span>
+        <n-button
+          quaternary
+          size="tiny"
+          :disabled="isBatchDeleting"
+          @click="exitSelectionMode"
+        >
+          取消
+        </n-button>
+        <n-button
+          type="error"
+          secondary
+          size="tiny"
+          :disabled="!selectedConversationCount || chatStore.isStreaming"
+          @click="confirmBatchDelete"
+        >
+          删除
+        </n-button>
       </div>
 
       <div class="overflow-y-auto space-y-0.5 flex-1 pr-0.5">
@@ -55,19 +98,29 @@
             conv.id === chatStore.currentConvId
               ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
             : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700',
+            { 'chat-sidebar__history-row--selected': isConversationSelected(conv.id) },
             { 'cursor-not-allowed opacity-50': chatStore.isStreaming },
           ]"
         >
+          <n-checkbox
+            v-if="isSelectionMode"
+            class="chat-sidebar__history-checkbox"
+            :checked="isConversationSelected(conv.id)"
+            :disabled="chatStore.isStreaming || isBatchDeleting"
+            :aria-label="`选择对话：${conv.title || '未命名对话'}`"
+            @update:checked="checked => toggleConversationSelection(conv.id, checked)"
+          />
           <button
             type="button"
             class="min-w-0 flex-1 rounded-lg px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60"
             :disabled="chatStore.isStreaming"
             :aria-current="conv.id === chatStore.currentConvId ? 'page' : undefined"
-            @click="selectConversation(conv.id)"
+            @click="handleConversationClick(conv)"
           >
             <span class="block truncate">{{ conv.title || '未命名对话' }}</span>
           </button>
           <n-dropdown
+            v-if="!isSelectionMode"
             trigger="click"
             placement="bottom-end"
             :options="conversationActionOptions"
@@ -139,12 +192,22 @@
     @confirm="submitDelete"
     @cancel="clearPendingDelete"
   />
+
+  <DangerConfirm
+    v-model:show="showBatchDeleteModal"
+    :loading="isBatchDeleting"
+    title="批量删除对话？"
+    :subject="`已选择 ${selectedConversationCount} 段对话`"
+    description="这些对话中的全部问答内容都会被永久删除，且无法恢复。"
+    :confirm-text="`永久删除 ${selectedConversationCount} 段`"
+    @confirm="submitBatchDelete"
+  />
 </template>
 
 <script setup>
 import { computed, h, nextTick, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NButton, NDropdown, NIcon, NInput, useMessage } from 'naive-ui'
+import { NButton, NCheckbox, NDropdown, NIcon, NInput, useMessage } from 'naive-ui'
 import { AddOutline, ChevronForwardOutline, CloseOutline, EllipsisHorizontalOutline, PencilOutline, SettingsOutline, TrashOutline } from '@vicons/ionicons5'
 import { hasAdminAccess } from '@/router/menus'
 import { useAuthStore } from '@/stores/auth'
@@ -178,6 +241,19 @@ const showDeleteModal = ref(false)
 const pendingDeleteConversation = ref(null)
 const isDeleting = ref(false)
 const pendingDeleteTitle = computed(() => pendingDeleteConversation.value?.title || '未命名对话')
+const isSelectionMode = ref(false)
+const selectedConversationIds = ref([])
+const showBatchDeleteModal = ref(false)
+const isBatchDeleting = ref(false)
+const selectedConversationIdSet = computed(() => new Set(selectedConversationIds.value))
+const selectedConversationCount = computed(() => selectedConversationIds.value.length)
+const allConversationsSelected = computed(() => (
+  chatStore.conversations.length > 0
+  && selectedConversationCount.value === chatStore.conversations.length
+))
+const someConversationsSelected = computed(() => (
+  selectedConversationCount.value > 0 && !allConversationsSelected.value
+))
 
 const renderMenuIcon = icon => () => h(NIcon, { size: 15 }, { default: () => h(icon) })
 const conversationActionOptions = [
@@ -198,6 +274,7 @@ onMounted(() => {
 
 function startNewConversation() {
   if (chatStore.isStreaming) return
+  exitSelectionMode()
   ui.closeChatSearch()
   closeDrawer()
 
@@ -208,6 +285,82 @@ function startNewConversation() {
   }
   delete query.conversation
   router.push({ name: 'chat', query }).catch(() => {})
+}
+
+function enterSelectionMode() {
+  if (chatStore.isStreaming || !chatStore.conversations.length) return
+  selectedConversationIds.value = []
+  isSelectionMode.value = true
+}
+
+function exitSelectionMode() {
+  if (isBatchDeleting.value) return
+  showBatchDeleteModal.value = false
+  selectedConversationIds.value = []
+  isSelectionMode.value = false
+}
+
+function isConversationSelected(conversationId) {
+  return selectedConversationIdSet.value.has(String(conversationId))
+}
+
+function toggleConversationSelection(conversationId, checked) {
+  if (!isSelectionMode.value || chatStore.isStreaming || isBatchDeleting.value) return
+  const id = String(conversationId)
+  const next = new Set(selectedConversationIds.value)
+  if (checked) next.add(id)
+  else next.delete(id)
+  selectedConversationIds.value = [...next]
+}
+
+function toggleAllConversations(checked) {
+  if (chatStore.isStreaming || isBatchDeleting.value) return
+  selectedConversationIds.value = checked
+    ? chatStore.conversations.map(conversation => String(conversation.id))
+    : []
+}
+
+function handleConversationClick(conversation) {
+  if (isSelectionMode.value) {
+    toggleConversationSelection(
+      conversation.id,
+      !isConversationSelected(conversation.id),
+    )
+    return
+  }
+  selectConversation(conversation.id)
+}
+
+function confirmBatchDelete() {
+  if (!selectedConversationCount.value || chatStore.isStreaming) return
+  showBatchDeleteModal.value = true
+}
+
+async function submitBatchDelete() {
+  if (chatStore.isStreaming) {
+    message.warning('生成回答时暂不能删除会话')
+    return
+  }
+  const existingIds = new Set(chatStore.conversations.map(item => String(item.id)))
+  const ids = selectedConversationIds.value.filter(id => existingIds.has(id))
+  if (!ids.length) {
+    message.warning('请选择需要删除的对话')
+    showBatchDeleteModal.value = false
+    return
+  }
+
+  isBatchDeleting.value = true
+  try {
+    const result = await chatStore.removeConversations(ids)
+    showBatchDeleteModal.value = false
+    selectedConversationIds.value = []
+    isSelectionMode.value = false
+    message.success(`已删除 ${result?.deleted_count || ids.length} 段对话`)
+  } catch (error) {
+    message.error(error?.response?.data?.detail || '批量删除失败，请稍后重试')
+  } finally {
+    isBatchDeleting.value = false
+  }
 }
 
 function selectConversation(conversationId) {
@@ -335,6 +488,57 @@ function closeDrawer() {
   box-shadow: var(--ui-shadow-float);
 }
 
+:deep(.chat-sidebar__manage.n-button) {
+  --n-height: 32px !important;
+  --n-border-radius: var(--ui-radius-control) !important;
+}
+
+.chat-sidebar__batch-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  min-height: 40px;
+  margin-bottom: 8px;
+  padding: 5px 6px 5px 9px;
+  background: var(--ui-surface-muted);
+  border: 1px solid var(--ui-border);
+  border-radius: var(--ui-radius-popover);
+}
+
+.chat-sidebar__batch-count {
+  min-width: 0;
+  margin-right: auto;
+  color: var(--ui-text-tertiary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chat-sidebar__batch-toolbar :deep(.n-button) {
+  --n-height: 32px !important;
+  --n-border-radius: var(--ui-radius-control) !important;
+  padding-inline: 7px;
+}
+
+.chat-sidebar__batch-toolbar :deep(.n-checkbox__label) {
+  padding-left: 5px;
+  font-size: 12px;
+}
+
+.chat-sidebar__history-row--selected {
+  box-shadow: inset 0 0 0 1px var(--ui-border-focus);
+}
+
+.chat-sidebar__history-checkbox {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  padding-left: 5px;
+}
+
 :deep(.chat-sidebar__history-action.n-button) {
   --n-height: 30px !important;
   --n-width: 30px !important;
@@ -370,6 +574,18 @@ function closeDrawer() {
 
 :global(.chat-sidebar__history-delete-option.n-dropdown-option-body--pending::before) {
   background-color: var(--ui-danger-subtle) !important;
+}
+
+@media (max-width: 639px) {
+  :deep(.chat-sidebar__manage.n-button),
+  .chat-sidebar__batch-toolbar :deep(.n-button) {
+    --n-height: 40px !important;
+  }
+
+  .chat-sidebar__history-checkbox {
+    min-width: 40px;
+    min-height: 40px;
+  }
 }
 
 </style>

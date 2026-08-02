@@ -62,7 +62,7 @@ VALID_RESPONSE_MODES = {"grounded_qa", "general_chat", "writing", "platform_help
 VALID_RETRIEVAL_POLICIES = {"required", "optional", "skip"}
 INTENT_PROMPT_VERSION = "2026-07-30.v3"
 INTENT_MAX_TOKENS = 512
-ROUTE_PROMPT_VERSION = "2026-07-31.rag-route-v4"
+ROUTE_PROMPT_VERSION = "2026-08-02.rag-route-v5"
 ROUTE_MAX_TOKENS = 2400
 
 # 这五类是首版的安全最小集合。Other 固定为检索动作，用于模型失败、低置信度和
@@ -828,6 +828,10 @@ def _route_system_prompt() -> str:
         "具体类别、等级或结果。"
         "readiness=ready 时 requirements 至少包含一个 role=answer 的回答目标；"
         "needs_clarification 时 requirements 可以暂时为空。\n"
+        "不要把用户没有要求提供的实施参数擅自设为必填槽。用户询问如何修改、配置或"
+        "调整某个参数时，目标值通常不是回答方法所必需；应先检索并回答入口、配置项和"
+        "步骤。只有用户明确要求生成或校验具体数值，且缺少该数值会导致无法回答时，才"
+        "可以为该数值建立 missing 槽。\n"
         "readiness=ready 时 clarification.question 必须为空且 unresolved=[]；"
         "needs_clarification 时必须提出一个具体问题并列出 missing/ambiguous/unavailable 槽；"
         "missing 槽如果由某几轮历史内容暴露，可在 candidate_keys 中绑定相关 t 键，"

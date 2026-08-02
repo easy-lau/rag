@@ -16,6 +16,7 @@ from api.chat import (
     _parse_sse_payload,
     _parse_evidence_scope_reply,
     _route_clarification_response,
+    _route_clarification_continuation,
     _refined_evidence_query,
     _scope_anchor_coverage_from_sources,
     _validate_stream_answer_sources,
@@ -1090,6 +1091,31 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(_active_pending_route_state(value))
         self.assertIsNone(_active_pending_route_state("not-an-object"))
 
+    def test_route_clarification_reply_rebuilds_original_task(self) -> None:
+        pending = {
+            "schema_version": "rag_pending_clarification.v1",
+            "state_id": "route-pending",
+            "original_query": "我现在想改验证码有效期时间",
+            "clarification_answers": [],
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "dispatch_authorized": False,
+        }
+
+        continuation = _route_clarification_continuation("云枢的", pending)
+
+        self.assertIsNotNone(continuation)
+        task_query, original_query, answers = continuation
+        self.assertEqual(original_query, "我现在想改验证码有效期时间")
+        self.assertEqual(answers, ("云枢的",))
+        self.assertIn("我现在想改验证码有效期时间", task_query)
+        self.assertIn("云枢的", task_query)
+        self.assertNotEqual(task_query, "云枢的")
+        self.assertIsNone(
+            _route_clarification_continuation("Redis 怎么配置？", pending)
+        )
+
     def test_active_v2_state_is_strictly_validated_and_non_executable(self) -> None:
         active = _evidence_pending_state()
 
@@ -1922,6 +1948,12 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["schema_version"], "rag_pending_clarification.v1")
         self.assertFalse(state["dispatch_authorized"])
         self.assertEqual(state["intent_code"], "knowledge_qa")
+        self.assertEqual(state["original_query"], "普通员工的出差标准")
+        self.assertEqual(state["clarification_answers"], [])
+        self.assertEqual(
+            state["clarification_message"],
+            contract.clarification.question,
+        )
         self.assertEqual(state["unresolved"][0]["role"], "knowledge_base")
         self.assertEqual(state["selected_kb_ids_snapshot"], [])
         self.assertIsNotNone(_active_pending_route_state(state))
@@ -2969,6 +3001,28 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             received_kwargs[0]["evidence_scope_filter"]["choices"][0]["key"],
             "c2",
         )
+        # The reply token selects a server-derived evidence scope; it is never
+        # the semantic question.  Every execution authority must retain the
+        # pending turn's original question so task queries cannot degrade to
+        # values such as "c2" after a document choice.
+        self.assertEqual(
+            received_kwargs[0]["question"],
+            pending["original_query"],
+        )
+        self.assertEqual(
+            received_kwargs[0]["standalone_query"],
+            pending["original_query"],
+        )
+        execution_bundle = received_kwargs[0]["execution_bundle"]
+        self.assertEqual(
+            execution_bundle.plan.original_query,
+            pending["original_query"],
+        )
+        self.assertEqual(
+            execution_bundle.plan.retrieval_queries[0],
+            pending["original_query"],
+        )
+        self.assertNotIn("c2", execution_bundle.plan.retrieval_queries)
         self.assertIs(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 8)
         self.assertIn(
@@ -3693,6 +3747,8 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         pending = {
             "schema_version": "rag_pending_clarification.v1",
             "state_id": "pending-state",
+            "original_query": "我现在想改验证码有效期时间",
+            "clarification_answers": [],
             "expires_at": (
                 datetime.now(timezone.utc) + timedelta(hours=1)
             ).isoformat(),
@@ -3739,6 +3795,10 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(prepare.await_args.kwargs["pending_route_state"], pending)
         self.assertTrue(classify.await_args.kwargs["has_pending_clarification"])
+        routed_question = classify.await_args.args[1]
+        self.assertIn("我现在想改验证码有效期时间", routed_question)
+        self.assertIn("补充后的完整回答", routed_question)
+        self.assertNotEqual(routed_question, "补充后的完整回答")
         self.assertIsNone(conv.pending_route_state)
         self.assertEqual(conv.route_state_revision, 5)
         self.assertEqual(db.commits, 1)

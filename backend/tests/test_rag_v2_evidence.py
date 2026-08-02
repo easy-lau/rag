@@ -2530,6 +2530,66 @@ class EvidenceBundleAssemblyTests(unittest.TestCase):
         self.assertEqual(bundle.missing_requirement_ids, ())
         self.assertEqual(bundle.state.completeness, "complete")
 
+    def test_ordered_process_ignores_incidental_scalar_claims(self) -> None:
+        """A purpose clause or deadline cannot replace the declared steps."""
+
+        query = "公司的请假流程是什么"
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description=query,
+            coverage_mode="collection",
+            coverage_contract="ordered_steps",
+        )
+        provisional, task_graph, ledger = _ledgered_evidence_bundle(
+            return_execution_state=True,
+            query=query,
+            answer_shape="process",
+            candidates=[
+                _candidate(
+                    "leave-purpose",
+                    content=(
+                        "本办法用于规范公司请假管理流程，"
+                        "自2026年1月1日起施行。"
+                    ),
+                    candidate_origins=["initial_retrieval"],
+                ),
+                _candidate(
+                    "leave-process",
+                    chunk_index=4,
+                    content=(
+                        "公司请假流程如下："
+                        "（一）填写申请单；"
+                        "（二）按权限逐级审批；"
+                        "（三）审批后交人力资源部备案；"
+                        "（四）假期结束后办理销假。"
+                        "突发情况须在返岗后1个工作日内补办。"
+                    ),
+                    candidate_origins=["initial_retrieval"],
+                ),
+            ],
+            requirements=(requirement,),
+            retrieval_queries=(query,),
+            rerank_succeeded=False,
+            expansion_succeeded=True,
+        )
+
+        finalized = finalize_visible_evidence_bundle(
+            provisional,
+            requirements=_explicit_test_requirements((requirement,)),
+            task_graph=task_graph,
+            task_ledger=ledger,
+        )
+        bundle = finalized.bundle
+
+        self.assertTrue(finalized.generation_allowed)
+        self.assertEqual(bundle.answer_source_ids, ("leave-process",))
+        self.assertEqual(bundle.missing_requirement_ids, ())
+        self.assertEqual(bundle.state.completeness, "complete")
+        by_id = {item.chunk_id: item for item in bundle.items}
+        self.assertEqual(by_id["leave-purpose"].supports_requirement_ids, ())
+        assertions = by_id["leave-process"].metadata["answer_claim_assertions"]
+        self.assertEqual(assertions["r1"][0]["result_kind"], "ordered_steps")
+
     def test_collection_requires_every_part_of_target_bound_table(self) -> None:
         query = "系统支持的登录方式有哪些"
         requirement = AnswerRequirementV2(

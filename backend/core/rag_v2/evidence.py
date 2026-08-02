@@ -2295,6 +2295,48 @@ def _reconcile_answer_claim_assertions(
                 )
                 if isinstance(value, str)
             }
+            # Collection contracts own their source structure.  When the
+            # current source explicitly closes a list or ordered procedure,
+            # emit that typed assertion before running the scalar/categorical
+            # parser.  Otherwise incidental values such as "3天", "5天" or a
+            # publication year can pre-empt the real procedure and leave the
+            # final graph with unrelated scalar claims but no collection
+            # closure.  This is contract-driven and applies to every
+            # collection/process question; it does not depend on business
+            # keywords or model availability.
+            explicit_collection_closure = bool(
+                answer.requires_collection_closure
+                and has_explicit_collection_closure(
+                    item,
+                    requirement=answer,
+                    requirements=requirements,
+                )
+            )
+            if explicit_collection_closure:
+                assertion_metadata[requirement_id] = [{
+                    "status": "active",
+                    "result_kind": answer.effective_coverage_contract,
+                    "normalized_result": (
+                        f"{answer.effective_coverage_contract}:{item.chunk_id}"
+                    ),
+                    "claim_key": (
+                        f"{answer.effective_coverage_contract}:{requirement_id}"
+                    ),
+                }]
+                continue
+
+            if answer.effective_coverage_contract == "ordered_steps":
+                # An ordered procedure is answerable only through an explicit
+                # source-authored sequence closure.  A nearby purpose clause,
+                # deadline or duration may be relevant background, but it is
+                # not one member of an independently mergeable procedure.
+                # Reject it here so one non-procedural scalar claim cannot join
+                # the real process chunk and invalidate the single declared
+                # sequence certificate in the final graph.
+                supports.discard(requirement_id)
+                rejected_answer_ids.append(requirement_id)
+                continue
+
             assertions = adjudicate_answer_claims(
                 answer.description,
                 item.content,
@@ -2349,32 +2391,6 @@ def _reconcile_answer_claim_assertions(
                         )
                         metadata["claim_proof_kind"] = proof_kinds
                         metadata["strict_terminology_rule_ids"] = proof_rules
-            # An exhaustive source declaration is itself a typed answer
-            # assertion for an explicitly declared finite collection or
-            # ordered procedure.  The scalar/categorical adjudicator cannot
-            # manufacture a value from such a structure, but the same proof
-            # predicate later used by the graph has already verified the
-            # requirement target.  Crucially, it executes ``coverage_contract``
-            # instead of guessing procedure semantics from this text.
-            if (
-                not assertions
-                and answer.requires_collection_closure
-                and has_explicit_collection_closure(
-                    item,
-                    requirement=answer,
-                    requirements=requirements,
-                )
-            ):
-                assertion_metadata[requirement_id] = [{
-                    "status": "active",
-                    "result_kind": answer.effective_coverage_contract,
-                    "normalized_result": (
-                        f"{answer.effective_coverage_contract}:{item.chunk_id}"
-                    ),
-                    "claim_key": (
-                        f"{answer.effective_coverage_contract}:{requirement_id}"
-                    ),
-                }]
             if (
                 not assertions
                 and requirement_id not in assertion_metadata

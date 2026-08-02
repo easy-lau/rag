@@ -17,6 +17,7 @@ from core.query_route_contract import parse_rag_route_decision
 from core.rag_v2.pipeline import (
     AnchorRetrievalSnapshot,
     _admit_and_bind_expansion_candidates,
+    _should_model_adjudicate_evidence,
     retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
 )
@@ -2677,6 +2678,154 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         ))
         search.assert_not_awaited()
         self.assertGreaterEqual(scoped_search.await_count, 1)
+
+    async def test_scope_selection_skips_model_when_bounded_evidence_is_closed(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        selected_doc_id = uuid.uuid4()
+        selected = _candidate(
+            kb_id=kb_id,
+            doc_id=selected_doc_id,
+            chunk_index=0,
+            content="验证码有效期配置为 10 分钟。",
+            filename="目标配置说明.md",
+        )
+        scope_filter = {
+            "mode": "single",
+            "kb_ids": [str(kb_id)],
+            "doc_ids": [str(selected_doc_id)],
+            "choices": [{
+                "key": "c2",
+                "label": "《目标配置说明》",
+                "products": [],
+                "canonical_products": [],
+                "versions": [],
+                "projects": [],
+                "filenames": ["目标配置说明.md"],
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(selected_doc_id)],
+                "anchor_doc_ids": [str(selected_doc_id)],
+                "companion_doc_ids": [],
+            }],
+        }
+        adjudicator = AsyncMock()
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            rag_v2_model_evidence_adjudication_enabled=True,
+            rag_v2_model_evidence_adjudication_timeout_seconds=1,
+        )
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=adjudicator,
+        ):
+            payloads, _client, _search, _fetch, _scoped = await self._run(
+                question="验证码有效期时间是多少",
+                kb_id=kb_id,
+                initial=[],
+                scoped=[selected],
+                full_document=[selected],
+                evidence_scope_filter=scope_filter,
+                settings_override=settings,
+            )
+
+        adjudicator.assert_not_awaited()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "hit", result)
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(selected_doc_id)},
+        )
+
+    def test_model_evidence_adjudication_requires_opt_in(self) -> None:
+        enabled = SimpleNamespace(rag_v2_model_evidence_adjudication_enabled=True)
+
+        self.assertTrue(_should_model_adjudicate_evidence(
+            settings=enabled,
+            search_config={"rerank": True},
+        ))
+        self.assertFalse(_should_model_adjudicate_evidence(
+            settings=enabled,
+            search_config={"rerank": False},
+        ))
+
+    async def test_process_answer_closes_before_model_adjudication(self) -> None:
+        """The evidence model is an enhancer, never a process-answer gate."""
+
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        contents = [
+            "XX公司员工请假管理办法。第一章总则。",
+            "请假类别包括事假、病假和年休假。",
+            "审批权限根据请假时长确定。",
+            "1天以内由直属主管审批，5天以上由总经理审批。",
+            (
+                "公司请假流程如下："
+                "（一）员工填写请假申请单；"
+                "（二）按审批权限逐级提交；"
+                "（三）审批通过后交人力资源部备案；"
+                "（四）假期结束后办理销假。"
+                "突发情况应在返岗后1个工作日内补办，"
+                "本办法自2026年1月1日起施行。"
+            ),
+        ]
+        full_document = _full_document(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            contents=contents,
+            filename="员工请假管理办法.docx",
+        )
+        process_seed = dict(full_document[4])
+        process_seed.update(
+            score=0.08,
+            retrieval_score=0.08,
+            vector_score=0.91,
+            vector_rank=1,
+            active_channels=["vector"],
+            candidate_origin="current_retrieval",
+            candidate_origins=["current_retrieval"],
+        )
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            rag_v2_model_evidence_adjudication_enabled=True,
+            rag_v2_model_evidence_adjudication_timeout_seconds=0.01,
+        )
+
+        adjudicator = AsyncMock()
+
+        async def never_finishes(*_args, **_kwargs):
+            await asyncio.sleep(1)
+
+        adjudicator.side_effect = never_finishes
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=adjudicator,
+        ):
+            payloads, client, *_ = await self._run(
+                question="公司的请假流程是什么",
+                kb_id=kb_id,
+                initial=[process_seed],
+                full_document=full_document,
+                settings_override=settings,
+            )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "hit", result)
+        self.assertIsNone(result["rerank_succeeded"])
+        adjudicator.assert_not_awaited()
+        self.assertEqual(
+            {item["chunk_index"] for item in result["answer_sources"]},
+            {4},
+        )
+        self.assertEqual(len(client.completions.calls), 1)
+        prompt = "\n".join(
+            message["content"]
+            for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("员工填写请假申请单", prompt)
+        self.assertIn("假期结束后办理销假", prompt)
 
     async def test_scope_slice_selection_drops_sibling_section_in_same_document(
         self,

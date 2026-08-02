@@ -55,6 +55,7 @@ from core.rag_pipeline import (
 )
 from core.rag_trace import content_fields, json_safe, trace_event
 from core.read_sessions import ReadSessionFactory, isolated_read_session
+from core.reranker import joint_rerank_with_coverage
 from core.rag_v2.bridge_resolution import (
     BridgeFactConflict,
     ResolvedBridgeFact,
@@ -136,6 +137,26 @@ _ANCHOR_SNAPSHOT_STATUSES = frozenset({
 # boundary itself lives in ``core.read_sessions`` so terminology, retrieval
 # enrichment and answer-source refresh use the same ownership semantics.
 TaskReadSessionFactory = ReadSessionFactory
+
+
+def _should_model_adjudicate_evidence(
+    *,
+    settings: Any,
+    search_config: Mapping[str, Any],
+) -> bool:
+    """Return whether bounded retrieved evidence may use model adjudication.
+
+    The model is deliberately downstream of authorization, task-graph
+    retrieval and any selected-document filter. It receives the original
+    question and already-authorized candidates only, and can only classify
+    their evidentiary contribution. This prevents a short reply such as ``c2``
+    from becoming either a semantic query or an authority to broaden retrieval.
+    """
+
+    return bool(
+        getattr(settings, "rag_v2_model_evidence_adjudication_enabled", False)
+        and bool(search_config.get("rerank", False))
+    )
 
 
 def _normalise_anchor_preflight_text(
@@ -5010,7 +5031,7 @@ def _source_from_item(item: EvidenceItem, *, direct: bool) -> dict[str, Any]:
         "supports_requirement_ids": list(item.supports_requirement_ids),
         "constraint_status": item.constraint_status,
         "answer_support": metadata.get("answer_support"),
-        "rerank_status": "retrieved_v2",
+        "rerank_status": str(metadata.get("rerank_status") or "retrieved_v2"),
         "candidate_origins": list(item.origins),
         "confidence": item.confidence,
         "pipeline_version": PIPELINE_VERSION,
@@ -5037,6 +5058,8 @@ def _result_payload(
     evidence_scope_anchor_hit: bool | None = None,
     evidence_scope_anchor_doc_ids: Sequence[str] = (),
     retrieval_executed: bool = True,
+    rerank_executed: bool = False,
+    rerank_succeeded: bool | None = None,
 ) -> dict[str, Any]:
     context_ids = set(
         answer_source_ids
@@ -5118,8 +5141,9 @@ def _result_payload(
         "trace_id": trace_id,
         "method": method,
         "top_k": top_k,
-        "rerank": False,
-        "ranker_executed": False,
+        "rerank": rerank_executed,
+        "ranker_executed": rerank_executed,
+        "rerank_succeeded": rerank_succeeded,
         "pipeline_version": PIPELINE_VERSION,
         "is_followup": is_followup,
         "carryover_source_count": carryover_source_count,
@@ -6432,6 +6456,12 @@ async def run_rag_v2_stream(
 
     yield _step_event("rerank", "active")
     result_constraints = constraints
+    model_adjudication_attempted = False
+    model_adjudication_succeeded: bool | None = None
+    model_adjudication_error: str | None = None
+    model_adjudication_elapsed_ms = 0
+    model_adjudication_candidate_count = 0
+    model_adjudication_skip_reason: str | None = None
     if retrieval_failed:
         bundle = _unavailable_bundle("retrieval_unavailable")
         ambiguity = EvidenceAmbiguityDecision(
@@ -6517,6 +6547,12 @@ async def run_rag_v2_stream(
         else:
             bundle_candidates = enriched_candidates
             overview_candidates = []
+        # First build the deterministic evidence route.  A model adjudicator
+        # is an enhancement for unresolved semantic cases, not a mandatory
+        # hop for every ordinary question.  Probing the same finalizer that
+        # will govern generation makes the decision contract exact: if a
+        # bounded source already closes the required answer, no upstream LLM
+        # latency or availability can delay it.
         bundle = assemble_evidence_bundle(
             query=query,
             candidates=bundle_candidates,
@@ -6536,6 +6572,116 @@ async def run_rag_v2_stream(
             max_context_chunks=MAX_CONTEXT_CHUNKS,
             max_context_chars=MAX_CONTEXT_CHARS,
         )
+        deterministic_probe = finalize_visible_evidence_bundle(
+            bundle,
+            requirements=plan.requirements,
+            task_graph=active_task_graph,
+            task_ledger=task_execution_ledger,
+            terminology_resolution=terminology_resolution,
+            max_context_chunks=MAX_CONTEXT_CHUNKS,
+            max_context_chars=MAX_CONTEXT_CHARS,
+        )
+        model_adjudication_requested = _should_model_adjudicate_evidence(
+            settings=settings,
+            search_config=search_config,
+        )
+        if model_adjudication_requested and not deterministic_probe.generation_allowed:
+            # The model is a semantic evidence adjudicator, not a retrieval
+            # authority. Its input has already passed authorization, task
+            # retrieval and any exact KB/document scope filter, while its
+            # output remains subject to the normal graph, coverage, source
+            # and renderer validations below.
+            model_adjudication_attempted = True
+            model_adjudication_candidate_count = len(bundle_candidates)
+            adjudication_started = time.perf_counter()
+            try:
+                outcome = await asyncio.wait_for(
+                    joint_rerank_with_coverage(
+                        query,
+                        list(bundle_candidates),
+                        [requirement.to_dict() for requirement in plan.requirements],
+                    ),
+                    timeout=float(
+                        getattr(
+                            settings,
+                            "rag_v2_model_evidence_adjudication_timeout_seconds",
+                            12.0,
+                        )
+                    ),
+                )
+                model_adjudication_elapsed_ms = round(
+                    (time.perf_counter() - adjudication_started) * 1000
+                )
+                if outcome.succeeded:
+                    # A successful response is schema-validated by the
+                    # reranker and revalidated against source constraints
+                    # there.  Retain only its annotations; scope remains the
+                    # immutable filter already applied to this candidate set.
+                    bundle_candidates = outcome.results
+                    model_adjudication_succeeded = True
+                else:
+                    # A failed/invalid model response must never erase a
+                    # deterministic answer path.  Keep the original bounded
+                    # candidates and record the degradation for operators.
+                    model_adjudication_succeeded = False
+                    model_adjudication_error = outcome.error or "unverified"
+            except Exception as exc:
+                model_adjudication_elapsed_ms = round(
+                    (time.perf_counter() - adjudication_started) * 1000
+                )
+                model_adjudication_succeeded = False
+                model_adjudication_error = type(exc).__name__
+            trace_event(
+                "evidence.model_adjudication",
+                trace_id=trace_id,
+                pipeline_version=PIPELINE_VERSION,
+                attempted=True,
+                succeeded=model_adjudication_succeeded,
+                candidate_count=model_adjudication_candidate_count,
+                elapsed_ms=model_adjudication_elapsed_ms,
+                error=model_adjudication_error,
+                scope_selected=bool(
+                    normalized_scope_filter is not None
+                    and normalized_scope_filter.valid
+                ),
+            )
+            if model_adjudication_succeeded is True:
+                bundle = assemble_evidence_bundle(
+                    query=query,
+                    candidates=outcome.results,
+                    requirements=plan.requirements,
+                    retrieval_queries=plan.retrieval_queries,
+                    task_graph=active_task_graph,
+                    task_ledger=task_execution_ledger,
+                    terminology_resolution=terminology_resolution,
+                    constraints=bundle_constraints,
+                    overview_candidates=overview_candidates,
+                    answer_shape=plan.answer_shape,
+                    rerank_succeeded=True,
+                    expansion_succeeded=expansion_succeeded,
+                    retrieval_degraded=retrieval_degraded,
+                    completeness=completeness,
+                    missing_requirement_ids=missing_requirement_ids,
+                    max_context_chunks=MAX_CONTEXT_CHUNKS,
+                    max_context_chars=MAX_CONTEXT_CHARS,
+                )
+        elif model_adjudication_requested:
+            model_adjudication_skip_reason = "deterministic_evidence_closed"
+            trace_event(
+                "evidence.model_adjudication",
+                trace_id=trace_id,
+                pipeline_version=PIPELINE_VERSION,
+                attempted=False,
+                succeeded=None,
+                candidate_count=len(bundle_candidates),
+                elapsed_ms=0,
+                error=None,
+                skip_reason=model_adjudication_skip_reason,
+                scope_selected=bool(
+                    normalized_scope_filter is not None
+                    and normalized_scope_filter.valid
+                ),
+            )
         if expansion_errors:
             bundle = replace(
                 bundle,
@@ -6553,16 +6699,18 @@ async def run_rag_v2_stream(
         "rerank.completed",
         trace_id=trace_id,
         pipeline_version=PIPELINE_VERSION,
-        # V2 intentionally does not execute a model reranker.  ``None`` is
-        # distinct from a successful rerank and prevents traces from implying
-        # validation that never happened.
-        succeeded=None,
         requested=bool(search_config.get("rerank", False)),
-        executed=False,
-        mode="rrf_deterministic",
+        executed=model_adjudication_attempted,
+        mode=(
+            "model_evidence_adjudication"
+            if model_adjudication_attempted
+            else "rrf_deterministic"
+        ),
         candidate_count=len(initial_candidates),
         selected_count=len(bundle.context_item_ids),
-        elapsed_ms=0,
+        elapsed_ms=model_adjudication_elapsed_ms,
+        succeeded=model_adjudication_succeeded,
+        skip_reason=model_adjudication_skip_reason,
     )
     yield _step_event("rerank", "done")
 
@@ -6809,6 +6957,8 @@ async def run_rag_v2_stream(
         clarification=(ambiguity.to_dict() if ambiguity.needs_clarification else None),
         evidence_scope_anchor_hit=scope_anchor_hit,
         evidence_scope_anchor_doc_ids=scope_anchor_doc_ids,
+        rerank_executed=model_adjudication_attempted,
+        rerank_succeeded=model_adjudication_succeeded,
     )
     trace_event(
         "evidence.selection",
@@ -6840,8 +6990,8 @@ async def run_rag_v2_stream(
         evidence_scope_anchor_hit=scope_anchor_hit,
         evidence_scope_anchor_doc_ids=list(scope_anchor_doc_ids),
         retrieval_elapsed_ms=round((time.perf_counter() - retrieval_started) * 1000),
-        rerank_elapsed_ms=0,
-        rerank_succeeded=None,
+        rerank_elapsed_ms=model_adjudication_elapsed_ms,
+        rerank_succeeded=model_adjudication_succeeded,
         selected=[
             {
                 "doc_id": source.get("doc_id"),

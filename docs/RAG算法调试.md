@@ -98,9 +98,9 @@
 7. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
 8. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
 9. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
-10. V2 不调用旧的生成式 reranker；`rerank.completed` 会明确记录 `attempted=false`。最终回答模型最多调用一次，并且只看到预算内的已授权 evidence bundle。`error / no_hit / scope_mismatch` 等无上下文终态由本地固定文案直接返回，避免再花时间让模型改写失败信息。正常聊天路径会在 V3 语义 barrier 后把 `not_ready` 统一转成 route clarification，禁止派发 V2；V2 保留的 `not_ready` SSE 分支只是供 direct/兼容调用者防御性终止，避免在流尾抛出 500。
+10. V2 先对已授权、任务图限量召回后的候选执行确定性证据闭合；只有该路径无法形成可生成答案时，才调用结构化证据裁判。`rerank.completed` 会记录 `mode=model_evidence_adjudication`、是否成功、耗时，或以 `skip_reason=deterministic_evidence_closed` 说明模型被跳过。模型只能标注片段对原问题的支撑关系，不能改写原问题、扩大 KB/文档范围或绕过最终图、覆盖和来源校验；超时、异常或结构无效时保留确定性候选链。最终回答模型仍只看到预算内的已授权 evidence bundle；`error / no_hit / scope_mismatch` 等无上下文终态由本地固定文案直接返回。正常聊天路径会在 V3 语义 barrier 后把 `not_ready` 统一转成 route clarification，禁止派发 V2；V2 保留的 `not_ready` SSE 分支只是供 direct/兼容调用者防御性终止，避免在流尾抛出 500。
 
-旧 V1 仍保留作为显式紧急回滚路径，其 `rerank.candidate`、`topic_relevance` 和 `answer_support` 字段仅用于 V1 Trace；不能与 V2 的确定性证据口径混算。
+旧 V1 仍保留作为显式紧急回滚路径。V1 的 `rerank.candidate` 明细与 V2 的模型裁判不是同一执行口径；V2 无论模型标注为何，最终仍以 `evidence.selection`、完整覆盖和来源校验为准，不能将模型分数单独当作可生成答案的证明。
 
 ## 回答交付与恢复
 

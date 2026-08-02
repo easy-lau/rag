@@ -110,6 +110,11 @@ _SINGLE_VALUE_TARGET_RE = re.compile(
     r"地址|名称|数值|价格|频率|状态|等级|级别|版本)$",
     re.IGNORECASE,
 )
+_ORDERED_PROCESS_CONTRACT_RE = re.compile(
+    r"(?:流程|步骤|操作步骤|处理流程|按(?:以下)?顺序|"
+    r"steps?|procedure|process)",
+    re.IGNORECASE,
+)
 
 # These are deliberately *shape* markers rather than business vocabulary.
 # An implicit mapping question has an entity/condition on the left and a
@@ -357,8 +362,20 @@ def _answer_coverage_contract(
     if mode == "single":
         return "single_claim"
 
-    frame = parse_query_surface_frame(question)
     normalized = re.sub(r"\s+", " ", str(question or "")).strip()
+    # An explicitly ordered process is not merely a finite set of members.
+    # Keep generic operational how-to questions (for example ``如何配置VPN``)
+    # as structured collections because a valid answer may be one declarative
+    # operation rather than a multi-step sequence.  Both the local planner and
+    # the V3 compiler call this helper, so timeout fallback and model
+    # compilation retain identical closure semantics.
+    if (
+        answer_shape == "process"
+        and _ORDERED_PROCESS_CONTRACT_RE.search(normalized)
+    ):
+        return "ordered_steps"
+
+    frame = parse_query_surface_frame(question)
     # ``供应商管理要求有哪些`` still asks for the governing requirement set;
     # the presence of ``有哪些`` does not prove that a bounded list is the
     # complete source.  Check the policy-head contract before the generic

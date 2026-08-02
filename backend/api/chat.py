@@ -10,7 +10,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import delete as sa_delete, select
 from database import AsyncSessionLocal as TaskReadSessionLocal, get_db
 from models.db_models import (
     ChatTurn,
@@ -40,7 +40,13 @@ from core.chat_turns import (
     turn_duration_ms,
     turn_lease_expired,
 )
-from models.schemas import ChatRequest, ConversationOut, ConversationRenameRequest, MessageOut
+from models.schemas import (
+    ChatRequest,
+    ConversationBatchDeleteRequest,
+    ConversationOut,
+    ConversationRenameRequest,
+    MessageOut,
+)
 from core.rag_pipeline import run_rag_stream
 from core.rag_v2.pipeline import (
     retrieve_anchor_retrieval_snapshot,
@@ -122,6 +128,7 @@ _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE = (
 _SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = SUCCESSFUL_EVIDENCE_SCOPE_STATUSES
 _EVIDENCE_PENDING_SCHEMA = "rag_pending_clarification.v2"
 _EVIDENCE_PENDING_KIND = "evidence_scope"
+_ROUTE_PENDING_SCHEMA = "rag_pending_clarification.v1"
 _EVIDENCE_EVENT_SCHEMA = "rag_evidence_clarification.v1"
 _EVIDENCE_ACK_SCHEMA = "rag_evidence_clarification_ack.v1"
 _EVIDENCE_DIMENSIONS = {
@@ -180,6 +187,63 @@ _EVIDENCE_REFINEMENT_HINT_RE = re.compile(
     r"(?:产品|版本|项目|范围|系统|平台|环境|地区|部门|职级)",
     re.IGNORECASE,
 )
+_ROUTE_CLARIFICATION_CANCEL_RE = re.compile(
+    r"^(?:取消|算了|不用了?|不需要|暂时不需要|先不用|不了|停止|退出)"
+    r"(?:吧|。|！|!)?$",
+    re.IGNORECASE,
+)
+_ROUTE_CLARIFICATION_NEW_QUESTION_RE = re.compile(
+    r"[?？]|(?:换(?:个|一个)(?:问题|话题)|另一个问题|新问题|重新问|"
+    r"请问|帮我|告诉我|怎么|如何|为什么|为何|什么|哪些|哪个|哪里|"
+    r"是否|能否|可以吗|介绍|说明|分析)",
+    re.IGNORECASE,
+)
+
+
+def _route_clarification_continuation(
+    question: str,
+    pending_state: dict | None,
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """Rebuild a pending semantic task from its original query plus answers.
+
+    A clarification reply is a slot value, not an independent retrieval
+    question.  The route model is still responsible for deciding whether the
+    rebuilt task is ready, but every downstream fallback receives the same
+    deterministic task query.  Complete new questions and explicit cancels do
+    not inherit the pending task.
+    """
+
+    if (
+        not isinstance(pending_state, dict)
+        or pending_state.get("schema_version") != _ROUTE_PENDING_SCHEMA
+    ):
+        return None
+    original_query = str(pending_state.get("original_query") or "").strip()
+    reply = str(question or "").strip()
+    if (
+        not original_query
+        or len(original_query) > 12000
+        or not reply
+        or len(reply) > 1200
+        or _ROUTE_CLARIFICATION_CANCEL_RE.fullmatch(reply)
+        or _ROUTE_CLARIFICATION_NEW_QUESTION_RE.search(reply)
+    ):
+        return None
+    stored_answers = pending_state.get("clarification_answers", [])
+    if not isinstance(stored_answers, list):
+        return None
+    answers: list[str] = []
+    for value in stored_answers:
+        answer = str(value or "").strip()
+        if not answer or len(answer) > 1200:
+            return None
+        answers.append(answer)
+    answers.append(reply)
+    answers = answers[-6:]
+    task_query = (
+        f"{original_query}\n已确认的补充条件：{'；'.join(answers)}"
+    )[:16000]
+    return task_query, original_query, tuple(answers)
 
 
 def _semantic_entry(settings: object) -> Literal["legacy", "v3"]:
@@ -624,7 +688,7 @@ def _active_pending_route_state(value: object) -> dict | None:
         return None
     if value.get("schema_version") == _EVIDENCE_PENDING_SCHEMA:
         return _validated_evidence_pending_state(value)
-    if value.get("schema_version") != "rag_pending_clarification.v1":
+    if value.get("schema_version") != _ROUTE_PENDING_SCHEMA:
         return None
     if not str(value.get("state_id") or "").strip():
         return None
@@ -1009,6 +1073,8 @@ async def _route_clarification_response(
     turn: ChatTurn | None = None,
     existing_user_message: Message | None = None,
     parent_stream_logging: bool = False,
+    original_query: str | None = None,
+    clarification_answers: tuple[str, ...] = (),
 ) -> StreamingResponse:
     """Persist a versioned, non-executable clarification and stream it.
 
@@ -1103,12 +1169,24 @@ async def _route_clarification_response(
     unresolved = (
         task_contract.clarification.unresolved if task_contract is not None else ()
     )
+    pending_original_query = str(original_query or question or "").strip()[:12000]
+    pending_clarification_answers = [
+        str(value).strip()[:1200]
+        for value in clarification_answers[-6:]
+        if str(value).strip()
+    ]
     conv.pending_route_state = {
-        "schema_version": "rag_pending_clarification.v1",
+        "schema_version": _ROUTE_PENDING_SCHEMA,
         "state_id": str(uuid.uuid4()),
         "base_user_message_id": str(user_msg.id),
         "clarification_message_id": str(assistant_msg.id),
         "intent_code": (task_contract.intent_code if task_contract is not None else "other"),
+        # A reply to this clarification is only a slot value.  Persist the
+        # immutable task root and bounded answers so every retry can recompile
+        # the full task instead of retrieving the reply text by itself.
+        "original_query": pending_original_query,
+        "clarification_answers": pending_clarification_answers,
+        "clarification_message": clarification_message.strip()[:12000],
         "unresolved": [
             {
                 "role": item.role,
@@ -3448,6 +3526,19 @@ async def send_message(
         if evidence_pending_state is not None and evidence_filter is not None
         else refined_evidence_query
     )
+    route_continuation = _route_clarification_continuation(
+        payload.question,
+        pending_route_state,
+    )
+    route_continuation_query = (
+        route_continuation[0] if route_continuation is not None else None
+    )
+    route_original_query = (
+        route_continuation[1] if route_continuation is not None else None
+    )
+    route_clarification_answers = (
+        route_continuation[2] if route_continuation is not None else ()
+    )
     evidence_pending_execution = bool(
         evidence_pending_state is not None
         and (evidence_filter is not None or evidence_refinement_active)
@@ -3467,10 +3558,10 @@ async def send_message(
         kb_ids=payload.knowledge_base_ids,
         pending_route_state=pending_route_state,
     )
-    if pipeline_base_query is not None:
+    if pipeline_base_query is not None or route_continuation_query is not None:
         conversation_context = replace(
             conversation_context,
-            standalone_query=pipeline_base_query,
+            standalone_query=(pipeline_base_query or route_continuation_query),
         )
 
     # 在任何路由/检索之前记录请求和多轮上下文，保证调用链的第一阶段始终
@@ -3614,7 +3705,11 @@ async def send_message(
     # 不再把 ``当前问题。上一轮问题`` 作为新的路由输入，否则路由、局部规划
     # 和后续检索会对同一问题分别猜一次语义。待源锚定理解完成后，才生成仅供
     # 检索使用的 canonical rendering。
-    routing_question = evidence_routing_query or payload.question
+    routing_question = (
+        evidence_routing_query
+        or route_continuation_query
+        or payload.question
+    )
     if evidence_pending_execution:
         try:
             routing_result = build_verified_evidence_scope_result(
@@ -3749,7 +3844,7 @@ async def send_message(
     ):
         semantic_entry_gate = assess_rag_semantic_entry_gate(
             route_task_contract,
-            question=payload.question,
+            question=routing_question,
             selected_kb_count=len(set(payload.knowledge_base_ids)),
         )
         trace_event(
@@ -3846,6 +3941,8 @@ async def send_message(
                 selected_kb_ids=payload.knowledge_base_ids,
                 task_contract=route_task_contract,
                 turn=durable_turn,
+                original_query=(route_original_query or routing_question),
+                clarification_answers=route_clarification_answers,
             )
             if cleared_evidence_state_id is not None:
                 trace_event(
@@ -3991,7 +4088,9 @@ async def send_message(
     # starts as the current turn and may later be replaced by the terminal,
     # source-only rendering of ResolvedTurnSemantics.  It is never fed back
     # into route/planning/model analysis.
-    effective_retrieval_query = (pipeline_base_query or payload.question).strip()
+    effective_retrieval_query = (
+        pipeline_base_query or route_continuation_query or payload.question
+    ).strip()
     if pipeline_version == "v2" and isinstance(task_contract, RagTaskContract):
         if semantic_entry == "v3" and not evidence_pending_execution:
             # Strip every heuristic/route-selected projection before V3 sees
@@ -4000,19 +4099,20 @@ async def send_message(
             # until a catalog-bound selection has been validated and reloaded.
             conversation_context = build_v3_catalog_candidate_context(
                 context=conversation_context,
-                current_question=payload.question,
+                current_question=effective_retrieval_query,
             )
-            effective_retrieval_query = payload.question.strip()
         v2_execution_context = build_current_turn_v2_execution_context(
             retrieval_query=effective_retrieval_query,
         )
-        # The deterministic baseline may inspect only the current user text.
-        # Historical qualifiers are represented later by a validated
-        # ``ResolvedTurnSemantics`` object, never by reparsing a concatenated
-        # standalone query.  The route contract remains the authority for
-        # category/policy/dispatch, but its free-text requirements are not a
-        # second semantic plan.
-        local_surface_plan = plan_query_locally(payload.question)
+        # The deterministic baseline normally inspects only the current user
+        # text.  Pending clarification replies are the deliberate exception:
+        # an evidence choice such as ``c2`` is a control value, while a route
+        # slot answer such as a product name is only a qualifier.  Preserve
+        # the pending task's original question as the immutable plan root.
+        # Historical qualifiers outside a pending task are still represented
+        # only by validated semantic contracts.
+        execution_question = effective_retrieval_query
+        local_surface_plan = plan_query_locally(execution_question)
         contextual_plan = local_surface_plan
         execution_plan = local_surface_plan
         analysis_route_context = _query_analysis_route_context(
@@ -4023,8 +4123,8 @@ async def send_message(
             plan=execution_plan,
             local_surface_plan=local_surface_plan,
             contextual_plan=contextual_plan,
-            question=payload.question,
-            standalone_query=payload.question,
+            question=execution_question,
+            standalone_query=execution_question,
             route_context=analysis_route_context,
             deterministic_is_followup=conversation_context.is_followup,
         )
@@ -4141,6 +4241,8 @@ async def send_message(
                 task_contract=blocked_contract,
                 query_execution_gate=query_execution_gate,
                 turn=durable_turn,
+                original_query=(route_original_query or execution_question),
+                clarification_answers=route_clarification_answers,
             )
             if cleared_evidence_state_id is not None:
                 trace_event(
@@ -4285,7 +4387,7 @@ async def send_message(
     current_pending = getattr(conv, "pending_route_state", None)
     if (
         isinstance(current_pending, dict)
-        and current_pending.get("schema_version") == "rag_pending_clarification.v1"
+        and current_pending.get("schema_version") == _ROUTE_PENDING_SCHEMA
     ):
         previous_state_id = current_pending.get("state_id")
         conv.pending_route_state = None
@@ -5028,6 +5130,8 @@ async def send_message(
                 turn=durable_turn,
                 existing_user_message=user_msg,
                 parent_stream_logging=True,
+                original_query=(route_original_query or effective_retrieval_query),
+                clarification_answers=route_clarification_answers,
             )
             async for clarification_chunk in clarification_response.body_iterator:
                 clarification_text = (
@@ -5067,7 +5171,11 @@ async def send_message(
                     **v2_execution_context.safe_summary(),
                 )
             rag_stream_kwargs = {
-                "question": pipeline_base_query or payload.question,
+                "question": (
+                    pipeline_base_query
+                    or route_continuation_query
+                    or payload.question
+                ),
                 "kb_ids": payload.knowledge_base_ids,
                 "search_config": search_config,
                 "conversation_id": str(conv.id),
@@ -6106,6 +6214,45 @@ async def rename_conversation(
     await db.commit()
     await db.refresh(conv)
     return conv
+
+
+@router.post("/batch-delete")
+async def delete_conversations_batch(
+    payload: ConversationBatchDeleteRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_permission(CHAT_USE)),
+):
+    """Atomically delete an authorised, bounded set of conversations."""
+
+    requested_ids = tuple(dict.fromkeys(payload.conversation_ids))
+    stmt = select(Conversation).where(Conversation.id.in_(requested_ids))
+    if not user.is_superadmin:
+        stmt = stmt.where(Conversation.user_id == user.id)
+    conversations = (await db.execute(stmt.with_for_update())).scalars().all()
+    conversations_by_id = {item.id: item for item in conversations}
+
+    # Fail the whole request when any id is missing or outside the caller's
+    # scope.  This both prevents partial destructive results and avoids
+    # disclosing whether an inaccessible conversation exists.
+    if any(conv_id not in conversations_by_id for conv_id in requested_ids):
+        raise HTTPException(
+            status_code=404,
+            detail="一个或多个会话不存在或无权操作",
+        )
+
+    # The foreign keys own transcript/turn cleanup.  One set-based delete
+    # avoids loading every message relationship into application memory.
+    await db.execute(
+        sa_delete(Conversation)
+        .where(Conversation.id.in_(requested_ids))
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return {
+        "message": "批量删除成功",
+        "deleted_count": len(requested_ids),
+        "deleted_ids": [str(conv_id) for conv_id in requested_ids],
+    }
 
 
 @router.delete("/{conv_id}")

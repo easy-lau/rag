@@ -1,6 +1,13 @@
 import { defineStore } from 'pinia'
 import { reactive, ref, watch } from 'vue'
-import { createChatStream, getChatHistory, getMessages, renameConversation as renameConversationRequest, deleteConversation } from '@/api/chat'
+import {
+  createChatStream,
+  deleteConversation,
+  deleteConversations as deleteConversationsRequest,
+  getChatHistory,
+  getMessages,
+  renameConversation as renameConversationRequest,
+} from '@/api/chat'
 import { useSearchStore } from './search'
 import { answerSourcesFromSearchEvent } from '@/utils/chatEvidence'
 import {
@@ -839,15 +846,33 @@ export const useChatStore = defineStore('chat', () => {
   async function removeConversation(convId) {
     if (isStreaming.value) return
     await deleteConversation(convId)
+    historyRequestId += 1
     conversations.value = conversations.value.filter(c => c.id !== convId)
     if (currentConvId.value === convId) newConversation()
+  }
+
+  async function removeConversations(convIds) {
+    if (isStreaming.value) return
+    const ids = [...new Set(
+      (Array.isArray(convIds) ? convIds : [])
+        .map(value => String(value || '').trim())
+        .filter(Boolean),
+    )]
+    if (!ids.length) return { deleted_count: 0, deleted_ids: [] }
+
+    const result = await deleteConversationsRequest(ids)
+    historyRequestId += 1
+    const deletedIds = new Set(ids)
+    conversations.value = conversations.value.filter(c => !deletedIds.has(String(c.id)))
+    if (currentConvId.value && deletedIds.has(String(currentConvId.value))) newConversation()
+    return result
   }
 
   return {
     messages, conversations, currentConvId, isStreaming, activeRequestId, isConversationLoading, conversationLoadError,
     searchConfig, selectedKbIds,
     sendMessage, submitClarification, stopStreaming, loadHistory, loadConversation,
-    newConversation, renameConversation, removeConversation,
+    newConversation, renameConversation, removeConversation, removeConversations,
     restoreMessageSearch, restoreLatestMessageSearch,
   }
 })

@@ -33,7 +33,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
 
         cases = {
             "如何配置VPN": ("process", "collection", "structured_collection"),
-            "采购申请流程是什么": ("process", "collection", "structured_collection"),
+            "采购申请流程是什么": ("process", "collection", "ordered_steps"),
             "连续出差超过30天住宿标准如何处理": (
                 "fact",
                 "single",
@@ -87,6 +87,17 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
         for question in (
             "登录方式有哪些",
             "偏远地区出差有什么补贴",
+        ):
+            with self.subTest(question=question):
+                answer = next(
+                    item
+                    for item in plan_query_locally(question).requirements
+                    if item.role == "answer"
+                )
+                self.assertEqual(answer.coverage_mode, "collection")
+                self.assertEqual(answer.coverage_contract, "structured_collection")
+
+        for question in (
             "采购申请流程是什么",
             "审批流程有哪些步骤",
         ):
@@ -97,7 +108,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                     if item.role == "answer"
                 )
                 self.assertEqual(answer.coverage_mode, "collection")
-                self.assertEqual(answer.coverage_contract, "structured_collection")
+                self.assertEqual(answer.coverage_contract, "ordered_steps")
 
     def test_what_is_does_not_automatically_expand_to_document_overview(
         self,

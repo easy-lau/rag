@@ -248,6 +248,10 @@ class ConversationRenameRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200)
 
 
+class ConversationBatchDeleteRequest(BaseModel):
+    conversation_ids: list[uuid.UUID] = Field(..., min_length=1, max_length=100)
+
+
 # ── Search ───────────────────────────────────────────────────────
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=12000)

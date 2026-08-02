@@ -308,6 +308,115 @@ async def _sse_events(response) -> list[dict]:
 
 
 class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pending_route_reply_keeps_original_task_when_v3_falls_back(self) -> None:
+        """A clarification value must never become the fallback retrieval query."""
+
+        reply = "云枢的"
+        original_query = "我现在想改验证码有效期时间"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        pending = {
+            "schema_version": "rag_pending_clarification.v1",
+            "state_id": "route-pending",
+            "base_user_message_id": str(uuid.uuid4()),
+            "clarification_message_id": str(uuid.uuid4()),
+            "intent_code": "knowledge_qa",
+            "original_query": original_query,
+            "clarification_answers": [],
+            "unresolved": [
+                {"role": "system_or_product", "reason": "missing", "candidate_count": 0}
+            ],
+            "selected_kb_ids_snapshot": [str(kb_id)],
+            "created_at": "2026-08-02T00:00:00+00:00",
+            "expires_at": "2099-08-02T00:00:00+00:00",
+            "dispatch_authorized": False,
+        }
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=pending,
+            route_state_revision=1,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=reply,
+            history_messages=(),
+            carryover_sources=(),
+            pending_route_state=pending,
+        )
+        v2_calls: list[dict] = []
+        route_calls: list[str] = []
+
+        class FallbackService:
+            async def run_active(self, **kwargs):
+                return _fallback_v3_result(baseline=kwargs["baseline"])
+
+        async def classify(_db, question, **_kwargs):
+            route_calls.append(question)
+            return _routing_result(selected_kb_count=1)
+
+        async def v2_stream(**kwargs):
+            v2_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps(
+                {"type": "done", "conversation_id": str(conversation_id)}
+            ) + "\n\n"
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch("api.chat.prepare_conversation_context", new=AsyncMock(return_value=context)),
+            patch("api.chat.classify_intent_result", new=classify),
+            patch("api.chat.get_settings", return_value=_v3_settings(anchor_prefetch_enabled=False)),
+            patch(
+                "api.chat.get_query_analysis_execution_service",
+                side_effect=AssertionError("V3 request must not invoke legacy analysis"),
+            ),
+            patch(
+                "api.chat.get_query_understanding_v3_execution_service",
+                return_value=FallbackService(),
+            ),
+            patch("api.chat.run_rag_v2_stream", new=v2_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=reply,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        self.assertEqual(len(route_calls), 1)
+        self.assertIn(original_query, route_calls[0])
+        self.assertIn(reply, route_calls[0])
+        self.assertEqual(len(v2_calls), 1)
+        handoff = v2_calls[0]
+        self.assertEqual(handoff["question"], route_calls[0])
+        self.assertEqual(handoff["standalone_query"], route_calls[0])
+        planned_query = handoff["execution_bundle"].plan.original_query
+        self.assertIn(original_query, planned_query)
+        self.assertIn(reply, planned_query)
+        self.assertNotEqual(planned_query, reply)
+        self.assertNotEqual(handoff["question"], reply)
+
     async def test_v3_defers_route_semantic_clarification_but_keeps_hard_contract_boundary(self) -> None:
         """A route model cannot preempt the source-bound V3 semantic entry."""
 
