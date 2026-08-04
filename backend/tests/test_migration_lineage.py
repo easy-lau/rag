@@ -241,7 +241,29 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertIn("turn_status", message_columns)
         self.assertIn("search_snapshot", message_columns)
 
-    def test_alembic_has_single_0033_head(self) -> None:
+    def test_active_task_state_migration_is_authorization_neutral(self) -> None:
+        migration_34 = _load_migration(
+            "0034_add_conversation_active_task_state.py"
+        )
+        recorder = _MigrationRecorder()
+
+        with patch.object(migration_34, "op", recorder):
+            migration_34.upgrade()
+
+        columns = {
+            (table_name, column.name): column
+            for table_name, column in recorder.added_columns
+        }
+        state = columns[("conversations", "active_task_state")]
+        self.assertIsInstance(state.type, JSONB)
+        self.assertTrue(state.nullable)
+        self.assertFalse(state.foreign_keys)
+        revision = columns[("conversations", "active_task_revision")]
+        self.assertIsInstance(revision.type, Integer)
+        self.assertFalse(revision.nullable)
+        self.assertEqual(str(revision.server_default.arg), "0")
+
+    def test_alembic_has_single_0035_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -249,8 +271,10 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0033"])
+        self.assertEqual(scripts.get_heads(), ["0035"])
         self.assertEqual(scripts.get_revision("0032").down_revision, "0031")
+        self.assertEqual(scripts.get_revision("0034").down_revision, "0033")
+        self.assertEqual(scripts.get_revision("0035").down_revision, "0034")
 
     def test_message_duration_migration_is_additive(self) -> None:
         migration_31 = _load_migration("0031_add_message_answer_duration.py")

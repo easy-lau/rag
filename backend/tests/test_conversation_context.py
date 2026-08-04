@@ -13,6 +13,7 @@ from core.conversation_context import (
     build_resolved_v2_execution_context,
     build_v3_catalog_candidate_context,
     build_v3_catalog_v2_execution_context,
+    build_verified_followup_v2_execution_context,
     build_standalone_query,
     detect_followup,
     prepare_conversation_context,
@@ -70,6 +71,25 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(execution_context.conversation_history, ())
         self.assertEqual(execution_context.carryover_sources, ())
         self.assertEqual(execution_context.context_turn_keys, ())
+
+    def test_verified_followup_baseline_keeps_sources_but_not_assistant_history(self) -> None:
+        context = ConversationContext(
+            is_followup=True,
+            followup_reason="missing_action_object",
+            standalone_query="应该如何配置默认密码强制修改",
+            history_messages=(
+                {"role": "assistant", "content": "未经本轮验证的旧回答"},
+            ),
+            carryover_sources=({"id": str(uuid.uuid4()), "content": "原文"},),
+            query_resolution_mode="contextualize",
+        )
+
+        execution = build_verified_followup_v2_execution_context(context=context)
+
+        self.assertEqual(execution.mode, "verified_followup_baseline")
+        self.assertTrue(execution.semantic_context_applied)
+        self.assertEqual(execution.conversation_history, ())
+        self.assertEqual(len(execution.carryover_sources), 1)
 
     def test_v3_candidate_context_clears_legacy_projection_but_keeps_authorised_catalog(self) -> None:
         candidate = RouteTurnCandidate(
@@ -698,7 +718,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
             )[0]
         )
 
-    def test_standalone_query_uses_topic_and_technical_terms(self) -> None:
+    def test_standalone_query_keeps_topic_without_answer_internals(self) -> None:
         rewritten = build_standalone_query(
             "这些配置有什么影响",
             previous_user_question="云枢 8.6 如何防止登录用户名枚举",
@@ -707,8 +727,8 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("云枢 8.6", rewritten)
-        self.assertIn("error_reply_same1", rewritten)
-        self.assertIn("defaultPwd", rewritten)
+        self.assertNotIn("error_reply_same1", rewritten)
+        self.assertNotIn("defaultPwd", rewritten)
         self.assertIn("这些配置有什么影响", rewritten)
 
     def test_current_explicit_version_overrides_previous_version(self) -> None:
@@ -725,6 +745,23 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(constraints.explicit_version)
         self.assertNotIn("8.6", rewritten)
         self.assertNotIn("原始追问", rewritten)
+
+    def test_answer_refinement_inherits_previous_task_object(self) -> None:
+        is_followup, reason = detect_followup(
+            "完整的配置是什么",
+            has_previous_turn=True,
+            previous_user_question="我现在想让云枢登录强制修改密码应该怎么办",
+        )
+        self.assertTrue(is_followup)
+        self.assertEqual(reason, "answer_refinement")
+        rewritten = build_standalone_query(
+            "完整的配置是什么",
+            previous_user_question="我现在想让云枢登录强制修改密码应该怎么办",
+            previous_assistant_answer="",
+            followup_reason=reason,
+        )
+        self.assertIn("登录强制修改密码", rewritten)
+        self.assertIn("完整的配置", rewritten)
 
     def test_missing_action_object_builds_clean_topic_query(self) -> None:
         rewritten = build_standalone_query(
@@ -805,7 +842,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("当前追问", rewritten)
         self.assertNotIn("用于消解指代", rewritten)
         self.assertIn("云枢 8.6", rewritten)
-        self.assertIn("error_reply_same1", rewritten)
+        self.assertNotIn("error_reply_same1", rewritten)
 
     def test_version_only_followup_inherits_product_but_overrides_version(self) -> None:
         rewritten = build_standalone_query(
@@ -1200,7 +1237,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
             "carryover_previous_turn",
         )
         self.assertIn("云枢 8.6", context.standalone_query)
-        self.assertIn("error_reply_same1", context.standalone_query)
+        self.assertNotIn("error_reply_same1", context.standalone_query)
         self.assertEqual([item["role"] for item in context.history_messages], ["user", "assistant"])
         self.assertEqual(db.execute_count, 2)
         source_sql = str(db.statements[1])

@@ -177,11 +177,39 @@ class DocumentRelevanceAdmissionTests(unittest.TestCase):
             ],
             query="不存在的火星基地量子补贴标准是什么",
         )
-
         self.assertEqual(decision.admitted_doc_ids, ())
         self.assertEqual(
             decision.reason,
             "no_document_met_lexical_or_vector_gate",
+        )
+
+    def test_unscoped_product_query_keeps_one_representative_per_version(self) -> None:
+        decision = assess_document_relevance(
+            [
+                _candidate(
+                    "cloudpivot-7",
+                    vector_score=0.88,
+                    filename="云枢7配置说明.md",
+                    content="云枢 登录 强制 修改 密码 应该 怎么办 配置",
+                    metadata={"产品名称": "云枢", "产品版本": "7"},
+                ),
+                _candidate(
+                    "cloudpivot-6",
+                    vector_score=0.80,
+                    filename="云枢6配置说明.md",
+                    content="云枢 登录 强制 修改 密码 应该 怎么办 配置",
+                    metadata={"产品名称": "云枢", "产品版本": "6"},
+                ),
+            ],
+            query="云枢登录强制修改密码应该怎么办",
+        )
+        self.assertEqual(
+            decision.admitted_doc_ids,
+            ("cloudpivot-7", "cloudpivot-6"),
+        )
+        self.assertEqual(
+            decision.reason,
+            "admitted_by_each_explicit_version_representative",
         )
 
     def test_query_topic_gate_keeps_strong_vector_without_exact_terms(self) -> None:

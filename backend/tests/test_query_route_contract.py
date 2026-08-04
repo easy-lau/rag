@@ -326,6 +326,18 @@ class RagRouteDecisionParserTests(unittest.TestCase):
             ("t1", "t2"),
         )
 
+        object_ambiguity = copy.deepcopy(one_candidate)
+        object_ambiguity["clarification"]["unresolved"][0]["role"] = "object_or_goal"
+        object_decision = parse_rag_route_decision(
+            object_ambiguity,
+            allowed_intent_codes=["knowledge_qa"],
+            available_turn_keys=["t1", "t2"],
+        )
+        self.assertEqual(
+            object_decision.clarification.unresolved[0].candidate_keys,
+            ("t1",),
+        )
+
         unavailable_with_candidate = copy.deepcopy(ambiguous)
         unavailable_with_candidate["clarification"]["unresolved"][0][
             "reason"

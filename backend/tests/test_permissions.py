@@ -32,12 +32,9 @@ from core.permissions import (
     LEGACY_KB_WRITE,
     MENU_CHAT,
     MENU_DOCUMENTS,
-    MENU_TERMINOLOGY,
     ROLE_MANAGE,
     SETTINGS_WRITE,
     SUPERADMIN_ROLE_CODE,
-    TERMINOLOGY_MANAGE,
-    TERMINOLOGY_READ,
     USER_MANAGE,
     capability_catalog_payload,
     derive_menus,
@@ -64,10 +61,6 @@ class PermissionPolicyTests(unittest.TestCase):
                     normalize_assignable_capabilities([key]),
                     {key, KB_READ},
                 )
-        self.assertEqual(
-            normalize_assignable_capabilities([TERMINOLOGY_MANAGE]),
-            {TERMINOLOGY_MANAGE, TERMINOLOGY_READ, KB_READ},
-        )
 
     def test_crud_actions_are_independently_assignable(self) -> None:
         capabilities = normalize_assignable_capabilities([DOC_UPDATE, KB_UPDATE])
@@ -99,10 +92,9 @@ class PermissionPolicyTests(unittest.TestCase):
             normalize_assignable_capabilities([LEGACY_DOC_WRITE])
 
     def test_menu_is_derived_not_assignable(self) -> None:
-        menus = derive_menus([CHAT_USE, DOC_UPDATE, TERMINOLOGY_READ])
+        menus = derive_menus([CHAT_USE, DOC_UPDATE])
         self.assertIn(MENU_CHAT, menus)
         self.assertIn(MENU_DOCUMENTS, menus)
-        self.assertIn(MENU_TERMINOLOGY, menus)
         with self.assertRaisesRegex(ValueError, "派生权限"):
             normalize_assignable_capabilities([MENU_CHAT])
 
@@ -118,8 +110,6 @@ class PermissionPolicyTests(unittest.TestCase):
     def test_none_scope_cannot_carry_kb_data_capabilities(self) -> None:
         with self.assertRaisesRegex(ValueError, "知识库数据权限"):
             validate_capability_scope({"kb:read"}, KB_SCOPE_NONE)
-        with self.assertRaisesRegex(ValueError, "知识库数据权限"):
-            validate_capability_scope({TERMINOLOGY_READ, KB_READ}, KB_SCOPE_NONE)
         # Chat can be used as a general conversation role without a KB scope.
         validate_capability_scope({CHAT_USE}, KB_SCOPE_NONE)
         # A selected scope may be attached before a role is given read/write
@@ -147,13 +137,6 @@ class PermissionPolicyTests(unittest.TestCase):
         )
         self.assertIsNotNone(
             non_superadmin_delegation_error(actor, {ROLE_MANAGE}, KB_SCOPE_NONE)
-        )
-        self.assertIsNotNone(
-            non_superadmin_delegation_error(
-                actor,
-                {TERMINOLOGY_MANAGE, TERMINOLOGY_READ, KB_READ},
-                KB_SCOPE_SELECTED,
-            )
         )
 
     def test_selected_role_scope_must_be_within_actor_access(self) -> None:
@@ -214,7 +197,6 @@ class PermissionPolicyTests(unittest.TestCase):
             KB_UPDATE,
             KB_DELETE,
             SETTINGS_WRITE,
-            TERMINOLOGY_MANAGE,
             USER_MANAGE,
             ROLE_MANAGE,
         ):

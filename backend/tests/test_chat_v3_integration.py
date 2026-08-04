@@ -308,6 +308,108 @@ async def _sse_events(response) -> list[dict]:
 
 
 class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verified_missing_object_followup_does_not_wait_for_v3_model(self) -> None:
+        question = "应该如何配置"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        source = {
+            "id": str(uuid.uuid4()),
+            "doc_id": str(uuid.uuid4()),
+            "kb_id": str(kb_id),
+            "content": "force_change_default_password: true # 默认密码强制修改",
+        }
+        context = ConversationContext(
+            is_followup=True,
+            followup_reason="missing_action_object",
+            standalone_query="应该如何配置默认密码强制修改",
+            history_messages=(
+                {"role": "user", "content": "默认密码强制修改"},
+                {"role": "assistant", "content": "已找到对应资料"},
+            ),
+            carryover_sources=(source,),
+            relation="followup",
+            query_resolution_mode="contextualize",
+        )
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=None,
+            active_task_revision=0,
+        )
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        routing_result = _routing_result(selected_kb_count=1)
+        v2_calls: list[dict] = []
+
+        async def v2_stream(**kwargs):
+            v2_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        v3_service = SimpleNamespace(
+            run_active=AsyncMock(
+                side_effect=AssertionError("verified follow-up must skip V3")
+            )
+        )
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=_v3_settings(anchor_prefetch_enabled=False),
+            ),
+            patch(
+                "api.chat.get_query_understanding_v3_execution_service",
+                return_value=v3_service,
+            ),
+            patch("api.chat.run_rag_v2_stream", new=v2_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        v3_service.run_active.assert_not_awaited()
+        self.assertEqual(len(v2_calls), 1)
+        self.assertEqual(
+            v2_calls[0]["standalone_query"],
+            "应该如何配置默认密码强制修改",
+        )
+        self.assertEqual(v2_calls[0]["conversation_history"], [])
+        self.assertEqual(v2_calls[0]["carryover_sources"], [source])
+        self.assertTrue(v2_calls[0]["is_followup"])
+
     async def test_pending_route_reply_keeps_original_task_when_v3_falls_back(self) -> None:
         """A clarification value must never become the fallback retrieval query."""
 

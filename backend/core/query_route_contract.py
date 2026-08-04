@@ -584,7 +584,16 @@ def parse_rag_route_decision(
             field=f"clarification.unresolved[{index}].candidate_keys",
             available_turn_keys=available_keys,
         )
-        if reason == "ambiguous" and len(candidate_keys) < 2:
+        # A context-turn ambiguity must compare at least two historical
+        # candidates.  Object/goal or product/version ambiguity can be a
+        # perfectly valid unresolved slot even when only one prior turn
+        # provides the topic anchor; rejecting it here discards useful model
+        # semantics and forces an unrelated fallback query.
+        if (
+            reason == "ambiguous"
+            and role == "context_turn"
+            and len(candidate_keys) < 2
+        ):
             raise RouteDecisionValidationError(
                 "ambiguous unresolved 至少需要两个 candidate_keys"
             )

@@ -1,5 +1,4 @@
 import json
-import os
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -7,10 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
-from pydantic import ValidationError
-
 from api.chat import _select_rag_pipeline_version, send_message
-from config import Settings
 from core.conversation_context import ConversationContext
 from core.query_analysis_execution import QueryAnalysisExecutionResult
 from core.query_route_compiler import (
@@ -144,19 +140,9 @@ def _evidence_pending_state(*, kb_id: uuid.UUID) -> dict:
     }
 
 
-class RagPipelineVersionConfigurationTests(unittest.TestCase):
-    def test_default_version_is_v2_and_invalid_values_are_rejected(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(Settings(_env_file=None).rag_pipeline_version, "v2")
-
-        with self.assertRaises(ValidationError):
-            Settings(rag_pipeline_version="v3", _env_file=None)
-
-
 class RagPipelineSelectionTests(unittest.TestCase):
     def _select(self, **overrides):
         values = {
-            "configured_version": "v2",
             "task_contract": _task_contract(),
             "evidence_scope_filter": None,
             "evidence_scope_refinement_active": False,
@@ -165,12 +151,6 @@ class RagPipelineSelectionTests(unittest.TestCase):
         }
         values.update(overrides)
         return _select_rag_pipeline_version(**values)
-
-    def test_configured_v1_remains_on_v1(self) -> None:
-        self.assertEqual(
-            self._select(configured_version="v1"),
-            ("v1", "configured_v1"),
-        )
 
     def test_eligible_grounded_qa_selects_v2(self) -> None:
         self.assertEqual(self._select(), ("v2", "eligible_grounded_qa"))
@@ -751,6 +731,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
                 "is_followup",
                 "followup_reason",
                 "evidence_scope_filter",
+                "active_task_scope",
                 "execution_bundle",
                 "task_read_session_factory",
             },
@@ -759,6 +740,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
             received_kwargs[0]["task_read_session_factory"],
             task_read_session_factory,
         )
+        self.assertIsNone(received_kwargs[0]["active_task_scope"])
         self.assertIsInstance(
             received_kwargs[0]["execution_bundle"],
             RagExecutionBundle,

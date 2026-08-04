@@ -19,7 +19,6 @@
 | `APP_VERSION` / `APP_REVISION` | `dev` / 空 | 发布版本和 Git revision，由镜像构建自动注入 |
 | `LOG_LEVEL` | `INFO` | Python 日志级别 |
 | `DEVELOPMENT_LOG_DIR` | `<项目根>/logs/development` | 开发环境每个后端进程的独立日志文件目录；生产环境不写本地文件 |
-| `RAG_PIPELINE_VERSION` | `v2` | 选择证据执行器；仅设为 `v1` 才整体回滚旧检索主链 |
 | `RAG_SEMANTIC_ENTRY` | `v3` | 选择语义理解 authority；`v3` 只允许模型选择服务器签发的原文 span，`legacy` 才启用旧 `query_analysis.v2` |
 | `RAG_QUERY_UNDERSTANDING_V3_MODE` | `active` | V3 的 `off / shadow / active` 模式；`active` 的失败只回退当前轮本地基线，不重跑旧语义模型 |
 | `RAG_QUERY_UNDERSTANDING_V3_ACTIVE_TIMEOUT_SECONDS` / `...MAX_INFLIGHT` | `2.5` / `2` | V3 首次 SSE 后的绝对等待预算和并发上限 |
@@ -89,7 +88,7 @@
 
 ## 当前 V3 语义理解与 V2 检索证据链路
 
-1. 后端先编译并校验 `rag_task_contract.v1`。知识问答和“依据知识库写作”进入 V2；问候、平台帮助和已附原文写作进入独立 `direct` runner。`RAG_PIPELINE_VERSION` 只选择证据执行器，默认 `v2`；只有显式设为 `v1` 才使用旧主链，V2 合同缺失、漂移或越权一律拒绝执行。
+1. 后端先编译并校验 `rag_task_contract.v1`。知识问答和“依据知识库写作”进入当前 V2 证据执行器；问候、平台帮助和已附原文写作进入独立 `direct` runner。V2 合同缺失、漂移或越权一律拒绝执行，不回退旧主链。
 2. V2 本地规划器只按问题结构拆分 `fact / process / list / comparison / multi_part / multi_hop`。诸如“普通员工的餐补”会生成最终 answer requirement 和身份到等级的 bridge requirement，不在代码中猜测 D 级、金额或其它业务值。规划完成后，`rag_query_execution.v1` 以不可变 plan/bundle 对单独判定能否执行；`query.plan` 的语义不会被该闸门覆盖。
 3. 默认语义入口是 `RAG_SEMANTIC_ENTRY=v3`。V3 模型只从服务器签发的 source-span catalog 中选择当前问题的答案目标、限定词及必要历史上下文 span；它不能编造检索词、别名、职级/金额等事实、KB/文档/权限、产品版本范围、coverage 或 DAG 边。可信编译器才可把已验证选择编译为多个 answer task，原问题始终保留为 `anchor_root`。已有显式 answer/proof 不会被模型降级，桥接最多经后端独立规则成为 optional augmentation，绝不成为 proof。
 4. V3 运行前会清空路由层和启发式层预选的历史投影；路由候选只作为可选 catalog。对于严格满足“那/那么 + 明确单一目标 + 呢”的追问，服务器会先选择当前目标和上一轮唯一用户实体的**精确原文 Span**，再把它绑定回同一 V3 catalog、可信编译器和 V2 证据任务图；此路径不读取 assistant 回答、不重写/拼接问题，也不继承产品版本、项目、条件或多个主体。若该显式追问的上一轮含范围/条件或主体不唯一，预检直接进入标准澄清，不能因模型超时或容量不足而退化成裸目标检索。未命中严格语法时，模型仍只能选择来源于“纯单实体”历史轮的精确实体 span；一旦选择了带范围/条件、多个主体或非实体历史片段，可信编译器会将其作为终态范围澄清，而非回退到可执行的裸当前轮。其他历史 span 才会由独立只读会话按当前 RBAC、KB 和文档状态重新加载，并重新投影进 V2。模型超时、容量不足、协议拒绝、普通编译失败或 revision fence 不匹配时，整轮只执行当前问题的安全基线，不携带未经验证的 history/carryover，也不调用 legacy 语义器。

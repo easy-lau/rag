@@ -18,7 +18,12 @@ from typing import Any, Iterable, Literal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from core.query_constraints import extract_query_constraints
+from core.active_task_state import ResolvedActiveTask
+from core.query_constraints import (
+    canonical_product_name,
+    extract_document_constraint_identity,
+    extract_query_constraints,
+)
 from core.query_surface_structure import (
     has_current_turn_local_enumeration_antecedent,
     parse_distributive_enumeration,
@@ -86,6 +91,13 @@ _SHORT_FOLLOWUP_RE = re.compile(
     r"为什么|有什么影响|有何影响|怎么处理|如何处理|具体呢|然后呢|还有呢|"
     r"能详细说说吗|可以展开说说吗"
     r")[？?。.!！\s]*$",
+    re.IGNORECASE,
+)
+_ANSWER_REFINEMENT_RE = re.compile(
+    r"^\s*(?:请给我|请提供|给我|提供|补充)?\s*"
+    r"(?:完整|详细|具体|全部|所有|完整的|详细的|具体的)\s*"
+    r"(?:配置|参数|内容|步骤|方案|清单|设置|说明|信息)\s*"
+    r"(?:是什么|有哪些|怎么配置|如何配置|是什么样的)?\s*[？?。.!！\s]*$",
     re.IGNORECASE,
 )
 _MISSING_ACTION_OBJECT_RE = re.compile(
@@ -369,10 +381,20 @@ class ConversationContext:
     query_resolution_mode: str = "current"
     context_turn_keys: tuple[str, ...] = ()
     pending_route_state: dict[str, Any] | None = None
+    # Server-resolved task continuity.  This object exists only for the current
+    # request after source ids have been re-authorized; persisted JSON is never
+    # copied here directly.
+    active_task: ResolvedActiveTask | None = None
+    # ``document`` reuses the previously closed source scope.  ``topic_only``
+    # keeps the task objective as context but requires a fresh authorized
+    # retrieval (for example CloudPivot 7 -> CloudPivot 6).
+    active_task_scope_mode: Literal["document", "topic_only"] = "document"
 
 
 V2ExecutionContextMode = Literal[
     "current_turn_baseline",
+    "active_task_state",
+    "verified_followup_baseline",
     "resolved_turn_semantics",
     "v3_catalog_context",
 ]
@@ -415,6 +437,20 @@ class V2ExecutionContext:
                 raise ValueError(
                     "current-turn V2 execution context cannot contain history"
                 )
+        elif self.mode == "active_task_state":
+            if not self.is_followup or not self.carryover_sources:
+                raise ValueError(
+                    "active-task V2 context requires a follow-up and sources"
+                )
+        elif self.mode == "verified_followup_baseline":
+            if (
+                not self.is_followup
+                or not self.carryover_sources
+                or self.conversation_history
+            ):
+                raise ValueError(
+                    "verified follow-up baseline requires sources without history"
+                )
         elif self.mode not in {"resolved_turn_semantics", "v3_catalog_context"}:
             raise ValueError("unsupported V2 execution context mode")
         object.__setattr__(self, "retrieval_query", query)
@@ -454,6 +490,76 @@ def build_current_turn_v2_execution_context(
         is_followup=False,
         followup_reason="v2_current_turn_baseline",
         context_turn_keys=(),
+    )
+
+
+def build_active_task_v2_execution_context(
+    *,
+    context: ConversationContext,
+) -> V2ExecutionContext:
+    """Project a freshly re-authorized task continuation into V2 inputs."""
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    if context.active_task is None or context.query_resolution_mode != "active_task_state":
+        raise ValueError("active-task execution requires resolved task state")
+    return V2ExecutionContext(
+        mode="active_task_state",
+        retrieval_query=context.standalone_query,
+        conversation_history=tuple(context.history_messages),
+        carryover_sources=tuple(context.carryover_sources),
+        is_followup=True,
+        followup_reason=context.followup_reason,
+        context_turn_keys=context.context_turn_keys,
+    )
+
+
+def build_verified_followup_v2_execution_context(
+    *,
+    context: ConversationContext,
+) -> V2ExecutionContext:
+    """Keep a deterministic, revalidated follow-up when a model is unavailable.
+
+    This compatibility path carries source rows, never the previous assistant
+    answer.  It is therefore safe for conversations created before durable
+    ActiveTaskState existed while preserving the same authorization boundary.
+    """
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    if not has_verified_deterministic_followup_context(context):
+        raise ValueError("context is not a verified deterministic follow-up")
+    return V2ExecutionContext(
+        mode="verified_followup_baseline",
+        retrieval_query=context.standalone_query,
+        conversation_history=(),
+        carryover_sources=tuple(context.carryover_sources),
+        is_followup=True,
+        followup_reason=context.followup_reason,
+        context_turn_keys=(),
+    )
+
+
+def has_verified_deterministic_followup_context(
+    context: ConversationContext,
+) -> bool:
+    """Return whether local grammar plus refreshed sources form a safe floor."""
+
+    reason = str(context.followup_reason or "")
+    supported = bool(
+        reason == "missing_action_object"
+        or reason == "elliptical_entity"
+        or reason == "answer_refinement"
+        or reason == "short_elliptical_question"
+        or reason.startswith("anaphora:")
+        or reason.startswith("clarification_answer:")
+    )
+    return bool(
+        context.is_followup
+        and supported
+        and not context.unresolved_reference
+        and context.carryover_sources
+        and context.query_resolution_mode == "contextualize"
     )
 
 
@@ -574,6 +680,7 @@ class RouteTurnCandidate:
     user_question: str
     assistant_answer: str | None
     raw_sources: tuple[dict[str, Any], ...] = ()
+    assistant_turn_id: uuid.UUID | None = None
 
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
@@ -630,6 +737,8 @@ def detect_followup(
         return True, f"anaphora:{match.group(0)}"
     if _ELLIPTICAL_ENTITY_FOLLOWUP_RE.fullmatch(normalized):
         return True, "elliptical_entity"
+    if _ANSWER_REFINEMENT_RE.fullmatch(normalized):
+        return True, "answer_refinement"
     if _MISSING_ACTION_OBJECT_RE.fullmatch(normalized):
         if not _previous_topic_supports_action_followup(previous_user_question):
             return False, "unresolved_reference:missing_action_object"
@@ -726,6 +835,11 @@ def _route_turn_candidates(
                     else None
                 ),
                 raw_sources=raw_sources,
+                assistant_turn_id=(
+                    assistant_message.turn_id
+                    if assistant_message is not None
+                    else None
+                ),
             )
         )
     return tuple(candidates)
@@ -896,22 +1010,15 @@ def build_standalone_query(
 ) -> str:
     """Turn an anaphoric follow-up into a retrieval-friendly query.
 
-    Previous assistant text only contributes technical identifiers to query
-    resolution.  It is never injected as knowledge evidence; factual grounding
-    continues to come from revalidated document chunks.
+    The previous turn contributes only the stable task topic for semantic
+    resolution.  Answer-internal identifiers are intentionally excluded from
+    this canonical query; factual grounding continues to come from
+    revalidated document chunks.
     """
 
     previous = (previous_user_question or "").strip()
     if not previous:
         return question.strip()
-    source_text = "\n".join(
-        f"{source.get('filename') or ''}\n{source.get('content') or ''}"
-        for source in carryover_sources
-    )
-    terms = _technical_terms(previous_assistant_answer or "", source_text)
-    # 技术标识可以帮助词面召回，但不要把“上一轮提到的关键配置项”这类
-    # 诊断元话语送进 embedding/FTS；它们会稀释真实主题或制造 AND 条件。
-    key_items = f" {' '.join(terms)}" if terms else ""
     current_text = question.strip()[:8000]
     # “那8.6呢 / 那云枢7呢”继承上一轮主题，但必须把旧版本替换掉；同时不把
     # “原始追问”这类调试字段送进召回。
@@ -940,16 +1047,18 @@ def build_standalone_query(
                 flags=re.IGNORECASE,
             )
         previous_topic = previous_topic.strip(" \t\r\n，。！？；：,.!?;:")
-        return f"{target_product}{target_version} {previous_topic}{key_items}".strip()[:8000]
+        return f"{target_product}{target_version} {previous_topic}".strip()[:8000]
     if followup_reason == "missing_action_object":
         # 检索问题中不能出现“需要继承的上一轮主题”这类调试元话语；它会
         # 稀释向量并让全文检索产生无意义的 AND 条件。上下文原因只写 Trace。
         return _merge_missing_action_object(current_text, previous)
+    if followup_reason == "answer_refinement":
+        return f"{previous[:600]} {current_text}"[:8000]
     return (
         # Current text must come first: deterministic constraint extraction
         # selects the first explicit product/version.  Natural sentences keep
         # vector/FTS inputs free from “用于消解指代” style diagnostic terms.
-        f"{current_text}。{previous[:600]}{key_items}"
+        f"{current_text}。{previous[:600]}"
     )
 
 
@@ -1156,6 +1265,90 @@ async def prepare_conversation_context(
         query_resolution_mode=("contextualize" if is_followup else "current"),
         context_turn_keys=((route_turn_candidates[0].candidate_key,) if is_followup and route_turn_candidates else ()),
         pending_route_state=pending_route_state,
+    )
+
+
+def apply_active_task_context(
+    *,
+    context: ConversationContext,
+    question: str,
+    resolved_task: ResolvedActiveTask | None,
+) -> ConversationContext:
+    """Use a grounded task as the deterministic baseline for a true follow-up.
+
+    The latest completed assistant turn must be the exact turn that produced
+    the persisted state.  This prevents a failed/newer topic from accidentally
+    reviving an older task.  Follow-up detection is then re-evaluated against
+    the task's stable root query rather than UI control text such as ``c2``.
+    """
+
+    if resolved_task is None:
+        return context
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    current = str(question or "").strip()
+    if not current:
+        return context
+    latest = context.route_turn_candidates[0] if context.route_turn_candidates else None
+    if (
+        latest is None
+        or latest.assistant_turn_id is None
+        or latest.assistant_turn_id != resolved_task.state.source_turn_id
+    ):
+        return context
+    is_followup, reason = detect_followup(
+        current,
+        has_previous_turn=True,
+        previous_user_question=resolved_task.state.root_query,
+    )
+    if not is_followup:
+        return context
+    scope_mode: Literal["document", "topic_only"] = "document"
+    current_constraints = extract_query_constraints(current)
+    root_constraints = extract_query_constraints(resolved_task.state.root_query)
+    current_identity = {
+        value
+        for source in resolved_task.sources
+        for value in extract_document_constraint_identity(source).versions
+    }
+    current_versions = {
+        str(value).strip().casefold()
+        for value in current_identity
+        if value
+    }
+    if current_constraints.product and root_constraints.product:
+        if canonical_product_name(current_constraints.product) != canonical_product_name(root_constraints.product):
+            scope_mode = "topic_only"
+    if current_constraints.explicit_version:
+        requested_version = str(current_constraints.version or "").casefold()
+        if requested_version and requested_version not in current_versions:
+            scope_mode = "topic_only"
+    standalone_query = build_standalone_query(
+        current,
+        previous_user_question=resolved_task.state.root_query,
+        previous_assistant_answer=latest.assistant_answer,
+        carryover_sources=resolved_task.sources if scope_mode == "document" else (),
+        followup_reason=reason,
+    )
+    return replace(
+        context,
+        is_followup=True,
+        followup_reason=f"active_task_state:{reason}",
+        standalone_query=standalone_query,
+        carryover_sources=(
+            resolved_task.sources if scope_mode == "document" else ()
+        ),
+        previous_user_question=resolved_task.state.root_query,
+        unresolved_reference=False,
+        relation="followup",
+        query_resolution_mode="active_task_state",
+        # The state is bound by source_turn_id, not a model-visible t* key.
+        context_turn_keys=(),
+        # A scope-changing continuation keeps the root topic but deliberately
+        # drops the executable document allow-list.  The next retrieval pass
+        # must rediscover authorized documents for the requested version.
+        active_task=(resolved_task if scope_mode == "document" else None),
+        active_task_scope_mode=scope_mode,
     )
 
 

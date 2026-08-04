@@ -31,6 +31,7 @@ from core.query_context_inheritance import (
     assess_historical_context_inheritability,
 )
 from core.query_surface_structure import (
+    is_exhaustive_configuration_request,
     answer_target_semantics,
     current_turn_candidate_targets_are_complete,
     has_current_turn_local_enumeration_antecedent,
@@ -611,6 +612,8 @@ def _answer_coverage(
 ) -> tuple[str, str]:
     """Choose only a small trusted coverage contract from surface grammar."""
 
+    if is_exhaustive_configuration_request(question):
+        return "collection", "structured_collection"
     frame = parse_query_surface_frame(question)
     if candidate_count == 1 and frame is not None and frame.question_operator == "enumeration":
         return "collection", "structured_collection"
@@ -627,6 +630,8 @@ def _answer_shape(
         return "comparison"
     if candidate_count > 1:
         return "multi_part"
+    if is_exhaustive_configuration_request(question):
+        return "list"
     frame = parse_query_surface_frame(question)
     if frame is not None and frame.question_operator == "enumeration":
         return "list"

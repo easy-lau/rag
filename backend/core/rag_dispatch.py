@@ -1,9 +1,8 @@
 """Runner-selection policy shared by the HTTP orchestration layer.
 
-This module owns the compatibility boundary: V1 is a deployment-wide explicit
-rollback choice, never an implicit fallback when a V2 contract is missing or
-unsafe.  It deliberately does not import any runner implementation, so the
-policy can be tested without creating model clients or retrieval sessions.
+This module owns the runner-selection policy for the active retrieval path.
+It deliberately does not import any runner implementation, so the policy can
+be tested without creating model clients or retrieval sessions.
 """
 
 from __future__ import annotations
@@ -13,12 +12,11 @@ from typing import Literal
 from core.query_route_compiler import RagTaskContract, rag_task_contract_gate_reason
 
 
-RagRunnerVersion = Literal["v1", "v2", "direct", "reject"]
+RagRunnerVersion = Literal["v2", "direct", "reject"]
 
 
 def select_rag_runner(
     *,
-    configured_version: Literal["v1", "v2"],
     task_contract: object,
     evidence_scope_filter: dict | None,
     evidence_scope_refinement_active: bool,
@@ -26,10 +24,9 @@ def select_rag_runner(
     carryover_sources: tuple[dict, ...] | list[dict],
     selected_kb_count: int | None = None,
 ) -> tuple[RagRunnerVersion, str]:
-    """Select exactly one runner without allowing an unsafe V2-to-V1 fallback."""
+    """Select exactly one active runner; invalid contracts are rejected."""
 
-    if configured_version != "v2":
-        return "v1", "configured_v1"
+
     if not isinstance(task_contract, RagTaskContract):
         return "reject", "missing_or_invalid_task_contract"
     if not task_contract.dispatch_authorized:

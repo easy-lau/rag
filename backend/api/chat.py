@@ -40,6 +40,11 @@ from core.chat_turns import (
     turn_duration_ms,
     turn_lease_expired,
 )
+from core.active_task_state import (
+    build_active_task_state,
+    parse_active_task_state,
+    resolve_active_task_state,
+)
 from models.schemas import (
     ChatRequest,
     ConversationBatchDeleteRequest,
@@ -47,11 +52,13 @@ from models.schemas import (
     ConversationRenameRequest,
     MessageOut,
 )
-from core.rag_pipeline import run_rag_stream
 from core.rag_v2.pipeline import (
     retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
 )
+# Transitional test/import alias only; it points at V2 and is not a legacy
+# execution path.
+run_rag_stream = run_rag_v2_stream
 from core.rag_v2.query_plan import plan_query_locally
 from core.rag_v2.task_graph import (
     RagExecutionBundle,
@@ -83,12 +90,16 @@ from core.intent_router import (
 from core.conversation_context import (
     ConversationContext,
     UNRESOLVED_REFERENCE_MESSAGE,
+    apply_active_task_context,
     apply_resolved_turn_semantics,
     apply_v3_catalog_context_selection,
+    build_active_task_v2_execution_context,
     build_current_turn_v2_execution_context,
     build_resolved_v2_execution_context,
     build_v3_catalog_candidate_context,
     build_v3_catalog_v2_execution_context,
+    build_verified_followup_v2_execution_context,
+    has_verified_deterministic_followup_context,
     prepare_conversation_context,
     resolve_routed_conversation_context,
     route_context_payloads,
@@ -249,11 +260,9 @@ def _route_clarification_continuation(
 def _semantic_entry(settings: object) -> Literal["legacy", "v3"]:
     """Resolve the one semantic authority for this request.
 
-    ``RAG_PIPELINE_VERSION`` chooses the evidence runner only.  Keeping this
-    decision in one small helper prevents a rolling settings object or a
-    future call site from accidentally running V3 and legacy query analysis
-    as two competing authorities.  Older test/rolling settings that predate
-    the explicit key retain legacy behaviour until their process is upgraded.
+    The evidence runner is always V2. Keeping this decision in one small
+    helper prevents a rolling settings object or a future call site from
+    accidentally running V3 and legacy query analysis as two authorities.
     """
 
     value = str(getattr(settings, "rag_semantic_entry", "legacy") or "").strip().casefold()
@@ -3558,6 +3567,32 @@ async def send_message(
         kb_ids=payload.knowledge_base_ids,
         pending_route_state=pending_route_state,
     )
+    resolved_active_task = None
+    if not evidence_pending_execution and route_continuation_query is None:
+        resolved_active_task = await resolve_active_task_state(
+            db,
+            value=getattr(conv, "active_task_state", None),
+            selected_kb_ids=payload.knowledge_base_ids,
+            read_session_factory=TaskReadSessionLocal,
+        )
+        conversation_context = apply_active_task_context(
+            context=conversation_context,
+            question=payload.question,
+            resolved_task=resolved_active_task,
+        )
+        if conversation_context.active_task is not None:
+            trace_event(
+                "conversation.active_task_resolved",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                resolution="applied",
+                task=conversation_context.active_task.safe_summary(),
+                **content_fields(
+                    "standalone_query",
+                    conversation_context.standalone_query,
+                ),
+            )
     if pipeline_base_query is not None or route_continuation_query is not None:
         conversation_context = replace(
             conversation_context,
@@ -3834,7 +3869,6 @@ async def send_message(
     ).strip().casefold()
     v3_semantic_compilation_active = (
         semantic_entry == "v3"
-        and settings.rag_pipeline_version == "v2"
         and configured_v3_mode == "active"
         and not evidence_pending_execution
     )
@@ -4008,7 +4042,6 @@ async def send_message(
         intent_payload = decision.to_dict()
 
     pipeline_version, pipeline_reason = _select_rag_pipeline_version(
-        configured_version=settings.rag_pipeline_version,
         task_contract=task_contract,
         evidence_scope_filter=evidence_filter,
         evidence_scope_refinement_active=evidence_refinement_active,
@@ -4045,7 +4078,6 @@ async def send_message(
             },
         )
     rag_stream_runner = {
-        "v1": run_rag_stream,
         "v2": run_rag_v2_stream,
         "direct": run_direct_response_stream,
     }[pipeline_version]
@@ -4089,10 +4121,31 @@ async def send_message(
     # source-only rendering of ResolvedTurnSemantics.  It is never fed back
     # into route/planning/model analysis.
     effective_retrieval_query = (
-        pipeline_base_query or route_continuation_query or payload.question
+        pipeline_base_query
+        or route_continuation_query
+            or (
+                conversation_context.standalone_query
+                if (
+                    conversation_context.active_task is not None
+                or conversation_context.active_task_scope_mode == "topic_only"
+                or has_verified_deterministic_followup_context(
+                    conversation_context
+                )
+            )
+            else payload.question
+        )
     ).strip()
+    verified_followup_baseline = bool(
+        conversation_context.active_task is None
+        and has_verified_deterministic_followup_context(conversation_context)
+    )
     if pipeline_version == "v2" and isinstance(task_contract, RagTaskContract):
-        if semantic_entry == "v3" and not evidence_pending_execution:
+        if (
+            semantic_entry == "v3"
+            and not evidence_pending_execution
+            and conversation_context.active_task is None
+            and not verified_followup_baseline
+        ):
             # Strip every heuristic/route-selected projection before V3 sees
             # the request.  Route candidates remain available as a bounded
             # source catalog, but V2 starts from the literal user question
@@ -4101,9 +4154,20 @@ async def send_message(
                 context=conversation_context,
                 current_question=effective_retrieval_query,
             )
-        v2_execution_context = build_current_turn_v2_execution_context(
-            retrieval_query=effective_retrieval_query,
-        )
+        if conversation_context.active_task is not None:
+            v2_execution_context = build_active_task_v2_execution_context(
+                context=conversation_context,
+            )
+            semantic_context_applied = True
+        elif verified_followup_baseline:
+            v2_execution_context = build_verified_followup_v2_execution_context(
+                context=conversation_context,
+            )
+            semantic_context_applied = True
+        else:
+            v2_execution_context = build_current_turn_v2_execution_context(
+                retrieval_query=effective_retrieval_query,
+            )
         # The deterministic baseline normally inspects only the current user
         # text.  Pending clarification replies are the deliberate exception:
         # an evidence choice such as ``c2`` is a control value, while a route
@@ -4139,7 +4203,12 @@ async def send_message(
         )
         if v3_mode not in {"off", "shadow", "active"}:
             v3_mode = "off"
-        if not evidence_pending_execution and v3_mode in {"shadow", "active"}:
+        if (
+            conversation_context.active_task is None
+            and not verified_followup_baseline
+            and not evidence_pending_execution
+            and v3_mode in {"shadow", "active"}
+        ):
             v3_baseline = build_query_understanding_v3_baseline(
                 fallback=execution_baseline,
             )
@@ -4181,6 +4250,15 @@ async def send_message(
             "query_execution": {
                 **query_execution_gate.to_dict(),
                 "semantic_compilation_pending": v3_active_pending,
+                "semantic_compilation_mode": (
+                    "active_task_state"
+                    if conversation_context.active_task is not None
+                    else (
+                        "verified_followup_baseline"
+                        if verified_followup_baseline
+                        else v3_mode
+                    )
+                ),
             },
         }
         trace_event(
@@ -4422,6 +4500,9 @@ async def send_message(
     expected_route_state_revision = int(
         getattr(conv, "route_state_revision", 0) or 0
     )
+    expected_active_task_revision = int(
+        getattr(conv, "active_task_revision", 0) or 0
+    )
     if v3_active_pending and v3_baseline is not None:
         try:
             fence_identity = build_query_understanding_v3_fence_identity(
@@ -4569,6 +4650,7 @@ async def send_message(
         tokens = None
         retrieval_executed = None
         evidence_status = None
+        coverage_status = None
         displayed_result_count = None
         context_evidence_count = None
         hit_count = None
@@ -5226,6 +5308,11 @@ async def send_message(
                 # production execution authority.  V1/direct callers retain
                 # their historical signatures during the rollout.
                 rag_stream_kwargs["execution_bundle"] = execution_bundle
+                rag_stream_kwargs["active_task_scope"] = (
+                    conversation_context.active_task
+                    if conversation_context.active_task_scope_mode == "document"
+                    else None
+                )
                 # The request session owns turn/message state and must never be
                 # shared by concurrent DAG retrieval workers.  V2 receives a
                 # factory for short-lived read sessions; V1/direct signatures
@@ -5320,6 +5407,12 @@ async def send_message(
                         else []
                     )
                     raw_evidence_status = data.get("evidence_status")
+                    raw_coverage_status = data.get("coverage_status")
+                    coverage_status = (
+                        str(raw_coverage_status).strip().casefold()
+                        if raw_coverage_status is not None
+                        else coverage_status
+                    )
                     # A rolling V1/custom producer may still emit the legacy
                     # ``version_mismatch`` spelling.  Normalize once at the
                     # stream trust boundary so SSE, turn/message persistence
@@ -5422,6 +5515,24 @@ async def send_message(
                             ):
                                 evidence_source_validation_error = (
                                     "answer_source_scope_slice_forbidden"
+                                )
+                        if (
+                            conversation_context.active_task is not None
+                            and evidence_source_validation_error is None
+                        ):
+                            active_doc_ids = set(
+                                conversation_context.active_task.doc_ids
+                            )
+                            active_kb_ids = set(
+                                conversation_context.active_task.kb_ids
+                            )
+                            if any(
+                                doc_id not in active_doc_ids
+                                or kb_id not in active_kb_ids
+                                for kb_id, doc_id in evidence_answer_pairs
+                            ):
+                                evidence_source_validation_error = (
+                                    "answer_source_active_task_scope_forbidden"
                                 )
                         evidence_source_validation_ok = (
                             evidence_source_validation_error is None
@@ -5742,6 +5853,7 @@ async def send_message(
         from database import AsyncSessionLocal
         created_pending_state = None
         resolved_pending_state_id = None
+        persisted_active_state = None
         persisted_route_state_revision = expected_route_state_revision
         # Stage the generated payload first, then complete the transcript in a
         # retryable transaction.  Any later pending-route CAS or statistics
@@ -5861,7 +5973,10 @@ async def send_message(
                 if evidence_clarification_payload is not None:
                     new_pending_state = _evidence_event_pending_state(
                         evidence_clarification_payload,
-                        original_query=conversation_context.standalone_query,
+                        original_query=(
+                            effective_retrieval_query
+                            or conversation_context.standalone_query
+                        ),
                         selected_kb_ids=payload.knowledge_base_ids,
                         base_user_message_id=user_msg.id,
                         clarification_message_id=ai_msg.id,
@@ -5893,10 +6008,32 @@ async def send_message(
                 should_update_route_state = bool(
                     new_pending_state is not None or selected_scope_completed
                 )
-                if should_update_route_state:
+                should_update_active_task = bool(
+                    durable_turn is not None
+                    and normalized_final_evidence_status == "hit"
+                    and (
+                        coverage_status == "complete"
+                        or not any(
+                            requirement.role == "answer"
+                            and requirement.requires_collection_closure
+                            for requirement in (
+                                execution_bundle.plan.requirements
+                                if execution_bundle is not None
+                                else ()
+                            )
+                        )
+                    )
+                    and evidence_source_validation_ok is True
+                    and not evidence_source_validation_locked
+                    and sources
+                    and execution_bundle is not None
+                )
+                persisted_conv = None
+                if should_update_route_state or should_update_active_task:
                     persisted_conv = await save_db.get(Conversation, conv.id)
                     if persisted_conv is None:
-                        raise RuntimeError("会话不存在，无法保存证据范围状态")
+                        raise RuntimeError("会话不存在，无法保存会话执行状态")
+                if should_update_route_state and persisted_conv is not None:
                     persisted_revision = int(
                         getattr(persisted_conv, "route_state_revision", 0) or 0
                     )
@@ -5928,6 +6065,42 @@ async def send_message(
                     persisted_conv.route_state_revision = persisted_revision + 1
                     persisted_route_state_revision = persisted_conv.route_state_revision
 
+                if should_update_active_task and persisted_conv is not None:
+                    persisted_active_revision = int(
+                        getattr(persisted_conv, "active_task_revision", 0) or 0
+                    )
+                    if persisted_active_revision != expected_active_task_revision:
+                        raise RuntimeError("会话任务状态已被其他请求更新")
+                    previous_active = parse_active_task_state(
+                        getattr(persisted_conv, "active_task_state", None)
+                    )
+                    task_root_query = (
+                        str(evidence_pending_state.get("original_query") or "").strip()
+                        if evidence_pending_state is not None
+                        else (
+                            conversation_context.active_task.state.root_query
+                            if conversation_context.active_task is not None
+                            else effective_retrieval_query
+                        )
+                    )
+                    active_state = build_active_task_state(
+                        root_query=task_root_query,
+                        answer_shape=execution_bundle.plan.answer_shape,
+                        sources=sources,
+                        source_turn_id=durable_turn.id,
+                        trace_id=trace_id,
+                        previous_revision=(
+                            previous_active.revision
+                            if previous_active is not None
+                            else persisted_active_revision
+                        ),
+                    )
+                    persisted_conv.active_task_state = active_state.to_dict()
+                    persisted_conv.active_task_revision = (
+                        persisted_active_revision + 1
+                    )
+                    persisted_active_state = active_state
+
                 if (
                     durable_turn is None
                     and routing_result.route_log_id is not None
@@ -5944,6 +6117,14 @@ async def send_message(
                         )
                         route_log.hit_count = int(hit_count or 0)
                 await save_db.commit()
+            if persisted_active_state is not None:
+                trace_event(
+                    "conversation.active_task_persisted",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    task=persisted_active_state.safe_summary(),
+                )
             if resolved_pending_state_id is not None:
                 trace_event(
                     "evidence.clarification_resolved",

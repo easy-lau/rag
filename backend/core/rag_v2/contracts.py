@@ -99,6 +99,7 @@ ClaimResultKind = Literal[
     "categorical",
     "normative",
     "procedure",
+    "config_assignment",
     "structured_collection",
     "ordered_steps",
     "document_policy",
@@ -147,20 +148,25 @@ CLAIM_APPLICABILITY_KINDS = frozenset({
 CLAIM_PROOF_KINDS = frozenset({"source_assertion", "terminology_strict"})
 # A result is deliberately a narrower contract than an arbitrary source
 # annotation.  It is produced by the current request's answer-claim
-# adjudicator and carried into ``EvidenceClaim``.  Only scalar/category values
-# are currently safe to compare for a mutually-exclusive answer decision;
-# procedural and normative text remains an independently closed claim but is
-# not string-compared as a contradiction.
+# adjudicator and carried into ``EvidenceClaim``.  Scalar/category values and
+# normalized configuration assignments are safe to compare for a mutually
+# exclusive answer decision; procedural and normative text remains an
+# independently closed claim but is not string-compared as a contradiction.
 CLAIM_RESULT_KINDS = frozenset({
     "scalar",
     "categorical",
     "normative",
     "procedure",
+    "config_assignment",
     "structured_collection",
     "ordered_steps",
     "document_policy",
 })
-CONFLICT_COMPARABLE_CLAIM_RESULT_KINDS = frozenset({"scalar", "categorical"})
+CONFLICT_COMPARABLE_CLAIM_RESULT_KINDS = frozenset({
+    "scalar",
+    "categorical",
+    "config_assignment",
+})
 BRIDGE_EDGE_MODES = frozenset({"proof", "augmentation"})
 COLLECTION_CLOSURE_SOURCE_KINDS = frozenset({
     "full_document_snapshot",

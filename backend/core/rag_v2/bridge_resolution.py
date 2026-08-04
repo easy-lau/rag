@@ -34,6 +34,7 @@ from core.query_surface_structure import (
     parse_query_surface_frame,
 )
 from core.rag_v2.contracts import AnswerRequirementV2, EvidenceItem
+from core.rag_v2.config_claims import matching_config_assignments
 from core.rag_v2.task_graph import AnswerBridgePath
 
 
@@ -452,6 +453,7 @@ class ClaimAssertion:
             "categorical",
             "normative",
             "procedure",
+            "config_assignment",
         }
 
 
@@ -2268,12 +2270,22 @@ def adjudicate_answer_claims(
     ``客户A``.
     """
 
+    config_assertions: list[ClaimAssertion] = []
+    if not bridge_subjects and not bridge_values and not required_subjects:
+        for claim in matching_config_assignments(answer_description, content):
+            config_assertions.append(ClaimAssertion(
+                status="active",
+                result_kind="config_assignment",
+                normalized_result=claim.normalized_assignment[:240],
+                claim_key=claim.normalized_path[:240],
+            ))
+
     target_terms = answer_target_terms(
         answer_description,
         bridge_subjects=bridge_subjects,
     )
     if not target_terms:
-        return ()
+        return tuple(config_assertions)
     effective_required_subjects = tuple(dict.fromkeys(
         str(subject).strip()
         for subject in required_subjects
@@ -2283,7 +2295,7 @@ def adjudicate_answer_claims(
         bridge_subjects=bridge_subjects,
         has_bridge_edge=has_bridge_edge,
     )
-    assertions: list[ClaimAssertion] = []
+    assertions: list[ClaimAssertion] = list(config_assertions)
     for claim in _iter_claim_units(content):
         if effective_required_subjects and not all(
             content_contains_positive_subject(

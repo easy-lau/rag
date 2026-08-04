@@ -1009,6 +1009,73 @@ class EvidenceCoverageGraphTests(unittest.TestCase):
             {"same-source-100", "same-source-200"},
         )
 
+    def test_configuration_values_merge_when_equal_and_conflict_when_different(self):
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description="默认密码强制修改应该如何配置",
+        )
+        left = _item(
+            "config-left",
+            "force_change_default_password: true",
+            doc_id="config-left",
+            role="direct",
+            contribution_kind="answer_claim",
+            supports=("r1",),
+        )
+        right = _item(
+            "config-right",
+            "force_change_default_password: false",
+            doc_id="config-right",
+            role="direct",
+            contribution_kind="answer_claim",
+            supports=("r1",),
+        )
+
+        def assessment(right_value: str):
+            graph = build_evidence_coverage_graph(
+                _bundle((left, right)),
+                (requirement,),
+                claims=(
+                    EvidenceClaim(
+                        id="config-left-claim",
+                        requirement_id="r1",
+                        evidence_item_id="config-left",
+                        document_key=("kb-travel", "config-left"),
+                        contribution_kind="answer_claim",
+                        applicability="direct_subject",
+                        result_kind="config_assignment",
+                        normalized_result="force_change_default_password=true",
+                        claim_key="force_change_default_password",
+                    ),
+                    EvidenceClaim(
+                        id="config-right-claim",
+                        requirement_id="r1",
+                        evidence_item_id="config-right",
+                        document_key=("kb-travel", "config-right"),
+                        contribution_kind="answer_claim",
+                        applicability="direct_subject",
+                        result_kind="config_assignment",
+                        normalized_result=(
+                            f"force_change_default_password={right_value}"
+                        ),
+                        claim_key="force_change_default_password",
+                    ),
+                ),
+            )
+            return assess_evidence_coverage_graph(graph)
+
+        self.assertEqual(assessment("true").answer_conflicts, ())
+        conflicts = assessment("false").answer_conflicts
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].result_kind, "config_assignment")
+        self.assertEqual(
+            set(conflicts[0].normalized_results),
+            {
+                "force_change_default_password=true",
+                "force_change_default_password=false",
+            },
+        )
+
     def test_bridge_value_claim_must_bind_every_declared_dependency(self):
         requirements = (
             AnswerRequirementV2(

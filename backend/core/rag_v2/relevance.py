@@ -13,6 +13,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from core.query_constraints import (
+    canonical_product_name,
+    extract_document_constraint_identity,
+    extract_query_constraints,
+)
+
 
 MIN_VECTOR_SCORE = 0.78
 MAX_DOC_VECTOR_GAP = 0.035
@@ -219,6 +225,33 @@ def assess_document_relevance(
     admitted_by_lexical = False
     admitted_by_vector = False
     admitted_by_topic = False
+    admitted_by_version = False
+    query_constraints = extract_query_constraints(query or "") if query else None
+    version_representatives: dict[str, tuple[str, float]] = {}
+    if query_constraints is not None and query_constraints.product and not query_constraints.explicit_version:
+        requested_product = canonical_product_name(query_constraints.product)
+        for doc_id in document_order:
+            doc_candidates = [
+                candidate for candidate in candidates
+                if isinstance(candidate, Mapping)
+                and str(candidate.get("doc_id") or "").strip() == doc_id
+            ]
+            versions = {
+                version.casefold()
+                for item in doc_candidates
+                for version in extract_document_constraint_identity(item).versions
+                if version
+                and requested_product in set(
+                    extract_document_constraint_identity(item).canonical_products
+                )
+            }
+            best = signals_by_document[doc_id].best_vector_score
+            if best is None or best < minimum:
+                continue
+            for version in versions:
+                current = version_representatives.get(version)
+                if current is None or best > current[1]:
+                    version_representatives[version] = (doc_id, best)
     for doc_id in document_order:
         signals = signals_by_document[doc_id]
         vector_admitted = False
@@ -248,11 +281,16 @@ def assess_document_relevance(
                 and signals.best_vector_score >= STRONG_VECTOR_TOPIC_BYPASS
             )
         )
-        if (signals.lexical_hit or vector_admitted) and topic_admitted:
+        version_representative = any(
+            representative_doc_id == doc_id
+            for representative_doc_id, _ in version_representatives.values()
+        )
+        if (signals.lexical_hit or vector_admitted or version_representative) and topic_admitted:
             admitted.append(doc_id)
             admitted_by_lexical = admitted_by_lexical or signals.lexical_hit
             admitted_by_vector = admitted_by_vector or vector_admitted
             admitted_by_topic = admitted_by_topic or bool(topic_coverage_values)
+            admitted_by_version = admitted_by_version or version_representative
         else:
             rejected.append(doc_id)
 
@@ -260,6 +298,8 @@ def assess_document_relevance(
         reason = "no_document_met_lexical_or_vector_gate"
     elif admitted_by_lexical and admitted_by_vector:
         reason = "admitted_by_lexical_or_vector_evidence"
+    elif admitted_by_version:
+        reason = "admitted_by_each_explicit_version_representative"
     elif admitted_by_lexical and admitted_by_topic:
         reason = "admitted_by_lexical_and_topic_evidence"
     elif admitted_by_lexical:

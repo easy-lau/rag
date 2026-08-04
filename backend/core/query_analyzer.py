@@ -27,6 +27,7 @@ from core.query_analysis_contract import (
     parse_query_analysis,
 )
 from core.rag_trace import content_fields, exception_log_text, trace_event
+from core.structured_output import create_structured_completion
 
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class QueryAnalysisRunResult:
     fallback_reason: str | None = None
     strict_schema_used: bool = False
     json_object_fallback_used: bool = False
+    structured_output_mode: str | None = None
 
     @property
     def accepted(self) -> bool:
@@ -66,6 +68,7 @@ class QueryAnalysisRunResult:
             "fallback_reason": self.fallback_reason,
             "strict_schema_used": self.strict_schema_used,
             "json_object_fallback_used": self.json_object_fallback_used,
+            "structured_output_mode": self.structured_output_mode,
             "analysis": self.analysis.safe_summary() if self.analysis else None,
         }
 
@@ -156,17 +159,6 @@ def _user_payload(
             for item in context
         ],
     }
-
-
-def _response_format_is_unsupported(exc: BaseException) -> bool:
-    text = str(exc).casefold()
-    return any(marker in text for marker in (
-        "response_format",
-        "json_schema",
-        "json schema",
-        "unsupported parameter",
-        "not support",
-    ))
 
 
 def _validation_error_code(exc: BaseException) -> str:
@@ -280,6 +272,7 @@ async def analyze_query(
 
     strict_schema_used = True
     json_object_fallback_used = False
+    structured_output_mode = "json_schema"
     raw_content = ""
     try:
         client = get_client()
@@ -306,31 +299,17 @@ async def analyze_query(
             available_turn_keys=context_user_inputs.keys(),
         )
 
-        async def invoke() -> Any:
-            nonlocal json_object_fallback_used
-            try:
-                return await client.chat.completions.create(
-                    **request,
-                    response_format=response_format,
-                )
-            except Exception as schema_error:
-                if not _response_format_is_unsupported(schema_error):
-                    raise
-                elapsed = time.perf_counter() - started
-                remaining = configured_timeout_seconds - elapsed
-                if remaining <= 0.1:
-                    raise TimeoutError("query_analysis_deadline_exhausted") from schema_error
-                json_object_fallback_used = True
-                request["timeout"] = remaining
-                return await client.chat.completions.create(
-                    **request,
-                    response_format={"type": "json_object"},
-                )
-
-        response = await asyncio.wait_for(
-            invoke(),
-            timeout=configured_timeout_seconds,
+        structured = await create_structured_completion(
+            client,
+            request=request,
+            strict_response_format=response_format,
+            timeout_seconds=configured_timeout_seconds,
+            provider_identity=getattr(settings, "llm_base_url", ""),
+            model=model,
         )
+        response = structured.response
+        structured_output_mode = structured.mode
+        json_object_fallback_used = structured.mode != "json_schema"
         choices = list(getattr(response, "choices", None) or [])
         choice = choices[0] if choices else None
         message = getattr(choice, "message", None) if choice is not None else None
@@ -345,6 +324,7 @@ async def analyze_query(
             latency_ms=latency_ms,
             strict_schema_used=strict_schema_used,
             json_object_fallback_used=json_object_fallback_used,
+            structured_output_mode=structured_output_mode,
             finish_reason=finish_reason,
             choice_count=len(choices),
             response_model=getattr(response, "model", None),
@@ -374,6 +354,7 @@ async def analyze_query(
             latency_ms=latency_ms,
             strict_schema_used=strict_schema_used,
             json_object_fallback_used=json_object_fallback_used,
+            structured_output_mode=structured_output_mode,
             analysis_summary=analysis.safe_summary(),
             **content_fields("query_analysis_validated", validated_json),
         )

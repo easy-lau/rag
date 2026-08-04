@@ -45,6 +45,7 @@ from core.query_route_contract import (
 )
 from core.query_surface_structure import parse_query_surface_frame
 from core.rag_trace import content_fields, exception_log_text, trace_event
+from core.structured_output import create_structured_completion
 from core.rag_v2.query_plan import infer_implicit_bridge
 from models.db_models import (
     IntentCategory,
@@ -166,6 +167,7 @@ class RouteModelAttemptResult:
     had_error: bool = False
     strict_schema_used: bool = True
     json_object_fallback_used: bool = False
+    structured_output_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1007,10 +1009,13 @@ def _response_format_is_unsupported(exc: BaseException) -> bool:
         "unknown parameter",
         "unrecognized",
         "unexpected",
+        "unavailable",
+        "not available",
         "extra inputs are not permitted",
         "invalid parameter",
         "不支持",
         "未知参数",
+        "不可用",
     )
     enumerated_format_rejection = (
         "json_schema" in detail
@@ -1306,9 +1311,9 @@ async def _run_route_model_attempt(
 ) -> RouteModelAttemptResult:
     """Execute one strict ``rag_route_decision.v1`` request.
 
-    Providers that explicitly reject ``json_schema`` may retry once with
-    ``json_object``.  We never fall through to unconstrained natural-language
-    output, and the strict local parser remains mandatory in both modes.
+    The shared structured-output adapter negotiates provider capability.  The
+    local route parser remains mandatory even when the wire transport is plain
+    JSON text.
     """
 
     started = time.perf_counter()
@@ -1316,6 +1321,7 @@ async def _run_route_model_attempt(
     normalized_context = _normalized_route_context(route_context)
     available_turn_keys = [item["candidate_key"] for item in normalized_context]
     json_object_fallback_used = False
+    structured_output_mode = "json_schema"
     try:
         request = dict(
             model=model,
@@ -1348,30 +1354,17 @@ async def _run_route_model_attempt(
             allowed_intent_codes=enabled_codes,
             available_turn_keys=available_turn_keys,
         )
-        try:
-            response = await client.chat.completions.create(
-                **request,
-                response_format=strict_format,
-            )
-        except Exception as schema_error:
-            if not _response_format_is_unsupported(schema_error):
-                raise
-            json_object_fallback_used = True
-            elapsed = time.perf_counter() - started
-            remaining = float(timeout_seconds) - elapsed
-            if remaining <= 0.1:
-                raise TimeoutError("意图路由总期限已耗尽") from schema_error
-            logger.info(
-                "[智能路由] 上游不支持 strict JSON Schema，降级 json_object "
-                "attempt=%s model=%s",
-                attempt,
-                model,
-            )
-            request["timeout"] = remaining
-            response = await client.chat.completions.create(
-                **request,
-                response_format={"type": "json_object"},
-            )
+        structured = await create_structured_completion(
+            client,
+            request=request,
+            strict_response_format=strict_format,
+            timeout_seconds=timeout_seconds,
+            provider_identity=getattr(get_settings(), "llm_base_url", ""),
+            model=model,
+        )
+        response = structured.response
+        structured_output_mode = structured.mode
+        json_object_fallback_used = structured.mode != "json_schema"
 
         choices = list(getattr(response, "choices", None) or [])
         choice = choices[0] if choices else None
@@ -1408,6 +1401,7 @@ async def _run_route_model_attempt(
             timeout_seconds=timeout_seconds,
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
+            structured_output_mode=structured_output_mode,
             parsed_intent_code=(route_decision.intent_code if route_decision else None),
             parsed_confidence=(route_decision.confidence if route_decision else None),
             relation=(route_decision.relation if route_decision else None),
@@ -1432,6 +1426,7 @@ async def _run_route_model_attempt(
             latency_ms=latency_ms,
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
+            structured_output_mode=structured_output_mode,
         )
     except Exception as exc:
         latency_ms = max(0, round((time.perf_counter() - started) * 1000))
@@ -1455,6 +1450,7 @@ async def _run_route_model_attempt(
             timeout_seconds=timeout_seconds,
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
+            structured_output_mode=structured_output_mode,
             error=exc,
         )
         return RouteModelAttemptResult(

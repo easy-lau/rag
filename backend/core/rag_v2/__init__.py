@@ -1,8 +1,8 @@
 """Typed building blocks for the deployment-selectable RAG v2 pipeline.
 
-The implementation remains isolated from v1, while ``api.chat`` can select it
-per deployment through ``RAG_PIPELINE_VERSION``.  Keeping the boundary explicit
-allows a verified rollout to switch to v2 and a restart-only rollback to v1.
+The implementation is the active evidence runner.  ``api.chat`` keeps the
+module boundary for diagnostics, while requests no longer switch to a legacy
+retrieval runner.
 """
 
 from core.rag_v2.contracts import (

@@ -37,10 +37,8 @@ class Settings(BaseSettings):
     rag_trace_queue_size: int = Field(500, ge=100, le=100000)
     rag_trace_max_event_bytes: int = Field(131072, ge=16384, le=1048576)
     rag_trace_max_events_per_run: int = Field(500, ge=20, le=5000)
-    # 新主链默认启用；部署环境仍可显式设为 v1 并重启以无迁移回滚。
-    rag_pipeline_version: Literal["v1", "v2"] = "v2"
     # V2 检索的各阶段期限还受整段工作流总期限约束；扩展超时只降级证据，
-    # 不清空首轮召回。改回 rag_pipeline_version=v1 可整体回滚 V2 主链。
+    # 不清空首轮召回；扩展失败只降级证据状态。
     rag_v2_retrieval_timeout_seconds: float = Field(15.0, ge=1.0, le=120.0)
     rag_v2_expansion_timeout_seconds: float = Field(8.0, ge=0.5, le=60.0)
     rag_v2_retrieval_workflow_timeout_seconds: float = Field(
@@ -61,9 +59,6 @@ class Settings(BaseSettings):
     # 任务图同一 wave 内的检索并发数。每个任务使用独立只读会话，避免并发
     # 复用请求事务；范围限制在连接池和单次工作流期限可承受的边界内。
     rag_v2_task_query_parallelism: int = Field(3, ge=1, le=8)
-    # 受控术语仅产生额外的、范围收窄的检索变体；0 可在不回滚 V2 的情况下
-    # 关闭术语召回增强。严格等价的证据解释仍要求注册表和来源文本共同成立。
-    rag_v2_terminology_max_aliases: int = Field(3, ge=0, le=8)
     # 包住建流、首分片前重试、退避等待和完整流读取，避免 max_attempts 倍增
     # llm_request_timeout_seconds。首个文本分片后的异常仍由流层直接抛出，不重放。
     rag_v2_generation_workflow_timeout_seconds: float = Field(
@@ -71,8 +66,8 @@ class Settings(BaseSettings):
         ge=1.0,
         le=300.0,
     )
-    # ``rag_pipeline_version`` 只选择证据执行器；语义理解入口由此开关单独
-    # 决定。默认 V3：模型只能选择服务器签发的 source span，随后由后端编译
+    # 语义理解入口由此开关单独决定。默认 V3：模型只能选择服务器签发的
+    # source span，随后由后端编译
     # V2 任务图。``legacy`` 仅保留给已知回滚场景使用 query_analysis.v2。
     rag_semantic_entry: Literal["legacy", "v3"] = "v3"
     # V3 是当前生产语义入口：模型只能选择服务器签发的 source span，随后由

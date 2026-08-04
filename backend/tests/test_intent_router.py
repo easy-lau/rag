@@ -28,6 +28,7 @@ from core.intent_router import (
     _requires_knowledge_retrieval,
     _rule_match,
 )
+from core.structured_output import clear_structured_output_capability_cache
 from models.db_models import IntentCategory
 
 
@@ -93,6 +94,7 @@ def _model_response(
 class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.config = _default_config()
+        clear_structured_output_capability_cache()
 
     def test_verified_evidence_scope_builds_contract_without_model(self) -> None:
         db = SimpleNamespace(add=Mock())

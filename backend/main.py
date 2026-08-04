@@ -18,7 +18,6 @@ from api import (
     roles,
     search,
     settings,
-    terminology,
     uploads,
     users,
 )
@@ -115,7 +114,6 @@ app.include_router(document.router, prefix="/api")
 app.include_router(search.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(intent_routing.router, prefix="/api")
-app.include_router(terminology.router, prefix="/api")
 app.include_router(uploads.router, prefix="/api")
 
 # 品牌图需要在登录页公开显示；文档原图由 uploads 路由鉴权后返回，不能

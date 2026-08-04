@@ -18,6 +18,7 @@ from core.query_constraints import (
 )
 from core.query_surface_structure import (
     answer_target_semantics,
+    is_exhaustive_configuration_request,
     is_procedure_question,
     is_distributive_request_tail,
     normalize_coordination_body,
@@ -295,9 +296,11 @@ def _answer_coverage_mode(
     single even if their source requires a bridge.
     """
 
+    normalized = re.sub(r"\s+", " ", str(question or "")).strip()
+    if is_exhaustive_configuration_request(normalized):
+        return "collection"
     if answer_shape in {"list", "overview"}:
         return "collection"
-    normalized = re.sub(r"\s+", " ", str(question or "")).strip()
     if not normalized:
         return "single"
     # A process question asks for an ordered/composed procedure even when its
@@ -1634,6 +1637,13 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                 answer_shape="process",
                 confidence=0.92,
                 reason="explicit_process_signal",
+            )
+        if is_exhaustive_configuration_request(normalized):
+            return _ready_plan(
+                normalized,
+                answer_shape="list",
+                confidence=0.9,
+                reason="explicit_exhaustive_configuration_signal",
             )
         if _is_conditional_policy_disposition(
             normalized,

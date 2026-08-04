@@ -10,7 +10,7 @@ from models.schemas import SearchRequest, SearchResponse, SearchResultItem
 from core.retriever import hybrid_search
 from core.reranker import rerank_with_status
 from core.query_constraints import extract_query_constraints
-from core.rag_pipeline import (
+from core.rag_shared import (
     annotate_deterministic_constraints,
     rerank_candidate_limit,
 )

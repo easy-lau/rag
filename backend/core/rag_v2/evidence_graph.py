@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from core.rag_v2.contracts import (
     CLAIM_APPLICABILITY_KINDS,
+    CONFLICT_COMPARABLE_CLAIM_RESULT_KINDS,
     EVIDENCE_CONTRIBUTION_KINDS,
     AnswerRequirementV2,
     BridgeClaimBinding,
@@ -613,6 +614,22 @@ def derive_verified_collection_closures(
         # prove transitions or that no later step exists.  It needs the
         # target-bound sequence declaration below.
         if contract == "structured_collection":
+            # When retrieval has a verified complete-document snapshot, that
+            # snapshot is a stronger completeness proof than a single chunk
+            # or an untrusted model annotation.  This covers open requests
+            # such as “完整配置/全部参数” without pretending chunk 0 alone is
+            # exhaustive.
+            if (
+                root_document_key == source_document_key
+                and source_document_key in source_complete_documents
+            ):
+                closures.append(VerifiedCollectionClosure(
+                    requirement_id=requirement.id,
+                    claim_item_ids=claim_item_ids,
+                    source_kind="full_document_snapshot",
+                    source_document_key=source_document_key,
+                ))
+                continue
             claim_table_keys = {
                 _table_key(item_by_id[item_id])
                 for item_id in claim_item_ids
@@ -896,7 +913,7 @@ def _closed_answer_claim_conflicts(
     for claim in closed_claims:
         if (
             claim.contribution_kind != "answer_claim"
-            or claim.result_kind not in {"scalar", "categorical"}
+            or claim.result_kind not in CONFLICT_COMPARABLE_CLAIM_RESULT_KINDS
             or claim.claim_key is None
             or claim.normalized_result is None
         ):

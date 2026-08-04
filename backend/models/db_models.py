@@ -425,6 +425,12 @@ class Conversation(Base):
     route_state_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # A grounded task continuity hint, never an authorization grant.  Every
+    # request re-resolves its source ids against current KB/document scope.
+    active_task_state: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    active_task_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation", cascade="all, delete-orphan")

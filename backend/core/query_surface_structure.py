@@ -39,6 +39,34 @@ _DISTRIBUTIVE_TAIL_RE = re.compile(
     r")\s*[？?。.!！\s]*$",
     re.IGNORECASE,
 )
+
+_EXHAUSTIVE_CONFIGURATION_RE = re.compile(
+    r"(?:完整|详细|具体|全部|所有)\s*(?:的)?\s*"
+    r"(?:配置|参数|内容|步骤|方案|设置|清单|说明)"
+    r"(?:是什么|有哪些|怎么配置|如何配置|是什么样的)?\s*[？?。.!！\s]*$",
+    re.IGNORECASE,
+)
+
+
+def is_exhaustive_configuration_request(question: object) -> bool:
+    """Recognize an open completeness/refinement request by grammar only."""
+
+    normalized = str(question or "").strip()
+    if _EXHAUSTIVE_CONFIGURATION_RE.fullmatch(normalized):
+        return True
+    # Canonical follow-up queries use an immutable root plus a refinement tail
+    # separated by ordinary sentence punctuation or whitespace.  Inspect only
+    # that terminal user-authored clause;
+    # never classify an arbitrary answer body as exhaustive merely because it
+    # contains the word “完整”.
+    tail_match = re.search(
+        r"(?:^|[；;，,。.!！?？\s])(?P<tail>(?:请给我|请提供|给我|提供|补充)?\s*"
+        r"(?:完整|详细|具体|全部|所有)\s*(?:的)?\s*(?:配置|参数|内容|步骤|方案|设置|清单|说明)"
+        r"(?:是什么|有哪些|怎么配置|如何配置|是什么样的)?\s*[？?。.!！\s]*)$",
+        normalized,
+        re.IGNORECASE,
+    )
+    return bool(tail_match and tail_match.group("tail").strip() != normalized)
 # These are only reference forms that make an item non-local.  The full
 # conversation reference classifier remains responsible for actual follow-up
 # decisions; this is deliberately narrower and solely guards the current

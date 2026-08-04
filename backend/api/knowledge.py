@@ -9,7 +9,6 @@ from database import get_db
 from models.db_models import (
     KnowledgeBase,
     Document,
-    TerminologyRegistryState,
     User,
 )
 from models.schemas import KnowledgeBaseCreate, KnowledgeBaseOut
@@ -116,12 +115,7 @@ async def create_knowledge_base(
         created_by=user.id,
     )
     db.add(kb)
-    await db.flush()  # 取得 kb.id，以在同一事务初始化该 KB 的术语 revision 状态
-    db.add(TerminologyRegistryState(
-        kb_id=kb.id,
-        revision=0,
-        updated_by=user.id,
-    ))
+    await db.flush()
     audit.log(db, "kb.create", target_type="knowledge_base", target_id=kb.id, target_name=kb.name)
     await db.commit()
     await db.refresh(kb)
