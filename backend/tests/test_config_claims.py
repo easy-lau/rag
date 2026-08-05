@@ -39,6 +39,21 @@ class ConfigClaimTests(unittest.TestCase):
             ["force_change_default_password"],
         )
 
+    def test_broad_password_question_keeps_close_related_assignments(self):
+        claims = matching_config_assignments(
+            "云枢6如何修改默认密码",
+            CONFIG_CHUNK,
+        )
+
+        self.assertEqual(
+            {item.path[-1] for item in claims},
+            {"defaultPwd", "force_change_default_password"},
+        )
+        self.assertEqual(
+            {item.meaning for item in claims},
+            {"默认密码配置", "默认密码强制修改"},
+        )
+
     def test_configuration_assignment_closes_generic_answer_claim(self):
         assertions = adjudicate_answer_claims(
             "我现在想让云枢登录强制修改密码应该怎么办",

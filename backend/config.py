@@ -60,6 +60,19 @@ class Settings(BaseSettings):
         ge=0.5,
         le=300.0,
     )
+    # 当同一模型/角色/合同连续超时或返回不可修复结构时，短暂跳过增强阶段。
+    # 确定性证据链仍照常执行；熔断只治理上游故障，不改变权限和证据闸门。
+    rag_v2_model_evidence_circuit_breaker_enabled: bool = True
+    rag_v2_model_evidence_circuit_breaker_threshold: int = Field(
+        2,
+        ge=1,
+        le=10,
+    )
+    rag_v2_model_evidence_circuit_breaker_cooldown_seconds: float = Field(
+        60.0,
+        ge=1.0,
+        le=3600.0,
+    )
     # 任务图同一 wave 内的检索并发数。每个任务使用独立只读会话，避免并发
     # 复用请求事务；范围限制在连接池和单次工作流期限可承受的边界内。
     rag_v2_task_query_parallelism: int = Field(3, ge=1, le=8)
@@ -132,6 +145,17 @@ class Settings(BaseSettings):
         validation_alias="__DATABASE_SETTINGS_ONLY_LLM_BASE_URL",
     )
     chat_model: str = Field("gpt-4o", validation_alias="__DATABASE_SETTINGS_ONLY_CHAT_MODEL")
+    # 结构化语义请求的传输模式。auto 按供应商能力协商；已知兼容模型可在后台
+    # 连接测试后保存为 json_schema/json_object，避免首次真实问答先探测失败。
+    llm_structured_output_mode: Literal[
+        "auto",
+        "json_schema",
+        "json_object",
+        "plain_json",
+    ] = Field(
+        "auto",
+        validation_alias="__DATABASE_SETTINGS_ONLY_LLM_STRUCTURED_OUTPUT_MODE",
+    )
     # 意图识别与对话共用 LLM 服务凭据；留空时运行时自动复用 chat_model。
     intent_model: str = Field(
         "", validation_alias="__DATABASE_SETTINGS_ONLY_INTENT_MODEL"

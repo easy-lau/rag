@@ -185,6 +185,60 @@ def _model_evidence_adjudication_timeout_seconds(settings: Any) -> float:
     return max(0.1, float(configured))
 
 
+def _model_evidence_adjudication_diagnostics(
+    outcome: Any,
+    *,
+    fallback_error: str | None,
+) -> dict[str, Any]:
+    """Return bounded, content-free diagnostics for one adjudication call."""
+
+    if outcome is None:
+        return {
+            "model": None,
+            "prompt_version": None,
+            "failure_kind": (
+                "timeout" if fallback_error == "TimeoutError" else None
+            ),
+            "structured_output_mode": None,
+            "structured_output_attempted_modes": [],
+            "first_attempt_elapsed_ms": None,
+            "repair_attempted": False,
+            "repair_elapsed_ms": None,
+            "validation_error": None,
+            "circuit_state": "disabled",
+            "circuit_key_fingerprint": None,
+        }
+    return {
+        "model": getattr(outcome, "model", None),
+        "prompt_version": getattr(outcome, "prompt_version", None),
+        "failure_kind": getattr(outcome, "failure_kind", None),
+        "structured_output_mode": getattr(
+            outcome,
+            "structured_output_mode",
+            None,
+        ),
+        "structured_output_attempted_modes": list(getattr(
+            outcome,
+            "structured_output_attempted_modes",
+            (),
+        )),
+        "first_attempt_elapsed_ms": getattr(
+            outcome,
+            "first_attempt_elapsed_ms",
+            None,
+        ),
+        "repair_attempted": bool(getattr(outcome, "repair_attempted", False)),
+        "repair_elapsed_ms": getattr(outcome, "repair_elapsed_ms", None),
+        "validation_error": getattr(outcome, "validation_error", None),
+        "circuit_state": getattr(outcome, "circuit_state", "disabled"),
+        "circuit_key_fingerprint": getattr(
+            outcome,
+            "circuit_key_fingerprint",
+            None,
+        ),
+    }
+
+
 def _normalise_general_fallback_mode(value: object) -> str:
     mode = str(value or "off").strip().casefold()
     return mode if mode in _GENERAL_FALLBACK_MODES else "off"
@@ -813,6 +867,25 @@ def _sse(payload: Mapping[str, Any]) -> str:
 
 def _step_event(step: str, status: str) -> str:
     return _sse({"type": "search_step", "step": step, "status": status})
+
+
+def _process_event(*, clarification: bool = False) -> str:
+    steps = [
+        ("analyze", "问题分析"),
+        ("generate", "生成"),
+    ] if clarification else [
+        ("analyze", "问题分析"),
+        ("expand", "查询扩展"),
+        ("retrieve", "检索"),
+        ("rerank", "重排"),
+        ("generate", "生成"),
+    ]
+    return _sse({
+        "type": "search_process",
+        "schema_version": "search_process.v1",
+        "execution_path": "clarification" if clarification else "rag",
+        "steps": [{"key": key, "label": label} for key, label in steps],
+    })
 
 
 def _intent_event(intent: dict) -> str:
@@ -5557,9 +5630,6 @@ async def run_rag_v2_stream(
             if str(item.get("doc_id") or "").strip()
         }
 
-    yield _step_event("analyze", "active")
-    if intent:
-        yield _intent_event(intent)
     if not isinstance(execution_bundle, RagExecutionBundle):
         raise ValueError("RAG v2 requires a RagExecutionBundle")
     # A bundle has exactly two deliberate modes.  ``ledgered`` executes the
@@ -5586,6 +5656,10 @@ async def run_rag_v2_stream(
         if active_task_graph is not None
         else None
     )
+    yield _process_event(clarification=bool(plan.needs_clarification))
+    yield _step_event("analyze", "active")
+    if intent:
+        yield _intent_event(intent)
     trace_include_content = bool(
         getattr(settings, "rag_trace_include_content", True)
     )
@@ -5719,6 +5793,7 @@ async def run_rag_v2_stream(
         )
         yield _sse(result_payload)
         yield _clarification_event(clarification)
+        yield _step_event("generate", "active")
         yield _delta_event(clarification.question)
         trace_event(
             "generation.skipped",
@@ -5727,6 +5802,7 @@ async def run_rag_v2_stream(
             reason="query_plan_requires_clarification",
             evidence_status="needs_clarification",
         )
+        yield _step_event("generate", "done")
         yield _done_event(conversation_id)
         return
     if active_task_graph is None or task_execution_ledger is None:
@@ -6580,6 +6656,7 @@ async def run_rag_v2_stream(
     model_adjudication_elapsed_ms = 0
     model_adjudication_candidate_count = 0
     model_adjudication_skip_reason: str | None = None
+    model_adjudication_outcome: Any = None
     if retrieval_failed:
         bundle = _unavailable_bundle("retrieval_unavailable")
         ambiguity = EvidenceAmbiguityDecision(
@@ -6733,9 +6810,13 @@ async def run_rag_v2_stream(
                         query,
                         list(bundle_candidates),
                         [requirement.to_dict() for requirement in plan.requirements],
+                        timeout_seconds=(
+                            _model_evidence_adjudication_timeout_seconds(settings)
+                        ),
                     ),
                     timeout=_model_evidence_adjudication_timeout_seconds(settings),
                 )
+                model_adjudication_outcome = outcome
                 model_adjudication_elapsed_ms = round(
                     (time.perf_counter() - adjudication_started) * 1000
                 )
@@ -6767,6 +6848,10 @@ async def run_rag_v2_stream(
                 candidate_count=model_adjudication_candidate_count,
                 elapsed_ms=model_adjudication_elapsed_ms,
                 error=model_adjudication_error,
+                **_model_evidence_adjudication_diagnostics(
+                    model_adjudication_outcome,
+                    fallback_error=model_adjudication_error,
+                ),
                 scope_selected=bool(
                     normalized_scope_filter is not None
                     and normalized_scope_filter.valid
@@ -6954,9 +7039,31 @@ async def run_rag_v2_stream(
     general_fallback_mode = _normalise_general_fallback_mode(
         getattr(settings, "rag_general_fallback_mode", "off")
     )
-    general_model_fallback = _should_use_general_model_fallback(
+    general_fallback_requested = _should_use_general_model_fallback(
         evidence_status=evidence_status,
         configured_mode=general_fallback_mode,
+    )
+    # A general model can help with an unscoped public question, but it cannot
+    # replace missing evidence for a source-bound product/version/project or a
+    # previously selected document scope.  This is a provenance boundary, not
+    # a product-name rule: without authorized evidence, any concrete setting,
+    # menu path or policy value would be a guess.
+    has_bound_applicability_scope = bool(
+        result_constraints.has_scope_constraint
+        or (
+            normalized_scope_filter is not None
+            and normalized_scope_filter.valid
+        )
+        or active_task_scope is not None
+    )
+    general_fallback_blocked_reason = (
+        "source_bound_scope_requires_knowledge_evidence"
+        if general_fallback_requested and has_bound_applicability_scope
+        else None
+    )
+    general_model_fallback = bool(
+        general_fallback_requested
+        and general_fallback_blocked_reason is None
     )
     answer_provenance = (
         GENERAL_MODEL_ANSWER_PROVENANCE
@@ -7105,6 +7212,9 @@ async def run_rag_v2_stream(
     )
     result_payload["answer_provenance"] = answer_provenance
     result_payload["general_fallback_mode"] = general_fallback_mode
+    result_payload["general_fallback_blocked_reason"] = (
+        general_fallback_blocked_reason
+    )
     trace_event(
         "evidence.selection",
         trace_id=trace_id,
@@ -7173,6 +7283,18 @@ async def run_rag_v2_stream(
         ],
     )
     yield _sse(result_payload)
+
+    if general_fallback_blocked_reason is not None:
+        trace_event(
+            "generation.general_fallback",
+            trace_id=trace_id,
+            pipeline_version=PIPELINE_VERSION,
+            status="blocked",
+            configured_mode=general_fallback_mode,
+            evidence_status=evidence_status,
+            reason=general_fallback_blocked_reason,
+            knowledge_context_included=False,
+        )
 
     if ambiguity.needs_clarification:
         yield _clarification_event(ambiguity)

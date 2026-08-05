@@ -107,6 +107,22 @@ class KnowledgeResultRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("《第一篇文章.md》", answer)
         self.assertIn("第一段正文", answer)
         self.assertIn("第二段正文", answer)
+        process = next(item for item in events if item["type"] == "search_process")
+        self.assertEqual(process["execution_path"], "result_reference")
+        self.assertEqual(
+            [(step["key"], step["label"]) for step in process["steps"]],
+            [
+                ("analyze", "问题分析"),
+                ("retrieve", "结果读取"),
+                ("generate", "生成"),
+            ],
+        )
+        active_steps = [
+            item["step"]
+            for item in events
+            if item["type"] == "search_step" and item["status"] == "active"
+        ]
+        self.assertEqual(active_steps, ["analyze", "retrieve", "generate"])
 
 
 if __name__ == "__main__":

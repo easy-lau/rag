@@ -16,6 +16,9 @@ const STEPS = [
   { key: 'generate', label: '生成' },
 ]
 
+const STEP_STATUS = new Set(['pending', 'active', 'done', 'skipped', 'error'])
+const STEP_LABELS = Object.fromEntries(STEPS.map(step => [step.key, step.label]))
+
 const EVIDENCE_ROLES = new Set(['direct', 'related', 'irrelevant'])
 
 function firstDefined(...values) {
@@ -129,6 +132,7 @@ export const useSearchStore = defineStore('search', () => {
   // latter intentionally hides the animated process so a refresh never
   // fabricates steps that were not stored by the server.
   const contextMode = ref('live')
+  const executionPath = ref('legacy')
   const steps = ref(STEPS.map(s => ({ ...s, status: 'pending' })))
 
   function resetSteps() {
@@ -139,16 +143,62 @@ export const useSearchStore = defineStore('search', () => {
     intentDecision.value = null
     hasResultEvent.value = false
     contextMode.value = 'live'
+    executionPath.value = 'legacy'
   }
 
-  function updateStep(key, status) {
-    const step = steps.value.find(s => s.key === key)
-    if (step) step.status = status
+  function setProcessPlan(process) {
+    const rawSteps = Array.isArray(process?.steps) ? process.steps : []
+    const previous = new Map(steps.value.map(step => [step.key, step]))
+    const seen = new Set()
+    const plannedSteps = []
+    for (const raw of rawSteps.slice(0, 8)) {
+      const key = typeof raw?.key === 'string' ? raw.key.trim() : ''
+      if (!/^[a-z][a-z0-9_]{0,31}$/.test(key) || seen.has(key)) continue
+      seen.add(key)
+      const label = typeof raw?.label === 'string' && raw.label.trim()
+        ? raw.label.trim().slice(0, 12)
+        : (STEP_LABELS[key] || key)
+      const existingStatus = previous.get(key)?.status
+      plannedSteps.push({
+        key,
+        label,
+        status: STEP_STATUS.has(existingStatus) ? existingStatus : 'pending',
+      })
+    }
+    if (!plannedSteps.length) return false
+    steps.value = plannedSteps
+    executionPath.value = typeof process?.execution_path === 'string'
+      ? process.execution_path.trim().slice(0, 32)
+      : 'planned'
+    contextMode.value = 'live'
+    return true
+  }
+
+  function updateStep(key, status, reason = '') {
+    const normalizedKey = typeof key === 'string' ? key.trim() : ''
+    const normalizedStatus = status === 'running' ? 'active' : status
+    if (!normalizedKey || !STEP_STATUS.has(normalizedStatus)) return
+    let step = steps.value.find(item => item.key === normalizedKey)
+    if (!step) {
+      step = {
+        key: normalizedKey,
+        label: STEP_LABELS[normalizedKey] || normalizedKey,
+        status: 'pending',
+      }
+      steps.value.push(step)
+    }
+    step.status = normalizedStatus
+    step.reason = typeof reason === 'string' ? reason.slice(0, 200) : ''
   }
 
   // 流程结束兜底：把仍在进行中的步骤收尾，避免步骤条一直停在蓝色转圈
   function finishSteps() {
     steps.value.forEach(s => { if (s.status === 'active') s.status = 'done' })
+  }
+
+  function failActiveStep(reason = '') {
+    const active = steps.value.find(step => step.status === 'active')
+    if (active) updateStep(active.key, 'error', reason)
   }
 
   function setResults(data, fallbackMeta = {}, options = {}) {
@@ -402,8 +452,10 @@ export const useSearchStore = defineStore('search', () => {
   }
 
   return {
-    results, totalCount, searchMeta, intentDecision, hasResultEvent, contextMode, steps,
-    resetSteps, updateStep, finishSteps, setResults, setIntentDecision, setClarification,
+    results, totalCount, searchMeta, intentDecision, hasResultEvent, contextMode,
+    executionPath, steps,
+    resetSteps, setProcessPlan, updateStep, finishSteps, failActiveStep,
+    setResults, setIntentDecision, setClarification,
     setTraceId, restoreSnapshot,
   }
 })

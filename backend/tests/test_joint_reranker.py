@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from core.reranker import (
     AnswerRequirement,
     RerankOutcome,
+    clear_rerank_circuit_breakers,
     joint_rerank_with_coverage,
     rerank_with_status,
     select_small_document_evidence_with_coverage,
@@ -698,6 +699,7 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
 class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         clear_structured_output_capability_cache()
+        clear_rerank_circuit_breakers()
 
     async def _run(self, query, results, requirements, payload):
         client = _client_with_payload(payload)
@@ -958,6 +960,52 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         )
         client.chat.completions.create.assert_awaited_once()
 
+    async def test_invalid_constraint_field_keeps_other_candidates_and_uses_code_status(self) -> None:
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{
+            "id": "hotel",
+            "content": "D级一线城市住宿450元/天。",
+            "score": 0.02,
+        }]
+        payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    constraint="made_up_status",
+                    contribution="standalone_answer",
+                    supports=["r1"],
+                    bridge_facts=[],
+                )
+            ],
+            "evidence_sets": [{
+                "id": "set_1",
+                "candidate_indexes": [1],
+                "joint_answer_support": 0.9,
+                "coverage": [{"requirement_id": "r1", "candidate_indexes": [1]}],
+                "coverage_status": "complete",
+                "missing_requirement_ids": [],
+                "reason": "住宿标准片段覆盖必要需求",
+            }],
+            "selected_set_id": "set_1",
+        }
+
+        outcome = await self._run(
+            "普通员工住宿标准是什么",
+            results,
+            requirements,
+            payload,
+        )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(outcome.results[0]["constraint_status"], "neutral")
+        self.assertEqual(
+            outcome.results[0]["constraint_status_resolution"],
+            "deterministic_fallback",
+        )
+        self.assertTrue(outcome.results[0]["jointly_selected"])
+
     async def test_unknown_contribution_role_is_downgraded_without_losing_batch(self) -> None:
         requirements = [
             _requirement("r1", "确定适用职级"),
@@ -1026,7 +1074,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(by_id["travel"]["jointly_selected"])
         client.chat.completions.create.assert_awaited_once()
 
-    async def test_invalid_structure_is_repaired_once_with_short_prompt(self) -> None:
+    async def test_coverage_status_wire_alias_is_canonicalized_without_retry(self) -> None:
         requirements = [_requirement("r1", "取得住宿标准")]
         results = [
             {
@@ -1062,7 +1110,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         }
         invalid_payload = json.loads(json.dumps(valid_payload))
         invalid_payload["evidence_sets"][0]["coverage_status"] = "fully_covered"
-        client = _client_with_payload_sequence(invalid_payload, valid_payload)
+        client = _client_with_payload_sequence(invalid_payload)
         with (
             patch("core.reranker.get_client", return_value=client),
             patch("core.reranker.get_settings", return_value=_settings()),
@@ -1075,17 +1123,8 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(outcome.succeeded)
         self.assertEqual(outcome.coverage_status, "complete")
-        self.assertEqual(client.chat.completions.create.await_count, 2)
-        repair_call = client.chat.completions.create.await_args_list[1]
-        self.assertAlmostEqual(repair_call.kwargs["timeout"], 8.0, places=3)
-        self.assertNotIn(
-            "UNIQUE_CANDIDATE_BODY",
-            repair_call.kwargs["messages"][1]["content"],
-        )
-        self.assertIn(
-            "coverage_status 无效",
-            repair_call.kwargs["messages"][1]["content"],
-        )
+        self.assertEqual(client.chat.completions.create.await_count, 1)
+        self.assertFalse(outcome.repair_attempted)
 
     async def test_schema_fallback_repair_uses_lowercase_json_contract(self) -> None:
         class ProviderContractError(Exception):
@@ -1509,6 +1548,41 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.results[0]["jointly_selected"])
         self.assertIsNone(outcome.results[0]["evidence_role"])
         self.assertEqual(outcome.results[0]["rerank_status"], "unverified")
+
+    async def test_contract_failures_open_role_scoped_circuit(self) -> None:
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{"id": "hotel", "content": "D级住宿450元/天。", "score": 0.02}]
+        client = _client_with_raw("{bad json")
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            llm_structured_output_mode="plain_json",
+            llm_base_url="https://provider.example/v1",
+            rag_v2_model_evidence_circuit_breaker_enabled=True,
+            rag_v2_model_evidence_circuit_breaker_threshold=2,
+            rag_v2_model_evidence_circuit_breaker_cooldown_seconds=60,
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=settings),
+        ):
+            first = await joint_rerank_with_coverage(
+                "住宿标准是什么", results, requirements, timeout_seconds=1.0
+            )
+            second = await joint_rerank_with_coverage(
+                "住宿标准是什么", results, requirements, timeout_seconds=1.0
+            )
+            third = await joint_rerank_with_coverage(
+                "住宿标准是什么", results, requirements, timeout_seconds=1.0
+            )
+
+        self.assertFalse(first.succeeded)
+        self.assertEqual(first.failure_kind, "contract_validation")
+        self.assertEqual(first.circuit_state, "closed")
+        self.assertEqual(second.circuit_state, "opened")
+        self.assertEqual(third.failure_kind, "circuit_open")
+        self.assertEqual(third.circuit_state, "open")
+        # The third request is rejected before any provider call.
+        self.assertEqual(client.chat.completions.create.await_count, 4)
 
     async def test_malformed_joint_json_falls_back_without_promotion(self) -> None:
         with (

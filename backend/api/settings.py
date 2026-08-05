@@ -23,6 +23,10 @@ from core.settings_crypto import (
     encrypt_setting_secret,
     is_encrypted_setting_value,
 )
+from core.structured_output import (
+    clear_structured_output_capability_cache,
+    create_structured_completion,
+)
 from database import get_db
 from models.db_models import SystemSetting, User
 
@@ -58,6 +62,9 @@ class SettingsOut(BaseModel):
     llm_api_key: str
     llm_base_url: str
     chat_model: str
+    llm_structured_output_mode: Literal[
+        "auto", "json_schema", "json_object", "plain_json"
+    ]
     intent_model: str
     rerank_model: str
     temperature: float
@@ -88,6 +95,9 @@ class SettingsUpdate(BaseModel):
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     chat_model: str | None = None
+    llm_structured_output_mode: Literal[
+        "auto", "json_schema", "json_object", "plain_json"
+    ] | None = None
     intent_model: str | None = Field(None, max_length=255)
     rerank_model: str | None = Field(None, max_length=255)
     temperature: float | None = None
@@ -130,6 +140,11 @@ class ModelConnectionTestOut(BaseModel):
     embedding_dimensions: int | None = None
     latency_ms: int
     error_code: str | None = None
+    structured_output_mode: Literal[
+        "json_schema", "json_object", "plain_json"
+    ] | None = None
+    structured_output_attempted_modes: list[str] = Field(default_factory=list)
+    thinking_disabled: bool | None = None
 
 
 class ModelListRequest(BaseModel):
@@ -180,7 +195,11 @@ def _coerce_setting_value(key: str, value: str, settings) -> object:
         }:
             raise ValueError("invalid general fallback mode")
         return normalized
-    current = getattr(settings, key)
+    current = getattr(
+        settings,
+        key,
+        "auto" if key == "llm_structured_output_mode" else None,
+    )
     if isinstance(current, bool):
         return value.strip().lower() in ("true", "1", "yes")
     if isinstance(current, int):
@@ -283,13 +302,18 @@ def _secret_status(db_value: str | None, env_value: str) -> str:
 
 def _value_from_database(db_map: dict[str, str | None], key: str, settings):
     value = db_map.get(key)
+    default = getattr(
+        settings,
+        key,
+        "auto" if key == "llm_structured_output_mode" else None,
+    )
     if value is None:
-        return getattr(settings, key)
+        return default
     try:
         return _coerce_setting_value(key, value, settings)
     except (TypeError, ValueError):
         logger.warning("[系统设置] 忽略无法解析的字段 key=%s", key)
-        return getattr(settings, key)
+        return default
 
 
 def _decrypt_secret_for_runtime(value: str, settings) -> str:
@@ -348,6 +372,9 @@ async def _load(db: AsyncSession) -> dict:
         "llm_api_key": _secret_status(db_map.get("llm_api_key"), settings.llm_api_key),
         "llm_base_url": _value_from_database(db_map, "llm_base_url", settings),
         "chat_model": _value_from_database(db_map, "chat_model", settings),
+        "llm_structured_output_mode": _value_from_database(
+            db_map, "llm_structured_output_mode", settings
+        ),
         "intent_model": _value_from_database(db_map, "intent_model", settings),
         "rerank_model": _value_from_database(db_map, "rerank_model", settings),
         "temperature": _value_from_database(db_map, "temperature", settings),
@@ -603,16 +630,44 @@ async def _run_model_connection_test(
                 latency_ms=elapsed_ms(),
             )
 
-        await client.chat.completions.create(
+        structured = await create_structured_completion(
+            client,
+            request={
+                "model": model,
+                "messages":[
+                    {
+                        "role": "system",
+                        "content": "输出一个 JSON 对象，内容为 {\"ok\":true}。",
+                    },
+                    {"role": "user", "content": "请执行结构化输出连接测试。"},
+                ],
+                "temperature": 0,
+                "max_tokens": 16,
+            },
+            strict_response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "connection_probe_v1",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    },
+                },
+            },
+            timeout_seconds=15,
+            provider_identity=base_url,
             model=model,
-            messages=[{"role": "user", "content": "请只回复 OK"}],
-            max_tokens=8,
-            timeout=15,
         )
         return ModelConnectionTestOut(
             ok=True,
-            message="模型连接成功",
+            message=f"模型连接及结构化输出测试成功（{structured.mode}）",
             latency_ms=elapsed_ms(),
+            structured_output_mode=structured.mode,
+            structured_output_attempted_modes=list(structured.attempted_modes),
+            thinking_disabled=structured.thinking_disabled,
         )
     except Exception as exc:
         error_code = type(exc).__name__
@@ -808,5 +863,11 @@ async def update_settings(
     # 单进程运行时即时生效；重启后 apply_stored_settings 会再次从数据库恢复。
     for key, value in updates.items():
         setattr(settings, key, value)
+    if any(
+        key in updates
+        for key in ("llm_base_url", "chat_model", "llm_structured_output_mode")
+    ):
+        # 端点、模型或管理员选择变化后，旧能力结论不能污染新配置。
+        clear_structured_output_capability_cache()
 
     return await _load(db)

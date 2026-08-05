@@ -153,6 +153,20 @@ class DirectResponseRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(search["evidence_status"], "skipped")
                 self.assertEqual(search["results"], [])
                 self.assertEqual(search["answer_sources"], [])
+                process = next(
+                    item for item in payloads if item["type"] == "search_process"
+                )
+                self.assertEqual(process["execution_path"], "direct")
+                self.assertEqual(
+                    [step["key"] for step in process["steps"]],
+                    ["analyze", "generate"],
+                )
+                active_steps = [
+                    item["step"]
+                    for item in payloads
+                    if item["type"] == "search_step" and item["status"] == "active"
+                ]
+                self.assertEqual(active_steps, ["analyze", "generate"])
                 self.assertEqual(
                     [item["content"] for item in payloads if item["type"] == "text_delta"],
                     ["直接回答"],

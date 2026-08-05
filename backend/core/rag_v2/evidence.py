@@ -979,6 +979,12 @@ def _attach_document_root_topic_anchors(
             section_labels_by_document[(item.kb_id, item.doc_id)].add(
                 section_label
             )
+    complete_snapshot_documents = frozenset(
+        complete_snapshot_document_keys(
+            items,
+            require_visible=False,
+        )
+    )
 
     root_ids_by_document: dict[tuple[str, str], set[str]] = defaultdict(set)
     document_policy_root_ids_by_document: dict[
@@ -994,12 +1000,27 @@ def _attach_document_root_topic_anchors(
         if not root_text:
             continue
         document_key = (item.kb_id, item.doc_id)
-        # Root inheritance is reserved for a genuinely multi-section document.
-        # A narrow title-only result such as ``餐饮补贴标准`` + ``D级为100``
-        # cannot use its filename to bypass the target-in-claim check.
-        if len(section_labels_by_document.get(document_key, set())) < 2:
-            continue
         for requirement in answer_requirements:
+            # Ordinary fact routes still require a genuinely multi-section
+            # source before a title/root seed may lend its topic to sibling
+            # chunks.  A document-policy overview has a stronger, structural
+            # proof available: the retriever supplied every indexed chunk of
+            # one bounded source.  That complete snapshot remains sufficient
+            # even when a DOCX importer did not preserve section headings.
+            # This distinction is contract based; filenames identify the
+            # retrieved source but never prove snapshot completeness.
+            has_multi_section_structure = (
+                len(section_labels_by_document.get(document_key, set())) >= 2
+            )
+            has_complete_policy_snapshot = (
+                requirement.requires_document_policy_snapshot
+                and document_key in complete_snapshot_documents
+            )
+            if not (
+                has_multi_section_structure
+                or has_complete_policy_snapshot
+            ):
+                continue
             # A governing policy name and its applicable subject frequently
             # live in different sections of the same source.  They can be
             # considered together only because this exact item is a current

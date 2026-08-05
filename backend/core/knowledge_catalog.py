@@ -43,6 +43,19 @@ def _sse(payload: Mapping[str, Any]) -> str:
     )
 
 
+def _process_event() -> str:
+    return _sse({
+        "type": "search_process",
+        "schema_version": "search_process.v1",
+        "execution_path": "catalog",
+        "steps": [
+            {"key": "analyze", "label": "问题分析"},
+            {"key": "retrieve", "label": "目录查询"},
+            {"key": "generate", "label": "生成"},
+        ],
+    })
+
+
 def _step_event(step: str, status: str) -> str:
     return _sse({"type": "search_step", "step": step, "status": status})
 
@@ -229,6 +242,7 @@ async def run_knowledge_catalog_stream(
     started = time.perf_counter()
     user_question = (standalone_query or question).strip() or question.strip()
 
+    yield _process_event()
     yield _step_event("analyze", "active")
     if intent:
         yield _sse({"type": "intent", "decision": intent})
@@ -241,8 +255,6 @@ async def run_knowledge_catalog_stream(
         **content_fields("question", user_question),
     )
     yield _step_event("analyze", "done")
-    yield _step_event("expand", "active")
-    yield _step_event("expand", "done")
     yield _step_event("retrieve", "active")
 
     conditions = _catalog_conditions(
@@ -309,7 +321,6 @@ async def run_knowledge_catalog_stream(
         elapsed_ms=elapsed_ms,
     )
     yield _step_event("retrieve", "done")
-    yield _step_event("rerank", "active")
     trace_event(
         "rerank.completed",
         trace_id=trace_id,
@@ -320,7 +331,6 @@ async def run_knowledge_catalog_stream(
         reason="authoritative_metadata_result",
         elapsed_ms=0,
     )
-    yield _step_event("rerank", "done")
     yield _sse({
         "type": "search_results",
         "trace_id": trace_id,

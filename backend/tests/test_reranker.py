@@ -657,7 +657,7 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["topic_relevance"] is None for item in outcome.results))
         self.assertEqual([item["id"] for item in compatible_results], ["a", "b"])
 
-    async def test_invalid_multidimensional_field_falls_back_without_threshold_score(self) -> None:
+    async def test_invalid_constraint_field_uses_backend_status_without_batch_failure(self) -> None:
         results = [{"id": "a", "content": "A", "score": 0.015625}]
         client = _client_with_payload(
             {
@@ -678,10 +678,14 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
         ):
             outcome = await rerank_with_status("query", results)
 
-        self.assertFalse(outcome.succeeded)
-        self.assertIn("constraint_status", outcome.error or "")
-        self.assertEqual(outcome.results[0]["score"], 0.015625)
-        self.assertEqual(outcome.results[0]["rerank_status"], "unverified")
+        self.assertTrue(outcome.succeeded)
+        self.assertIsNone(outcome.error)
+        self.assertEqual(outcome.results[0]["constraint_status"], "neutral")
+        self.assertEqual(
+            outcome.results[0]["constraint_status_resolution"],
+            "deterministic_fallback",
+        )
+        self.assertEqual(outcome.results[0]["rerank_status"], "verified")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -25,6 +25,10 @@ from api.chat import (
     send_message,
 )
 from core.conversation_context import ConversationContext, RouteTurnCandidate
+from core.authorized_scope import (
+    AuthorizedScopeChoice,
+    AuthorizedScopeClarification,
+)
 from core.query_analysis_execution import get_query_analysis_execution_service
 from core.query_analysis_contract import QueryAnalysisSourceRef
 from core.query_semantics import ResolvedAnswerUnit, ResolvedTurnSemantics
@@ -1151,6 +1155,30 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             _route_clarification_continuation("Redis 怎么配置？", pending)
         )
 
+    def test_route_scope_choice_reply_maps_to_server_label(self) -> None:
+        pending = {
+            "schema_version": "rag_pending_clarification.v1",
+            "state_id": "scope-pending",
+            "original_query": "平台A的登录参数应该怎么修改",
+            "clarification_answers": [],
+            "choices": [
+                {"key": "scope1", "label": "平台A 版本 6", "value": "6"},
+                {"key": "scope2", "label": "平台A 版本 7", "value": "7"},
+            ],
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            ).isoformat(),
+            "dispatch_authorized": False,
+        }
+
+        for reply in ("2", "scope2", "7", "平台A7"):
+            with self.subTest(reply=reply):
+                continuation = _route_clarification_continuation(reply, pending)
+                self.assertIsNotNone(continuation)
+                self.assertEqual(continuation.original_query, pending["original_query"])
+                self.assertEqual(continuation.current_answer, "平台A 版本 7")
+                self.assertIn("平台A 版本 7", continuation.canonical_retrieval_query)
+
     def test_active_v2_state_is_strictly_validated_and_non_executable(self) -> None:
         active = _evidence_pending_state()
 
@@ -2252,6 +2280,111 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(execution_trace["dispatch_authorized"])
         self.assertEqual(execution_trace["unresolved_role"], "query_execution")
         self.assertEqual(execution_trace["unresolved_reason"], "missing")
+
+    async def test_authorized_catalog_ambiguity_uses_route_clarification_gate(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        question = "平台A的登录参数应该怎么修改"
+        conv = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+        )
+        _route, _contract, routing_result = _route_and_contract(
+            intent_code="knowledge_qa",
+            action="retrieve",
+            evidence_scope="enterprise_kb",
+            selected_kb_count=1,
+        )
+        scope_clarification = AuthorizedScopeClarification(
+            dimension="product_version",
+            question=(
+                "当前授权知识库中存在多个适用版本，请先选择版本：\n"
+                "1. 平台A 版本 6\n2. 平台A 版本 7"
+            ),
+            choices=(
+                AuthorizedScopeChoice(
+                    key="scope1",
+                    product="平台A",
+                    version="6",
+                    kb_ids=(str(kb_id),),
+                    doc_ids=(str(uuid.uuid4()),),
+                ),
+                AuthorizedScopeChoice(
+                    key="scope2",
+                    product="平台A",
+                    version="7",
+                    kb_ids=(str(kb_id),),
+                    doc_ids=(str(uuid.uuid4()),),
+                ),
+            ),
+        )
+        db = _RouteStateDB(conv)
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=routing_result),
+            ),
+            patch(
+                "api.chat.resolve_authorized_scope_clarification",
+                new=AsyncMock(return_value=scope_clarification),
+            ) as scope_resolver,
+            patch("api.chat.run_rag_v2_stream", new=AsyncMock()) as rag_v2,
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=db,
+                user=user,
+            )
+            payloads = [
+                _parse_sse_payload(
+                    chunk.decode() if isinstance(chunk, bytes) else chunk
+                )
+                async for chunk in response.body_iterator
+            ]
+
+        scope_resolver.assert_awaited_once()
+        rag_v2.assert_not_awaited()
+        state = conv.pending_route_state
+        self.assertEqual(state["unresolved"][0]["role"], "product_version")
+        self.assertEqual(state["unresolved"][0]["reason"], "ambiguous")
+        self.assertEqual(
+            state["choices"],
+            [
+                {"key": "scope1", "label": "平台A 版本 6", "value": "6"},
+                {"key": "scope2", "label": "平台A 版本 7", "value": "7"},
+            ],
+        )
+        self.assertNotIn("kb_ids", state["choices"][0])
+        clarification_text = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item and item.get("type") == "text_delta"
+        )
+        self.assertIn("当前授权知识库中存在多个适用版本", clarification_text)
+        self.assertIn("平台A 版本 6", clarification_text)
+        self.assertIn("平台A 版本 7", clarification_text)
 
     def test_broad_refinement_remains_one_query_plan(self) -> None:
         refined = _refined_evidence_query("员工标准是什么", "2025版")

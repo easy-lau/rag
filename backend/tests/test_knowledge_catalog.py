@@ -99,6 +99,22 @@ class KnowledgeCatalogRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("《云枢6配置参数说明》", answer)
         self.assertIn("《云枢7配置》", answer)
         self.assertNotIn("embedding", answer.casefold())
+        process = next(item for item in events if item["type"] == "search_process")
+        self.assertEqual(process["execution_path"], "catalog")
+        self.assertEqual(
+            [(step["key"], step["label"]) for step in process["steps"]],
+            [
+                ("analyze", "问题分析"),
+                ("retrieve", "目录查询"),
+                ("generate", "生成"),
+            ],
+        )
+        active_steps = [
+            item["step"]
+            for item in events
+            if item["type"] == "search_step" and item["status"] == "active"
+        ]
+        self.assertEqual(active_steps, ["analyze", "retrieve", "generate"])
 
         for statement in db.statements:
             params = statement.compile().params

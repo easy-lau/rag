@@ -450,6 +450,11 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "hit")
+        process = next(item for item in payloads if item["type"] == "search_process")
+        self.assertEqual(
+            [step["key"] for step in process["steps"]],
+            ["analyze", "expand", "retrieve", "rerank", "generate"],
+        )
         self.assertEqual(
             {item["doc_id"] for item in result["answer_sources"]},
             {str(doc_id)},
@@ -458,6 +463,66 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             message["content"] for message in client.completions.calls[0]["messages"]
         )
         self.assertIn("force_change_default_password", prompt)
+
+    async def test_flattened_configuration_block_closes_without_model_adjudication(
+        self,
+    ) -> None:
+        """Importer-flattened YAML keeps configuration evidence deterministic."""
+
+        question = "云枢6如何修改默认密码"
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description=question,
+            role="answer",
+            importance="required",
+            source="explicit",
+            coverage_mode="collection",
+            coverage_contract="structured_collection",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        execution_bundle = compile_rag_execution_bundle(QueryPlanV2(
+            original_query=question,
+            answer_shape="process",
+            retrieval_queries=(question,),
+            requirements=(requirement,),
+            confidence=0.95,
+            source="local",
+        ))
+        candidate = _candidate(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            chunk_index=0,
+            filename="云枢6配置参数说明",
+            content=(
+                "```yaml cloudpivot: organization: defaultPwd: "
+                "Authine@123456 #默认密码配置 login: error_reply_same: true "
+                "#解决登录用户名枚举 switch: force_change_default_password: true "
+                "#默认密码强制修改 ```"
+            ),
+        )
+        candidate["metadata"] = {"product": "云枢", "version": "6"}
+
+        payloads, client, *_ = await self._run(
+            question=question,
+            kb_id=kb_id,
+            initial=[candidate],
+            full_document=[candidate],
+            execution_bundle=execution_bundle,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "hit")
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(doc_id)},
+        )
+        self.assertTrue(any(
+            "defaultPwd" in str(call)
+            for call in client.completions.calls
+        ))
 
     async def test_unversioned_configuration_routes_are_not_silently_merged(
         self,
@@ -981,6 +1046,19 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             item for item in payloads if item["type"] == "evidence_clarification"
         )
         self.assertTrue(clarification["question"])
+        process = next(item for item in payloads if item["type"] == "search_process")
+        self.assertEqual(
+            [step["key"] for step in process["steps"]],
+            ["analyze", "generate"],
+        )
+        self.assertEqual(
+            [
+                item["step"]
+                for item in payloads
+                if item["type"] == "search_step" and item["status"] == "active"
+            ],
+            ["analyze", "generate"],
+        )
 
     async def test_task_graph_replay_closes_manager_grade_to_lodging_chain(self) -> None:
         """Replay the log-15 failure without relying on query-array positions."""
@@ -2945,6 +3023,95 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("员工填写请假申请单", prompt)
         self.assertIn("假期结束后办理销假", prompt)
+
+    async def test_complete_document_overview_closes_before_model_adjudication(
+        self,
+    ) -> None:
+        """A bounded DOCX snapshot is deterministic overview evidence.
+
+        Plain DOCX chunks do not always retain section-heading metadata.  The
+        complete snapshot cardinality and a current-query document root still
+        form a closed document-policy route, so an optional evidence model may
+        not become the availability gate for this request class.
+        """
+
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        contents = [
+            "XX公司员工请假管理办法。第一章总则。",
+            "请假类别包括事假、病假和年休假。",
+            "审批权限根据请假时长确定。",
+            "1天以内由直属主管审批，5天以上由总经理审批。",
+            "请假流程包括申请、逐级审批、人力资源备案和销假。",
+        ]
+        full_document = _full_document(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            contents=contents,
+            filename="员工请假管理办法.docx",
+        )
+        initial = []
+        for index, source in enumerate(full_document):
+            candidate = dict(source)
+            candidate.update(
+                score=0.03,
+                retrieval_score=0.03,
+                vector_score=0.86,
+                vector_rank=index + 1,
+                active_channels=["vector"],
+                candidate_origin="current_retrieval",
+                candidate_origins=["current_retrieval"],
+            )
+            initial.append(candidate)
+        requirement = AnswerRequirementV2(
+            id="a1",
+            description="员工请假管理办法",
+            role="answer",
+            importance="required",
+            source="explicit",
+            coverage_mode="collection",
+            coverage_contract="document_policy",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        execution_bundle = compile_rag_execution_bundle(QueryPlanV2(
+            original_query="我要查询知识库里面的员工请假管理办法",
+            answer_shape="overview",
+            retrieval_queries=("我要查询知识库里面的员工请假管理办法",),
+            requirements=(requirement,),
+            confidence=0.9,
+            source="model",
+        ))
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            rag_v2_model_evidence_adjudication_enabled=True,
+        )
+        adjudicator = AsyncMock()
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=adjudicator,
+        ):
+            payloads, client, *_ = await self._run(
+                question="我要查询知识库里面的员工请假管理办法",
+                kb_id=kb_id,
+                initial=initial,
+                full_document=full_document,
+                execution_bundle=execution_bundle,
+                settings_override=settings,
+            )
+
+        adjudicator.assert_not_awaited()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "hit", result)
+        self.assertIsNone(result["rerank_succeeded"])
+        self.assertEqual(len(result["answer_sources"]), len(contents))
+        prompt = "\n".join(
+            message["content"]
+            for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("病假和年休假", prompt)
+        self.assertIn("人力资源备案和销假", prompt)
 
     async def test_scope_slice_selection_drops_sibling_section_in_same_document(
         self,
@@ -6051,6 +6218,37 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             client.completions.calls[0]["extra_body"],
             {"thinking": {"type": "disabled"}},
         )
+
+    async def test_source_bound_no_hit_does_not_let_general_model_guess(self) -> None:
+        kb_id = uuid.uuid4()
+        settings = _settings()
+        settings.rag_general_fallback_mode = "no_hit"
+        settings.rag_general_fallback_model = "fast-fallback-model"
+
+        payloads, client, *_ = await self._run(
+            question="云枢8.6的登录参数应该怎么修改",
+            kb_id=kb_id,
+            initial=[],
+            full_document=[],
+            settings_override=settings,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "no_hit")
+        self.assertEqual(result["answer_provenance"], "knowledge_base")
+        self.assertEqual(
+            result["general_fallback_blocked_reason"],
+            "source_bound_scope_requires_knowledge_evidence",
+        )
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(client.completions.calls, [])
+        answer = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text_delta"
+        )
+        self.assertIn("知识库中未找到", answer)
+        self.assertIn("暂时无法提供准确答案", answer)
 
     async def test_insufficient_evidence_fallback_requires_broadest_mode(self) -> None:
         kb_id = uuid.uuid4()

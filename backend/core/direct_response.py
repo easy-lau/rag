@@ -40,6 +40,15 @@ def _sse(payload: Mapping[str, Any]) -> str:
     )
 
 
+def _process_event(*steps: tuple[str, str]) -> str:
+    return _sse({
+        "type": "search_process",
+        "schema_version": "search_process.v1",
+        "execution_path": "direct",
+        "steps": [{"key": key, "label": label} for key, label in steps],
+    })
+
+
 def _step_event(step: str, status: str) -> str:
     return _sse({"type": "search_step", "step": step, "status": status})
 
@@ -136,6 +145,7 @@ async def run_direct_response_stream(
     history = _bounded_history(conversation_history if is_followup else ())
     user_question = (standalone_query or question).strip() or question.strip()
 
+    yield _process_event(("analyze", "问题分析"), ("generate", "生成"))
     yield _step_event("analyze", "active")
     if intent:
         yield _sse({"type": "intent", "decision": intent})
@@ -150,9 +160,6 @@ async def run_direct_response_stream(
         **content_fields("question", user_question),
     )
     yield _step_event("analyze", "done")
-    yield _step_event("expand", "active")
-    yield _step_event("expand", "done")
-    yield _step_event("retrieve", "active")
     trace_event(
         "retrieval.completed",
         trace_id=trace_id,
@@ -162,8 +169,6 @@ async def run_direct_response_stream(
         candidate_count=0,
         elapsed_ms=0,
     )
-    yield _step_event("retrieve", "done")
-    yield _step_event("rerank", "active")
     trace_event(
         "rerank.completed",
         trace_id=trace_id,
@@ -176,7 +181,6 @@ async def run_direct_response_stream(
         elapsed_ms=0,
         reason="retrieval_skipped",
     )
-    yield _step_event("rerank", "done")
     yield _sse({
         "type": "search_results",
         "trace_id": trace_id,

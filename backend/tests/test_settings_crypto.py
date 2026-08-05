@@ -541,6 +541,31 @@ class SettingsDisplayAndTestConfigTests(unittest.TestCase):
 
 
 class ModelConnectionTestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_llm_connection_test_probes_structured_output_capability(self) -> None:
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace()))
+            ),
+            close=AsyncMock(),
+        )
+
+        with patch("api.settings.AsyncOpenAI", return_value=client):
+            result = await _run_model_connection_test(
+                ModelConnectionTest(service="llm"),
+                api_key="sk-never-log-this",
+                base_url="https://llm.example.test/v1",
+                model="chat-model",
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.structured_output_mode, "json_schema")
+        self.assertEqual(result.structured_output_attempted_modes, ["json_schema"])
+        self.assertEqual(client.chat.completions.create.await_count, 1)
+        request = client.chat.completions.create.await_args.kwargs
+        self.assertEqual(request["response_format"]["type"], "json_schema")
+        self.assertNotIn("sk-never-log-this", repr(request))
+        client.close.assert_awaited_once()
+
     async def test_model_test_returns_safe_failure_and_closes_client(self) -> None:
         client = SimpleNamespace(
             chat=SimpleNamespace(

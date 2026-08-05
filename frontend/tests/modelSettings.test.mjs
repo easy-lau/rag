@@ -43,6 +43,13 @@ test('重排模型操作继续服从 settings write 权限', () => {
   assert.match(modelManagementSource, /:disabled="!canWrite \|\| connectionTests\.rerank\.loading"/)
 })
 
+test('模型管理页提供结构化输出能力探测模式并在测试成功后回填', () => {
+  assert.match(modelManagementSource, /v-model:value="form\.llm_structured_output_mode"/)
+  assert.match(modelManagementSource, /structuredOutputModeOptions/)
+  assert.match(modelManagementSource, /result\.structured_output_mode/)
+  assert.match(modelManagementSource, /llm_structured_output_mode: form\.value\.llm_structured_output_mode/)
+})
+
 test('系统设置提供三档知识库未命中兜底策略并随设置保存', () => {
   assert.match(settingsViewSource, /v-model:value="form\.rag_general_fallback_mode"/)
   assert.ok(settingsViewSource.includes("value: 'off'"))

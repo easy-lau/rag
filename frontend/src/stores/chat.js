@@ -593,8 +593,10 @@ export const useChatStore = defineStore('chat', () => {
     } else if (data.type === 'intent') {
       aiMsg.intent_decision = data.decision || data
       searchStore.setIntentDecision(aiMsg.intent_decision)
+    } else if (data.type === 'search_process') {
+      searchStore.setProcessPlan(data)
     } else if (data.type === 'search_step') {
-      searchStore.updateStep(data.step, data.status)
+      searchStore.updateStep(data.step, data.status, data.reason)
     } else if (data.type === 'search_results') {
       // 搜索事件现在会返回实际执行与证据状态；搜索配置只作为旧版本接口
       // 未携带 method/top_k 时的展示兜底，不能代替服务端执行结论。
@@ -685,6 +687,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       searchStore.finishSteps()
     } else if (data.type === 'error') {
+      searchStore.failActiveStep(data.message || '')
       // 正常管线会先发送 search_results；若异常发生得更早，则显式标记为
       // “检索状态失败”，避免结果面板一直误显示为等待中。
       if (!searchStore.hasResultEvent) {

@@ -234,7 +234,10 @@ _QUERY_ADJACENT_RE = re.compile(
     re.IGNORECASE,
 )
 _QUERY_VERSION_LABEL_RE = re.compile(
-    rf"(?P<product>[A-Za-z][A-Za-z0-9_.\-]{{1,30}}|[\u3400-\u9fff]{{2,16}})"
+    # An explicit ``产品名 + 版本`` label is safe to parse across mixed
+    # Chinese/ASCII names.  Unlike the looser adjacent-number grammar, the
+    # literal version cue prevents ordinary quantities from becoming scopes.
+    rf"(?P<product>[A-Za-z\u3400-\u9fff][A-Za-z0-9_.\-\u3400-\u9fff]{{1,30}})"
     rf"\s*版本\s*(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
     re.IGNORECASE,
 )

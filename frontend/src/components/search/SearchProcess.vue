@@ -9,6 +9,7 @@
             :class="stepClass(step.status)"
           >
             <n-icon v-if="step.status === 'done'" :size="14"><CheckmarkOutline /></n-icon>
+            <n-icon v-else-if="step.status === 'error'" :size="14"><CloseOutline /></n-icon>
             <span v-else-if="step.status === 'active'">
               <n-spin :size="14" />
             </span>
@@ -19,7 +20,7 @@
         <div
           v-if="i < steps.length - 1"
           class="min-w-0 flex-1 h-0.5 mx-1 mb-5 transition-colors duration-300"
-          :class="step.status === 'done' ? 'bg-green-400' : 'bg-gray-200 dark:bg-gray-600'"
+          :class="connectorClass(step.status)"
         />
       </template>
     </div>
@@ -28,7 +29,7 @@
 
 <script setup>
 import { NSpin, NIcon } from 'naive-ui'
-import { CheckmarkOutline } from '@vicons/ionicons5'
+import { CheckmarkOutline, CloseOutline } from '@vicons/ionicons5'
 import { useSearchStore } from '@/stores/search'
 import { storeToRefs } from 'pinia'
 
@@ -37,12 +38,20 @@ const { steps } = storeToRefs(useSearchStore())
 function stepClass(status) {
   if (status === 'done')   return 'bg-green-500 text-white'
   if (status === 'active') return 'bg-blue-500 text-white ring-2 ring-blue-300 ring-offset-1 dark:ring-blue-400 dark:ring-offset-gray-800'
+  if (status === 'error')  return 'bg-red-500 text-white'
   return 'bg-gray-200 dark:bg-gray-600 text-gray-400'
 }
 
 function labelClass(status) {
   if (status === 'done')   return 'text-green-600 dark:text-green-400 font-medium'
   if (status === 'active') return 'text-blue-500 font-medium'
+  if (status === 'error')  return 'text-red-600 dark:text-red-400 font-medium'
   return 'text-gray-400'
+}
+
+function connectorClass(status) {
+  if (status === 'done') return 'bg-green-400'
+  if (status === 'error') return 'bg-red-300 dark:bg-red-700'
+  return 'bg-gray-200 dark:bg-gray-600'
 }
 </script>

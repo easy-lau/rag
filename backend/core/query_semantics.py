@@ -33,6 +33,7 @@ from core.query_surface_structure import parse_query_surface_frame
 
 
 RESOLVED_TURN_SEMANTICS_SCHEMA_VERSION = "resolved_turn_semantics.v1"
+ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION = "route_clarification_continuation.v1"
 
 RequestKind = Literal[
     "single_fact",
@@ -144,6 +145,21 @@ _DOCUMENT_CATALOG_STATUS_RE = re.compile(
     r"(?:状态|处理中|处理完成|尚未完成|未完成|失败|停用|禁用)",
     re.IGNORECASE,
 )
+_DOCUMENT_CATALOG_FILE_TYPE_RE = re.compile(
+    r"(?:文件类型|文档类型|格式|扩展名)",
+    re.IGNORECASE,
+)
+_DOCUMENT_CATALOG_KB_GROUP_RE = re.compile(
+    r"(?:每个|各个|按)\s*(?:知识库|库)",
+    re.IGNORECASE,
+)
+_DOCUMENT_CATALOG_SUBJECT_RE = re.compile(
+    r"(?:关于|有关|针对|围绕)\s*"
+    r"(?P<subject>[^，,。；;！？?]{1,96}?)\s*"
+    r"(?:相关)?的\s*(?:失败|处理中|处理完成|未完成|停用|禁用)?\s*"
+    r"(?:知识库|文档|文章|资料|文件)",
+    re.IGNORECASE,
+)
 
 # These patterns describe question form, not any company-specific fact.  The
 # distinction is intentionally made here once, rather than by separate
@@ -154,8 +170,19 @@ _CONFIGURATION_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _CONFIGURATION_PROCEDURE_RE = re.compile(
+    # Keep the procedure-vs-state distinction independent from any product
+    # vocabulary.  Both natural Chinese orderings are common:
+    # ``怎么修改参数`` and ``修改参数应该怎么办``.  The latter was
+    # previously classified as an ordered procedure even when the source only
+    # contained a key/value configuration assignment, making rerank failure
+    # erase otherwise usable deterministic evidence.
+    r"(?:"
     r"(?:如何|怎么|怎样)\s*(?:进行|完成|实现|操作)?\s*"
-    r"(?:配置|设置|修改|调整|变更|启用|停用|开启|关闭)",
+    r"(?:配置|设置|修改|更改|调整|变更|启用|停用|开启|关闭|改)"
+    r"|"
+    r"(?:配置|设置|修改|更改|调整|变更|启用|停用|开启|关闭|改)"
+    r"[^。！？?]{0,32}(?:怎么办|怎么做|如何处理|怎样处理)"
+    r")",
     re.IGNORECASE,
 )
 _CONFIGURATION_STATE_RE = re.compile(
@@ -185,6 +212,78 @@ def _unique(values: list[str]) -> tuple[str, ...]:
             seen.add(key)
             output.append(value)
     return tuple(output)
+
+
+@dataclass(frozen=True)
+class RouteClarificationContinuation:
+    """Structured hand-off for a reply that fills a pending route slot.
+
+    ``current_answer`` is the literal latest user input and
+    ``original_query`` is the immutable task root.  The combined rendering is
+    intentionally produced once for retrieval/generation only; it must never
+    be parsed as a new user sentence by V3 or the local query planner.
+    """
+
+    schema_version: Literal["route_clarification_continuation.v1"]
+    original_query: str
+    current_answer: str
+    prior_answers: tuple[str, ...] = ()
+    canonical_retrieval_query: str = ""
+
+    def __post_init__(self) -> None:
+        original = _normalised(self.original_query)
+        current = _normalised(self.current_answer)
+        answers = tuple(_normalised(value) for value in self.prior_answers)
+        if self.schema_version != ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION:
+            raise ValueError("unsupported clarification continuation schema")
+        if not original or not current:
+            raise ValueError("clarification continuation requires task and answer")
+        if any(not value for value in answers):
+            raise ValueError("clarification continuation answers cannot be empty")
+        canonical = _normalised(self.canonical_retrieval_query)
+        if not canonical:
+            qualifiers = "、".join(_unique([*answers, current]))
+            canonical = f"{original}（已确认补充条件：{qualifiers}）"
+        object.__setattr__(self, "original_query", original)
+        object.__setattr__(self, "current_answer", current)
+        object.__setattr__(self, "prior_answers", answers[-6:])
+        object.__setattr__(self, "canonical_retrieval_query", canonical[:16000])
+
+    @property
+    def semantic_query(self) -> str:
+        """Return the task root used by semantic analysis/planning."""
+
+        return self.original_query
+
+    @property
+    def answers(self) -> tuple[str, ...]:
+        return (*self.prior_answers, self.current_answer)[-6:]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "original_query": self.original_query,
+            "current_answer": self.current_answer,
+            "prior_answers": list(self.prior_answers),
+            "canonical_retrieval_query": self.canonical_retrieval_query,
+        }
+
+    def safe_summary(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "original_query_length": len(self.original_query),
+            "answer_count": len(self.answers),
+            "canonical_query_length": len(self.canonical_retrieval_query),
+        }
+
+    # Compatibility for internal callers written against the former tuple
+    # return value.  New code should use named fields; yielding the same three
+    # projections keeps rolling upgrades harmless without restoring text
+    # concatenation as a semantic input.
+    def __iter__(self):
+        yield self.canonical_retrieval_query
+        yield self.original_query
+        yield self.answers
 
 
 def _request_kind(
@@ -449,6 +548,60 @@ def document_catalog_surface_operation(
     return None
 
 
+def document_catalog_request_for_question(
+    question: object,
+) -> KnowledgeRequestSemantics | None:
+    """Build the conservative catalog capability floor for a clear surface.
+
+    This is used only when strict semantic compilation is unavailable.  It
+    derives a closed capability from the shared resource grammar; it never
+    authorises scope, filters, documents, or content retrieval.
+    """
+
+    operation = document_catalog_surface_operation(question)
+    if operation is None:
+        return None
+    text = _normalised(question)
+    status_filter: KnowledgeStatusFilter = "any"
+    status_values = (
+        ("not_ready", r"(?:未完成|尚未完成|未就绪|未准备好)"),
+        ("processing", r"(?:处理中|处理中的?)"),
+        ("failed", r"(?:失败|处理失败)"),
+        ("inactive", r"(?:停用|禁用|已停用)"),
+        ("ready", r"(?:已完成|处理完成|已就绪|就绪)"),
+    )
+    for candidate, pattern in status_values:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            status_filter = candidate  # type: ignore[assignment]
+            break
+    group_by: KnowledgeGroupBy = "none"
+    if operation == "group":
+        text = _normalised(question)
+        if _DOCUMENT_CATALOG_KB_GROUP_RE.search(text):
+            group_by = "knowledge_base"
+        elif _DOCUMENT_CATALOG_STATUS_RE.search(text):
+            group_by = "status"
+        elif _DOCUMENT_CATALOG_FILE_TYPE_RE.search(text):
+            group_by = "file_type"
+        else:
+            return None
+    subject_match = _DOCUMENT_CATALOG_SUBJECT_RE.search(text)
+    filter_terms = (
+        (subject_match.group("subject").strip(),)
+        if subject_match is not None and subject_match.group("subject").strip()
+        else ()
+    )
+    return KnowledgeRequestSemantics(
+        resource="document_catalog",
+        operation=operation,
+        filter_span_ids=("floor_1",) if filter_terms else (),
+        filter_terms=filter_terms,
+        group_by=group_by,
+        status_filter=status_filter,
+        answer_form=("enumeration" if operation == "list" else "fact"),
+    )
+
+
 @dataclass(frozen=True)
 class ResolvedAnswerUnit:
     """One literal answer target with its source-anchored qualifiers."""
@@ -627,6 +780,7 @@ def resolve_turn_semantics(
 
 __all__ = [
     "RESOLVED_TURN_SEMANTICS_SCHEMA_VERSION",
+    "ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION",
     "RequestKind",
     "KnowledgeGroupBy",
     "KnowledgeAnswerForm",
@@ -636,10 +790,12 @@ __all__ = [
     "KnowledgeStatusFilter",
     "ResolvedAnswerUnit",
     "ResolvedTurnSemantics",
+    "RouteClarificationContinuation",
     "answer_shape_for_request_kind",
     "request_kind_for_question",
     "reconcile_answer_form",
     "content_knowledge_request",
     "document_catalog_surface_operation",
+    "document_catalog_request_for_question",
     "resolve_turn_semantics",
 ]

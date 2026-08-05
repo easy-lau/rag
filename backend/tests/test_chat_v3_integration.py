@@ -778,9 +778,8 @@ class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handoff["question"], route_calls[0])
         self.assertEqual(handoff["standalone_query"], route_calls[0])
         planned_query = handoff["execution_bundle"].plan.original_query
-        self.assertIn(original_query, planned_query)
-        self.assertIn(reply, planned_query)
-        self.assertNotEqual(planned_query, reply)
+        self.assertEqual(planned_query, original_query)
+        self.assertNotIn(reply, planned_query)
         self.assertNotEqual(handoff["question"], reply)
 
     async def test_v3_defers_route_semantic_clarification_but_keeps_hard_contract_boundary(self) -> None:

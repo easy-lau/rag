@@ -7,6 +7,7 @@ export const useSettingsStore = defineStore('settings', () => {
     llm_api_key: '',
     llm_base_url: 'https://api.openai.com/v1',
     chat_model: 'gpt-4o',
+    llm_structured_output_mode: 'auto',
     intent_model: '',
     rerank_model: '',
     temperature: 0.7,

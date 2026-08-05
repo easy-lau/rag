@@ -9,6 +9,8 @@ from core.query_analysis_contract import (
 from core.query_analysis_validation import validate_query_analysis_for_execution
 from core.query_semantics import (
     KnowledgeRequestSemantics,
+    RouteClarificationContinuation,
+    document_catalog_request_for_question,
     document_catalog_surface_operation,
     resolve_turn_semantics,
 )
@@ -65,6 +67,29 @@ class ResolvedTurnSemanticsTests(unittest.TestCase):
             "list",
         )
         self.assertIsNone(document_catalog_surface_operation("如何配置登录密码"))
+
+    def test_clarification_continuation_separates_task_from_retrieval_rendering(self):
+        continuation = RouteClarificationContinuation(
+            schema_version="route_clarification_continuation.v1",
+            original_query="我现在有哪些文章",
+            current_answer="知识库里面的全部文章",
+        )
+        self.assertEqual(continuation.semantic_query, "我现在有哪些文章")
+        self.assertEqual(continuation.answers, ("知识库里面的全部文章",))
+        self.assertIn("我现在有哪些文章", continuation.canonical_retrieval_query)
+        self.assertIn("知识库里面的全部文章", continuation.canonical_retrieval_query)
+        self.assertNotIn("；", continuation.canonical_retrieval_query)
+        self.assertEqual(
+            document_catalog_request_for_question(
+                continuation.canonical_retrieval_query
+            ).operation,
+            "list",
+        )
+        filtered = document_catalog_request_for_question("列出关于报销制度的文章")
+        self.assertEqual(filtered.status_filter, "any")
+        self.assertEqual(filtered.filter_terms, ("报销制度",))
+        failed = document_catalog_request_for_question("列出失败的文章")
+        self.assertEqual(failed.status_filter, "failed")
 
     def test_contextual_single_target_keeps_history_as_a_source_ref(self):
         current = "餐补呢"
@@ -168,6 +193,7 @@ class ResolvedTurnSemanticsTests(unittest.TestCase):
         cases = (
             ("登录用户名枚举要配置什么", "登录用户名枚举", "configuration_state"),
             ("如何配置登录用户名枚举", "登录用户名枚举", "configuration_procedure"),
+            ("修改参数应该怎么办", "参数", "configuration_procedure"),
         )
         for question, target, expected_kind in cases:
             with self.subTest(question=question):

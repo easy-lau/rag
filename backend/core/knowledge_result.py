@@ -35,6 +35,19 @@ def _step(step: str, status: str) -> str:
     return _sse({"type": "search_step", "step": step, "status": status})
 
 
+def _process_event() -> str:
+    return _sse({
+        "type": "search_process",
+        "schema_version": "search_process.v1",
+        "execution_path": "result_reference",
+        "steps": [
+            {"key": "analyze", "label": "问题分析"},
+            {"key": "retrieve", "label": "结果读取"},
+            {"key": "generate", "label": "生成"},
+        ],
+    })
+
+
 def _parse_uuid(value: object) -> uuid.UUID:
     try:
         return uuid.UUID(str(value))
@@ -134,12 +147,11 @@ async def run_knowledge_result_stream(
     trace_id = trace_id or uuid.uuid4().hex
     started = time.perf_counter()
     user_question = (standalone_query or question).strip() or question.strip()
+    yield _process_event()
     yield _step("analyze", "active")
     if intent:
         yield _sse({"type": "intent", "decision": intent})
     yield _step("analyze", "done")
-    yield _step("expand", "active")
-    yield _step("expand", "done")
     yield _step("retrieve", "active")
 
     document_ids = [doc_id for _, doc_id in ordered_pairs]
@@ -171,8 +183,6 @@ async def run_knowledge_result_stream(
         names = "、".join(f"《{item.filename}》" for item in ordered_documents)
         answer = f"{names}当前不是已就绪且启用的文档，暂时无法读取正文。"
         yield _step("retrieve", "done")
-        yield _step("rerank", "active")
-        yield _step("rerank", "done")
         yield _sse({
             "type": "search_results",
             "trace_id": trace_id,
@@ -245,8 +255,6 @@ async def run_knowledge_result_stream(
         **content_fields("question", user_question),
     )
     yield _step("retrieve", "done")
-    yield _step("rerank", "active")
-    yield _step("rerank", "done")
     yield _sse({
         "type": "search_results",
         "trace_id": trace_id,

@@ -163,12 +163,30 @@
                 </n-form-item>
               </div>
 
-              <div v-if="service.key === 'llm'" class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div v-if="service.key === 'llm'" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 <n-form-item label="Temperature">
                   <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" class="w-full" />
                 </n-form-item>
                 <n-form-item label="Max Tokens">
                   <n-input-number v-model:value="form.max_tokens" :min="256" :max="8192" :step="256" class="w-full" />
+                </n-form-item>
+                <n-form-item>
+                  <template #label>
+                    <span class="inline-flex items-center gap-1">
+                      结构化输出模式
+                      <n-tooltip trigger="hover" placement="top">
+                        <template #trigger>
+                          <n-icon :size="15" class="text-gray-400 cursor-help" aria-label="结构化输出模式说明">
+                            <HelpCircleOutline />
+                          </n-icon>
+                        </template>
+                        <div class="max-w-xs text-xs leading-relaxed">
+                          自动模式会按当前接口和模型能力协商结构化输出；测试模型后会回填探测到的模式，保存后可减少首次问答的探测延迟或失败。
+                        </div>
+                      </n-tooltip>
+                    </span>
+                  </template>
+                  <n-select v-model:value="form.llm_structured_output_mode" :options="structuredOutputModeOptions" />
                 </n-form-item>
               </div>
             </n-form>
@@ -187,8 +205,8 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { NAutoComplete, NButton, NForm, NFormItem, NIcon, NInput, NInputNumber, NSpin, NTag, useMessage } from 'naive-ui'
-import { LockClosedOutline, RefreshOutline } from '@vicons/ionicons5'
+import { NAutoComplete, NButton, NForm, NFormItem, NIcon, NInput, NInputNumber, NSelect, NSpin, NTag, NTooltip, useMessage } from 'naive-ui'
+import { HelpCircleOutline, LockClosedOutline, RefreshOutline } from '@vicons/ionicons5'
 import { getAvailableModels, testModelConnection } from '@/api/settings'
 import { normalizeOptionalModel, resolveOptionalLlmModel } from '@/utils/modelSettings'
 import { useAuthStore } from '@/stores/auth'
@@ -213,6 +231,12 @@ const connectionTests = ref({
 
 const keyPlaceholder = (status) => status ? `${status}，留空则不修改` : 'sk-...'
 const modelSelectPlaceholder = '输入模型 ID，或获取后选择'
+const structuredOutputModeOptions = [
+  { label: '自动探测（推荐）', value: 'auto' },
+  { label: '严格 JSON Schema', value: 'json_schema' },
+  { label: 'JSON Object', value: 'json_object' },
+  { label: '普通 JSON 文本', value: 'plain_json' },
+]
 const modelLists = reactive({
   llm: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
   intent: { models: [], loading: false, loaded: false, error: '', requestSequence: 0 },
@@ -310,12 +334,19 @@ onMounted(async () => {
   serviceKeys.vision = ''
 })
 for (const service of Object.keys(modelServiceConfig)) {
-  watch(() => [currentServiceBaseUrl(service), typedServiceKey(service)], ([nextUrl, nextKey], [previousUrl, previousKey]) => {
-    if (nextUrl !== previousUrl || nextKey !== previousKey) {
+  watch(() => [
+    currentServiceBaseUrl(service),
+    typedServiceKey(service),
+    String(form.value[modelServiceConfig[service].modelField] || '').trim(),
+  ], ([nextUrl, nextKey, nextModel], [previousUrl, previousKey, previousModel]) => {
+    if (nextUrl !== previousUrl || nextKey !== previousKey || nextModel !== previousModel) {
       resetModelList(service)
       if (service === 'llm') {
         resetModelList('intent')
         resetModelList('rerank')
+        if (nextUrl !== previousUrl || nextModel !== previousModel) {
+          form.value.llm_structured_output_mode = 'auto'
+        }
       }
     }
   })
@@ -339,8 +370,14 @@ async function handleTestConnection(service) {
   try {
     const result = await testModelConnection(createConnectionPayload(service))
     const success = result.ok === true
+    if (service === 'llm' && success && result.structured_output_mode) {
+      form.value.llm_structured_output_mode = result.structured_output_mode
+    }
     const dimensions = success && result.embedding_dimensions ? `，实际向量维度为 ${result.embedding_dimensions}` : ''
-    const message = `${result.message || (success ? '模型连接成功' : '连接测试失败，请检查模型配置后重试。')}${dimensions}`
+    const detected = service === 'llm' && success && result.structured_output_mode
+      ? `，已探测结构化输出模式为 ${result.structured_output_mode}，请保存配置`
+      : ''
+    const message = `${result.message || (success ? '模型连接成功' : '连接测试失败，请检查模型配置后重试。')}${dimensions}${detected}`
     if (success) msg.success(message)
     else msg.error(message)
   } catch (error) {
@@ -385,6 +422,7 @@ async function handleSave() {
   try {
     const payload = {
       chat_model: form.value.chat_model,
+      llm_structured_output_mode: form.value.llm_structured_output_mode,
       intent_model: normalizeOptionalModel(form.value.intent_model),
       rerank_model: normalizeOptionalModel(form.value.rerank_model),
       temperature: form.value.temperature,

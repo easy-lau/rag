@@ -51,6 +51,20 @@ _JSON_ONLY_INSTRUCTION = (
 )
 
 
+def _configured_initial_mode(*, provider_identity: object, model: object) -> StructuredOutputMode | None:
+    """Read the optional administrator-selected mode without coupling imports."""
+
+    try:
+        from config import get_settings
+
+        configured = str(getattr(get_settings(), "llm_structured_output_mode", "auto") or "auto")
+    except Exception:
+        configured = "auto"
+    if configured in _MODE_ORDER:
+        return configured  # explicit mode applies to the configured LLM service
+    return None
+
+
 def clear_structured_output_capability_cache() -> None:
     """Clear process-local capability observations (primarily for tests)."""
 
@@ -278,7 +292,11 @@ async def create_structured_completion(
 
     deadline = time.perf_counter() + max(0.1, float(timeout_seconds))
     key = _cache_key(provider_identity=provider_identity, model=model)
-    initial_mode = _CAPABILITY_CACHE.get(key, "json_schema")
+    configured_mode = _configured_initial_mode(
+        provider_identity=provider_identity,
+        model=model,
+    )
+    initial_mode = configured_mode or _CAPABILITY_CACHE.get(key, "json_schema")
     initial_index = _MODE_ORDER.index(initial_mode)
     attempted: list[StructuredOutputMode] = []
     base_request = dict(request)

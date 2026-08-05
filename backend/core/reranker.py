@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Literal, Sequence
@@ -41,6 +43,21 @@ ContributionRole = Literal[
 ]
 CoverageStatus = Literal["complete", "partial", "insufficient"]
 _CONSTRAINT_STATUSES = {"exact", "compatible", "unknown", "mismatch", "neutral"}
+# Providers often emit a one-to-one wire spelling such as ``exact_match``.
+# Normalize only unambiguous aliases; an unknown value falls back to the
+# backend's deterministic constraint evaluation for this candidate instead of
+# invalidating the entire evidence batch.
+_CONSTRAINT_STATUS_ALIASES: dict[str, ConstraintStatus] = {
+    "exact_match": "exact",
+    "exact-match": "exact",
+    "compatible_match": "compatible",
+    "compatible-match": "compatible",
+    "incompatible": "mismatch",
+    "conflict": "mismatch",
+    "not_applicable": "neutral",
+    "not-applicable": "neutral",
+    "unresolved": "unknown",
+}
 _EVIDENCE_ROLES = {"direct", "related", "irrelevant"}
 _CONTRIBUTION_ROLES = {
     "standalone_answer",
@@ -74,6 +91,17 @@ _CONTRIBUTION_ROLE_ALIASES: dict[str, ContributionRole] = {
     "不相关": "irrelevant",
 }
 _COVERAGE_STATUSES = {"complete", "partial", "insufficient"}
+_COVERAGE_STATUS_ALIASES: dict[str, CoverageStatus] = {
+    # These are one-to-one wire-vocabulary variants, not weaker semantic
+    # guesses.  The backend still recomputes final coverage from candidate
+    # indexes, requirement bindings and hard constraints below.
+    "fully_covered": "complete",
+    "complete_coverage": "complete",
+    "partially_covered": "partial",
+    "partial_coverage": "partial",
+    "not_covered": "insufficient",
+    "insufficient_coverage": "insufficient",
+}
 _REQUIREMENT_IMPORTANCE = {"required", "helpful"}
 _REQUIREMENT_SOURCES = {"explicit", "inferred"}
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")
@@ -105,6 +133,108 @@ _SMALL_DOCUMENT_MAX_SELECTED_CANDIDATES = 12
 _SMALL_DOCUMENT_MAX_ELIGIBLE_CONTENT_CHARS = 12_000
 _SMALL_DOCUMENT_MAX_COMPETITOR_CONTENT_CHARS = 240
 _SMALL_DOCUMENT_TIMEOUT_SECONDS = 15.0
+_JOINT_REPAIR_MAX_SECONDS = 2.5
+_JOINT_REPAIR_MIN_SECONDS = 0.5
+_JOINT_REPAIR_BUDGET_RATIO = 0.25
+_JOINT_REPAIR_START_MIN_SECONDS = 0.2
+
+
+@dataclass
+class _RerankCircuitState:
+    consecutive_failures: int = 0
+    open_until: float = 0.0
+
+
+_RERANK_CIRCUIT_STATES: dict[str, _RerankCircuitState] = {}
+_RERANK_CIRCUIT_LOCK = threading.Lock()
+
+
+def clear_rerank_circuit_breakers() -> None:
+    """Clear process-local model/role/contract reliability observations."""
+
+    with _RERANK_CIRCUIT_LOCK:
+        _RERANK_CIRCUIT_STATES.clear()
+
+
+def _rerank_circuit_key(
+    *,
+    provider_identity: object,
+    model: object,
+    role: str,
+    contract_version: str,
+) -> str:
+    raw = "\x1f".join((
+        str(provider_identity or "").strip(),
+        str(model or "").strip(),
+        role,
+        contract_version,
+    ))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _rerank_circuit_is_open(key: str, *, enabled: bool) -> bool:
+    if not enabled:
+        return False
+    now = time.monotonic()
+    with _RERANK_CIRCUIT_LOCK:
+        state = _RERANK_CIRCUIT_STATES.get(key)
+        if state is None:
+            return False
+        if state.open_until > now:
+            return True
+        if state.open_until:
+            _RERANK_CIRCUIT_STATES.pop(key, None)
+        return False
+
+
+def _record_rerank_circuit_success(key: str, *, enabled: bool) -> None:
+    if not enabled:
+        return
+    with _RERANK_CIRCUIT_LOCK:
+        _RERANK_CIRCUIT_STATES.pop(key, None)
+
+
+def _record_rerank_circuit_failure(
+    key: str,
+    *,
+    enabled: bool,
+    threshold: int,
+    cooldown_seconds: float,
+) -> bool:
+    if not enabled:
+        return False
+    now = time.monotonic()
+    with _RERANK_CIRCUIT_LOCK:
+        state = _RERANK_CIRCUIT_STATES.setdefault(key, _RerankCircuitState())
+        state.consecutive_failures += 1
+        if state.consecutive_failures >= max(1, threshold):
+            state.open_until = now + max(1.0, cooldown_seconds)
+            return True
+        return False
+
+
+def _joint_rerank_attempt_budgets(total_seconds: float) -> tuple[float, float]:
+    """Reserve part of one absolute stage budget for contract repair."""
+
+    total = max(0.1, float(total_seconds))
+    repair = min(
+        _JOINT_REPAIR_MAX_SECONDS,
+        max(_JOINT_REPAIR_MIN_SECONDS, total * _JOINT_REPAIR_BUDGET_RATIO),
+    )
+    if repair >= total:
+        repair = max(0.0, total - 0.1)
+    return max(0.1, total - repair), repair
+
+
+def _rerank_failure_kind(exc: BaseException) -> str:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(exc, (ValueError, json.JSONDecodeError)):
+        return "contract_validation"
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return "provider_rejection" if status_code in {400, 401, 403, 422} else "provider_error"
 
 
 def _configured_rerank_model(settings: Any) -> str:
@@ -314,6 +444,8 @@ class EvidenceAssessment:
     bridge_facts: tuple[BridgeFact, ...] = ()
     contribution_role_original: str | None = None
     contribution_role_resolution: str = "exact"
+    constraint_status_original: str | None = None
+    constraint_status_resolution: str = "exact"
     assessment_source: Literal["model", "omitted"] = "model"
 
 
@@ -378,6 +510,15 @@ class RerankOutcome:
     prompt_version: str | None = None
     elapsed_ms: int | None = None
     candidate_count: int | None = None
+    failure_kind: str | None = None
+    structured_output_mode: str | None = None
+    structured_output_attempted_modes: tuple[str, ...] = ()
+    first_attempt_elapsed_ms: int | None = None
+    repair_attempted: bool = False
+    repair_elapsed_ms: int | None = None
+    validation_error: str | None = None
+    circuit_state: Literal["disabled", "closed", "opened", "open"] = "disabled"
+    circuit_key_fingerprint: str | None = None
 
 
 def _parse_probability(value: Any, field: str) -> float:
@@ -387,6 +528,31 @@ def _parse_probability(value: Any, field: str) -> float:
     if not math.isfinite(numeric) or not 0 <= numeric <= 1:
         raise ValueError(f"{field} 必须位于 0~1")
     return numeric
+
+
+def _resolve_constraint_status(
+    value: Any,
+    *,
+    deterministic_status: ConstraintStatus,
+) -> tuple[ConstraintStatus, str | None, str]:
+    """Parse model constraint metadata without making it an authority.
+
+    The code-level evaluation is always the final status.  This parser only
+    keeps a safe model annotation for diagnostics and ranking; if the model
+    invents an enum value, use the deterministic status for this candidate and
+    continue processing the other candidates.
+    """
+
+    if isinstance(value, str):
+        original = value.strip()
+        canonical = original.casefold().replace(" ", "_")
+        if canonical in _CONSTRAINT_STATUSES:
+            return canonical, None, "exact"  # type: ignore[return-value]
+        alias = _CONSTRAINT_STATUS_ALIASES.get(canonical)
+        if alias is not None:
+            return alias, original, "normalized_alias"
+        return deterministic_status, original[:80], "deterministic_fallback"
+    return deterministic_status, f"<{type(value).__name__}>", "deterministic_fallback"
 
 
 def _parse_bounded_text(value: Any, field: str, max_chars: int) -> str:
@@ -403,6 +569,18 @@ def _parse_identifier(value: Any, field: str) -> str:
     if not _SAFE_IDENTIFIER_RE.fullmatch(text):
         raise ValueError(f"{field} 格式无效")
     return text
+
+
+def _parse_model_coverage_status(value: Any) -> CoverageStatus:
+    if not isinstance(value, str):
+        raise ValueError("coverage_status 必须为字符串")
+    normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+    if normalized in _COVERAGE_STATUSES:
+        return normalized  # type: ignore[return-value]
+    alias = _COVERAGE_STATUS_ALIASES.get(normalized)
+    if alias is not None:
+        return alias
+    raise ValueError(f"coverage_status 无效: {value[:80]}")
 
 
 def _parse_unique_indexes(
@@ -596,11 +774,23 @@ def _parse_assessment_items(
             item.get("topic_relevance"), "topic_relevance"
         )
         answer_support = _parse_probability(item.get("answer_support"), "answer_support")
-        constraint_status = item.get("constraint_status")
-        if constraint_status not in _CONSTRAINT_STATUSES:
-            raise ValueError(
-                "constraint_status 必须为 exact/compatible/unknown/mismatch/neutral"
-            )
+        candidate = (results[index - 1] if results is not None else {})
+        deterministic_status: ConstraintStatus = (
+            evaluate_candidate_constraints(
+                extract_query_constraints(query),
+                candidate,
+            ).status
+            if query
+            else "neutral"
+        )
+        (
+            constraint_status,
+            constraint_status_original,
+            constraint_status_resolution,
+        ) = _resolve_constraint_status(
+            item.get("constraint_status"),
+            deterministic_status=deterministic_status,
+        )
         evidence_role = item.get("evidence_role")
         if evidence_role not in _EVIDENCE_ROLES:
             raise ValueError("evidence_role 必须为 direct/related/irrelevant")
@@ -652,7 +842,6 @@ def _parse_assessment_items(
                 supports_list.append(parsed_id)
             supports = tuple(supports_list)
 
-        candidate = (results[index - 1] if results is not None else {})
         raw_facts = item.get("bridge_facts")
         if contribution_role_was_downgraded:
             raw_facts = []
@@ -681,6 +870,8 @@ def _parse_assessment_items(
             bridge_facts=bridge_facts,
             contribution_role_original=contribution_role_original,
             contribution_role_resolution=contribution_role_resolution,
+            constraint_status_original=constraint_status_original,
+            constraint_status_resolution=constraint_status_resolution,
         )
 
     expected_indexes = set(range(1, result_count + 1))
@@ -1113,9 +1304,7 @@ def _parse_model_evidence_sets(
             candidate_indexes=candidate_indexes,
             result_count=result_count,
         )
-        model_status = item.get("coverage_status")
-        if model_status not in _COVERAGE_STATUSES:
-            raise ValueError("coverage_status 无效")
+        model_status = _parse_model_coverage_status(item.get("coverage_status"))
         missing_raw = item.get("missing_requirement_ids", [])
         if not isinstance(missing_raw, list) or len(missing_raw) > _MAX_REQUIREMENTS:
             raise ValueError("missing_requirement_ids 数量无效")
@@ -1686,7 +1875,7 @@ async def _repair_joint_response_once(
     timeout: float,
     provider_identity: object,
     strict_response_format: dict[str, Any],
-) -> _ParsedJointResponse:
+) -> tuple[_ParsedJointResponse, Any]:
     """用不含候选全文的短提示修复一次结构，不重复或递归重试。"""
 
     repair_prompt = _build_joint_repair_prompt(
@@ -1728,7 +1917,7 @@ async def _repair_joint_response_once(
             query=query,
             results=results,
             requirements=requirements,
-        )
+        ), structured
     except ValueError as repair_error:
         raise ValueError(
             "联合重排结构修复失败："
@@ -2038,6 +2227,12 @@ async def rerank_with_status(
                     "contribution_role_resolution": (
                         assessment.contribution_role_resolution
                     ),
+                    "constraint_status_original": (
+                        assessment.constraint_status_original
+                    ),
+                    "constraint_status_resolution": (
+                        assessment.constraint_status_resolution
+                    ),
                     "supports_requirement_ids": list(
                         assessment.supports_requirement_ids
                     ),
@@ -2245,6 +2440,8 @@ def _materialize_joint_candidates(
                 "contribution_role_resolution": (
                     assessment.contribution_role_resolution
                 ),
+                "constraint_status_original": assessment.constraint_status_original,
+                "constraint_status_resolution": assessment.constraint_status_resolution,
                 "supports_requirement_ids": list(
                     assessment.supports_requirement_ids
                 ),
@@ -2911,6 +3108,8 @@ async def joint_rerank_with_coverage(
     query: str,
     results: list[dict],
     requirements: Sequence[AnswerRequirement | dict[str, Any]] | None = None,
+    *,
+    timeout_seconds: float | None = None,
 ) -> RerankOutcome:
     """联合评估扩展候选，并用代码重新计算必要维度覆盖。
 
@@ -2924,6 +3123,17 @@ async def joint_rerank_with_coverage(
     model: str | None = None
     constraints = extract_query_constraints(query)
     normalized_requirements: tuple[AnswerRequirement, ...] = ()
+    failure_kind: str | None = None
+    structured_output_mode: str | None = None
+    attempted_modes: tuple[str, ...] = ()
+    first_attempt_elapsed_ms: int | None = None
+    repair_attempted = False
+    repair_elapsed_ms: int | None = None
+    validation_error_text: str | None = None
+    circuit_enabled = False
+    circuit_key: str | None = None
+    circuit_state: Literal["disabled", "closed", "opened", "open"] = "disabled"
+    settings: Any = None
     try:
         normalized_requirements = _coerce_requirements(requirements)
         if not results:
@@ -2948,13 +3158,57 @@ async def joint_rerank_with_coverage(
         if hasattr(client, "with_options"):
             client = client.with_options(max_retries=0)
         model = _configured_rerank_model(settings)
-        timeout = float(
-            getattr(
+        configured_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(
                 settings,
                 "rerank_request_timeout_seconds",
                 getattr(settings, "llm_request_timeout_seconds", 60.0),
             )
         )
+        if isinstance(configured_timeout, bool):
+            raise ValueError("联合重排 timeout_seconds 必须为数字")
+        timeout = max(0.1, float(configured_timeout))
+        deadline = time.perf_counter() + timeout
+        first_attempt_budget, repair_reserve = _joint_rerank_attempt_budgets(
+            timeout
+        )
+        provider_identity = getattr(settings, "llm_base_url", "")
+        circuit_enabled = bool(getattr(
+            settings,
+            "rag_v2_model_evidence_circuit_breaker_enabled",
+            False,
+        ))
+        circuit_key = _rerank_circuit_key(
+            provider_identity=provider_identity,
+            model=model,
+            role="joint_evidence_adjudication",
+            contract_version=JOINT_RERANK_PROMPT_VERSION,
+        )
+        circuit_state = "closed" if circuit_enabled else "disabled"
+        if _rerank_circuit_is_open(circuit_key, enabled=circuit_enabled):
+            required_ids = tuple(
+                item.id
+                for item in normalized_requirements
+                if item.importance == "required" and item.source == "explicit"
+            )
+            return RerankOutcome(
+                results=_joint_fallback_results(results, constraints),
+                succeeded=False,
+                error="rerank_contract_circuit_open",
+                constraints=constraints,
+                requirements=normalized_requirements,
+                coverage_status="insufficient",
+                missing_requirement_ids=required_ids,
+                model=model,
+                prompt_version=JOINT_RERANK_PROMPT_VERSION,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+                candidate_count=len(results),
+                failure_kind="circuit_open",
+                circuit_state="open",
+                circuit_key_fingerprint=circuit_key,
+            )
         prompt = _build_joint_prompt(
             query,
             results,
@@ -2975,21 +3229,31 @@ async def joint_rerank_with_coverage(
                     900 + len(normalized_requirements) * 180,
                 ),
             ),
-            timeout=timeout,
+            timeout=first_attempt_budget,
         )
         strict_response_format = _build_joint_response_format(
             result_count=len(results),
             requirements=normalized_requirements,
         )
-        provider_identity = getattr(settings, "llm_base_url", "")
-        structured = await create_structured_completion(
-            client,
-            request=request,
-            strict_response_format=strict_response_format,
-            timeout_seconds=timeout,
-            provider_identity=provider_identity,
-            model=model,
-        )
+        first_attempt_started = time.perf_counter()
+        try:
+            structured = await asyncio.wait_for(
+                create_structured_completion(
+                    client,
+                    request=request,
+                    strict_response_format=strict_response_format,
+                    timeout_seconds=first_attempt_budget,
+                    provider_identity=provider_identity,
+                    model=model,
+                ),
+                timeout=first_attempt_budget,
+            )
+        finally:
+            first_attempt_elapsed_ms = round(
+                (time.perf_counter() - first_attempt_started) * 1000
+            )
+        structured_output_mode = structured.mode
+        attempted_modes = tuple(structured.attempted_modes)
         response = structured.response
         raw = response.choices[0].message.content
         if not isinstance(raw, str) or not raw.strip():
@@ -3002,23 +3266,49 @@ async def joint_rerank_with_coverage(
                 requirements=normalized_requirements,
             )
         except ValueError as validation_error:
+            validation_error_text = (
+                f"{type(validation_error).__name__}: {validation_error}"
+            )
+            remaining_timeout = min(
+                repair_reserve,
+                deadline - time.perf_counter(),
+            )
+            if remaining_timeout < _JOINT_REPAIR_START_MIN_SECONDS:
+                raise TimeoutError(
+                    "joint_rerank_repair_budget_exhausted"
+                ) from validation_error
             logger.info(
                 "[联合证据重排] 首次响应结构无效，执行一次短修复: %s: %s",
                 type(validation_error).__name__,
                 validation_error,
             )
-            parsed = await _repair_joint_response_once(
-                client,
-                model=model,
-                raw=raw,
-                validation_error=validation_error,
-                query=query,
-                results=results,
-                requirements=normalized_requirements,
-                timeout=timeout,
-                provider_identity=provider_identity,
-                strict_response_format=strict_response_format,
-            )
+            repair_attempted = True
+            repair_started = time.perf_counter()
+            try:
+                parsed, repair_structured = await asyncio.wait_for(
+                    _repair_joint_response_once(
+                        client,
+                        model=model,
+                        raw=raw,
+                        validation_error=validation_error,
+                        query=query,
+                        results=results,
+                        requirements=normalized_requirements,
+                        timeout=remaining_timeout,
+                        provider_identity=provider_identity,
+                        strict_response_format=strict_response_format,
+                    ),
+                    timeout=remaining_timeout,
+                )
+            finally:
+                repair_elapsed_ms = round(
+                    (time.perf_counter() - repair_started) * 1000
+                )
+            structured_output_mode = repair_structured.mode
+            attempted_modes = tuple(dict.fromkeys((
+                *attempted_modes,
+                *repair_structured.attempted_modes,
+            )))
             logger.info("[联合证据重排] 结构修复成功")
         ranked, items_by_index = _materialize_joint_candidates(
             results,
@@ -3037,6 +3327,11 @@ async def joint_rerank_with_coverage(
             parsed.selected_set_id,
         )
         ranked = _apply_joint_selection(ranked, selected)
+        if circuit_key is not None:
+            _record_rerank_circuit_success(
+                circuit_key,
+                enabled=circuit_enabled,
+            )
         required_ids = tuple(
             item.id
             for item in normalized_requirements
@@ -3066,8 +3361,47 @@ async def joint_rerank_with_coverage(
             prompt_version=JOINT_RERANK_PROMPT_VERSION,
             elapsed_ms=round((time.perf_counter() - started_at) * 1000),
             candidate_count=len(results),
+            structured_output_mode=structured_output_mode,
+            structured_output_attempted_modes=attempted_modes,
+            first_attempt_elapsed_ms=first_attempt_elapsed_ms,
+            repair_attempted=repair_attempted,
+            repair_elapsed_ms=repair_elapsed_ms,
+            validation_error=validation_error_text,
+            circuit_state=circuit_state,
+            circuit_key_fingerprint=circuit_key,
         )
     except Exception as exc:
+        failure_kind = _rerank_failure_kind(exc)
+        if not attempted_modes:
+            attempted_modes = tuple(
+                str(value)
+                for value in getattr(
+                    exc,
+                    "structured_output_attempted_modes",
+                    (),
+                )
+            )
+        if circuit_key is not None and failure_kind in {
+            "timeout",
+            "contract_validation",
+            "provider_error",
+        }:
+            opened = _record_rerank_circuit_failure(
+                circuit_key,
+                enabled=circuit_enabled,
+                threshold=int(getattr(
+                    settings,
+                    "rag_v2_model_evidence_circuit_breaker_threshold",
+                    2,
+                )),
+                cooldown_seconds=float(getattr(
+                    settings,
+                    "rag_v2_model_evidence_circuit_breaker_cooldown_seconds",
+                    60.0,
+                )),
+            )
+            if opened:
+                circuit_state = "opened"
         error = f"{type(exc).__name__}: {exc}"
         logger.warning(
             "[联合证据重排] 调用失败，不提升扩展候选: %s",
@@ -3090,6 +3424,15 @@ async def joint_rerank_with_coverage(
             prompt_version=JOINT_RERANK_PROMPT_VERSION,
             elapsed_ms=round((time.perf_counter() - started_at) * 1000),
             candidate_count=len(results),
+            failure_kind=failure_kind,
+            structured_output_mode=structured_output_mode,
+            structured_output_attempted_modes=attempted_modes,
+            first_attempt_elapsed_ms=first_attempt_elapsed_ms,
+            repair_attempted=repair_attempted,
+            repair_elapsed_ms=repair_elapsed_ms,
+            validation_error=validation_error_text,
+            circuit_state=circuit_state,
+            circuit_key_fingerprint=circuit_key,
         )
 
 

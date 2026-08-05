@@ -60,9 +60,13 @@ from core.rag_v2.pipeline import (
 from core.knowledge_catalog import run_knowledge_catalog_stream
 from core.knowledge_result import run_knowledge_result_stream
 from core.query_semantics import (
+    ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION,
+    RouteClarificationContinuation,
     content_knowledge_request,
+    document_catalog_request_for_question,
     document_catalog_surface_operation,
 )
+from core.authorized_scope import resolve_authorized_scope_clarification
 # Transitional test/import alias only; it points at V2 and is not a legacy
 # execution path.
 run_rag_stream = run_rag_v2_stream
@@ -76,6 +80,7 @@ from core.query_analysis_execution import (
     QUERY_EXECUTION_UNRESOLVED_ROLE,
     QueryExecutionGate,
     build_execution_baseline,
+    build_execution_clarification_baseline,
     evaluate_query_execution_gate,
     get_query_analysis_execution_service,
     should_attempt_active_analysis,
@@ -119,7 +124,8 @@ from core.query_route_compiler import (
 )
 from core.rag_dispatch import select_rag_runner as _select_rag_pipeline_version
 from core.query_route_contract import RouteClarification, RouteUnresolvedSlot
-from core.query_constraints import candidate_section_key
+from core.query_constraints import candidate_section_key, extract_query_constraints
+from core.evidence_ambiguity import query_requests_all_scopes
 from core.evidence_status import (
     ANSWER_SOURCE_REQUIRED_EVIDENCE_STATUSES,
     CANONICAL_EVIDENCE_STATUSES,
@@ -150,6 +156,22 @@ _EVIDENCE_PENDING_KIND = "evidence_scope"
 _ROUTE_PENDING_SCHEMA = "rag_pending_clarification.v1"
 _EVIDENCE_EVENT_SCHEMA = "rag_evidence_clarification.v1"
 _EVIDENCE_ACK_SCHEMA = "rag_evidence_clarification_ack.v1"
+
+
+def _search_process_event(
+    execution_path: str,
+    steps: tuple[tuple[str, str], ...],
+) -> dict:
+    """Publish the server-authoritative process the current branch will run."""
+
+    return {
+        "type": "search_process",
+        "schema_version": "search_process.v1",
+        "execution_path": execution_path,
+        "steps": [{"key": key, "label": label} for key, label in steps],
+    }
+
+
 _EVIDENCE_DIMENSIONS = {
     "version",
     "product",
@@ -244,14 +266,13 @@ _ROUTE_CLARIFICATION_NEW_QUESTION_RE = re.compile(
 def _route_clarification_continuation(
     question: str,
     pending_state: dict | None,
-) -> tuple[str, str, tuple[str, ...]] | None:
-    """Rebuild a pending semantic task from its original query plus answers.
+) -> RouteClarificationContinuation | None:
+    """Build a source-separated continuation for one pending route task.
 
     A clarification reply is a slot value, not an independent retrieval
-    question.  The route model is still responsible for deciding whether the
-    rebuilt task is ready, but every downstream fallback receives the same
-    deterministic task query.  Complete new questions and explicit cancels do
-    not inherit the pending task.
+    question.  Complete new questions and explicit cancels do not inherit the
+    pending task.  The task root and answers remain separate for semantic
+    analysis; only the contract owns their retrieval rendering.
     """
 
     if (
@@ -270,6 +291,32 @@ def _route_clarification_continuation(
         or _ROUTE_CLARIFICATION_NEW_QUESTION_RE.search(reply)
     ):
         return None
+    choices = pending_state.get("choices", [])
+    if not isinstance(choices, list):
+        return None
+    normalized_reply = _normalized_choice_text(reply)
+    mapped_reply = reply
+    for index, raw_choice in enumerate(choices, start=1):
+        if not isinstance(raw_choice, dict):
+            return None
+        key = str(raw_choice.get("key") or "").strip()
+        label = str(raw_choice.get("label") or "").strip()
+        value = str(raw_choice.get("value") or "").strip()
+        if not key or not label or not value:
+            return None
+        aliases = {
+            str(index),
+            _normalized_choice_text(key),
+            _normalized_choice_text(label),
+            _normalized_choice_text(label).replace("版本", ""),
+            _normalized_choice_text(value),
+        }
+        if normalized_reply in aliases:
+            # Persisted choices are display/value hints issued by the server,
+            # never KB/document authorization.  Rendering the full label gives
+            # the ordinary scope parser a source-authored product+version span.
+            mapped_reply = label
+            break
     stored_answers = pending_state.get("clarification_answers", [])
     if not isinstance(stored_answers, list):
         return None
@@ -279,12 +326,33 @@ def _route_clarification_continuation(
         if not answer or len(answer) > 1200:
             return None
         answers.append(answer)
-    answers.append(reply)
-    answers = answers[-6:]
-    task_query = (
-        f"{original_query}\n已确认的补充条件：{'；'.join(answers)}"
-    )[:16000]
-    return task_query, original_query, tuple(answers)
+    return RouteClarificationContinuation(
+        schema_version=ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION,
+        original_query=original_query,
+        current_answer=mapped_reply,
+        prior_answers=tuple(answers[-5:]),
+    )
+
+
+def _clarification_answer_supplies_scope(
+    continuation: RouteClarificationContinuation | None,
+) -> bool:
+    """Whether a slot reply may be parsed as part of the semantic task.
+
+    Most clarification answers stay source-separated from the immutable task
+    root.  An explicit applicability scope is different: without parsing the
+    selected version (or an explicit request for all versions), the resolver
+    would ask the same question forever.  This projection is still bounded to
+    the server-owned continuation contract and grants no data access.
+    """
+
+    if continuation is None:
+        return False
+    answer = continuation.current_answer
+    return bool(
+        extract_query_constraints(answer).has_version_constraint
+        or query_requests_all_scopes(answer)
+    )
 
 
 def _semantic_entry(settings: object) -> Literal["legacy", "v3"]:
@@ -1062,6 +1130,8 @@ def _evidence_clarification_ack(
 def _closed_query_execution_task_contract(
     task_contract: RagTaskContract,
     query_execution_gate: QueryExecutionGate,
+    *,
+    unresolved_role: str = QUERY_EXECUTION_UNRESOLVED_ROLE,
 ) -> RagTaskContract:
     """Project a closed execution gate into the sole durable route contract.
 
@@ -1088,7 +1158,7 @@ def _closed_query_execution_task_contract(
             question=query_execution_gate.clarification_question,
             unresolved=(
                 RouteUnresolvedSlot(
-                    role=QUERY_EXECUTION_UNRESOLVED_ROLE,
+                    role=unresolved_role,
                     reason=unresolved_reason,
                 ),
             ),
@@ -1114,6 +1184,7 @@ async def _route_clarification_response(
     parent_stream_logging: bool = False,
     original_query: str | None = None,
     clarification_answers: tuple[str, ...] = (),
+    clarification_choices: tuple[dict, ...] = (),
 ) -> StreamingResponse:
     """Persist a versioned, non-executable clarification and stream it.
 
@@ -1214,6 +1285,18 @@ async def _route_clarification_response(
         for value in clarification_answers[-6:]
         if str(value).strip()
     ]
+    pending_clarification_choices: list[dict[str, str]] = []
+    for raw_choice in clarification_choices[:20]:
+        if not isinstance(raw_choice, dict):
+            raise ValueError("route clarification choice must be an object")
+        choice = {
+            "key": str(raw_choice.get("key") or "").strip()[:120],
+            "label": str(raw_choice.get("label") or "").strip()[:500],
+            "value": str(raw_choice.get("value") or "").strip()[:200],
+        }
+        if not all(choice.values()):
+            raise ValueError("route clarification choice is incomplete")
+        pending_clarification_choices.append(choice)
     conv.pending_route_state = {
         "schema_version": _ROUTE_PENDING_SCHEMA,
         "state_id": str(uuid.uuid4()),
@@ -1225,6 +1308,9 @@ async def _route_clarification_response(
         # the full task instead of retrieving the reply text by itself.
         "original_query": pending_original_query,
         "clarification_answers": pending_clarification_answers,
+        # Choices are only input aliases for the next semantic turn.  Scope
+        # UUIDs and execution authorization are deliberately not persisted.
+        "choices": pending_clarification_choices,
         "clarification_message": clarification_message.strip()[:12000],
         "unresolved": [
             {
@@ -1362,6 +1448,10 @@ async def _route_clarification_response(
         ]
         if turn is not None:
             events.append(_turn_state_event(turn))
+        events.append(_search_process_event(
+            "clarification",
+            (("analyze", "问题分析"), ("generate", "生成")),
+        ))
         if task_contract is not None:
             # The clarification branch does not enter ``run_rag_stream``, so
             # publish the same contract-authoritative intent state here.  Do
@@ -1410,7 +1500,9 @@ async def _route_clarification_response(
                 "is_followup": False,
                 "carryover_source_count": 0,
             },
+            {"type": "search_step", "step": "generate", "status": "active"},
             {"type": "text_delta", "content": clarification_message},
+            {"type": "search_step", "step": "generate", "status": "done"},
             {"type": "done", "conversation_id": str(conv.id)},
             ]
         )
@@ -1681,6 +1773,13 @@ async def _evidence_pending_direct_response(
         ]
         if turn is not None:
             events.insert(1, _turn_state_event(turn))
+        events.insert(
+            2 if turn is not None else 1,
+            _search_process_event(
+                "clarification",
+                (("analyze", "问题分析"), ("generate", "生成")),
+            ),
+        )
         if action == "repeat" and repeat_reason != "scope_unavailable":
             events.append(
                 {
@@ -1708,7 +1807,9 @@ async def _evidence_pending_direct_response(
             )
         events.extend(
             [
+                {"type": "search_step", "step": "generate", "status": "active"},
                 {"type": "text_delta", "content": answer},
+                {"type": "search_step", "step": "generate", "status": "done"},
                 {"type": "done", "conversation_id": str(conv.id)},
             ]
         )
@@ -3740,13 +3841,17 @@ async def send_message(
         pending_route_state,
     )
     route_continuation_query = (
-        route_continuation[0] if route_continuation is not None else None
+        route_continuation.canonical_retrieval_query
+        if route_continuation is not None
+        else None
     )
     route_original_query = (
-        route_continuation[1] if route_continuation is not None else None
+        route_continuation.original_query
+        if route_continuation is not None
+        else None
     )
     route_clarification_answers = (
-        route_continuation[2] if route_continuation is not None else ()
+        route_continuation.answers if route_continuation is not None else ()
     )
     evidence_pending_execution = bool(
         evidence_pending_state is not None
@@ -3936,14 +4041,16 @@ async def send_message(
             )
         return response
 
-    # 路由只理解用户本轮原文；历史候选以 request-local ``t*`` 单独传入。
-    # 不再把 ``当前问题。上一轮问题`` 作为新的路由输入，否则路由、局部规划
-    # 和后续检索会对同一问题分别猜一次语义。待源锚定理解完成后，才生成仅供
-    # 检索使用的 canonical rendering。
+    # 普通请求的路由输入就是本轮原文；澄清续接使用合同生成的单任务投影
+    # 来判断是否已经 ready。投影将补充条件放进同一任务的限定语中，不会把
+    # slot value 渲染为第二个并列问题。
     routing_question = (
         evidence_routing_query
-        or route_continuation_query
-        or payload.question
+        or (
+            route_continuation.canonical_retrieval_query
+            if route_continuation is not None
+            else payload.question
+        )
     )
     if evidence_pending_execution:
         try:
@@ -4337,6 +4444,15 @@ async def send_message(
             else payload.question
         )
     ).strip()
+    semantic_task_query = (
+        route_continuation.canonical_retrieval_query
+        if _clarification_answer_supplies_scope(route_continuation)
+        else (
+            route_continuation.semantic_query
+            if route_continuation is not None
+            else effective_retrieval_query
+        )
+    ).strip()
     verified_followup_baseline = bool(
         conversation_context.active_task is None
         and has_verified_deterministic_followup_context(conversation_context)
@@ -4354,7 +4470,7 @@ async def send_message(
             # until a catalog-bound selection has been validated and reloaded.
             conversation_context = build_v3_catalog_candidate_context(
                 context=conversation_context,
-                current_question=effective_retrieval_query,
+                current_question=semantic_task_query,
             )
         if conversation_context.active_task is not None:
             v2_execution_context = build_active_task_v2_execution_context(
@@ -4377,7 +4493,11 @@ async def send_message(
         # the pending task's original question as the immutable plan root.
         # Historical qualifiers outside a pending task are still represented
         # only by validated semantic contracts.
-        execution_question = effective_retrieval_query
+        # The planner/V3 floor normally consumes the immutable task root.  An
+        # explicit applicability answer uses the continuation contract's
+        # single-task rendering so the selected scope becomes source-authored
+        # semantics without turning into a second answer target.
+        execution_question = semantic_task_query
         local_surface_plan = plan_query_locally(execution_question)
         contextual_plan = local_surface_plan
         execution_plan = local_surface_plan
@@ -4862,6 +4982,10 @@ async def send_message(
         nonlocal v2_execution_context, execution_baseline, query_execution_gate
         nonlocal v3_anchor_snapshot, v3_anchor_snapshot_revision
         nonlocal knowledge_request, rag_stream_runner
+        v3_adopted = False
+        knowledge_capability_authorized = False
+        execution_clarification_role = QUERY_EXECUTION_UNRESOLVED_ROLE
+        execution_clarification_choices: tuple[dict, ...] = ()
         full_response = []
         sources = []
         tokens = None
@@ -5077,7 +5201,6 @@ async def send_message(
                     reason=v3_anchor_prefetch_suppression_reason,
             )
             v3_decision = None
-            v3_adopted = False
             try:
                 v3_decision = await v3_decision_task
             except asyncio.CancelledError:
@@ -5201,10 +5324,21 @@ async def send_message(
                         knowledge_request = (
                             v3_decision.compilation.knowledge_request
                         )
+                        knowledge_capability_authorized = bool(
+                            knowledge_request.is_catalog_operation
+                            or knowledge_request.is_result_operation
+                        )
                     if resolved_v3_context is not None and resolved_v3_execution_context is not None:
                         conversation_context = resolved_v3_context
                         v2_execution_context = resolved_v3_execution_context
                         semantic_context_applied = True
+                        if route_continuation is not None:
+                            v2_execution_context = replace(
+                                v2_execution_context,
+                                retrieval_query=(
+                                    route_continuation.canonical_retrieval_query
+                                ),
+                            )
                         effective_retrieval_query = v2_execution_context.retrieval_query
                     intent_payload["query_execution"] = {
                         **query_execution_gate.to_dict(),
@@ -5363,6 +5497,98 @@ async def send_message(
                 fence=v3_revision_fence.safe_summary(),
             )
 
+        # A clear document-metadata request must never degrade into vector
+        # content retrieval merely because the optional semantic model timed
+        # out or returned an unusable contract.  The shared resource grammar
+        # can authorize only the closed catalog capability; RBAC and selected
+        # KB scope are still enforced by the catalog runner.
+        if (
+            pipeline_version == "v2"
+            and isinstance(task_contract, RagTaskContract)
+            and task_contract.dispatch_authorized
+            and not knowledge_capability_authorized
+        ):
+            catalog_floor = document_catalog_request_for_question(
+                route_continuation.canonical_retrieval_query
+                if route_continuation is not None
+                else semantic_task_query
+            )
+            if catalog_floor is not None:
+                knowledge_request = catalog_floor
+                knowledge_capability_authorized = True
+                trace_event(
+                    "knowledge.capability.floor_selected",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    reason="explicit_document_catalog_surface",
+                    capability=knowledge_request.safe_summary(),
+                    selected_kb_count=len(set(payload.knowledge_base_ids)),
+                )
+
+        # Resolve applicability ambiguity from the caller's current authorized
+        # document catalog before retrieval.  Ranking models may score evidence
+        # only after this business-semantic boundary is closed; they may never
+        # choose a product version on the user's behalf.
+        if (
+            pipeline_version == "v2"
+            and isinstance(task_contract, RagTaskContract)
+            and task_contract.dispatch_authorized
+            and execution_baseline is not None
+            and query_execution_gate is not None
+            and not query_execution_gate.needs_clarification
+            and not knowledge_request.is_catalog_operation
+            and not knowledge_request.is_result_operation
+        ):
+            try:
+                scope_clarification = await resolve_authorized_scope_clarification(
+                    db,
+                    plan=execution_baseline.plan,
+                    query=effective_retrieval_query,
+                    kb_ids=payload.knowledge_base_ids,
+                )
+            except Exception as exc:
+                scope_clarification = None
+                trace_event(
+                    "query.scope_resolution.failed",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    error=exc,
+                )
+            if scope_clarification is not None:
+                execution_baseline = build_execution_clarification_baseline(
+                    baseline=execution_baseline,
+                    reason="authorized_scope_ambiguous",
+                    clarification_question=scope_clarification.question,
+                )
+                execution_bundle = execution_baseline.execution_bundle
+                query_execution_gate = QueryExecutionGate(
+                    baseline=execution_baseline,
+                    state="needs_clarification",
+                    decision_reason="execution_baseline_not_runnable",
+                    unresolved_reason="ambiguous",
+                )
+                execution_clarification_role = scope_clarification.dimension
+                execution_clarification_choices = tuple(
+                    {
+                        "key": choice.key,
+                        "label": choice.label,
+                        "value": choice.version,
+                    }
+                    for choice in scope_clarification.choices
+                )
+                trace_event(
+                    "query.scope_resolution.clarification",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    dimension=scope_clarification.dimension,
+                    reason=scope_clarification.reason,
+                    choice_count=len(scope_clarification.choices),
+                    selected_kb_count=len(set(payload.knowledge_base_ids)),
+                )
+
         # V3 intentionally delays a closed local gate because a valid
         # catalog-bound compilation may make it executable.  Once the V3
         # barrier is sealed, however, there is no remaining semantic authority
@@ -5382,6 +5608,7 @@ async def send_message(
             blocked_contract = _closed_query_execution_task_contract(
                 task_contract,
                 query_execution_gate,
+                unresolved_role=execution_clarification_role,
             )
             plan_trace = (
                 execution_baseline.plan.to_dict()
@@ -5442,6 +5669,7 @@ async def send_message(
                 parent_stream_logging=True,
                 original_query=(route_original_query or effective_retrieval_query),
                 clarification_answers=route_clarification_answers,
+                clarification_choices=execution_clarification_choices,
             )
             async for clarification_chunk in clarification_response.body_iterator:
                 clarification_text = (
@@ -5468,9 +5696,9 @@ async def send_message(
             result_execution = knowledge_request.is_result_operation
             result_sources: tuple[dict[str, Any], ...] = ()
             if catalog_execution or result_execution:
-                if pipeline_version != "v2" or not v3_adopted:
+                if pipeline_version != "v2" or not knowledge_capability_authorized:
                     raise ValueError(
-                        "direct knowledge execution requires an adopted V3 capability"
+                        "direct knowledge execution requires an authorized capability"
                     )
                 if result_execution:
                     result_sources = resolve_result_reference_sources(
