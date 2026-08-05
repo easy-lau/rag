@@ -74,6 +74,15 @@ test('调用链页面展示 V2 执行器、规划、证据覆盖和任务恢复�
   }
 })
 
+test('通用模型兜底在调用链中使用明确名称和警告语义', () => {
+  assert.ok(
+    traceViewSource.includes(
+      "'generation.general_fallback': '启用通用模型兜底'",
+    ),
+  )
+  assert.match(traceViewSource, /name === 'generation\.general_fallback'/)
+})
+
 test('调用链页面区分查询执行闸门与可选大模型结构化理解阶段', () => {
   for (const [event, label] of [
     ['query.execution', '校验查询执行基线'],

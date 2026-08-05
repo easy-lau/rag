@@ -682,6 +682,77 @@ class RouteTurnCandidate:
     raw_sources: tuple[dict[str, Any], ...] = ()
     assistant_turn_id: uuid.UUID | None = None
 
+    def result_reference_sources(
+        self,
+        *,
+        allowed_kb_ids: Iterable[uuid.UUID] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return unique trusted document sources in their displayed order."""
+
+        items: list[dict[str, Any]] = []
+        seen_documents: set[tuple[str, str]] = set()
+        allowed = (
+            {str(value) for value in allowed_kb_ids}
+            if allowed_kb_ids is not None
+            else None
+        )
+        for source in self.raw_sources:
+            if not isinstance(source, dict) or not _source_is_reusable(source):
+                continue
+            kb_id = str(source.get("kb_id") or "").strip()
+            doc_id = str(source.get("doc_id") or "").strip()
+            label = str(source.get("filename") or "").strip()
+            if not kb_id or not doc_id or not label or (
+                allowed is not None and kb_id not in allowed
+            ):
+                continue
+            identity = (kb_id, doc_id)
+            if identity in seen_documents:
+                continue
+            seen_documents.add(identity)
+            items.append(source)
+            if len(items) >= 20:
+                break
+        return tuple(items)
+
+    def result_reference_items(
+        self,
+        *,
+        allowed_kb_ids: Iterable[uuid.UUID] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Return an identity-free, display-order catalog of trusted documents."""
+
+        items: list[dict[str, Any]] = []
+        for source in self.result_reference_sources(
+            allowed_kb_ids=allowed_kb_ids,
+        ):
+            ordinal = len(items) + 1
+            label = str(source.get("filename") or "").strip()
+            items.append({
+                "handle": f"r_{self.candidate_key}_{ordinal:03d}",
+                "ordinal": ordinal,
+                "resource": "document",
+                "label": label[:255],
+                "status": str(source.get("status") or "").strip()[:32] or None,
+            })
+        return tuple(items)
+
+    def to_analysis_dict(
+        self,
+        *,
+        allowed_kb_ids: Iterable[uuid.UUID] | None = None,
+    ) -> dict[str, Any]:
+        """Return the source-catalog view used by strict V3 understanding."""
+
+        return {
+            "candidate_key": self.candidate_key,
+            "user_input": self.user_question[:1200],
+            "assistant_answer": (self.assistant_answer or "")[:1200],
+            "result_items": list(self.result_reference_items(
+                allowed_kb_ids=allowed_kb_ids,
+            )),
+        }
+
     def to_prompt_dict(self) -> dict[str, Any]:
         return {
             "candidate_key": self.candidate_key,
@@ -851,6 +922,53 @@ def route_context_payloads(
     """Return the bounded, identity-free candidate catalogue for the router."""
 
     return tuple(candidate.to_prompt_dict() for candidate in context.route_turn_candidates)
+
+
+def resolve_result_reference_sources(
+    *,
+    context: ConversationContext,
+    handles: Iterable[str],
+    kb_ids: Iterable[uuid.UUID],
+) -> tuple[dict[str, Any], ...]:
+    """Bind request-local result handles to prior sources without trusting IDs from a model."""
+
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    authorized_kb_ids = tuple(kb_ids)
+    allowed_kb_ids = {str(value) for value in authorized_kb_ids}
+    candidates = {
+        candidate.candidate_key: candidate
+        for candidate in context.route_turn_candidates
+    }
+    resolved: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_handle in handles:
+        handle = str(raw_handle or "").strip()
+        match = re.fullmatch(r"r_(t[1-9][0-9]{0,2})_([0-9]{3})", handle)
+        if match is None or handle in seen:
+            raise ValueError("result reference handle is invalid")
+        candidate = candidates.get(match.group(1))
+        ordinal = int(match.group(2))
+        sources = (
+            candidate.result_reference_sources(allowed_kb_ids=authorized_kb_ids)
+            if candidate is not None
+            else ()
+        )
+        if ordinal < 1 or ordinal > len(sources):
+            raise ValueError("result reference is no longer available")
+        source = sources[ordinal - 1]
+        kb_id = str(source.get("kb_id") or "").strip()
+        doc_id = str(source.get("doc_id") or "").strip()
+        if kb_id not in allowed_kb_ids or not doc_id:
+            raise ValueError("result reference is outside the current KB scope")
+        seen.add(handle)
+        resolved.append({
+            "handle": handle,
+            "kb_id": kb_id,
+            "doc_id": doc_id,
+            "filename": str(source.get("filename") or "").strip(),
+        })
+    return tuple(resolved)
 
 
 def build_route_context_payloads(

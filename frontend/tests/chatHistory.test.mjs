@@ -124,6 +124,32 @@ test('历史快照保留完整证据状态合同，避免 evidence_status 在恢
   }
 })
 
+test('通用模型回答来源从持久化 counters 恢复到消息与检索快照', () => {
+  const restored = restoreHistoryMessageState({
+    id: 'assistant-general-fallback',
+    role: 'assistant',
+    content: '通用参考回答',
+    evidence_status: 'no_hit',
+    retrieval_executed: true,
+    search_snapshot: {
+      schema_version: 'rag_search_snapshot.v1',
+      candidates: [],
+      answer_sources: [],
+      counters: {
+        evidence_status: 'no_hit',
+        retrieval_executed: true,
+        answer_provenance: 'general_model',
+        general_fallback_mode: 'no_hit',
+      },
+    },
+  })
+
+  assert.equal(restored.answer_provenance, 'general_model')
+  assert.equal(restored.search_snapshot.answer_provenance, 'general_model')
+  assert.equal(restored.search_meta.answer_provenance, 'general_model')
+  assert.deepEqual(restored.search_snapshot.answer_sources, [])
+})
+
 test('choices=[] 的已授权历史澄清同步进入检索快照，供面板提示自由补充', () => {
   const restored = restoreHistoryMessageState({
     id: 'assistant-refinement',

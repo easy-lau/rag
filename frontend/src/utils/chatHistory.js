@@ -18,6 +18,11 @@ function normalizedBoolean(value) {
   return typeof value === 'boolean' ? value : null
 }
 
+function normalizedAnswerProvenance(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  return ['knowledge_base', 'general_model'].includes(normalized) ? normalized : null
+}
+
 function candidateSnapshot(message) {
   const source = objectValue(message)
   if (!source) return null
@@ -83,6 +88,11 @@ export function searchSnapshotFromHistoryMessage(message) {
     counters.trace_id,
     raw?.traceId,
   ))
+  const answerProvenance = normalizedAnswerProvenance(firstDefined(
+    source.answer_provenance,
+    raw?.answer_provenance,
+    counters.answer_provenance,
+  ))
   const results = normalizedResults(raw, source)
   const hasMessageClarification = Object.prototype.hasOwnProperty.call(source, 'clarification')
   const clarification = hasMessageClarification
@@ -96,6 +106,7 @@ export function searchSnapshotFromHistoryMessage(message) {
     evidence_status: status || undefined,
     retrieval_executed: retrievalExecuted,
     trace_id: traceId || undefined,
+    answer_provenance: answerProvenance || undefined,
     clarification: clarification || undefined,
     // The panel must never pretend that a historical snapshot is a live SSE
     // process.  SearchResultPanel uses this marker to render a static summary.
@@ -126,10 +137,15 @@ export function restoreHistoryMessageState(message) {
     strictSource.retrieval_executed,
     snapshot?.retrieval_executed,
   ))
+  const answerProvenance = normalizedAnswerProvenance(firstDefined(
+    strictSource.answer_provenance,
+    snapshot?.answer_provenance,
+  ))
   const restored = {
     ...strictSource,
     trace_id: traceId || null,
     evidence_status: status || undefined,
+    answer_provenance: answerProvenance || undefined,
     retrieval_executed: retrievalExecuted,
     delivery_status: firstDefined(strictSource.delivery_status, strictSource.deliveryState, null),
     persistence_status: firstDefined(strictSource.persistence_status, strictSource.persistenceState, null),

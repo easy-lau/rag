@@ -142,6 +142,14 @@ test('回答依据仅使用 answer_support，不把召回排序伪装成匹配�
   assert.ok(chatMessageSource.includes("const level = score === null ? '已验证'"))
 })
 
+test('通用模型回答显示独立警示且不伪装成知识库依据', () => {
+  assert.ok(chatMessageSource.includes('props.message.answer_provenance'))
+  assert.ok(chatMessageSource.includes("=== 'general_model'"))
+  assert.ok(chatMessageSource.includes('通用大模型回答'))
+  assert.ok(chatMessageSource.includes('未经知识库验证'))
+  assert.ok(chatMessageSource.includes('message-general-fallback'))
+})
+
 test('聊天与检索测试不再提供或发送用户标签检索偏好', () => {
   assert.doesNotMatch(chatInputSource, /标签筛选|searchConfig\.tags|getDocumentTags|PricetagOutline/)
   assert.doesNotMatch(searchTestSource, /config\.tags|getDocumentTags|标签（软加权|标签筛选/)

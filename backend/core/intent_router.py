@@ -168,6 +168,7 @@ class RouteModelAttemptResult:
     strict_schema_used: bool = True
     json_object_fallback_used: bool = False
     structured_output_mode: str | None = None
+    thinking_disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -1322,6 +1323,7 @@ async def _run_route_model_attempt(
     available_turn_keys = [item["candidate_key"] for item in normalized_context]
     json_object_fallback_used = False
     structured_output_mode = "json_schema"
+    thinking_disabled = False
     try:
         request = dict(
             model=model,
@@ -1365,6 +1367,7 @@ async def _run_route_model_attempt(
         response = structured.response
         structured_output_mode = structured.mode
         json_object_fallback_used = structured.mode != "json_schema"
+        thinking_disabled = structured.thinking_disabled
 
         choices = list(getattr(response, "choices", None) or [])
         choice = choices[0] if choices else None
@@ -1402,6 +1405,7 @@ async def _run_route_model_attempt(
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
             structured_output_mode=structured_output_mode,
+            thinking_disabled=thinking_disabled,
             parsed_intent_code=(route_decision.intent_code if route_decision else None),
             parsed_confidence=(route_decision.confidence if route_decision else None),
             relation=(route_decision.relation if route_decision else None),
@@ -1427,6 +1431,7 @@ async def _run_route_model_attempt(
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
             structured_output_mode=structured_output_mode,
+            thinking_disabled=thinking_disabled,
         )
     except Exception as exc:
         latency_ms = max(0, round((time.perf_counter() - started) * 1000))
@@ -1451,6 +1456,7 @@ async def _run_route_model_attempt(
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
             structured_output_mode=structured_output_mode,
+            thinking_disabled=thinking_disabled,
             error=exc,
         )
         return RouteModelAttemptResult(
@@ -1460,6 +1466,7 @@ async def _run_route_model_attempt(
             had_error=True,
             strict_schema_used=True,
             json_object_fallback_used=json_object_fallback_used,
+            thinking_disabled=thinking_disabled,
         )
 
 

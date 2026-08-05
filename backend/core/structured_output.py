@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
@@ -29,13 +30,24 @@ class StructuredOutputResult:
     response: Any
     mode: StructuredOutputMode
     attempted_modes: tuple[StructuredOutputMode, ...]
+    thinking_disabled: bool = False
 
 
 _CAPABILITY_CACHE: dict[tuple[str, str], StructuredOutputMode] = {}
+_THINKING_CONTROL_CACHE: dict[tuple[str, str], bool] = {}
 _MODE_ORDER: tuple[StructuredOutputMode, ...] = (
     "json_schema",
     "json_object",
     "plain_json",
+)
+
+# Several OpenAI-compatible gateways reject ``response_format=json_object``
+# unless the prompt itself explicitly asks for JSON.  Keep this instruction in
+# the shared transport adapter: callers should not need provider-specific
+# prompt branches merely to use a weaker wire-format mode.
+_JSON_ONLY_INSTRUCTION = (
+    "Return exactly one valid JSON object. Do not include Markdown, prose, or "
+    "any text outside the JSON object."
 )
 
 
@@ -43,6 +55,7 @@ def clear_structured_output_capability_cache() -> None:
     """Clear process-local capability observations (primarily for tests)."""
 
     _CAPABILITY_CACHE.clear()
+    _THINKING_CONTROL_CACHE.clear()
 
 
 def _status_code(exc: BaseException) -> int | None:
@@ -50,9 +63,24 @@ def _status_code(exc: BaseException) -> int | None:
     if value is None:
         value = getattr(getattr(exc, "response", None), "status_code", None)
     try:
-        return int(value) if value is not None else None
+        if value is not None:
+            return int(value)
     except (TypeError, ValueError):
-        return None
+        pass
+    # AxonHub and some OpenAI-compatible wrappers omit ``status_code`` but put
+    # the HTTP code in the rendered error, e.g. ``Error code: 400 - ...``.
+    # Recover only the explicit 400/422 values used for format negotiation.
+    detail = str(exc)
+    match = re.search(r"\b(?:error\s+code|status[_ ]?code)\s*[:=]\s*(400|422)\b", detail, re.I)
+    if match:
+        return int(match.group(1))
+    # The AxonHub gateway emits ``Request failed: Bad Request, error: ...``
+    # without exposing a numeric status on the client exception.  This is the
+    # standard HTTP 400 phrase; the caller still additionally requires an
+    # explicit response_format rejection before allowing a downgrade.
+    if "bad request" in detail.casefold():
+        return 400
+    return None
 
 
 def response_format_is_unsupported(
@@ -100,11 +128,136 @@ def response_format_is_unsupported(
     )
 
 
+def _is_deepseek_v4_model(model: object) -> bool:
+    normalized = str(model or "").strip().casefold()
+    return bool(re.search(r"(?:^|[/._:-])deepseek-v4(?:$|[-._:])", normalized))
+
+
+def _thinking_control_is_unsupported(exc: BaseException) -> bool:
+    """Detect an explicit gateway rejection of DeepSeek's thinking control."""
+
+    if _status_code(exc) not in {400, 422}:
+        return False
+    body = getattr(exc, "body", None)
+    try:
+        body_text = json.dumps(body, ensure_ascii=False, default=str) if body else ""
+    except (TypeError, ValueError):
+        body_text = str(body or "")
+    detail = f"{exc} {body_text}".casefold()
+    rejection_markers = (
+        "unsupported",
+        "not supported",
+        "does not support",
+        "unavailable",
+        "unknown parameter",
+        "unrecognized",
+        "unexpected",
+        "extra inputs are not permitted",
+        "invalid parameter",
+        "不支持",
+        "不可用",
+        "未知参数",
+    )
+    return "thinking" in detail and any(
+        marker in detail for marker in rejection_markers
+    )
+
+
+def _with_disabled_thinking(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Merge DeepSeek's non-reasoning control without dropping caller extras."""
+
+    updated = dict(request)
+    raw_extra_body = request.get("extra_body")
+    extra_body = (
+        dict(raw_extra_body)
+        if isinstance(raw_extra_body, Mapping)
+        else {}
+    )
+    extra_body["thinking"] = {"type": "disabled"}
+    updated["extra_body"] = extra_body
+    return updated
+
+
+def _without_thinking_control(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a request with only the optional thinking control removed."""
+
+    updated = dict(request)
+    raw_extra_body = request.get("extra_body")
+    if not isinstance(raw_extra_body, Mapping):
+        return updated
+    extra_body = dict(raw_extra_body)
+    extra_body.pop("thinking", None)
+    if extra_body:
+        updated["extra_body"] = extra_body
+    else:
+        updated.pop("extra_body", None)
+    return updated
+
+
+async def create_stream_completion(
+    client: Any,
+    *,
+    request: Mapping[str, Any],
+    provider_identity: object,
+    model: object,
+) -> tuple[Any, bool]:
+    """Open a streaming completion with DeepSeek thinking negotiation.
+
+    The optional ``thinking.type=disabled`` control is sent only to DeepSeek
+    V4 models.  If the gateway rejects that optional parameter, retry the same
+    request once without it before any text can be emitted, then cache the
+    endpoint/model capability for subsequent requests.
+    """
+
+    key = _cache_key(provider_identity=provider_identity, model=model)
+    thinking_enabled = (
+        _is_deepseek_v4_model(model)
+        and _THINKING_CONTROL_CACHE.get(key, True)
+    )
+    call_request = (
+        _with_disabled_thinking(request) if thinking_enabled else dict(request)
+    )
+    try:
+        stream = await client.chat.completions.create(**call_request)
+    except Exception as exc:
+        if not (thinking_enabled and _thinking_control_is_unsupported(exc)):
+            raise
+        _THINKING_CONTROL_CACHE[key] = False
+        stream = await client.chat.completions.create(
+            **_without_thinking_control(call_request)
+        )
+        return stream, False
+    if thinking_enabled:
+        _THINKING_CONTROL_CACHE[key] = True
+    return stream, thinking_enabled
+
+
 def _cache_key(*, provider_identity: object, model: object) -> tuple[str, str]:
     return (
         str(provider_identity or "default").strip().casefold(),
         str(model or "").strip().casefold(),
     )
+
+
+def _with_json_only_instruction(request: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy a request and append a trusted JSON-only system instruction.
+
+    The instruction is appended only for ``json_object`` and plain-JSON
+    transports.  It is independent from caller-provided business content and
+    preserves every existing message unchanged.
+    """
+
+    updated = dict(request)
+    raw_messages = request.get("messages")
+    if not isinstance(raw_messages, (list, tuple)):
+        return updated
+    messages: list[Any] = [
+        dict(message) if isinstance(message, Mapping) else message
+        for message in raw_messages
+    ]
+    messages.append({"role": "system", "content": _JSON_ONLY_INSTRUCTION})
+    updated["messages"] = messages
+    return updated
 
 
 async def create_structured_completion(
@@ -129,37 +282,88 @@ async def create_structured_completion(
     initial_index = _MODE_ORDER.index(initial_mode)
     attempted: list[StructuredOutputMode] = []
     base_request = dict(request)
+    thinking_control_enabled = (
+        _is_deepseek_v4_model(model)
+        and _THINKING_CONTROL_CACHE.get(key, True)
+    )
 
     for mode in _MODE_ORDER[initial_index:]:
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0.05:
-            raise TimeoutError("structured_output_deadline_exhausted")
-        call_request = dict(base_request)
-        call_request["timeout"] = remaining
-        if mode == "json_schema":
-            call_request["response_format"] = dict(strict_response_format)
-        elif mode == "json_object":
-            call_request["response_format"] = {"type": "json_object"}
-        attempted.append(mode)
-        try:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(**call_request),
-                timeout=remaining,
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.05:
+                raise TimeoutError("structured_output_deadline_exhausted")
+            call_request = dict(base_request)
+            if thinking_control_enabled:
+                call_request = _with_disabled_thinking(call_request)
+            if mode != "json_schema":
+                call_request = _with_json_only_instruction(call_request)
+            call_request["timeout"] = remaining
+            if mode == "json_schema":
+                call_request["response_format"] = dict(strict_response_format)
+            elif mode == "json_object":
+                call_request["response_format"] = {"type": "json_object"}
+            if not attempted or attempted[-1] != mode:
+                attempted.append(mode)
+            try:
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(**call_request),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                # Some gateways keep an unsupported json_schema request open
+                # until their upstream timeout instead of returning 400. A strict
+                # absolute deadline would otherwise make compatibility fallback
+                # unreachable. Only the strongest mode gets a fresh retry budget.
+                if mode == "json_schema":
+                    # A timeout may be transient, so do not persist a capability
+                    # downgrade. The current request still gets a compatibility
+                    # retry; a later request should be allowed to probe again.
+                    deadline = time.perf_counter() + max(
+                        0.1, min(float(timeout_seconds), 5.0)
+                    )
+                    try:
+                        setattr(exc, "structured_output_attempted_modes", tuple(attempted))
+                    except (AttributeError, TypeError):
+                        pass
+                    break
+                try:
+                    setattr(exc, "structured_output_attempted_modes", tuple(attempted))
+                except (AttributeError, TypeError):
+                    pass
+                raise
+            except Exception as exc:
+                if (
+                    thinking_control_enabled
+                    and _thinking_control_is_unsupported(exc)
+                ):
+                    # The current proxy/model cannot forward DeepSeek's
+                    # optional control. Retry the same response-format mode
+                    # without it and remember the capability for this process.
+                    thinking_control_enabled = False
+                    _THINKING_CONTROL_CACHE[key] = False
+                    continue
+                if not response_format_is_unsupported(exc, mode=mode):
+                    # Preserve attempt diagnostics for callers' safe traces without
+                    # changing the original exception type or error handling.
+                    try:
+                        setattr(exc, "structured_output_attempted_modes", tuple(attempted))
+                    except (AttributeError, TypeError):
+                        pass
+                    raise
+                next_index = _MODE_ORDER.index(mode) + 1
+                if next_index >= len(_MODE_ORDER):
+                    raise
+                _CAPABILITY_CACHE[key] = _MODE_ORDER[next_index]
+                break
+            _CAPABILITY_CACHE[key] = mode
+            if thinking_control_enabled:
+                _THINKING_CONTROL_CACHE[key] = True
+            return StructuredOutputResult(
+                response=response,
+                mode=mode,
+                attempted_modes=tuple(attempted),
+                thinking_disabled=thinking_control_enabled,
             )
-        except Exception as exc:
-            if not response_format_is_unsupported(exc, mode=mode):
-                raise
-            next_index = _MODE_ORDER.index(mode) + 1
-            if next_index >= len(_MODE_ORDER):
-                raise
-            _CAPABILITY_CACHE[key] = _MODE_ORDER[next_index]
-            continue
-        _CAPABILITY_CACHE[key] = mode
-        return StructuredOutputResult(
-            response=response,
-            mode=mode,
-            attempted_modes=tuple(attempted),
-        )
     raise RuntimeError("structured output negotiation produced no attempt")
 
 
@@ -167,6 +371,7 @@ __all__ = [
     "StructuredOutputMode",
     "StructuredOutputResult",
     "clear_structured_output_capability_cache",
+    "create_stream_completion",
     "create_structured_completion",
     "response_format_is_unsupported",
 ]

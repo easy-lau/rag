@@ -55,21 +55,45 @@ QueryExecutionState = Literal["ready", "needs_clarification"]
 
 def _normalised_context(
     values: Iterable[Mapping[str, Any]] | None,
-) -> tuple[dict[str, str], ...]:
+) -> tuple[dict[str, Any], ...]:
     """Copy the bounded, request-local context accepted by the analyzer."""
 
-    copied: list[dict[str, str]] = []
+    copied: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in values or ():
         key = str(raw.get("candidate_key") or "").strip()
         if not key or key in seen:
             continue
         seen.add(key)
-        copied.append({
+        result_items: list[dict[str, Any]] = []
+        raw_result_items = raw.get("result_items")
+        if isinstance(raw_result_items, (list, tuple)):
+            for ordinal, item in enumerate(raw_result_items[:20], start=1):
+                if not isinstance(item, Mapping):
+                    continue
+                handle = str(item.get("handle") or "").strip()
+                label = str(item.get("label") or "").strip()[:255]
+                if (
+                    handle != f"r_{key}_{ordinal:03d}"
+                    or not label
+                    or str(item.get("resource") or "") != "document"
+                ):
+                    continue
+                result_items.append({
+                    "handle": handle,
+                    "ordinal": ordinal,
+                    "resource": "document",
+                    "label": label,
+                    "status": str(item.get("status") or "").strip()[:32] or None,
+                })
+        copied_item: dict[str, Any] = {
             "candidate_key": key,
             "user_input": str(raw.get("user_input") or "")[:1200],
             "assistant_answer": str(raw.get("assistant_answer") or "")[:1200],
-        })
+        }
+        if result_items:
+            copied_item["result_items"] = result_items
+        copied.append(copied_item)
     return tuple(copied)
 
 
@@ -114,7 +138,7 @@ class ExecutionBaseline:
     contextual_plan: QueryPlanV2
     question: str
     standalone_query: str
-    route_context: tuple[dict[str, str], ...]
+    route_context: tuple[dict[str, Any], ...]
     deterministic_is_followup: bool
     fingerprint: str
     scope_fingerprint: str

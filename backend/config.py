@@ -51,10 +51,14 @@ class Settings(BaseSettings):
     # 绕过最终证据校验；异常和超时保留确定性候选链。该开关用于在不回滚 V2
     # 的情况下快速降级为纯确定性模式。
     rag_v2_model_evidence_adjudication_enabled: bool = True
-    rag_v2_model_evidence_adjudication_timeout_seconds: float = Field(
-        12.0,
+    # Evidence adjudication is an optional enhancement and must not consume the
+    # full answer-model deadline.  Eight seconds bounds tail latency while a
+    # deployment may still set ``None`` explicitly to inherit the ordinary LLM
+    # timeout when accuracy is preferred over latency.
+    rag_v2_model_evidence_adjudication_timeout_seconds: float | None = Field(
+        8.0,
         ge=0.5,
-        le=60.0,
+        le=300.0,
     )
     # 任务图同一 wave 内的检索并发数。每个任务使用独立只读会话，避免并发
     # 复用请求事务；范围限制在连接池和单次工作流期限可承受的边界内。
@@ -74,10 +78,14 @@ class Settings(BaseSettings):
     # 后端编译为 V2 任务图。模型失败、schema 拒绝或容量不足时原子回退当前轮
     # 本地计划；本地 planner 的未知/不可运行不再能在 V3 前提前拦截请求。
     rag_query_understanding_v3_mode: Literal["off", "shadow", "active"] = "active"
-    rag_query_understanding_v3_active_timeout_seconds: float = Field(
-        2.5,
+    # ``None`` means that V3 has no separate short deadline and instead shares
+    # the normal LLM request deadline.  Set a numeric value only when the
+    # deployment explicitly needs to trade V3 understanding quality for a
+    # tighter first-answer latency budget.
+    rag_query_understanding_v3_active_timeout_seconds: float | None = Field(
+        None,
         ge=0.5,
-        le=15.0,
+        le=300.0,
     )
     rag_query_understanding_v3_active_max_inflight: int = Field(2, ge=1, le=32)
     # 与 V3 模型理解并发的不可变 anchor 预取。超过这个短期限直接丢弃，由
@@ -182,6 +190,22 @@ class Settings(BaseSettings):
     top_k: int = Field(5, validation_alias="__DATABASE_SETTINGS_ONLY_TOP_K")
     rerank_enabled: bool = Field(
         True, validation_alias="__DATABASE_SETTINGS_ONLY_RERANK_ENABLED"
+    )
+    # Knowledge-base terminal states remain authoritative.  Administrators may
+    # explicitly allow a separately labelled general-model answer, but that
+    # answer never becomes a knowledge-base hit or acquires source authority.
+    rag_general_fallback_mode: Literal[
+        "off",
+        "no_hit",
+        "no_hit_or_insufficient",
+    ] = Field(
+        "off",
+        validation_alias="__DATABASE_SETTINGS_ONLY_RAG_GENERAL_FALLBACK_MODE",
+    )
+    # 通用兜底可使用单独的低延迟模型；留空时沿用主对话模型。
+    rag_general_fallback_model: str = Field(
+        "",
+        validation_alias="__DATABASE_SETTINGS_ONLY_RAG_GENERAL_FALLBACK_MODEL",
     )
     show_sources: bool = Field(
         True,

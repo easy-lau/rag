@@ -331,6 +331,7 @@ const EVENT_LABELS = {
   'rerank.joint_completed': '完成联合证据评估',
   'evidence.selection': '筛选回答证据',
   'generation.context': '组装生成上下文',
+  'generation.general_fallback': '启用通用模型兜底',
   'generation.skipped': '跳过回答生成',
   'generation.completed': '完成模型生成',
   'generation.error': '回答生成失败',
@@ -592,7 +593,8 @@ function eventTone(event) {
     && event?.payload?.state === 'needs_clarification'
   ) return 'is-warning'
   if (
-    name === 'chat.cancelled'
+    name === 'generation.general_fallback'
+    || name === 'chat.cancelled'
     || name === 'intent.clarification_expired'
     || name === 'evidence.clarification_required'
     || name === 'evidence.clarification_repeated'

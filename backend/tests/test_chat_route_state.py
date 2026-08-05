@@ -51,7 +51,7 @@ from core.rag_v2.pipeline import _post_evidence_document_assessments
 from core.rag_v2.query_plan import plan_query_locally
 from core.rag_v2.task_graph import compile_rag_execution_bundle
 from config import get_settings
-from models.db_models import Document, DocumentChunk, IntentRouteLog
+from models.db_models import Document, DocumentChunk, IntentRouteLog, KnowledgeBase
 from models.schemas import ChatRequest, IntentEvidenceStatus
 
 
@@ -658,6 +658,41 @@ class QuerySemanticApiHandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refreshes_metadata_for_inactive_and_failed_documents(self) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        knowledge_base = KnowledgeBase(id=kb_id, name="授权知识库")
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="失败文档.md",
+            status="failed",
+            is_active=False,
+            file_type="md",
+        )
+        source = {
+            "source_kind": "document_metadata",
+            "id": str(doc_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "filename": "producer 伪造名称",
+            "status": "ready",
+            "evidence_role": "direct",
+        }
+
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(document, knowledge_base)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(pairs, {(kb_id, doc_id)})
+        self.assertEqual(refreshed[0]["filename"], "失败文档.md")
+        self.assertEqual(refreshed[0]["status"], "inactive")
+        self.assertEqual(refreshed[0]["knowledge_base_name"], "授权知识库")
+
     async def test_refreshes_only_active_ready_current_chunk(self) -> None:
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()

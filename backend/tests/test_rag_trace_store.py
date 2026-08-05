@@ -1365,6 +1365,7 @@ class RagTraceStoreTests(unittest.TestCase):
             "evidence.clarification_repeated",
             "evidence.clarification_resolved",
             "evidence.scope_filter_applied",
+            "generation.general_fallback",
             "generation.skipped",
         ):
             self.assertIn(event_name, _TRACE_CORE_EVENTS)

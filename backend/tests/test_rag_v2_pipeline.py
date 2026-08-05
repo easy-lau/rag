@@ -17,6 +17,7 @@ from core.query_route_contract import parse_rag_route_decision
 from core.rag_v2.pipeline import (
     AnchorRetrievalSnapshot,
     _admit_and_bind_expansion_candidates,
+    _should_use_general_model_fallback,
     _should_model_adjudicate_evidence,
     retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
@@ -33,6 +34,7 @@ from core.query_constraints import (
     ScopeSourceSpan,
     admit_candidates_for_scopes,
 )
+from core.structured_output import clear_structured_output_capability_cache
 
 
 def _settings():
@@ -394,6 +396,123 @@ class _HangingClient:
 
 
 class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configuration_assignment_is_direct_evidence_without_ordered_steps(
+        self,
+    ) -> None:
+        """A YAML assignment must close a configuration answer globally."""
+
+        question = "云枢如何修改默认密码"
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description=question,
+            role="answer",
+            importance="required",
+            source="explicit",
+            coverage_mode="collection",
+            coverage_contract="structured_collection",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        execution_bundle = compile_rag_execution_bundle(QueryPlanV2(
+            original_query=question,
+            answer_shape="process",
+            retrieval_queries=(question,),
+            requirements=(requirement,),
+            confidence=0.95,
+            source="local",
+        ))
+        candidate = _candidate(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            chunk_index=0,
+            filename="云枢6配置参数说明",
+            content=(
+                "```yaml\n"
+                "cloudpivot:\n"
+                "  organization:\n"
+                "    defaultPwd: Authine@123456 # 默认密码配置\n"
+                "  switch:\n"
+                "    force_change_default_password: true # 默认密码强制修改\n"
+                "```"
+            ),
+        )
+        candidate["metadata"] = {"product": "云枢", "version": "6"}
+
+        payloads, client, *_ = await self._run(
+            question=question,
+            kb_id=kb_id,
+            initial=[candidate],
+            full_document=[candidate],
+            execution_bundle=execution_bundle,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "hit")
+        self.assertEqual(
+            {item["doc_id"] for item in result["answer_sources"]},
+            {str(doc_id)},
+        )
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("force_change_default_password", prompt)
+
+    async def test_unversioned_configuration_routes_are_not_silently_merged(
+        self,
+    ) -> None:
+        """Different version assignments must remain separate answer routes."""
+
+        question = "云枢如何修改默认密码"
+        kb_id = uuid.uuid4()
+        requirement = AnswerRequirementV2(
+            id="r1",
+            description=question,
+            role="answer",
+            importance="required",
+            source="explicit",
+            coverage_mode="collection",
+            coverage_contract="structured_collection",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        execution_bundle = compile_rag_execution_bundle(QueryPlanV2(
+            original_query=question,
+            answer_shape="process",
+            retrieval_queries=(question,),
+            requirements=(requirement,),
+            confidence=0.95,
+            source="local",
+        ))
+        candidates = []
+        for version, default_key in (("6", "defaultPwd"), ("7", "defaultPwd1")):
+            candidate = _candidate(
+                kb_id=kb_id,
+                doc_id=uuid.uuid4(),
+                chunk_index=0,
+                filename=f"云枢{version}配置",
+                content=(
+                    f"云枢{version}解决方案：\n"
+                    f"cloudpivot.organization.{default_key}: Authine@123456 # 默认密码配置\n"
+                    "cloudpivot.switch.force_change_default_password: true # 默认密码强制修改"
+                ),
+            )
+            candidate["metadata"] = {"product": "云枢", "version": version}
+            candidates.append(candidate)
+
+        payloads, *_ = await self._run(
+            question=question,
+            kb_id=kb_id,
+            initial=candidates,
+            full_document=candidates,
+            execution_bundle=execution_bundle,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
+        self.assertTrue(result.get("clarification"))
+
     async def _run(
         self,
         *,
@@ -5871,6 +5990,151 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("安全配置值为方法A", prompt)
         self.assertNotIn("安全配置值为方法B", prompt)
+
+    async def test_no_hit_general_fallback_calls_model_without_sources(self) -> None:
+        kb_id = uuid.uuid4()
+        settings = _settings()
+        settings.rag_general_fallback_mode = "no_hit"
+        settings.rag_general_fallback_model = "fast-fallback-model"
+
+        payloads, client, *_ = await self._run(
+            question="如何设计一个通用的排班流程",
+            kb_id=kb_id,
+            initial=[],
+            full_document=[],
+            settings_override=settings,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "no_hit")
+        self.assertEqual(result["answer_provenance"], "general_model")
+        self.assertEqual(result["general_fallback_mode"], "no_hit")
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(result["answer_source_count"], 0)
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(
+            client.completions.calls[0]["model"],
+            "fast-fallback-model",
+        )
+        prompt = "\n".join(
+            message["content"]
+            for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("明确标记为非知识库依据", prompt)
+        self.assertNotIn("知识库证据：", prompt)
+        answer = "".join(
+            item.get("content", "")
+            for item in payloads
+            if item.get("type") == "text_delta"
+        )
+        self.assertNotIn("未获得知识库证据支持", answer)
+        self.assertIn("已根据资料回答", answer)
+
+    async def test_deepseek_v4_general_fallback_disables_thinking(self) -> None:
+        clear_structured_output_capability_cache()
+        kb_id = uuid.uuid4()
+        settings = _settings()
+        settings.rag_general_fallback_mode = "no_hit"
+        settings.rag_general_fallback_model = "deepseek-v4-pro"
+        settings.llm_base_url = "https://llm.example/v1"
+
+        _payloads_result, client, *_ = await self._run(
+            question="如何设计一个通用的排班流程",
+            kb_id=kb_id,
+            initial=[],
+            full_document=[],
+            settings_override=settings,
+        )
+
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(
+            client.completions.calls[0]["extra_body"],
+            {"thinking": {"type": "disabled"}},
+        )
+
+    async def test_insufficient_evidence_fallback_requires_broadest_mode(self) -> None:
+        kb_id = uuid.uuid4()
+        leave_doc = uuid.uuid4()
+        travel_doc = uuid.uuid4()
+        candidates = [
+            _candidate(
+                kb_id=kb_id,
+                doc_id=leave_doc,
+                chunk_index=index,
+                filename="员工请假管理办法.docx",
+                content=f"员工请假制度第{index + 1}部分：审批、休假和销假要求。",
+            )
+            for index in range(6)
+        ]
+        candidates.append(_candidate(
+            kb_id=kb_id,
+            doc_id=travel_doc,
+            chunk_index=0,
+            filename="公司出差管理标准.docx",
+            content="员工出差交通、住宿和餐饮补贴标准。",
+        ))
+
+        no_hit_only = _settings()
+        no_hit_only.rag_general_fallback_mode = "no_hit"
+        strict_payloads, strict_client, *_ = await self._run(
+            question="员工标准是什么",
+            kb_id=kb_id,
+            initial=candidates,
+            full_document=[],
+            settings_override=no_hit_only,
+        )
+        strict_result = next(
+            item for item in strict_payloads if item["type"] == "search_results"
+        )
+        self.assertEqual(strict_result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(strict_result["answer_provenance"], "knowledge_base")
+        self.assertEqual(strict_client.completions.calls, [])
+
+        broad = _settings()
+        broad.rag_general_fallback_mode = "no_hit_or_insufficient"
+        payloads, client, *_ = await self._run(
+            question="员工标准是什么",
+            kb_id=kb_id,
+            initial=candidates,
+            full_document=[],
+            settings_override=broad,
+        )
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["answer_provenance"], "general_model")
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(len(client.completions.calls), 1)
+        prompt = "\n".join(
+            message["content"]
+            for message in client.completions.calls[0]["messages"]
+        )
+        self.assertNotIn("员工请假制度第1部分", prompt)
+        self.assertNotIn("员工出差交通、住宿和餐饮补贴标准", prompt)
+        generation_context = next(
+            call.kwargs
+            for call in self._last_trace.call_args_list
+            if call.args and call.args[0] == "generation.context"
+        )
+        self.assertEqual(generation_context["context"], "")
+        self.assertEqual(generation_context["context_sources"], [])
+        self.assertEqual(generation_context["all_context_sources"], [])
+
+    def test_general_fallback_never_opens_for_error_or_scope_mismatch(self) -> None:
+        for status in ("error", "scope_mismatch", "needs_clarification", "hit"):
+            with self.subTest(status=status):
+                self.assertFalse(_should_use_general_model_fallback(
+                    evidence_status=status,
+                    configured_mode="no_hit_or_insufficient",
+                ))
+
+        self.assertTrue(_should_use_general_model_fallback(
+            evidence_status="no_hit",
+            configured_mode="no_hit",
+        ))
+        self.assertTrue(_should_use_general_model_fallback(
+            evidence_status="insufficient_evidence",
+            configured_mode="no_hit_or_insufficient",
+        ))
 
 
 if __name__ == "__main__":

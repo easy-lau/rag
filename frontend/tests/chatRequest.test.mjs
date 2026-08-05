@@ -142,8 +142,9 @@ test('恢复请求在首个 SSE 事件前断开时还原原位回答和证据', 
     request_id: 'persist-request-001',
     content: '普通员工餐补为 100 元/天。',
     sources: [{ id: 'travel-policy' }],
+    answer_provenance: 'general_model',
     stream_errors: ['回答保存失败'],
-    search_snapshot: { evidence_status: 'hit' },
+    search_snapshot: { evidence_status: 'no_hit', answer_provenance: 'general_model' },
     delivery_status: 'failed',
     persistence_status: 'failed',
     failure_reason: 'persistence_failed',
@@ -153,12 +154,17 @@ test('恢复请求在首个 SSE 事件前断开时还原原位回答和证据', 
   resetAssistantForLogicalRetry(assistant, 'persist-request-001')
   assert.equal(assistant.content, '')
   assert.deepEqual(assistant.sources, [])
+  assert.equal(assistant.answer_provenance, null)
   assert.equal(assistant.delivery_status, 'streaming')
 
   assert.equal(restoreAssistantPresentationAfterUnconfirmedRetry(assistant, snapshot), true)
   assert.equal(assistant.content, '普通员工餐补为 100 元/天。')
   assert.deepEqual(assistant.sources, [{ id: 'travel-policy' }])
-  assert.deepEqual(assistant.search_snapshot, { evidence_status: 'hit' })
+  assert.equal(assistant.answer_provenance, 'general_model')
+  assert.deepEqual(assistant.search_snapshot, {
+    evidence_status: 'no_hit',
+    answer_provenance: 'general_model',
+  })
   // 传输状态不属于展示快照，调用方可继续标记本次恢复失败。
   assert.equal(assistant.delivery_status, 'streaming')
 })

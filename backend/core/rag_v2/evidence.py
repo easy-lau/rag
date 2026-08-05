@@ -2295,6 +2295,40 @@ def _reconcile_answer_claim_assertions(
                 )
                 if isinstance(value, str)
             }
+            # Configuration blocks carry a stronger typed claim than a
+            # generic collection marker.  Preserve the path/value assertion
+            # so the evidence graph can compare conflicting assignments and
+            # the renderer can explain exactly which setting was used.  This
+            # runs before the generic collection-closure projection because
+            # a YAML/properties block may be complete without numbered steps.
+            config_assertions = adjudicate_answer_claims(
+                answer.description,
+                item.content,
+                bridge_subjects=bridge_subjects,
+                bridge_values=bridge_values,
+                has_bridge_edge=bool(
+                    answer.proof_bridge_requirement_ids
+                    or answer.augmentation_bridge_requirement_ids
+                ),
+                document_root_target_verified=root_verified,
+            )
+            config_assertions = tuple(
+                assertion
+                for assertion in config_assertions
+                if assertion.result_kind == "config_assignment"
+                and assertion.status == "active"
+            )
+            if config_assertions:
+                assertion_metadata[requirement_id] = [
+                    {
+                        "status": assertion.status,
+                        "result_kind": assertion.result_kind,
+                        "normalized_result": assertion.normalized_result,
+                        "claim_key": assertion.claim_key,
+                    }
+                    for assertion in config_assertions[:12]
+                ]
+                continue
             # Collection contracts own their source structure.  When the
             # current source explicitly closes a list or ordered procedure,
             # emit that typed assertion before running the scalar/categorical

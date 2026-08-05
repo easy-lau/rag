@@ -19,6 +19,8 @@ export const useSettingsStore = defineStore('settings', () => {
     vision_model: 'gpt-4o',
     top_k: 5,
     rerank_enabled: true,
+    rag_general_fallback_mode: 'off',
+    rag_general_fallback_model: '',
     show_sources: true,
     site_title: 'RAG 检索系统',
     site_description: '知识增强·精准问答',

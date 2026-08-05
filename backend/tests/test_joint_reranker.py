@@ -10,6 +10,7 @@ from core.reranker import (
     rerank_with_status,
     select_small_document_evidence_with_coverage,
 )
+from core.structured_output import clear_structured_output_capability_cache
 
 
 def _client_with_payload(payload: dict):
@@ -695,6 +696,9 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        clear_structured_output_capability_cache()
+
     async def _run(self, query, results, requirements, payload):
         client = _client_with_payload(payload)
         with (
@@ -1073,7 +1077,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.coverage_status, "complete")
         self.assertEqual(client.chat.completions.create.await_count, 2)
         repair_call = client.chat.completions.create.await_args_list[1]
-        self.assertEqual(repair_call.kwargs["timeout"], 8.0)
+        self.assertAlmostEqual(repair_call.kwargs["timeout"], 8.0, places=3)
         self.assertNotIn(
             "UNIQUE_CANDIDATE_BODY",
             repair_call.kwargs["messages"][1]["content"],
@@ -1229,9 +1233,11 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
             "evidence_sets": "not-an-array",
             "selected_set_id": None,
         }
-        create = AsyncMock(
-            side_effect=[_payload_response(invalid_payload), TimeoutError("repair timeout")]
-        )
+        create = AsyncMock(side_effect=[
+            _payload_response(invalid_payload),
+            TimeoutError("repair schema timeout"),
+            TimeoutError("repair json_object timeout"),
+        ])
         client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=create))
         )
@@ -1247,7 +1253,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(outcome.succeeded)
         self.assertIn("TimeoutError", outcome.error or "")
-        self.assertEqual(create.await_count, 2)
+        self.assertEqual(create.await_count, 3)
         self.assertFalse(outcome.results[0]["jointly_selected"])
         self.assertIsNone(outcome.results[0]["evidence_role"])
 
@@ -1499,7 +1505,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(outcome.succeeded)
         self.assertIn("TimeoutError", outcome.error or "")
-        self.assertEqual(client.chat.completions.create.await_count, 1)
+        self.assertEqual(client.chat.completions.create.await_count, 2)
         self.assertFalse(outcome.results[0]["jointly_selected"])
         self.assertIsNone(outcome.results[0]["evidence_role"])
         self.assertEqual(outcome.results[0]["rerank_status"], "unverified")

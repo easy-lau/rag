@@ -33,6 +33,7 @@ from core.evidence_ambiguity import (
 )
 from core.llm_stream import stream_with_retry_before_first_delta
 from core.openai_client import get_client
+from core.structured_output import create_stream_completion
 from core.query_constraints import (
     ApplicabilityScope,
     QueryConstraints,
@@ -121,6 +122,13 @@ DEFAULT_EXPANSION_TIMEOUT_SECONDS = 8.0
 DEFAULT_RETRIEVAL_WORKFLOW_TIMEOUT_SECONDS = 22.0
 DEFAULT_GENERATION_WORKFLOW_TIMEOUT_SECONDS = 60.0
 DEFAULT_TASK_QUERY_PARALLELISM = 3
+GENERAL_MODEL_ANSWER_PROVENANCE = "general_model"
+KNOWLEDGE_BASE_ANSWER_PROVENANCE = "knowledge_base"
+_GENERAL_FALLBACK_MODES = frozenset({
+    "off",
+    "no_hit",
+    "no_hit_or_insufficient",
+})
 # 企业知识问答优先保证证据忠实度。后台通用 temperature 仍可用于普通聊天，
 # RAG 生成单独使用低温度；显式设置为 0 时保持 0。
 RAG_GENERATION_TEMPERATURE = 0.1
@@ -159,6 +167,62 @@ def _should_model_adjudicate_evidence(
     return bool(
         getattr(settings, "rag_v2_model_evidence_adjudication_enabled", False)
         and bool(search_config.get("rerank", False))
+    )
+
+
+def _model_evidence_adjudication_timeout_seconds(settings: Any) -> float:
+    """Resolve the optional stage deadline while retaining LLM safety."""
+
+    configured = getattr(
+        settings,
+        "rag_v2_model_evidence_adjudication_timeout_seconds",
+        None,
+    )
+    if configured is None:
+        configured = getattr(settings, "llm_request_timeout_seconds", 60.0)
+    if isinstance(configured, bool):
+        raise ValueError("evidence adjudication timeout must be numeric or None")
+    return max(0.1, float(configured))
+
+
+def _normalise_general_fallback_mode(value: object) -> str:
+    mode = str(value or "off").strip().casefold()
+    return mode if mode in _GENERAL_FALLBACK_MODES else "off"
+
+
+def _should_use_general_model_fallback(
+    *,
+    evidence_status: str,
+    configured_mode: object,
+) -> bool:
+    """Allow only explicitly configured terminal evidence states to fall back.
+
+    Retrieval errors, explicit scope conflicts, clarifications and permission
+    failures remain closed.  The fallback changes only answer provenance; it
+    never promotes the evidence status or creates answer sources.
+    """
+
+    mode = _normalise_general_fallback_mode(configured_mode)
+    if mode == "no_hit":
+        return evidence_status == "no_hit"
+    if mode == "no_hit_or_insufficient":
+        return evidence_status in {"no_hit", "insufficient_evidence"}
+    return False
+
+
+def _general_fallback_system_prompt(*, evidence_status: str) -> str:
+    evidence_note = (
+        "知识库检索正常完成，但没有找到可用证据。"
+        if evidence_status == "no_hit"
+        else "知识库只找到相关但不足以闭合答案的资料。"
+    )
+    return (
+        "你正在生成一条明确标记为非知识库依据的通用模型参考回答。"
+        f"{evidence_note}不得声称答案来自知识库、企业内部资料或当前运行环境，"
+        "不得伪造引用、链接、配置现状、内部制度、金额或权限信息。"
+        "可以依据通用知识给出有帮助的解释、常见做法和排查方向；涉及明确产品、"
+        "版本、参数值或组织内部规则而无法可靠确认时，必须直说不确定，并建议以"
+        "官方文档、目标环境或管理员确认为准。界面会独立标记回答来源，不要在正文重复免责声明。"
     )
 
 
@@ -6670,13 +6734,7 @@ async def run_rag_v2_stream(
                         list(bundle_candidates),
                         [requirement.to_dict() for requirement in plan.requirements],
                     ),
-                    timeout=float(
-                        getattr(
-                            settings,
-                            "rag_v2_model_evidence_adjudication_timeout_seconds",
-                            12.0,
-                        )
-                    ),
+                    timeout=_model_evidence_adjudication_timeout_seconds(settings),
                 )
                 model_adjudication_elapsed_ms = round(
                     (time.perf_counter() - adjudication_started) * 1000
@@ -6893,6 +6951,18 @@ async def run_rag_v2_stream(
     )
     ambiguity = final_adjudication.ambiguity
     evidence_status = final_adjudication.evidence_status
+    general_fallback_mode = _normalise_general_fallback_mode(
+        getattr(settings, "rag_general_fallback_mode", "off")
+    )
+    general_model_fallback = _should_use_general_model_fallback(
+        evidence_status=evidence_status,
+        configured_mode=general_fallback_mode,
+    )
+    answer_provenance = (
+        GENERAL_MODEL_ANSWER_PROVENANCE
+        if general_model_fallback
+        else KNOWLEDGE_BASE_ANSWER_PROVENANCE
+    )
     if final_adjudication.suppression_reason is not None:
         assessment = finalized_evidence.assessment
         trace_event(
@@ -6973,7 +7043,11 @@ async def run_rag_v2_stream(
     rendered_context_ids = set(context.item_ids)
     effective_source_ids = (
         ()
-        if ambiguity.needs_clarification or not finalized_evidence.generation_allowed
+        if (
+            ambiguity.needs_clarification
+            or not finalized_evidence.generation_allowed
+            or general_model_fallback
+        )
         else tuple(
             chunk_id
             for chunk_id in bundle.answer_source_ids
@@ -7029,6 +7103,8 @@ async def run_rag_v2_stream(
         rerank_executed=model_adjudication_attempted,
         rerank_succeeded=model_adjudication_succeeded,
     )
+    result_payload["answer_provenance"] = answer_provenance
+    result_payload["general_fallback_mode"] = general_fallback_mode
     trace_event(
         "evidence.selection",
         trace_id=trace_id,
@@ -7111,10 +7187,14 @@ async def run_rag_v2_stream(
         yield _done_event(conversation_id)
         return
 
-    deterministic_answer = _deterministic_evidence_answer(
-        evidence_status,
-        query=query,
-        display_query=question,
+    deterministic_answer = (
+        _deterministic_evidence_answer(
+            evidence_status,
+            query=query,
+            display_query=question,
+        )
+        if not general_model_fallback
+        else None
     )
     if deterministic_answer is not None:
         # Terminal evidence states are deliberately answered locally.  Keep
@@ -7134,6 +7214,9 @@ async def run_rag_v2_stream(
             evidence_completeness=bundle.state.completeness,
             response_mode=task_contract.response_mode,
             retrieval_policy=task_contract.retrieval_policy,
+            answer_provenance=answer_provenance,
+            general_fallback_mode=general_fallback_mode,
+            general_model_fallback=False,
             model=None,
             temperature=None,
             max_tokens=0,
@@ -7162,6 +7245,7 @@ async def run_rag_v2_stream(
             pipeline_version=PIPELINE_VERSION,
             reason="deterministic_evidence_fallback",
             evidence_status=evidence_status,
+            answer_provenance=answer_provenance,
             answer_chars=len(deterministic_answer),
         )
         trace_event(
@@ -7170,6 +7254,8 @@ async def run_rag_v2_stream(
             pipeline_version=PIPELINE_VERSION,
             model=None,
             deterministic=True,
+            answer_provenance=answer_provenance,
+            general_model_fallback=False,
             answer_chars=len(deterministic_answer),
             prompt_tokens=0,
             completion_tokens=0,
@@ -7193,26 +7279,53 @@ async def run_rag_v2_stream(
     generation_deadline = (
         generation_started + generation_workflow_timeout_seconds
     )
-    system_prompt = _system_prompt(
-        evidence_status=evidence_status,
-        answer_shape=plan.answer_shape,
-        response_mode=task_contract.response_mode,
+    system_prompt = (
+        _general_fallback_system_prompt(evidence_status=evidence_status)
+        if general_model_fallback
+        else _system_prompt(
+            evidence_status=evidence_status,
+            answer_shape=plan.answer_shape,
+            response_mode=task_contract.response_mode,
+        )
     )
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
         *history,
     ]
-    if context.text:
+    generation_context = "" if general_model_fallback else context.text
+    generation_context_item_ids = (
+        () if general_model_fallback else context.item_ids
+    )
+    if generation_context:
         messages.append({
             "role": "user",
             "content": _context_message(
-                context=context.text,
+                context=generation_context,
                 bundle=bundle,
                 plan=plan,
             ),
         })
     messages.append({"role": "user", "content": question})
+    if general_model_fallback:
+        trace_event(
+            "generation.general_fallback",
+            trace_id=trace_id,
+            pipeline_version=PIPELINE_VERSION,
+            status="selected",
+            configured_mode=general_fallback_mode,
+            evidence_status=evidence_status,
+            answer_provenance=answer_provenance,
+            knowledge_context_included=False,
+        )
     context_item_by_id = {item.chunk_id: item for item in bundle.items}
+    generation_model = (
+        (
+            str(getattr(settings, "rag_general_fallback_model", "") or "").strip()
+            or settings.chat_model
+        )
+        if general_model_fallback
+        else settings.chat_model
+    )
     trace_event(
         "generation.context",
         trace_id=trace_id,
@@ -7223,7 +7336,10 @@ async def run_rag_v2_stream(
         evidence_completeness=bundle.state.completeness,
         response_mode=task_contract.response_mode,
         retrieval_policy=task_contract.retrieval_policy,
-        model=settings.chat_model,
+        answer_provenance=answer_provenance,
+        general_fallback_mode=general_fallback_mode,
+        general_model_fallback=general_model_fallback,
+        model=generation_model,
         temperature=_rag_generation_temperature(settings),
         max_tokens=settings.max_tokens,
         request_timeout_seconds=min(
@@ -7241,7 +7357,9 @@ async def run_rag_v2_stream(
         missing_requirement_count=len(bundle.missing_requirement_ids),
         expansion_attempted=expansion_attempted,
         expansion_succeeded=expansion_succeeded,
-        context_budget_dropped_count=len(context.dropped_item_ids),
+        context_budget_dropped_count=(
+            0 if general_model_fallback else len(context.dropped_item_ids)
+        ),
         context_sources=[
             {
                 "doc_id": source.get("doc_id"),
@@ -7282,38 +7400,48 @@ async def run_rag_v2_stream(
                     context_item_by_id[chunk_id].origins
                 ),
             }
-            for chunk_id in context.item_ids
+            for chunk_id in generation_context_item_ids
             if chunk_id in context_item_by_id
         ],
-        **content_fields("context", context.text),
+        **content_fields("context", generation_context),
     )
 
     create_kwargs = {
-        "model": settings.chat_model,
+        "model": generation_model,
         "messages": messages,
         "temperature": _rag_generation_temperature(settings),
         "max_tokens": settings.max_tokens,
         "stream": True,
     }
     client = get_client().with_options(max_retries=0)
+    thinking_disabled = False
 
     async def open_stream():
+        nonlocal thinking_disabled
         request_timeout = _remaining_stage_timeout(
             deadline=generation_deadline,
             stage_timeout_seconds=float(settings.llm_request_timeout_seconds),
         )
-        return await client.chat.completions.create(
-            **create_kwargs,
-            timeout=request_timeout,
+        stream, thinking_disabled = await create_stream_completion(
+            client,
+            request={**create_kwargs, "timeout": request_timeout},
+            provider_identity=getattr(settings, "llm_base_url", ""),
+            model=generation_model,
         )
+        return stream
 
     usage = None
     finish_reason = None
     answer_chars = 0
+    first_delta_at: float | None = None
+    previous_delta_at: float | None = None
+    chunk_count = 0
+    total_chunk_gap_ms = 0
+    max_chunk_gap_ms = 0
     prompt_chars = sum(len(message["content"]) for message in messages)
     retrying_stream = stream_with_retry_before_first_delta(
         open_stream,
-        model=settings.chat_model,
+        model=generation_model,
         prompt_chars=prompt_chars,
         timeout_seconds=min(
             float(settings.llm_request_timeout_seconds),
@@ -7348,6 +7476,15 @@ async def run_rag_v2_stream(
                 getattr(getattr(choice, "delta", None), "content", "") or ""
             )
             if delta:
+                now = time.perf_counter()
+                if first_delta_at is None:
+                    first_delta_at = now
+                if previous_delta_at is not None:
+                    gap_ms = max(0, round((now - previous_delta_at) * 1000))
+                    total_chunk_gap_ms += gap_ms
+                    max_chunk_gap_ms = max(max_chunk_gap_ms, gap_ms)
+                previous_delta_at = now
+                chunk_count += 1
                 answer_chars += len(delta)
                 yield _delta_event(delta)
     except asyncio.TimeoutError as exc:
@@ -7355,7 +7492,7 @@ async def run_rag_v2_stream(
             "generation.error",
             trace_id=trace_id,
             pipeline_version=PIPELINE_VERSION,
-            model=settings.chat_model,
+            model=generation_model,
             stage="workflow_deadline",
             workflow_timeout_seconds=generation_workflow_timeout_seconds,
             emitted_text=answer_chars > 0,
@@ -7387,7 +7524,7 @@ async def run_rag_v2_stream(
         "generation.completed",
         trace_id=trace_id,
         pipeline_version=PIPELINE_VERSION,
-        model=settings.chat_model,
+        model=generation_model,
         answer_chars=answer_chars,
         prompt_tokens=(getattr(usage, "prompt_tokens", None) if usage else None),
         completion_tokens=(
@@ -7395,6 +7532,21 @@ async def run_rag_v2_stream(
         ),
         total_tokens=(getattr(usage, "total_tokens", None) if usage else None),
         finish_reason=finish_reason,
+        answer_provenance=answer_provenance,
+        general_model_fallback=general_model_fallback,
+        thinking_disabled=thinking_disabled,
+        first_token_ms=(
+            round((first_delta_at - generation_started) * 1000)
+            if first_delta_at is not None
+            else None
+        ),
+        chunk_count=chunk_count,
+        max_chunk_gap_ms=max_chunk_gap_ms,
+        average_chunk_gap_ms=(
+            round(total_chunk_gap_ms / (chunk_count - 1))
+            if chunk_count > 1
+            else 0
+        ),
         generation_ms=round((time.perf_counter() - generation_started) * 1000),
         total_ms=round((time.perf_counter() - started_at) * 1000),
         retrieval_error=(type(retrieval_error).__name__ if retrieval_error else None),

@@ -70,6 +70,12 @@ class SettingsOut(BaseModel):
     vision_model: str
     top_k: int
     rerank_enabled: bool
+    rag_general_fallback_mode: Literal[
+        "off",
+        "no_hit",
+        "no_hit_or_insufficient",
+    ]
+    rag_general_fallback_model: str
     show_sources: bool
     site_title: str
     site_description: str
@@ -94,6 +100,12 @@ class SettingsUpdate(BaseModel):
     vision_model: str | None = None
     top_k: int | None = None
     rerank_enabled: bool | None = None
+    rag_general_fallback_mode: Literal[
+        "off",
+        "no_hit",
+        "no_hit_or_insufficient",
+    ] | None = None
+    rag_general_fallback_model: str | None = Field(None, max_length=255)
     show_sources: bool | None = None
     site_title: str | None = None
     site_description: str | None = None
@@ -159,6 +171,15 @@ class SiteSettingsOut(BaseModel):
 
 
 def _coerce_setting_value(key: str, value: str, settings) -> object:
+    if key == "rag_general_fallback_mode":
+        normalized = value.strip().casefold()
+        if normalized not in {
+            "off",
+            "no_hit",
+            "no_hit_or_insufficient",
+        }:
+            raise ValueError("invalid general fallback mode")
+        return normalized
     current = getattr(settings, key)
     if isinstance(current, bool):
         return value.strip().lower() in ("true", "1", "yes")
@@ -339,6 +360,16 @@ async def _load(db: AsyncSession) -> dict:
         "vision_model": _value_from_database(db_map, "vision_model", settings),
         "top_k": _value_from_database(db_map, "top_k", settings),
         "rerank_enabled": _value_from_database(db_map, "rerank_enabled", settings),
+        "rag_general_fallback_mode": _value_from_database(
+            db_map,
+            "rag_general_fallback_mode",
+            settings,
+        ),
+        "rag_general_fallback_model": _value_from_database(
+            db_map,
+            "rag_general_fallback_model",
+            settings,
+        ),
         "show_sources": _value_from_database(db_map, "show_sources", settings),
         "site_title": _value_from_database(db_map, "site_title", settings),
         "site_description": _value_from_database(db_map, "site_description", settings),

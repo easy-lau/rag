@@ -30,11 +30,13 @@ MAX_CURRENT_QUESTION_CHARS = 8000
 MAX_ROUTE_CONTEXT_TURNS = 3
 MAX_ROUTE_CONTEXT_CHARS = 2000
 MAX_CATALOG_SPANS_PER_SOURCE = 96
+MAX_RESULT_REFERENCES_PER_TURN = 20
 
 CatalogSourceKind = Literal["current", "route_context"]
 
 _TURN_KEY_RE = re.compile(r"^t[1-9][0-9]{0,2}$")
 _SPAN_ID_RE = re.compile(r"^s_(?:current|t[1-9][0-9]{0,2})_[0-9]{3}$")
+_RESULT_HANDLE_RE = re.compile(r"^r_(t[1-9][0-9]{0,2})_[0-9]{3}$")
 _FRAGMENT_SEPARATOR_RE = re.compile(
     r"(?:以及|还有|并且|或者|并|和|与|及|或|的|[、，,；;。！？?])"
 )
@@ -48,6 +50,17 @@ _QUESTION_SUFFIX_RE = re.compile(
     r"是否|能否|可以吗|吗|呢)+$"
 )
 _COMPARISON_SUFFIX_RE = re.compile(r"(?:的)?(?:差异|区别|不同|异同|对比)$")
+_KNOWLEDGE_CATALOG_SUBJECT_RE = re.compile(
+    r"(?:关于|有关(?!于)|针对|围绕)\s*"
+    r"(?P<subject>[^，,。；;！？?]{1,96}?)\s*"
+    r"(?:相关)?的\s*(?:知识库|文档|文章|资料|文件)",
+    re.IGNORECASE,
+)
+_KNOWLEDGE_CATALOG_RELATED_SUBJECT_RE = re.compile(
+    r"(?P<subject>[^，,。；;！？?]{1,96}?)\s*"
+    r"(?:相关|有关)(?:的)?\s*(?:文档|文章|资料|文件)",
+    re.IGNORECASE,
+)
 
 
 class SourceSpanCatalogError(ValueError):
@@ -89,6 +102,32 @@ class CatalogSpan:
             and self.start < other.end
             and other.start < self.end
         )
+
+
+@dataclass(frozen=True)
+class CatalogResultReference:
+    """One server-issued handle for a previously displayed trusted result.
+
+    The model receives the handle, ordinal and display label, but never a
+    database, knowledge-base or document id.  ``source_key`` remains local so
+    a selected handle can be rebound to the exact authorised turn.
+    """
+
+    handle: str
+    source_key: str
+    ordinal: int
+    resource: Literal["document"]
+    label: str
+    status: str | None = None
+
+    def model_dict(self) -> dict[str, object]:
+        return {
+            "handle": self.handle,
+            "ordinal": self.ordinal,
+            "resource": self.resource,
+            "label": self.label,
+            "status": self.status,
+        }
 
 
 def _source_text(
@@ -243,6 +282,26 @@ def _surface_frame_ranges(source: str) -> tuple[tuple[int, int], ...]:
     return tuple(result)
 
 
+def _knowledge_catalog_subject_ranges(source: str) -> tuple[tuple[int, int], ...]:
+    """Expose exact subject literals from generic catalog-reference grammar.
+
+    ``关于 X 的文章`` and ``X 相关文档`` identify ``X`` as a metadata filter,
+    independent of any business vocabulary.  Publishing the literal range
+    lets V3 select the filter without copying or rewriting user text.
+    """
+
+    result: list[tuple[int, int]] = []
+    for pattern in (
+        _KNOWLEDGE_CATALOG_SUBJECT_RE,
+        _KNOWLEDGE_CATALOG_RELATED_SUBJECT_RE,
+    ):
+        for match in pattern.finditer(source):
+            span = _trim_range(source, match.start("subject"), match.end("subject"))
+            if span is not None and span not in result:
+                result.append(span)
+    return tuple(result)
+
+
 def _normalise_route_context(
     values: Iterable[Mapping[str, Any]] | None,
 ) -> tuple[tuple[str, str], ...]:
@@ -265,7 +324,12 @@ def _normalise_route_context(
         key = key.strip()
         if key in seen:
             raise SourceSpanCatalogError("route_context 包含重复候选键")
-        if set(raw) - {"candidate_key", "user_input", "assistant_answer"}:
+        if set(raw) - {
+            "candidate_key",
+            "user_input",
+            "assistant_answer",
+            "result_items",
+        }:
             raise SourceSpanCatalogError(
                 f"route_context[{index}] 包含未允许字段"
             )
@@ -281,12 +345,71 @@ def _normalise_route_context(
     return tuple(result)
 
 
+def _normalise_result_references(
+    values: Iterable[Mapping[str, Any]] | None,
+) -> tuple[CatalogResultReference, ...]:
+    """Validate identity-free result handles supplied by the conversation layer."""
+
+    result: list[CatalogResultReference] = []
+    seen_handles: set[str] = set()
+    for raw_turn in values or ():
+        if not isinstance(raw_turn, Mapping):
+            continue
+        source_key = str(raw_turn.get("candidate_key") or "").strip()
+        if not _TURN_KEY_RE.fullmatch(source_key):
+            continue
+        raw_items = raw_turn.get("result_items")
+        if raw_items is None:
+            continue
+        if not isinstance(raw_items, (list, tuple)):
+            raise SourceSpanCatalogError("route_context.result_items 必须是数组")
+        for expected_ordinal, raw_item in enumerate(
+            raw_items[:MAX_RESULT_REFERENCES_PER_TURN],
+            start=1,
+        ):
+            if not isinstance(raw_item, Mapping):
+                raise SourceSpanCatalogError("result item 必须是对象")
+            if set(raw_item) - {"handle", "ordinal", "resource", "label", "status"}:
+                raise SourceSpanCatalogError("result item 包含未允许字段")
+            handle = str(raw_item.get("handle") or "").strip()
+            match = _RESULT_HANDLE_RE.fullmatch(handle)
+            if match is None or match.group(1) != source_key:
+                raise SourceSpanCatalogError("result handle 非法")
+            ordinal = raw_item.get("ordinal")
+            if (
+                isinstance(ordinal, bool)
+                or not isinstance(ordinal, int)
+                or ordinal != expected_ordinal
+            ):
+                raise SourceSpanCatalogError("result ordinal 非法")
+            if str(raw_item.get("resource") or "").strip() != "document":
+                raise SourceSpanCatalogError("result resource 非法")
+            label = str(raw_item.get("label") or "").strip()
+            if not label or len(label) > 255:
+                raise SourceSpanCatalogError("result label 非法")
+            status_value = raw_item.get("status")
+            status = str(status_value).strip()[:32] if status_value is not None else None
+            if handle in seen_handles:
+                raise SourceSpanCatalogError("result handle 重复")
+            seen_handles.add(handle)
+            result.append(CatalogResultReference(
+                handle=handle,
+                source_key=source_key,
+                ordinal=ordinal,
+                resource="document",
+                label=label,
+                status=status or None,
+            ))
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class SourceSpanCatalog:
     """Immutable, request-scoped catalog of exact user-source fragments."""
 
     entries: tuple[CatalogSpan, ...]
     _source_texts: tuple[tuple[str, str], ...]
+    result_references: tuple[CatalogResultReference, ...] = ()
 
     def __post_init__(self) -> None:
         sources = dict(self._source_texts)
@@ -341,6 +464,18 @@ class SourceSpanCatalog:
             seen_identities.add(entry.identity)
         if not self.entries:
             raise SourceSpanCatalogError("catalog 至少包含一个 span")
+        result_handles: set[str] = set()
+        for reference in self.result_references:
+            if (
+                not _RESULT_HANDLE_RE.fullmatch(reference.handle)
+                or reference.source_key not in sources
+                or reference.source_key == "current"
+                or not reference.handle.startswith(f"r_{reference.source_key}_")
+            ):
+                raise SourceSpanCatalogError("catalog result reference 非法")
+            if reference.handle in result_handles:
+                raise SourceSpanCatalogError("catalog result handle 重复")
+            result_handles.add(reference.handle)
 
     @classmethod
     def build(
@@ -355,6 +490,7 @@ class SourceSpanCatalog:
             max_chars=MAX_CURRENT_QUESTION_CHARS,
         )
         contexts = _normalise_route_context(route_context)
+        result_references = _normalise_result_references(route_context)
         sources = (("current", current), *contexts)
         entries: list[CatalogSpan] = []
         for source_key, source_text in sources:
@@ -363,6 +499,9 @@ class SourceSpanCatalog:
             )
             ranges = list(_fragment_ranges(source_text))
             for item in _surface_frame_ranges(source_text):
+                if item not in ranges:
+                    ranges.append(item)
+            for item in _knowledge_catalog_subject_ranges(source_text):
                 if item not in ranges:
                     ranges.append(item)
             # The strict contextual producer binds this literal target by
@@ -392,7 +531,11 @@ class SourceSpanCatalog:
                     end=end,
                     text=source_text[start:end],
                 ))
-        return cls(entries=tuple(entries), _source_texts=tuple(sources))
+        return cls(
+            entries=tuple(entries),
+            _source_texts=tuple(sources),
+            result_references=result_references,
+        )
 
     @property
     def current_entries(self) -> tuple[CatalogSpan, ...]:
@@ -411,6 +554,10 @@ class SourceSpanCatalog:
         return tuple(item.span_id for item in self.entries)
 
     @property
+    def all_result_handles(self) -> tuple[str, ...]:
+        return tuple(item.handle for item in self.result_references)
+
+    @property
     def authorised_context_keys(self) -> tuple[str, ...]:
         return tuple(key for key, _ in self._source_texts if key != "current")
 
@@ -427,6 +574,14 @@ class SourceSpanCatalog:
             if entry.span_id == span_id:
                 return entry
         raise SourceSpanCatalogError("span_id 不在当前 catalog")
+
+    def resolve_result(self, handle: object) -> CatalogResultReference:
+        if not isinstance(handle, str) or not _RESULT_HANDLE_RE.fullmatch(handle):
+            raise SourceSpanCatalogError("result handle 非法")
+        for reference in self.result_references:
+            if reference.handle == handle:
+                return reference
+        raise SourceSpanCatalogError("result handle 不在当前 catalog")
 
     def find_exact_span(
         self,
@@ -469,6 +624,7 @@ class SourceSpanCatalog:
         return {
             "schema_version": SOURCE_SPAN_CATALOG_SCHEMA_VERSION,
             "spans": [entry.model_dict() for entry in self.entries],
+            "results": [item.model_dict() for item in self.result_references],
         }
 
     def safe_summary(self) -> dict[str, object]:
@@ -478,6 +634,7 @@ class SourceSpanCatalog:
             "current_span_count": len(self.current_entries),
             "route_context_span_count": len(self.context_entries),
             "authorised_context_turn_count": len(self.authorised_context_keys),
+            "result_reference_count": len(self.result_references),
         }
 
 
@@ -496,8 +653,10 @@ def build_source_span_catalog(
 
 __all__ = [
     "CatalogSpan",
+    "CatalogResultReference",
     "CatalogSourceKind",
     "MAX_CATALOG_SPANS_PER_SOURCE",
+    "MAX_RESULT_REFERENCES_PER_TURN",
     "SOURCE_SPAN_CATALOG_SCHEMA_VERSION",
     "SourceSpanCatalog",
     "SourceSpanCatalogError",

@@ -18,6 +18,18 @@
       <!-- AI card -->
       <div v-else class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
         <div
+          v-if="isGeneralModelAnswer"
+          class="message-general-fallback"
+          role="status"
+          aria-label="通用大模型回答，未经知识库验证"
+        >
+          <n-icon :size="16" aria-hidden="true"><WarningOutline /></n-icon>
+          <div>
+            <strong>通用大模型回答</strong>
+            <span>未经知识库验证，请勿视为企业制度或内部事实依据。</span>
+          </div>
+        </div>
+        <div
           v-if="message.content"
           class="markdown-body text-sm text-gray-800 dark:text-gray-200"
           v-html="rendered"
@@ -253,7 +265,7 @@
 <script setup>
 import { computed, ref } from 'vue'
 import { NButton, NIcon, NSpin, useMessage } from 'naive-ui'
-import { ChevronDownOutline, CopyOutline, RefreshOutline, HardwareChipOutline, PersonOutline, DocumentTextOutline, StopCircleOutline, LinkOutline } from '@vicons/ionicons5'
+import { ChevronDownOutline, CopyOutline, RefreshOutline, HardwareChipOutline, PersonOutline, DocumentTextOutline, StopCircleOutline, LinkOutline, WarningOutline } from '@vicons/ionicons5'
 import { useClipboard } from '@vueuse/core'
 import { renderMarkdown } from '@/utils/markdown'
 import { useSettingsStore } from '@/stores/settings'
@@ -278,6 +290,14 @@ const authStore = useAuthStore()
 const evidenceExpanded = ref(false)
 
 const isUser = computed(() => props.message.role === 'user')
+const isGeneralModelAnswer = computed(() => (
+  !isUser.value
+  && (
+    props.message.answer_provenance
+    || props.message.search_meta?.answer_provenance
+    || props.message.search_snapshot?.answer_provenance
+  ) === 'general_model'
+))
 const emptyPresentation = computed(() => emptyAssistantPresentation(props.message, {
   isStreaming: chatStore.isStreaming,
   activeRequestId: chatStore.activeRequestId,
@@ -592,6 +612,36 @@ function formatTime(t) {
 </script>
 
 <style scoped>
+.message-general-fallback {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 12px;
+  border: 1px solid color-mix(in srgb, var(--ui-warning) 38%, var(--ui-border));
+  border-radius: var(--ui-radius-control);
+  background: color-mix(in srgb, var(--ui-warning) 8%, var(--ui-surface));
+  padding: 9px 10px;
+  color: var(--ui-warning);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.message-general-fallback > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.message-general-fallback strong {
+  color: var(--ui-text);
+  font-weight: 650;
+}
+
+.message-general-fallback span {
+  color: var(--ui-text-secondary);
+  overflow-wrap: anywhere;
+}
+
 .message-clarification {
   margin-top: 12px;
   border: 1px solid color-mix(in srgb, var(--ui-warning) 34%, var(--ui-border));

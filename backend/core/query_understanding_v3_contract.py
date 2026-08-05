@@ -24,6 +24,10 @@ from core.query_understanding_v3_catalog import (
     SourceSpanCatalog,
     SourceSpanCatalogError,
 )
+from core.query_semantics import (
+    KnowledgeRequestSemantics,
+    content_knowledge_request,
+)
 
 
 QUERY_UNDERSTANDING_V3_SCHEMA_VERSION = "query_understanding.v3"
@@ -37,8 +41,24 @@ _SPAN_ID_RE = re.compile(r"^s_(?:current|t[1-9][0-9]{0,2})_[0-9]{3}$")
 _TOP_LEVEL_KEYS = {
     "schema_version",
     "answer_candidates",
+    "knowledge_request",
 }
+_LEGACY_TOP_LEVEL_KEYS = {"schema_version", "answer_candidates"}
 _ANSWER_CANDIDATE_KEYS = {"id", "target_span_id", "qualifier_span_ids"}
+_KNOWLEDGE_REQUEST_KEYS = {
+    "resource",
+    "operation",
+    "filter_span_ids",
+    "group_by",
+    "status_filter",
+    "result_handles",
+    "answer_form",
+}
+_LEGACY_KNOWLEDGE_REQUEST_KEYS = _KNOWLEDGE_REQUEST_KEYS - {
+    "result_handles",
+    "answer_form",
+}
+_RESULT_HANDLE_KNOWLEDGE_REQUEST_KEYS = _KNOWLEDGE_REQUEST_KEYS - {"answer_form"}
 
 
 class QueryUnderstandingV3ValidationError(ValueError):
@@ -168,6 +188,7 @@ class QueryUnderstandingV3:
 
     schema_version: Literal["query_understanding.v3"]
     answer_candidates: tuple[QueryUnderstandingV3Candidate, ...]
+    knowledge_request: KnowledgeRequestSemantics
 
     @property
     def referenced_context_keys(self) -> tuple[str, ...]:
@@ -176,6 +197,9 @@ class QueryUnderstandingV3:
             for span in candidate.qualifier_spans:
                 if span.source_kind == "route_context" and span.source_key not in keys:
                     keys.append(span.source_key)
+        for source_key in _knowledge_request_context_keys(self.knowledge_request):
+            if source_key not in keys:
+                keys.append(source_key)
         return tuple(keys)
 
     @property
@@ -194,6 +218,15 @@ class QueryUnderstandingV3:
         return {
             "schema_version": self.schema_version,
             "answer_candidates": [item.to_dict() for item in self.answer_candidates],
+            "knowledge_request": {
+                "resource": self.knowledge_request.resource,
+                "operation": self.knowledge_request.operation,
+                "filter_span_ids": list(self.knowledge_request.filter_span_ids),
+                "group_by": self.knowledge_request.group_by,
+                "status_filter": self.knowledge_request.status_filter,
+                "result_handles": list(self.knowledge_request.result_handles),
+                "answer_form": self.knowledge_request.answer_form,
+            },
         }
 
     def safe_summary(self) -> dict[str, object]:
@@ -203,7 +236,91 @@ class QueryUnderstandingV3:
             "self_contained": self.self_contained,
             "answer_candidate_count": len(self.answer_candidates),
             "referenced_context_turn_count": len(self.referenced_context_keys),
+            "knowledge_request": self.knowledge_request.safe_summary(),
         }
+
+
+def _knowledge_request_context_keys(
+    request: KnowledgeRequestSemantics,
+) -> tuple[str, ...]:
+    keys: list[str] = []
+    for span_id in request.filter_span_ids:
+        match = re.fullmatch(r"s_(t[1-9][0-9]{0,2})_[0-9]{3}", span_id)
+        if match is not None and match.group(1) not in keys:
+            keys.append(match.group(1))
+    for handle in request.result_handles:
+        match = re.fullmatch(r"r_(t[1-9][0-9]{0,2})_[0-9]{3}", handle)
+        if match is not None and match.group(1) not in keys:
+            keys.append(match.group(1))
+    return tuple(keys)
+
+
+def _parse_knowledge_request(
+    value: object,
+    *,
+    catalog: SourceSpanCatalog,
+) -> KnowledgeRequestSemantics:
+    if isinstance(value, dict) and set(value) == _LEGACY_KNOWLEDGE_REQUEST_KEYS:
+        value = {**value, "result_handles": [], "answer_form": "fact"}
+    elif isinstance(value, dict) and set(value) == _RESULT_HANDLE_KNOWLEDGE_REQUEST_KEYS:
+        # Read compatibility for responses produced immediately before answer
+        # form became part of the shared semantic contract.  New schemas and
+        # prompts always require it; an old response retains the conservative
+        # single-fact behavior.
+        value = {**value, "answer_form": "fact"}
+    item = _expect_exact_keys(
+        value, keys=_KNOWLEDGE_REQUEST_KEYS, field="knowledge_request"
+    )
+    filter_spans = _parse_qualifier_spans(
+        item["filter_span_ids"],
+        field="knowledge_request.filter_span_ids",
+        catalog=catalog,
+    )
+    for field in (
+        "resource",
+        "operation",
+        "group_by",
+        "status_filter",
+        "answer_form",
+    ):
+        if not isinstance(item[field], str):
+            raise QueryUnderstandingV3ValidationError(
+                f"knowledge_request.{field} 必须是字符串"
+            )
+    raw_handles = item["result_handles"]
+    if not isinstance(raw_handles, list):
+        raise QueryUnderstandingV3ValidationError(
+            "knowledge_request.result_handles 必须是数组"
+        )
+    result_references = []
+    for index, handle in enumerate(raw_handles):
+        try:
+            reference = catalog.resolve_result(handle)
+        except SourceSpanCatalogError as exc:
+            raise QueryUnderstandingV3ValidationError(
+                f"knowledge_request.result_handles[{index}] 非法"
+            ) from exc
+        if reference in result_references:
+            raise QueryUnderstandingV3ValidationError(
+                "knowledge_request.result_handles 包含重复项"
+            )
+        result_references.append(reference)
+    try:
+        return KnowledgeRequestSemantics(
+            resource=item["resource"],
+            operation=item["operation"],
+            filter_span_ids=tuple(span.span_id for span in filter_spans),
+            filter_terms=tuple(span.text for span in filter_spans),
+            group_by=item["group_by"],
+            status_filter=item["status_filter"],
+            result_handles=tuple(item.handle for item in result_references),
+            result_labels=tuple(item.label for item in result_references),
+            answer_form=item["answer_form"],
+        )
+    except ValueError as exc:
+        raise QueryUnderstandingV3ValidationError(
+            f"knowledge_request 组合非法: {exc}"
+        ) from exc
 
 
 def _parse_answer_candidates(
@@ -221,6 +338,24 @@ def _parse_answer_candidates(
     seen_ids: set[str] = set()
     selected_targets: list[CatalogSpan] = []
     for index, raw in enumerate(value):
+        # ``id`` is only a server-local candidate handle and carries no model
+        # authority.  Some json_object-only providers omit it despite the
+        # prompt.  Assigning the deterministic ordinal is therefore safe.  A
+        # target repeated verbatim as its own qualifier is equally redundant;
+        # removing only that exact id cannot add a source, historical context,
+        # scope or execution permission.  All other shape/source violations
+        # remain strict failures below.
+        if isinstance(raw, dict):
+            raw = dict(raw)
+            if "id" not in raw:
+                raw["id"] = f"a{index + 1}"
+            target_span_id = raw.get("target_span_id")
+            qualifier_span_ids = raw.get("qualifier_span_ids")
+            if isinstance(qualifier_span_ids, list):
+                raw["qualifier_span_ids"] = [
+                    item for item in qualifier_span_ids
+                    if item != target_span_id
+                ]
         item = _expect_exact_keys(
             raw,
             keys=_ANSWER_CANDIDATE_KEYS,
@@ -272,6 +407,12 @@ def build_query_understanding_schema(*, catalog: SourceSpanCatalog) -> dict[str,
         raise QueryUnderstandingV3ValidationError("catalog 必须是 SourceSpanCatalog")
     target_span_ids = list(catalog.current_span_ids)
     all_span_ids = list(catalog.all_span_ids)
+    result_handles = list(catalog.all_result_handles)
+    resources = ["document_content", "document_catalog"]
+    operations = ["answer", "count", "list", "group"]
+    if result_handles:
+        resources.append("document_result")
+        operations.extend(["read", "summarize", "compare"])
     return {
         "type": "object",
         "additionalProperties": False,
@@ -294,6 +435,61 @@ def build_query_understanding_schema(*, catalog: SourceSpanCatalog) -> dict[str,
                             "maxItems": MAX_QUALIFIER_SPAN_IDS,
                             "items": {"type": "string", "enum": all_span_ids},
                         },
+                    },
+                },
+            },
+            "knowledge_request": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": sorted(_KNOWLEDGE_REQUEST_KEYS),
+                "properties": {
+                    "resource": {
+                        "type": "string",
+                        "enum": resources,
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": operations,
+                    },
+                    "filter_span_ids": {
+                        "type": "array",
+                        "maxItems": MAX_QUALIFIER_SPAN_IDS,
+                        "items": {"type": "string", "enum": all_span_ids},
+                    },
+                    "group_by": {
+                        "type": "string",
+                        "enum": ["none", "knowledge_base", "status", "file_type"],
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "enum": [
+                            "any",
+                            "ready",
+                            "processing",
+                            "failed",
+                            "inactive",
+                            "not_ready",
+                        ],
+                    },
+                    "result_handles": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": (
+                            {"type": "string", "enum": result_handles}
+                            if result_handles
+                            else {"type": "string", "pattern": "a^"}
+                        ),
+                    },
+                    "answer_form": {
+                        "type": "string",
+                        "enum": [
+                            "fact",
+                            "enumeration",
+                            "procedure",
+                            "overview",
+                            "comparison",
+                            "judgement",
+                        ],
                     },
                 },
             },
@@ -331,17 +527,38 @@ def parse_query_understanding(
 
     if not isinstance(catalog, SourceSpanCatalog):
         raise QueryUnderstandingV3ValidationError("catalog 必须是 SourceSpanCatalog")
+    raw_payload = _parse_json_object(raw)
+    # Read compatibility for in-flight/recorded V3 responses produced before
+    # the capability field existed.  New response schemas require the field;
+    # an old response can only retain the conservative content-answer path.
+    if set(raw_payload) == _LEGACY_TOP_LEVEL_KEYS:
+        raw_payload = dict(raw_payload)
+        legacy = content_knowledge_request()
+        raw_payload["knowledge_request"] = {
+            "resource": legacy.resource,
+            "operation": legacy.operation,
+            "filter_span_ids": [],
+            "group_by": legacy.group_by,
+            "status_filter": legacy.status_filter,
+            "result_handles": [],
+            "answer_form": legacy.answer_form,
+        }
     payload = _expect_exact_keys(
-        _parse_json_object(raw),
+        raw_payload,
         keys=_TOP_LEVEL_KEYS,
         field="query_understanding",
     )
     if payload["schema_version"] != QUERY_UNDERSTANDING_V3_SCHEMA_VERSION:
         raise QueryUnderstandingV3ValidationError("schema_version 不受支持")
     candidates = _parse_answer_candidates(payload["answer_candidates"], catalog=catalog)
+    knowledge_request = _parse_knowledge_request(
+        payload["knowledge_request"],
+        catalog=catalog,
+    )
     analysis = QueryUnderstandingV3(
         schema_version=QUERY_UNDERSTANDING_V3_SCHEMA_VERSION,
         answer_candidates=candidates,
+        knowledge_request=knowledge_request,
     )
     return analysis
 

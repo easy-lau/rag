@@ -21,8 +21,9 @@
 | `DEVELOPMENT_LOG_DIR` | `<项目根>/logs/development` | 开发环境每个后端进程的独立日志文件目录；生产环境不写本地文件 |
 | `RAG_SEMANTIC_ENTRY` | `v3` | 选择语义理解 authority；`v3` 只允许模型选择服务器签发的原文 span，`legacy` 才启用旧 `query_analysis.v2` |
 | `RAG_QUERY_UNDERSTANDING_V3_MODE` | `active` | V3 的 `off / shadow / active` 模式；`active` 的失败只回退当前轮本地基线，不重跑旧语义模型 |
-| `RAG_QUERY_UNDERSTANDING_V3_ACTIVE_TIMEOUT_SECONDS` / `...MAX_INFLIGHT` | `2.5` / `2` | V3 首次 SSE 后的绝对等待预算和并发上限 |
+| `RAG_QUERY_UNDERSTANDING_V3_ACTIVE_TIMEOUT_SECONDS` / `...MAX_INFLIGHT` | 未设置（继承 `LLM_REQUEST_TIMEOUT_SECONDS`，默认 `60`）/ `2` | V3 首次 SSE 后的等待预算和并发上限；删除该变量即不设置 V3 专用硬限制，仍受全局 LLM 请求超时保护；设置数值（`0.5`–`300` 秒）可显式收紧该阶段 |
 | `RAG_QUERY_UNDERSTANDING_V3_ANCHOR_PREFETCH_ENABLED` / `...TIMEOUT_SECONDS` | `true` / `2.5` | 是否与 V3 并发预取原问题 anchor；超时或未通过围栏时丢弃，正常 V2 DAG 会自行召回 |
+| `RAG_V2_MODEL_EVIDENCE_ADJUDICATION_TIMEOUT_SECONDS` | 未设置（继承 `LLM_REQUEST_TIMEOUT_SECONDS`，默认 `60`） | 证据模型判定等待预算；删除该变量即不设置该阶段专用硬限制，仍受全局 LLM 请求超时保护；设置数值（`0.5`–`300` 秒）可显式收紧 |
 
 本地以 `uvicorn main:app --reload --port 8000` 启动时，后端会在
 `logs/development/` 自动创建 `backend-日期-pid.log`。控制台输出仍会保留；
@@ -66,6 +67,7 @@
 | `evidence.scope_filter_applied` | 用户选择后应用的知识库、文档和选项数量；`global_fallback_allowed=false` 表示禁止退回全库检索 |
 | `evidence.selection` | 直接证据、相近资料、淘汰数量及最终证据状态 |
 | `generation.context` | 实际注入模型的文档、角色和上下文字符数 |
+| `generation.general_fallback` | 后台策略允许通用模型兜底；记录原始证据状态、配置档位，并确认未注入知识库上下文 |
 | `generation.skipped` | 因证据范围待澄清而跳过回答模型 |
 | `generation.completed` | 模型生成完成、回答长度、token 与耗时 |
 | `chat.response` | 最终回答、来源摘要、token 和证据状态 |
@@ -83,6 +85,7 @@
 - `evidence_role`：`direct` 是回答依据，`related` 是相近资料，`irrelevant` 不进入上下文。
 - `results` / `displayed_result_count`：右侧检索面板展示的候选及其数量，可能包含直接依据和相近资料，不等于生成依据。
 - `answer_sources` / `answer_source_count`：实际进入本轮生成上下文、随后可随历史回答保存的片段及其数量；它与 `results` 明确分离。
+- `answer_provenance`：`knowledge_base` 表示知识库证据链或其确定性终态提示，`general_model` 表示后台明确允许的通用模型参考回答。后者不会改变原始 `evidence_status`，且 `answer_sources` 必须为空。
 - `context_evidence_count`：实际注入生成模型的片段数，正常情况下等于 `answer_source_count`；单独保留该指标便于检查生成上下文是否与持久化来源一致。
 - `hit_count` / `direct_evidence_count`：通过直接证据门控的数量。Trace schema `v2` 中两者语义一致；历史 `v1.hit_count` 曾表示前端候选数，只能按旧口径解释。
 
@@ -97,7 +100,7 @@
 7. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
 8. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
 9. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
-10. V2 先对已授权、任务图限量召回后的候选执行确定性证据闭合；只有该路径无法形成可生成答案时，才调用结构化证据裁判。`rerank.completed` 会记录 `mode=model_evidence_adjudication`、是否成功、耗时，或以 `skip_reason=deterministic_evidence_closed` 说明模型被跳过。模型只能标注片段对原问题的支撑关系，不能改写原问题、扩大 KB/文档范围或绕过最终图、覆盖和来源校验；超时、异常或结构无效时保留确定性候选链。最终回答模型仍只看到预算内的已授权 evidence bundle；`error / no_hit / scope_mismatch` 等无上下文终态由本地固定文案直接返回。正常聊天路径会在 V3 语义 barrier 后把 `not_ready` 统一转成 route clarification，禁止派发 V2；V2 保留的 `not_ready` SSE 分支只是供 direct/兼容调用者防御性终止，避免在流尾抛出 500。
+10. V2 先对已授权、任务图限量召回后的候选执行确定性证据闭合；只有该路径无法形成可生成答案时，才调用结构化证据裁判。`rerank.completed` 会记录 `mode=model_evidence_adjudication`、是否成功、耗时，或以 `skip_reason=deterministic_evidence_closed` 说明模型被跳过。模型只能标注片段对原问题的支撑关系，不能改写原问题、扩大 KB/文档范围或绕过最终图、覆盖和来源校验；超时、异常或结构无效时保留确定性候选链。最终知识库回答模型仍只看到预算内的已授权 evidence bundle。后台“系统设置 → 知识库未命中策略”默认保持严格模式；管理员可选择仅在 `no_hit`，或在 `no_hit / insufficient_evidence` 时生成独立标记的通用模型参考回答。该回答不注入本轮知识库上下文、不保留回答来源、不写入可复用证据，原始 `evidence_status` 保持不变，并以 `answer_provenance=general_model` 和固定免责声明展示。`error`、`scope_mismatch`、澄清和权限拒绝始终禁止兜底。正常聊天路径会在 V3 语义 barrier 后把 `not_ready` 统一转成 route clarification，禁止派发 V2；V2 保留的 `not_ready` SSE 分支只是供 direct/兼容调用者防御性终止，避免在流尾抛出 500。
 
 旧 V1 仍保留作为显式紧急回滚路径。V1 的 `rerank.candidate` 明细与 V2 的模型裁判不是同一执行口径；V2 无论模型标注为何，最终仍以 `evidence.selection`、完整覆盖和来源校验为准，不能将模型分数单独当作可生成答案的证明。
 
@@ -108,6 +111,7 @@
 3. 路由失败、流异常和用户取消分别落入明确终态；保存最多有限重试三次。回答提交与 pending 澄清状态使用分离事务，后者 CAS 冲突不会回滚已经保存的回答，也不会发送虚假的澄清 ACK。
 4. 回答历史保存最终 `search_snapshot`，候选最多 20 条且不保存正文。重新打开历史或重放幂等请求时，服务端按当前 RBAC、文档 active/ready 状态重新加载正文；撤权后保留用户自己的回答文本和计数，但不再披露旧来源。
 5. 前端绑定响应头中的 Trace/Turn/Request ID。`error` 后即使收到尾随 `done` 也保持失败状态；保存/传输不确定时复用原 request 恢复，已完成回答的“重新生成”会创建新的逻辑 request。
+6. 通用模型兜底的 `answer_provenance` 和策略档位随无正文检索快照保存。历史恢复和幂等重放仍显示“通用大模型回答 · 未经知识库验证”，但不会出现知识库回答依据。
 
 ## 路由判定矩阵
 

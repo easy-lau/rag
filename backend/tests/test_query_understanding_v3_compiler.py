@@ -53,6 +53,7 @@ def _candidate(
     *,
     targets: tuple[str, ...],
     qualifier_texts: tuple[str, ...] = (),
+    answer_form: str = "fact",
 ) -> object:
     qualifier_span_ids = [_span_id(catalog, value) for value in qualifier_texts]
     payload = {
@@ -65,6 +66,15 @@ def _candidate(
             }
             for index, target in enumerate(targets, start=1)
         ],
+        "knowledge_request": {
+            "resource": "document_content",
+            "operation": "answer",
+            "filter_span_ids": [],
+            "group_by": "none",
+            "status_filter": "any",
+            "result_handles": [],
+            "answer_form": answer_form,
+        },
     }
     return parse_query_understanding(json.dumps(payload, ensure_ascii=False), catalog=catalog)
 
@@ -103,6 +113,69 @@ def _not_ready_fallback(question: str) -> QueryPlanV2:
 
 
 class QueryUnderstandingV3CompilerTests(unittest.TestCase):
+    def test_answer_form_compiles_across_topics_without_business_rules(self):
+        cases = (
+            ("员工想请假怎么办", "procedure", "process", "ordered_steps"),
+            ("依赖安装失败后应该怎么处理", "procedure", "process", "ordered_steps"),
+            ("云枢如何修改默认密码", "procedure", "process", "structured_collection"),
+            ("介绍一下访问控制制度", "overview", "overview", "document_policy"),
+            ("判断当前配置是否符合要求", "judgement", "judgement", "single_claim"),
+        )
+        for question, answer_form, answer_shape, coverage_contract in cases:
+            with self.subTest(question=question):
+                catalog = SourceSpanCatalog.build(current_question=question)
+                understanding = _candidate(
+                    catalog,
+                    targets=(question,),
+                    answer_form=answer_form,
+                )
+                compiled = compile_query_understanding(
+                    catalog=catalog,
+                    understanding=understanding,
+                    baseline_floor=BaselineFloor(
+                        current_question=question,
+                        fallback_plan=_runnable_fallback(question),
+                    ),
+                )
+
+                self.assertTrue(
+                    compiled.validation.accepted,
+                    compiled.validation.reason,
+                )
+                self.assertEqual(compiled.plan.answer_shape, answer_shape)
+                answer = next(
+                    item
+                    for item in compiled.plan.requirements
+                    if item.role == "answer"
+                )
+                self.assertEqual(
+                    answer.effective_coverage_contract,
+                    coverage_contract,
+                )
+
+    def test_surface_floor_upgrades_a_misclassified_solution_question(self):
+        question = "员工想请假怎么办"
+        catalog = SourceSpanCatalog.build(current_question=question)
+        # Simulate a provider that returned a valid but overly broad fact form.
+        understanding = _candidate(
+            catalog,
+            targets=(question,),
+            answer_form="fact",
+        )
+        compiled = compile_query_understanding(
+            catalog=catalog,
+            understanding=understanding,
+            baseline_floor=BaselineFloor(
+                current_question=question,
+                fallback_plan=_runnable_fallback(question),
+            ),
+        )
+        self.assertEqual(compiled.plan.answer_shape, "process")
+        answer = next(
+            item for item in compiled.plan.requirements if item.role == "answer"
+        )
+        self.assertEqual(answer.effective_coverage_contract, "ordered_steps")
+
     def test_travel_multi_target_has_complete_coverage_and_shared_classification_augmentation(self):
         question = "普通员工的住宿标准、餐补和出差补贴这些分别是多少"
         catalog = SourceSpanCatalog.build(current_question=question)

@@ -192,8 +192,10 @@ class QuerySurfaceFrameTests(unittest.TestCase):
         cases = {
             "如何配置VPN": True,
             "采购申请流程是什么": True,
+            "员工想请假怎么办": True,
             "连续出差超过30天住宿标准如何处理": False,
             "超出报销标准如何处理": False,
+            "超出报销标准怎么办": False,
         }
         for question, expected in cases.items():
             with self.subTest(question=question):

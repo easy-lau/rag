@@ -492,7 +492,7 @@ _PROCEDURAL_INTERROGATIVE_RE = re.compile(
     r"完成|办理|申请|提交|配置|设置|安装|部署|注册|登录|开通|"
     r"填写|审批|报销|操作|执行|导入|同步|创建|修改|删除|撤销|"
     r"启用|停用|排查|修复|升级|迁移"
-    r")",
+    r")|(?:想|需要|准备|打算)[^？?。.!！]{1,48}怎么办",
     re.IGNORECASE,
 )
 _JUDGEMENT_OPERATOR_RE = re.compile(

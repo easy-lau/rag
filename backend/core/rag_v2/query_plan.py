@@ -26,6 +26,7 @@ from core.query_surface_structure import (
     parse_distributive_enumeration,
     split_coordination_body,
 )
+from core.query_semantics import request_kind_for_question
 from core.rag_v2.contracts import (
     AnswerRequirementV2,
     BridgeRequirementKind,
@@ -366,6 +367,14 @@ def _answer_coverage_contract(
         return "single_claim"
 
     normalized = re.sub(r"\s+", " ", str(question or "")).strip()
+    # Configuration operations are source-authored assignments, not ordered
+    # human procedures.  The shared semantic classifier recognizes both
+    # ``如何配置`` and ``如何修改`` forms; use that result here so V3 and the
+    # local planner compile the same evidence closure.  A config block can
+    # therefore close through typed key/value claims even when it has no
+    # numbered step declaration.
+    if request_kind_for_question(normalized) == "configuration_procedure":
+        return "structured_collection"
     # An explicitly ordered process is not merely a finite set of members.
     # Keep generic operational how-to questions (for example ``如何配置VPN``)
     # as structured collections because a valid answer may be one declarative

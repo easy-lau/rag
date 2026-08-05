@@ -590,87 +590,100 @@ def derive_verified_collection_closures(
         )
         if not claims:
             continue
-        claim_item_ids = tuple(sorted({claim.evidence_item_id for claim in claims}))
-        claim_documents = {claim.document_key for claim in claims}
-        if len(claim_documents) != 1:
-            continue
-        source_document_key = next(iter(claim_documents))
-
-        if contract == "document_policy":
-            if (
-                root_document_key == source_document_key
-                and source_document_key in source_complete_documents
-            ):
-                closures.append(VerifiedCollectionClosure(
-                    requirement_id=requirement.id,
-                    claim_item_ids=claim_item_ids,
-                    source_kind="full_document_snapshot",
-                    source_document_key=source_document_key,
-                ))
-            continue
-
-        # A finite, unordered collection may be closed by an authoritative
-        # parsed table.  An ordered procedure cannot: row order alone does not
-        # prove transitions or that no later step exists.  It needs the
-        # target-bound sequence declaration below.
+        # Verify each independent document route separately.  Multiple
+        # complete routes must remain distinguishable for the post-evidence
+        # ambiguity layer (for example, one route per product/version).
         if contract == "structured_collection":
-            # When retrieval has a verified complete-document snapshot, that
-            # snapshot is a stronger completeness proof than a single chunk
-            # or an untrusted model annotation.  This covers open requests
-            # such as “完整配置/全部参数” without pretending chunk 0 alone is
-            # exhaustive.
-            if (
-                root_document_key == source_document_key
-                and source_document_key in source_complete_documents
-            ):
-                closures.append(VerifiedCollectionClosure(
-                    requirement_id=requirement.id,
-                    claim_item_ids=claim_item_ids,
-                    source_kind="full_document_snapshot",
-                    source_document_key=source_document_key,
-                ))
+            claims_by_document: dict[DocumentKey, list[EvidenceClaim]] = defaultdict(list)
+            for claim in claims:
+                claims_by_document[claim.document_key].append(claim)
+            claim_groups = tuple(
+                tuple(group)
+                for _, group in sorted(claims_by_document.items(), key=lambda value: value[0])
+            )
+        else:
+            claim_groups = (claims,)
+
+        for claim_group in claim_groups:
+            claim_item_ids = tuple(sorted({claim.evidence_item_id for claim in claim_group}))
+            claim_documents = {claim.document_key for claim in claim_group}
+            if len(claim_documents) != 1:
                 continue
-            claim_table_keys = {
-                _table_key(item_by_id[item_id])
-                for item_id in claim_item_ids
-            }
-            if len(claim_table_keys) == 1:
-                source_table_key = next(iter(claim_table_keys))
-                table_items = tuple(
-                    item
-                    for item in graph.evidence_items
-                    if _table_key(item) == source_table_key
-                )
+            source_document_key = next(iter(claim_documents))
+
+            if contract == "document_policy":
                 if (
-                    source_table_key is not None
-                    and source_table_key in source_complete_tables
-                    and table_matches_collection_target(
-                        table_items,
-                        requirement=requirement,
-                        requirements=graph.requirements,
-                    )
+                    root_document_key == source_document_key
+                    and source_document_key in source_complete_documents
                 ):
                     closures.append(VerifiedCollectionClosure(
                         requirement_id=requirement.id,
                         claim_item_ids=claim_item_ids,
-                        source_kind="complete_table",
+                        source_kind="full_document_snapshot",
                         source_document_key=source_document_key,
-                        source_table_key=source_table_key,
                     ))
+                continue
 
-        if len(claim_item_ids) == 1:
-            source_item = item_by_id[claim_item_ids[0]]
-            if has_explicit_collection_closure(
-                source_item,
-                requirement=requirement,
-                requirements=graph.requirements,
-            ):
-                closures.append(VerifiedCollectionClosure(
-                    requirement_id=requirement.id,
-                    claim_item_ids=claim_item_ids,
-                    source_kind="source_declaration",
-                    source_document_key=source_document_key,
-                ))
+            # A finite, unordered collection may be closed by an authoritative
+            # parsed table.  An ordered procedure cannot: row order alone does not
+            # prove transitions or that no later step exists.  It needs the
+            # target-bound sequence declaration below.
+            if contract == "structured_collection":
+                # When retrieval has a verified complete-document snapshot,
+                # that snapshot is a stronger completeness proof than a single
+                # chunk or an untrusted model annotation.
+                if (
+                    root_document_key == source_document_key
+                    and source_document_key in source_complete_documents
+                ):
+                    closures.append(VerifiedCollectionClosure(
+                        requirement_id=requirement.id,
+                        claim_item_ids=claim_item_ids,
+                        source_kind="full_document_snapshot",
+                        source_document_key=source_document_key,
+                    ))
+                    continue
+                claim_table_keys = {
+                    _table_key(item_by_id[item_id])
+                    for item_id in claim_item_ids
+                }
+                if len(claim_table_keys) == 1:
+                    source_table_key = next(iter(claim_table_keys))
+                    table_items = tuple(
+                        item
+                        for item in graph.evidence_items
+                        if _table_key(item) == source_table_key
+                    )
+                    if (
+                        source_table_key is not None
+                        and source_table_key in source_complete_tables
+                        and table_matches_collection_target(
+                            table_items,
+                            requirement=requirement,
+                            requirements=graph.requirements,
+                        )
+                    ):
+                        closures.append(VerifiedCollectionClosure(
+                            requirement_id=requirement.id,
+                            claim_item_ids=claim_item_ids,
+                            source_kind="complete_table",
+                            source_document_key=source_document_key,
+                            source_table_key=source_table_key,
+                        ))
+
+            if len(claim_item_ids) == 1:
+                source_item = item_by_id[claim_item_ids[0]]
+                if has_explicit_collection_closure(
+                    source_item,
+                    requirement=requirement,
+                    requirements=graph.requirements,
+                ):
+                    closures.append(VerifiedCollectionClosure(
+                        requirement_id=requirement.id,
+                        claim_item_ids=claim_item_ids,
+                        source_kind="source_declaration",
+                        source_document_key=source_document_key,
+                    ))
     return tuple(dict.fromkeys(closures))
 
 
@@ -874,6 +887,7 @@ def _verified_closure_proven(
         claim.evidence_item_id
         for claim in closed_claims
     }
+    valid_closure_item_sets: list[frozenset[str]] = []
     for closure in closures:
         if requirement.effective_coverage_contract == "document_policy" and (
             closure.source_kind != "full_document_snapshot"
@@ -881,12 +895,23 @@ def _verified_closure_proven(
         ):
             continue
         closure_item_ids = set(closure.claim_item_ids)
-        if (
-            closure_item_ids == candidate_item_ids
-            and closure_item_ids.issubset(closed_item_ids)
-        ):
+        if closure_item_ids and closure_item_ids.issubset(closed_item_ids):
+            valid_closure_item_sets.append(frozenset(closure_item_ids))
+        if closure_item_ids == candidate_item_ids:
             return True
-    return False
+    # Several mutually exclusive documents can each provide a complete
+    # collection route.  Treat the requirement as covered when those route
+    # certificates partition all typed claims; the ambiguity stage then
+    # decides whether to merge or ask the user for a scope/version.
+    unique_sets = tuple(dict.fromkeys(valid_closure_item_sets))
+    if len(unique_sets) < 2:
+        return False
+    union: set[str] = set()
+    total_members = 0
+    for item_ids in unique_sets:
+        union.update(item_ids)
+        total_members += len(item_ids)
+    return union == candidate_item_ids and total_members == len(candidate_item_ids)
 
 
 def _closed_answer_claim_conflicts(

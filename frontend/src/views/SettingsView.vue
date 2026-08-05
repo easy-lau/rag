@@ -23,7 +23,7 @@
             检索参数
           </h3>
           <n-form :model="form" :disabled="!canWrite" label-placement="top">
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
               <n-form-item label="Top K（召回数量）">
                 <n-input-number v-model:value="form.top_k" :min="1" :max="20" class="w-full" />
               </n-form-item>
@@ -60,6 +60,36 @@
                   </span>
                 </template>
                 <n-switch v-model:value="form.show_sources" />
+              </n-form-item>
+              <n-form-item>
+                <template #label>
+                  <span class="inline-flex items-center gap-1">
+                    知识库未命中策略
+                    <n-tooltip trigger="hover" placement="top">
+                      <template #trigger>
+                        <n-icon :size="15" class="text-gray-400 cursor-help"><HelpCircleOutline /></n-icon>
+                      </template>
+                      <div class="max-w-xs text-xs leading-relaxed">
+                        通用大模型回答不会被标记为知识库命中，也不会展示或保存为回答依据。<br>
+                        · 严格模式：未命中时只提示没有知识库依据。<br>
+                        · 仅完全未命中：知识库没有可用资料时自动使用通用大模型。<br>
+                        · 未命中或证据不足：相关资料不足以闭合答案时也允许通用大模型回答。
+                      </div>
+                    </n-tooltip>
+                  </span>
+                </template>
+                <n-select
+                  v-model:value="form.rag_general_fallback_mode"
+                  :options="generalFallbackOptions"
+                  class="w-full"
+                />
+              </n-form-item>
+              <n-form-item label="兜底低延迟模型">
+                <n-input
+                  v-model:value="form.rag_general_fallback_model"
+                  placeholder="留空则使用主对话模型"
+                  clearable
+                />
               </n-form-item>
             </div>
           </n-form>
@@ -119,7 +149,7 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { NForm, NFormItem, NInput, NInputNumber, NSwitch, NButton, NSpin, NTooltip, NIcon, NTag, NUpload, useMessage } from 'naive-ui'
+import { NForm, NFormItem, NInput, NInputNumber, NSelect, NSwitch, NButton, NSpin, NTooltip, NIcon, NTag, NUpload, useMessage } from 'naive-ui'
 import { HelpCircleOutline, LockClosedOutline } from '@vicons/ionicons5'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
@@ -135,6 +165,11 @@ const msg = useMessage()
 const saving = ref(false)
 const form = ref({ ...settingsStore.data })
 const canWrite = computed(() => authStore.hasPerm('settings:write'))
+const generalFallbackOptions = [
+  { label: '严格知识库模式', value: 'off' },
+  { label: '仅完全未命中时兜底', value: 'no_hit' },
+  { label: '未命中或证据不足时兜底', value: 'no_hit_or_insufficient' },
+]
 
 onMounted(async () => {
   await settingsStore.fetch()
@@ -164,6 +199,8 @@ async function handleSave() {
     const payload = {
       top_k: form.value.top_k,
       rerank_enabled: form.value.rerank_enabled,
+      rag_general_fallback_mode: form.value.rag_general_fallback_mode,
+      rag_general_fallback_model: form.value.rag_general_fallback_model?.trim() || '',
       show_sources: form.value.show_sources,
       site_title: form.value.site_title,
       site_description: form.value.site_description,

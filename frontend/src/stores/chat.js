@@ -291,6 +291,7 @@ export const useChatStore = defineStore('chat', () => {
       request_id: requestId,
       trace_id: null,
       evidence_status: null,
+      answer_provenance: null,
       retrieval_executed: null,
       delivery_status: 'streaming',
       persistence_status: 'pending',
@@ -614,15 +615,20 @@ export const useChatStore = defineStore('chat', () => {
       aiMsg.evidence_status = clarification
         ? 'needs_clarification'
         : (data.evidence_status ?? eventMeta.evidence_status)
+      aiMsg.answer_provenance = clarification
+        ? null
+        : (data.answer_provenance ?? eventMeta.answer_provenance ?? null)
       aiMsg.search_meta = {
         ...(aiMsg.search_meta || {}),
         ...eventMeta,
         retrieval_executed: aiMsg.retrieval_executed,
         evidence_status: aiMsg.evidence_status,
+        answer_provenance: aiMsg.answer_provenance,
       }
       aiMsg.search_snapshot = searchSnapshotFromEvent(data, {
         trace_id: aiMsg.trace_id,
         evidence_status: aiMsg.evidence_status,
+        answer_provenance: aiMsg.answer_provenance,
         retrieval_executed: aiMsg.retrieval_executed,
         intent_decision: aiMsg.intent_decision,
       })

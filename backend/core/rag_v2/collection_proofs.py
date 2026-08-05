@@ -17,6 +17,7 @@ from core.rag_v2.bridge_resolution import (
     bridge_subject_for_requirement,
     content_matches_complete_answer_target,
 )
+from core.rag_v2.config_claims import matching_config_assignments
 from core.rag_v2.contracts import AnswerRequirementV2, EvidenceItem
 
 
@@ -809,6 +810,32 @@ def derive_source_collection_closure_proofs(
     content = str(item.content or "")
     candidates: list[SourceCollectionClosureProof] = []
     closure_kind = _closure_kind_for_requirement(requirement)
+    if closure_kind == "collection":
+        # Configuration answers are often authored as a YAML/properties block
+        # without numbered steps or an exhaustive prose marker.  The typed
+        # assignment extractor is the source declaration in that format: it
+        # binds the user's configuration target to concrete path/value spans
+        # and therefore provides the same closure guarantee as a source-local
+        # ``以下为`` list.  This is intentionally generic; it does not know
+        # product names, parameter names or secret values.
+        assignments = matching_config_assignments(
+            requirement.description,
+            content,
+        )
+        if assignments:
+            first = min(assignments, key=lambda value: value.source_start)
+            last = max(assignments, key=lambda value: value.source_end)
+            candidates.append(SourceCollectionClosureProof(
+                closure_kind="collection",
+                anchor_span=SourceSpan(
+                    start=first.source_start,
+                    end=first.source_end,
+                ),
+                member_block_span=SourceSpan(
+                    start=first.source_start,
+                    end=last.source_end,
+                ),
+            ))
     # An ordered procedure is not merely an unordered collection.  Its own
     # closure path below has stricter sequence grammar, so do not emit a
     # second, weaker ``collection`` certificate for the same evidence.

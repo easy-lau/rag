@@ -240,6 +240,21 @@ class CollectionSourceProofTests(unittest.TestCase):
             coverage_contract="ordered_steps",
         ))
 
+    def test_configuration_assignment_block_closes_without_numbered_steps(self):
+        """YAML/properties assignments are a typed source declaration."""
+
+        question = "云枢如何修改默认密码"
+        content = (
+            "```yaml\n"
+            "cloudpivot:\n"
+            "  organization:\n"
+            "    defaultPwd: Authine@123456 # 默认密码配置\n"
+            "  switch:\n"
+            "    force_change_default_password: true # 默认密码强制修改\n"
+            "```"
+        )
+        self.assertTrue(self._proves(question, content))
+
 
 if __name__ == "__main__":
     unittest.main()

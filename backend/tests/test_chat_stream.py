@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 from api.chat import (
     _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE,
+    _bounded_search_snapshot,
     _messages_with_current_source_scope,
     _parse_sse_payload,
     _public_stream_error_message,
@@ -185,6 +186,33 @@ def _routing_result(
 
 
 class ChatStreamParsingTests(unittest.TestCase):
+    def test_search_snapshot_persists_general_answer_provenance(self) -> None:
+        snapshot = _bounded_search_snapshot({
+            "results": [],
+            "answer_sources": [],
+            "evidence_status": "no_hit",
+            "answer_provenance": "general_model",
+            "general_fallback_mode": "no_hit",
+        })
+
+        self.assertEqual(
+            snapshot["counters"]["answer_provenance"],
+            "general_model",
+        )
+        self.assertEqual(
+            snapshot["counters"]["general_fallback_mode"],
+            "no_hit",
+        )
+
+    def test_search_snapshot_drops_unknown_general_fallback_metadata(self) -> None:
+        snapshot = _bounded_search_snapshot({
+            "answer_provenance": "producer_defined",
+            "general_fallback_mode": "always",
+        })
+
+        self.assertNotIn("answer_provenance", snapshot["counters"])
+        self.assertNotIn("general_fallback_mode", snapshot["counters"])
+
     def test_text_delta_content_cannot_spoof_search_results_event(self) -> None:
         content = '下面只是正文示例：{"type": "search_results"}，不是 SSE 事件。'
         chunk = (

@@ -149,6 +149,8 @@ def _runtime_settings(**overrides):
         "vision_model": "vision-model",
         "top_k": 5,
         "rerank_enabled": True,
+        "rag_general_fallback_mode": "off",
+        "rag_general_fallback_model": "",
         "show_sources": True,
         "site_title": "RAG",
         "site_description": "desc",
@@ -332,6 +334,73 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
             result = await _load(session)
 
         self.assertEqual(result["rerank_model"], "fast-reranker")
+
+    async def test_general_fallback_mode_is_saved_and_applied_immediately(self) -> None:
+        session = _Session()
+        audit = Mock()
+        settings = _runtime_settings()
+
+        with (
+            patch("api.settings.get_settings", return_value=settings),
+            patch(
+                "api.settings._load",
+                new=AsyncMock(return_value={
+                    "rag_general_fallback_mode": "no_hit_or_insufficient",
+                }),
+            ),
+        ):
+            result = await update_settings(
+                SettingsUpdate(
+                    rag_general_fallback_mode="no_hit_or_insufficient",
+                ),
+                db=session,
+                audit=audit,
+                _=None,
+            )
+
+        self.assertEqual(
+            result["rag_general_fallback_mode"],
+            "no_hit_or_insufficient",
+        )
+        self.assertEqual(
+            settings.rag_general_fallback_mode,
+            "no_hit_or_insufficient",
+        )
+        self.assertEqual(session.added[0].value, "no_hit_or_insufficient")
+        self.assertEqual(
+            audit.log.call_args.kwargs["detail"],
+            {"changed": ["rag_general_fallback_mode"]},
+        )
+
+    async def test_startup_restores_general_fallback_mode(self) -> None:
+        row = SystemSetting(
+            key="rag_general_fallback_mode",
+            value="no_hit",
+        )
+        session = _Session([row])
+        settings = _runtime_settings()
+
+        with (
+            patch("api.settings.get_settings", return_value=settings),
+            patch("database.AsyncSessionLocal", return_value=_SessionContext(session)),
+        ):
+            await apply_stored_settings()
+
+        self.assertEqual(settings.rag_general_fallback_mode, "no_hit")
+        self.assertEqual(session.commits, 0)
+
+    async def test_load_ignores_invalid_general_fallback_mode(self) -> None:
+        session = _Session([
+            SystemSetting(
+                key="rag_general_fallback_mode",
+                value="unexpected_mode",
+            ),
+        ])
+
+        with patch("api.settings.get_settings", return_value=_runtime_settings()):
+            result = await _load(session)
+
+        self.assertEqual(result["rag_general_fallback_mode"], "off")
 
     async def test_update_rejects_base_url_change_without_a_new_key(self) -> None:
         session = _Session()

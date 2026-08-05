@@ -43,6 +43,12 @@ from core.query_understanding_v3_contract import (
     QueryUnderstandingV3,
     QueryUnderstandingV3Candidate,
 )
+from core.query_semantics import (
+    KnowledgeRequestSemantics,
+    content_knowledge_request,
+    reconcile_answer_form,
+    request_kind_for_question,
+)
 from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
 from core.rag_v2.task_graph import RagExecutionBundle, compile_rag_execution_bundle
 
@@ -211,6 +217,9 @@ class CompiledQueryUnderstanding:
     validation: QueryUnderstandingV3ExecutionValidation
     compiler_decision: CompilerDecision
     description_span_ids: Mapping[str, tuple[str, ...]]
+    knowledge_request: KnowledgeRequestSemantics = field(
+        default_factory=content_knowledge_request
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, QueryPlanV2):
@@ -223,6 +232,16 @@ class CompiledQueryUnderstanding:
             raise ValueError("compiled V3 result requires execution validation")
         if self.compiler_decision not in {"compiled", "fallback"}:
             raise ValueError("compiled V3 result has unsupported decision")
+        if not isinstance(self.knowledge_request, KnowledgeRequestSemantics):
+            raise ValueError("compiled V3 result requires a knowledge request")
+        if (
+            self.compiler_decision == "fallback"
+            and (
+                self.knowledge_request.is_catalog_operation
+                or self.knowledge_request.is_result_operation
+            )
+        ):
+            raise ValueError("fallback compilation cannot grant a direct knowledge capability")
         normalized: dict[str, tuple[str, ...]] = {}
         for requirement_id, span_ids in dict(self.description_span_ids).items():
             key = str(requirement_id or "").strip()
@@ -245,6 +264,7 @@ class CompiledQueryUnderstanding:
             "answer_shape": self.plan.answer_shape,
             "requirement_count": len(self.plan.requirements),
             "description_provenance_count": len(self.description_span_ids),
+            "knowledge_request": self.knowledge_request.safe_summary(),
             "validation": self.validation.safe_summary(),
             "execution_bundle": self.execution_bundle.safe_summary(),
         }
@@ -609,13 +629,27 @@ def _answer_coverage(
     *,
     question: str,
     candidate_count: int,
+    understanding: QueryUnderstandingV3,
 ) -> tuple[str, str]:
-    """Choose only a small trusted coverage contract from surface grammar."""
+    """Compile the shared semantic form into one bounded coverage contract."""
 
-    if is_exhaustive_configuration_request(question):
-        return "collection", "structured_collection"
-    frame = parse_query_surface_frame(question)
-    if candidate_count == 1 and frame is not None and frame.question_operator == "enumeration":
+    answer_form = reconcile_answer_form(
+        question,
+        understanding.knowledge_request.answer_form,
+        candidate_count=candidate_count,
+    )
+    if answer_form == "procedure":
+        # A configuration operation is usually a source-authored assignment
+        # (YAML/properties/path -> value), not an ordered human procedure.
+        # Keep ordinary ``怎么办``/``怎么处理`` questions on the stricter
+        # ordered-step contract while sharing the distinction with V2's local
+        # planner through the semantic request-kind classifier.
+        if request_kind_for_question(question) == "configuration_procedure":
+            return "collection", "structured_collection"
+        return "collection", "ordered_steps"
+    if answer_form == "overview":
+        return "collection", "document_policy"
+    if answer_form == "enumeration":
         return "collection", "structured_collection"
     return "single", "single_claim"
 
@@ -625,17 +659,26 @@ def _answer_shape(
     question: str,
     candidate_count: int,
     floor: BaselineFloor,
+    understanding: QueryUnderstandingV3,
 ) -> str:
+    answer_form = reconcile_answer_form(
+        question,
+        understanding.knowledge_request.answer_form,
+        candidate_count=candidate_count,
+    )
     if _is_explicit_scope_comparison(question, floor):
+        return "comparison"
+    if answer_form == "comparison":
         return "comparison"
     if candidate_count > 1:
         return "multi_part"
-    if is_exhaustive_configuration_request(question):
+    if answer_form == "enumeration":
         return "list"
-    frame = parse_query_surface_frame(question)
-    if frame is not None and frame.question_operator == "enumeration":
-        return "list"
-    return "fact"
+    return {
+        "procedure": "process",
+        "overview": "overview",
+        "judgement": "judgement",
+    }.get(answer_form, "fact")
 
 
 def _classification_subject(
@@ -869,6 +912,7 @@ def _compiled_plan(
             coverage_mode, coverage_contract = _answer_coverage(
                 question=floor.current_question,
                 candidate_count=len(understanding.answer_candidates),
+                understanding=understanding,
             )
             requirements.append(AnswerRequirementV2(
                 id=requirement_id,
@@ -933,6 +977,7 @@ def _compiled_plan(
             question=floor.current_question,
             candidate_count=len(understanding.answer_candidates),
             floor=floor,
+            understanding=understanding,
         ),
         # The task graph owns executable task queries.  Keeping the immutable
         # original question as the only flat recall query both preserves the
@@ -973,6 +1018,7 @@ def compile_query_understanding(
             validation=validation,
             compiler_decision="fallback",
             description_span_ids={},
+            knowledge_request=content_knowledge_request(),
         )
 
     plan, provenance = _compiled_plan(
@@ -993,6 +1039,7 @@ def compile_query_understanding(
         validation=validation,
         compiler_decision="compiled",
         description_span_ids=provenance,
+        knowledge_request=understanding.knowledge_request,
     )
 
 

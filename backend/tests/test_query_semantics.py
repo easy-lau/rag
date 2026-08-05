@@ -7,7 +7,11 @@ from core.query_analysis_contract import (
     parse_query_analysis,
 )
 from core.query_analysis_validation import validate_query_analysis_for_execution
-from core.query_semantics import resolve_turn_semantics
+from core.query_semantics import (
+    KnowledgeRequestSemantics,
+    document_catalog_surface_operation,
+    resolve_turn_semantics,
+)
 from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
 
 
@@ -39,6 +43,29 @@ def _generic_baseline(question: str) -> QueryPlanV2:
 
 
 class ResolvedTurnSemanticsTests(unittest.TestCase):
+    def test_document_catalog_contract_and_prefetch_surface_are_generic(self):
+        request = KnowledgeRequestSemantics(
+            resource="document_catalog",
+            operation="group",
+            group_by="status",
+            status_filter="any",
+        )
+
+        self.assertTrue(request.is_catalog_operation)
+        self.assertEqual(
+            document_catalog_surface_operation("按状态分别统计这些文档"),
+            "group",
+        )
+        self.assertEqual(
+            document_catalog_surface_operation("当前知识库有多少篇文章"),
+            "count",
+        )
+        self.assertEqual(
+            document_catalog_surface_operation("列出文档名称和状态"),
+            "list",
+        )
+        self.assertIsNone(document_catalog_surface_operation("如何配置登录密码"))
+
     def test_contextual_single_target_keeps_history_as_a_source_ref(self):
         current = "餐补呢"
         previous = "普通员工的住宿标准是多少"

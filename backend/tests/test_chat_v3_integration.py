@@ -15,7 +15,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from api.chat import send_message
+from api.chat import _v3_active_timeout_seconds, send_message
 from core.conversation_context import ConversationContext, RouteTurnCandidate
 from core.query_analysis_execution import (
     build_execution_baseline,
@@ -192,6 +192,7 @@ def _compiled_v3_result(
     target_texts: tuple[str, ...],
     qualifier_text: str | None = None,
     qualifier_source_key: str = "current",
+    knowledge_request: dict | None = None,
 ) -> QueryUnderstandingV3ExecutionResult:
     """Compile a real catalog-bound V3 result for the supplied chat baseline."""
 
@@ -219,6 +220,14 @@ def _compiled_v3_result(
             }
             for index, target in enumerate(target_texts, start=1)
         ],
+        "knowledge_request": knowledge_request or {
+            "resource": "document_content",
+            "operation": "answer",
+            "filter_span_ids": [],
+            "group_by": "none",
+            "status_filter": "any",
+            "result_handles": [],
+        },
     }
     understanding = parse_query_understanding(
         json.dumps(raw, ensure_ascii=False),
@@ -308,6 +317,261 @@ async def _sse_events(response) -> list[dict]:
 
 
 class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_v3_active_timeout_uses_global_llm_timeout_when_unset(self) -> None:
+        settings = SimpleNamespace(
+            rag_query_understanding_v3_active_timeout_seconds=None,
+            llm_request_timeout_seconds=60.0,
+        )
+
+        self.assertEqual(_v3_active_timeout_seconds(settings), 60.0)
+
+    async def test_catalog_capability_skips_vector_prefetch_and_v2_runner(self) -> None:
+        question = "我现在有关于云枢配置的知识库有几个文章"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+        )
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=None,
+            active_task_revision=0,
+        )
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        catalog_calls: list[dict] = []
+
+        class V3Service:
+            async def run_active(self, **kwargs):
+                catalog = SourceSpanCatalog.build(
+                    current_question=kwargs["baseline"].fallback.question,
+                    route_context=kwargs["baseline"].fallback.route_context,
+                )
+                return _compiled_v3_result(
+                    baseline=kwargs["baseline"],
+                    target_texts=("知识库有几个文章",),
+                    knowledge_request={
+                        "resource": "document_catalog",
+                        "operation": "count",
+                        "filter_span_ids": [
+                            _span_id(catalog, "云枢配置", source_key="current")
+                        ],
+                        "group_by": "none",
+                        "status_filter": "any",
+                    },
+                )
+
+        async def catalog_stream(**kwargs):
+            catalog_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "text_delta",
+                "content": "当前授权范围内没有匹配文章。",
+            }, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        no_prefetch = AsyncMock(
+            side_effect=AssertionError("catalog request must not prefetch vectors")
+        )
+
+        async def no_v2_stream(**_kwargs):
+            raise AssertionError("catalog request must not enter V2 retrieval")
+            yield  # pragma: no cover
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=_routing_result(selected_kb_count=1)),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=_v3_settings(anchor_prefetch_enabled=True),
+            ),
+            patch(
+                "api.chat.get_query_analysis_execution_service",
+                side_effect=AssertionError("V3 request must not invoke legacy analysis"),
+            ),
+            patch(
+                "api.chat.get_query_understanding_v3_execution_service",
+                return_value=V3Service(),
+            ),
+            patch(
+                "api.chat.apply_v3_catalog_context_selection",
+                new=AsyncMock(return_value=context),
+            ),
+            patch("api.chat.retrieve_anchor_retrieval_snapshot", new=no_prefetch),
+            patch("api.chat.run_rag_v2_stream", new=no_v2_stream),
+            patch("api.chat.run_knowledge_catalog_stream", new=catalog_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        no_prefetch.assert_not_awaited()
+        self.assertEqual(len(catalog_calls), 1)
+        self.assertEqual(catalog_calls[0]["kb_ids"], [kb_id])
+        self.assertNotIn("execution_bundle", catalog_calls[0])
+        request = catalog_calls[0]["knowledge_request"]
+        self.assertTrue(request.is_catalog_operation)
+        self.assertEqual(request.operation, "count")
+        self.assertEqual(request.filter_terms, ("云枢配置",))
+
+    async def test_result_reference_dispatches_only_the_selected_prior_document(self) -> None:
+        question = "我想看第一个文章"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        first_doc_id = uuid.uuid4()
+        second_doc_id = uuid.uuid4()
+        prior_sources = tuple({
+            "source_kind": "document_metadata",
+            "id": str(doc_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "filename": filename,
+            "status": "ready",
+            "evidence_role": "direct",
+        } for doc_id, filename in (
+            (first_doc_id, "第一篇.md"),
+            (second_doc_id, "第二篇.md"),
+        ))
+        candidate = RouteTurnCandidate(
+            candidate_key="t1",
+            user_question="列出当前文章",
+            assistant_answer="1. 第一篇.md\n2. 第二篇.md",
+            raw_sources=prior_sources,
+        )
+        context = ConversationContext(
+            is_followup=True,
+            followup_reason="result_reference",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=prior_sources,
+            route_turn_candidates=(candidate,),
+            relation="followup",
+            query_resolution_mode="v3_catalog",
+            context_turn_keys=("t1",),
+        )
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=None,
+            active_task_revision=0,
+        )
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        result_calls: list[dict] = []
+
+        class V3Service:
+            async def run_active(self, **kwargs):
+                if not kwargs["baseline"].fallback.route_context[0].get("result_items"):
+                    raise AssertionError(kwargs["baseline"].fallback.route_context)
+                return _compiled_v3_result(
+                    baseline=kwargs["baseline"],
+                    target_texts=(question,),
+                    knowledge_request={
+                        "resource": "document_result",
+                        "operation": "read",
+                        "filter_span_ids": [],
+                        "group_by": "none",
+                        "status_filter": "any",
+                        "result_handles": ["r_t1_001"],
+                    },
+                )
+
+        async def result_stream(**kwargs):
+            result_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "text_delta",
+                "content": "文档当前不可读。",
+            }, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        async def no_v2_stream(**_kwargs):
+            raise AssertionError("result reference must not enter vector retrieval")
+            yield  # pragma: no cover
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch("api.chat.prepare_conversation_context", new=AsyncMock(return_value=context)),
+            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=_routing_result(selected_kb_count=1))),
+            patch("api.chat.get_settings", return_value=_v3_settings(anchor_prefetch_enabled=False)),
+            patch("api.chat.get_query_understanding_v3_execution_service", return_value=V3Service()),
+            patch("api.chat.apply_v3_catalog_context_selection", new=AsyncMock(return_value=context)),
+            patch("api.chat.run_rag_v2_stream", new=no_v2_stream),
+            patch("api.chat.run_knowledge_result_stream", new=result_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        self.assertEqual(len(result_calls), 1, trace.call_args_list)
+        call = result_calls[0]
+        self.assertTrue(call["knowledge_request"].is_result_operation)
+        self.assertEqual(call["knowledge_request"].result_handles, ("r_t1_001",))
+        self.assertEqual(len(call["result_sources"]), 1)
+        self.assertEqual(call["result_sources"][0]["doc_id"], str(first_doc_id))
+
     async def test_verified_missing_object_followup_does_not_wait_for_v3_model(self) -> None:
         question = "应该如何配置"
         conversation_id = uuid.uuid4()

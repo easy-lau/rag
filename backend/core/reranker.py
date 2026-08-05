@@ -18,6 +18,7 @@ from typing import Any, Literal, Sequence
 
 from config import get_settings
 from core.openai_client import get_client
+from core.structured_output import create_structured_completion
 from core.query_constraints import (
     ConstraintStatus,
     QueryConstraints,
@@ -1683,7 +1684,8 @@ async def _repair_joint_response_once(
     results: Sequence[dict],
     requirements: Sequence[AnswerRequirement],
     timeout: float,
-    response_format: dict[str, Any],
+    provider_identity: object,
+    strict_response_format: dict[str, Any],
 ) -> _ParsedJointResponse:
     """用不含候选全文的短提示修复一次结构，不重复或递归重试。"""
 
@@ -1693,21 +1695,27 @@ async def _repair_joint_response_once(
         result_count=len(results),
         requirements=requirements,
     )
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": _JOINT_REPAIR_SYSTEM_PROMPT},
-            {"role": "user", "content": repair_prompt},
-        ],
-        temperature=0,
-        max_tokens=min(
-            2800,
-            max(900, 700 + len(requirements) * 160),
-        ),
-        response_format=response_format,
+    structured = await create_structured_completion(
+        client,
+        request={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _JOINT_REPAIR_SYSTEM_PROMPT},
+                {"role": "user", "content": repair_prompt},
+            ],
+            "temperature": 0,
+            "max_tokens": min(
+                2800,
+                max(900, 700 + len(requirements) * 160),
+            ),
+        },
+        strict_response_format=strict_response_format,
         # 修复不应再次占用一次完整重排的时长。
-        timeout=max(1.0, min(timeout, 8.0)),
+        timeout_seconds=max(1.0, min(timeout, 8.0)),
+        provider_identity=provider_identity,
+        model=model,
     )
+    response = structured.response
     repaired_raw = response.choices[0].message.content
     if not isinstance(repaired_raw, str) or not repaired_raw.strip():
         raise ValueError(
@@ -2973,36 +2981,16 @@ async def joint_rerank_with_coverage(
             result_count=len(results),
             requirements=normalized_requirements,
         )
-        repair_response_format = strict_response_format
-        request_started_at = time.perf_counter()
-        try:
-            response = await client.chat.completions.create(
-                **request,
-                response_format=strict_response_format,
-            )
-        except Exception as schema_error:
-            if not _strict_json_schema_is_unsupported(schema_error):
-                raise
-            # 兼容明确不支持 structured outputs 的 OpenAI-compatible 服务。
-            # 仅降级一次到 json_object，本地严格解析仍是最终信任边界。
-            remaining_timeout = timeout - (
-                time.perf_counter() - request_started_at
-            )
-            if remaining_timeout <= 0.1:
-                raise TimeoutError(
-                    "联合重排 JSON 契约降级期限已耗尽"
-                ) from schema_error
-            logger.info(
-                "[联合证据重排] 上游不支持 strict JSON Schema，"
-                "降级一次 json_object: %s",
-                type(schema_error).__name__,
-            )
-            request["timeout"] = remaining_timeout
-            repair_response_format = {"type": "json_object"}
-            response = await client.chat.completions.create(
-                **request,
-                response_format=repair_response_format,
-            )
+        provider_identity = getattr(settings, "llm_base_url", "")
+        structured = await create_structured_completion(
+            client,
+            request=request,
+            strict_response_format=strict_response_format,
+            timeout_seconds=timeout,
+            provider_identity=provider_identity,
+            model=model,
+        )
+        response = structured.response
         raw = response.choices[0].message.content
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError("联合重排模型返回空内容")
@@ -3028,7 +3016,8 @@ async def joint_rerank_with_coverage(
                 results=results,
                 requirements=normalized_requirements,
                 timeout=timeout,
-                response_format=repair_response_format,
+                provider_identity=provider_identity,
+                strict_response_format=strict_response_format,
             )
             logger.info("[联合证据重排] 结构修复成功")
         ranked, items_by_index = _materialize_joint_candidates(

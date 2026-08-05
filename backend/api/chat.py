@@ -18,6 +18,7 @@ from models.db_models import (
     Document,
     DocumentChunk,
     IntentRouteLog,
+    KnowledgeBase,
     Message,
     User,
     now_utc,
@@ -55,6 +56,12 @@ from models.schemas import (
 from core.rag_v2.pipeline import (
     retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
+)
+from core.knowledge_catalog import run_knowledge_catalog_stream
+from core.knowledge_result import run_knowledge_result_stream
+from core.query_semantics import (
+    content_knowledge_request,
+    document_catalog_surface_operation,
 )
 # Transitional test/import alias only; it points at V2 and is not a legacy
 # execution path.
@@ -102,6 +109,7 @@ from core.conversation_context import (
     has_verified_deterministic_followup_context,
     prepare_conversation_context,
     resolve_routed_conversation_context,
+    resolve_result_reference_sources,
     route_context_payloads,
 )
 from core.query_route_compiler import (
@@ -158,6 +166,28 @@ _CHOICE_TEXT_FIELDS = (
     "filenames",
 )
 _CHOICE_UUID_FIELDS = ("kb_ids", "doc_ids")
+
+
+def _v3_active_timeout_seconds(settings: Any) -> float:
+    """Resolve V3's optional per-stage deadline without removing LLM safety.
+
+    ``None`` deliberately means "no V3-specific hard limit".  The request
+    still uses the ordinary LLM timeout so an unavailable upstream cannot keep
+    a streaming chat request open indefinitely.
+    """
+
+    configured = getattr(
+        settings,
+        "rag_query_understanding_v3_active_timeout_seconds",
+        None,
+    )
+    if configured is None:
+        configured = getattr(settings, "llm_request_timeout_seconds", 60.0)
+    if isinstance(configured, bool):
+        raise ValueError("V3 active timeout must be numeric or None")
+    return max(0.1, float(configured))
+
+
 _PUBLIC_CHOICE_FIELDS = (
     "key",
     "label",
@@ -1709,19 +1739,34 @@ def _bounded_source_identity_snapshot(value: object) -> dict | None:
 
     if not isinstance(value, dict):
         return None
-    identity = _source_snapshot_identity(value)
-    if identity is None:
+    metadata_identity = _metadata_source_snapshot_identity(value)
+    chunk_identity = _source_snapshot_identity(value)
+    if metadata_identity is not None:
+        kb_id, doc_id = metadata_identity
+        item: dict[str, object] = {
+            "source_kind": "document_metadata",
+            "id": str(doc_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+        }
+    elif chunk_identity is not None:
+        kb_id, doc_id, chunk_id = chunk_identity
+        item = {
+            "source_kind": "document_chunk",
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+        }
+    else:
         return None
-    kb_id, doc_id, chunk_id = identity
-    item: dict[str, object] = {
-        "id": str(chunk_id),
-        "chunk_id": str(chunk_id),
-        "doc_id": str(doc_id),
-        "kb_id": str(kb_id),
-    }
     for key in (
         "filename",
         "file_type",
+        "status",
+        "status_label",
+        "is_active",
+        "knowledge_base_name",
         "chunk_index",
         "score",
         "retrieval_score",
@@ -1780,9 +1825,24 @@ def _bounded_search_snapshot(payload: object) -> dict:
         "evidence_status",
         "coverage_status",
         "trace_id",
+        "answer_provenance",
+        "general_fallback_mode",
     ):
         if key in data:
-            counters[key] = data.get(key)
+            value = data.get(key)
+            if key == "answer_provenance":
+                value = str(value or "").strip().casefold()
+                if value not in {"knowledge_base", "general_model"}:
+                    continue
+            elif key == "general_fallback_mode":
+                value = str(value or "").strip().casefold()
+                if value not in {
+                    "off",
+                    "no_hit",
+                    "no_hit_or_insufficient",
+                }:
+                    continue
+            counters[key] = value
     return {
         "schema_version": "rag_search_snapshot.v1",
         "candidates": candidates,
@@ -1854,7 +1914,11 @@ def _source_snapshot_identity(
     后已删除的旧 content 仍从 Message.sources JSON 中返回。
     """
 
-    if not isinstance(source, dict):
+    if (
+        not isinstance(source, dict)
+        or str(source.get("source_kind") or "").strip().casefold()
+        == "document_metadata"
+    ):
         return None
     try:
         kb_id = uuid.UUID(str(source.get("kb_id")))
@@ -1874,6 +1938,35 @@ def _source_snapshot_identity(
     return kb_id, doc_id, chunk_id
 
 
+def _metadata_source_snapshot_identity(
+    source: object,
+) -> tuple[uuid.UUID, uuid.UUID] | None:
+    """Read one authoritative document-metadata source identity.
+
+    Metadata answers prove catalog facts from the document row itself, so a
+    chunk id would be both artificial and stale after re-chunking.  The source
+    kind is mandatory and the producer ``id`` alias, when present, must equal
+    ``doc_id`` before the database refresh below can trust it.
+    """
+
+    if (
+        not isinstance(source, dict)
+        or str(source.get("source_kind") or "").strip().casefold()
+        != "document_metadata"
+    ):
+        return None
+    try:
+        kb_id = uuid.UUID(str(source.get("kb_id")))
+        doc_id = uuid.UUID(str(source.get("doc_id")))
+        if source.get("id") is not None and uuid.UUID(str(source.get("id"))) != doc_id:
+            return None
+        if source.get("chunk_id") is not None:
+            return None
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return kb_id, doc_id
+
+
 async def _validate_stream_answer_sources(
     db: AsyncSession,
     *,
@@ -1887,10 +1980,12 @@ async def _validate_stream_answer_sources(
     ``search_results`` is an internal SSE boundary, but it is still possible
     for a rolling/custom producer to emit stale or forged source snapshots.
     Before those snapshots are persisted (or used to resolve a pending scope),
-    require a complete ``kb/doc/chunk`` identity, membership in the current
-    request's KB set and a live ``DocumentChunk`` joined to an active/ready
-    document.  The returned source body is reloaded from the database so old
-    or producer-supplied content cannot cross the boundary.
+    require membership in the current request's KB set and reload one of two
+    trusted identities: ``kb/doc/chunk`` for active/ready content evidence, or
+    ``kb/doc`` for catalog metadata.  Metadata deliberately accepts inactive,
+    processing and failed documents because those states can themselves be
+    the fact being answered.  Every returned field is refreshed from the
+    database so stale producer content cannot cross the boundary.
 
     An empty source list is a valid no-evidence result and returns ``None`` as
     the validation error.  Any non-empty list is fail-closed when the DB
@@ -1920,15 +2015,20 @@ async def _validate_stream_answer_sources(
     if not allowed_kb_ids:
         return [], set(), "selected_kb_ids_empty"
 
-    parsed_sources: list[tuple[dict, tuple[uuid.UUID, uuid.UUID, uuid.UUID]]] = []
-    seen_source_identities: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = set()
+    parsed_sources: list[tuple[dict, tuple[Any, ...]]] = []
+    seen_source_identities: set[tuple[Any, ...]] = set()
     for raw_source in raw_sources:
         if not isinstance(raw_source, dict):
             return [], set(), "answer_source_not_an_object"
-        identity = _source_snapshot_identity(raw_source)
-        if identity is None:
+        metadata_identity = _metadata_source_snapshot_identity(raw_source)
+        chunk_identity = _source_snapshot_identity(raw_source)
+        if metadata_identity is not None:
+            identity: tuple[Any, ...] = ("document_metadata", *metadata_identity)
+        elif chunk_identity is not None:
+            identity = ("document_chunk", *chunk_identity)
+        else:
             return [], set(), "answer_source_identity_invalid"
-        kb_id, _doc_id, _chunk_id = identity
+        kb_id = identity[1]
         if kb_id not in allowed_kb_ids:
             return [], set(), "answer_source_kb_forbidden"
         if identity in seen_source_identities:
@@ -1945,17 +2045,29 @@ async def _validate_stream_answer_sources(
     # A source claimed as generation context must also be present in the
     # producer's displayed result snapshot.  This catches a common rolling
     # upgrade failure where answer_sources is populated from a previous pass.
-    result_identities: set[tuple[uuid.UUID, uuid.UUID, uuid.UUID]] = set()
+    result_identities: set[tuple[Any, ...]] = set()
     for raw_result in raw_results:
         if not isinstance(raw_result, dict):
             continue
-        identity = _source_snapshot_identity(raw_result)
-        if identity is not None:
-            result_identities.add(identity)
+        metadata_identity = _metadata_source_snapshot_identity(raw_result)
+        chunk_identity = _source_snapshot_identity(raw_result)
+        if metadata_identity is not None:
+            result_identities.add(("document_metadata", *metadata_identity))
+        elif chunk_identity is not None:
+            result_identities.add(("document_chunk", *chunk_identity))
     if any(identity not in result_identities for _, identity in parsed_sources):
         return [], set(), "answer_source_not_in_results"
 
-    chunk_ids = {identity[2] for _, identity in parsed_sources}
+    chunk_ids = {
+        identity[3]
+        for _, identity in parsed_sources
+        if identity[0] == "document_chunk"
+    }
+    metadata_document_ids = {
+        identity[2]
+        for _, identity in parsed_sources
+        if identity[0] == "document_metadata"
+    }
     # ``isolated_read_session`` always rolls back its owned read transaction
     # before closing it.  SQLAlchemy consequently expires ORM instances on
     # that boundary, even when the session factory normally uses
@@ -1963,22 +2075,8 @@ async def _validate_stream_answer_sources(
     # snapshot *inside* that boundary; retaining ORM rows for projection below
     # would turn an otherwise successful validation into a detached-instance
     # failure after the request has already generated an answer.
-    current: dict[tuple[uuid.UUID, uuid.UUID, uuid.UUID], dict[str, object]] = {}
+    current: dict[tuple[Any, ...], dict[str, object]] = {}
     try:
-        statement = (
-            select(DocumentChunk, Document)
-            .join(
-                Document,
-                (Document.id == DocumentChunk.doc_id)
-                & (Document.kb_id == DocumentChunk.kb_id),
-            )
-            .where(
-                DocumentChunk.id.in_(chunk_ids),
-                DocumentChunk.kb_id.in_(allowed_kb_ids),
-                Document.is_active.is_(True),
-                Document.status == "ready",
-            )
-        )
         # This defensive validation is allowed to fail closed, but it must not
         # inherit an aborted transaction from an unrelated optional read (for
         # example a rolling registry migration).  The request session still
@@ -1988,36 +2086,123 @@ async def _validate_stream_answer_sources(
             request_db=db,
             session_factory=read_session_factory,
         ) as read_db:
-            result = await read_db.execute(statement)
-            rows = result.all() if hasattr(result, "all") else []
-            for row in rows or ():
-                try:
-                    chunk, document = row
-                    if (
-                        document is None
-                        or document.is_active is not True
-                        or str(document.status or "").strip().casefold() != "ready"
-                        or document.id != chunk.doc_id
-                        or document.kb_id != chunk.kb_id
-                    ):
+            if chunk_ids:
+                chunk_statement = (
+                    select(DocumentChunk, Document)
+                    .join(
+                        Document,
+                        (Document.id == DocumentChunk.doc_id)
+                        & (Document.kb_id == DocumentChunk.kb_id),
+                    )
+                    .where(
+                        DocumentChunk.id.in_(chunk_ids),
+                        DocumentChunk.kb_id.in_(allowed_kb_ids),
+                        Document.is_active.is_(True),
+                        Document.status == "ready",
+                    )
+                )
+                result = await read_db.execute(chunk_statement)
+                rows = result.all() if hasattr(result, "all") else []
+                for row in rows or ():
+                    try:
+                        chunk, document = row
+                        if (
+                            document is None
+                            or document.is_active is not True
+                            or str(document.status or "").strip().casefold() != "ready"
+                            or document.id != chunk.doc_id
+                            or document.kb_id != chunk.kb_id
+                        ):
+                            continue
+                        identity = (
+                            "document_chunk",
+                            chunk.kb_id,
+                            chunk.doc_id,
+                            chunk.id,
+                        )
+                        current[identity] = {
+                            "source_kind": "document_chunk",
+                            "id": str(chunk.id),
+                            "chunk_id": str(chunk.id),
+                            "doc_id": str(chunk.doc_id),
+                            "kb_id": str(chunk.kb_id),
+                            "content": chunk.content,
+                            "chunk_index": chunk.chunk_index,
+                            "metadata": dict(chunk.metadata_ or {}),
+                            "filename": document.filename,
+                            "file_type": document.file_type,
+                            "source_url": document.source_url,
+                            "image_url": document.image_url,
+                            "doc_tags": list(document.tags or []),
+                        }
+                    except (TypeError, ValueError, AttributeError):
                         continue
-                    identity = (chunk.kb_id, chunk.doc_id, chunk.id)
-                    current[identity] = {
-                        "id": str(chunk.id),
-                        "chunk_id": str(chunk.id),
-                        "doc_id": str(chunk.doc_id),
-                        "kb_id": str(chunk.kb_id),
-                        "content": chunk.content,
-                        "chunk_index": chunk.chunk_index,
-                        "metadata": dict(chunk.metadata_ or {}),
-                        "filename": document.filename,
-                        "file_type": document.file_type,
-                        "source_url": document.source_url,
-                        "image_url": document.image_url,
-                        "doc_tags": list(document.tags or []),
-                    }
-                except (TypeError, ValueError, AttributeError):
-                    continue
+            if metadata_document_ids:
+                metadata_statement = (
+                    select(Document, KnowledgeBase)
+                    .join(KnowledgeBase, KnowledgeBase.id == Document.kb_id)
+                    .where(
+                        Document.id.in_(metadata_document_ids),
+                        Document.kb_id.in_(allowed_kb_ids),
+                    )
+                )
+                result = await read_db.execute(metadata_statement)
+                rows = result.all() if hasattr(result, "all") else []
+                for row in rows or ():
+                    try:
+                        document, knowledge_base = row
+                        if (
+                            document is None
+                            or knowledge_base is None
+                            or document.kb_id != knowledge_base.id
+                        ):
+                            continue
+                        status = (
+                            str(document.status or "").strip().casefold()
+                            if document.is_active is True
+                            else "inactive"
+                        )
+                        identity = (
+                            "document_metadata",
+                            document.kb_id,
+                            document.id,
+                        )
+                        current[identity] = {
+                            "source_kind": "document_metadata",
+                            "id": str(document.id),
+                            "doc_id": str(document.id),
+                            "kb_id": str(document.kb_id),
+                            "filename": document.filename,
+                            "file_type": document.file_type,
+                            "status": status,
+                            "status_label": {
+                                "ready": "已就绪",
+                                "processing": "处理中",
+                                "failed": "处理失败",
+                                "inactive": "已停用",
+                            }.get(status, status or "未知"),
+                            "is_active": bool(document.is_active),
+                            "doc_tags": list(document.tags or []),
+                            "knowledge_base_name": knowledge_base.name,
+                            "created_at": (
+                                document.created_at.isoformat()
+                                if document.created_at
+                                else None
+                            ),
+                            "updated_at": (
+                                document.updated_at.isoformat()
+                                if document.updated_at
+                                else None
+                            ),
+                            "content": (
+                                f"文档名称：{document.filename}；"
+                                f"知识库：{knowledge_base.name}；"
+                                f"状态：{status or '未知'}；"
+                                f"文件类型：{document.file_type or '未知'}"
+                            ),
+                        }
+                    except (TypeError, ValueError, AttributeError):
+                        continue
     except Exception as exc:
         # Do not expose producer content or clear a pending scope when the
         # authorization refresh itself is unavailable.  The caller records a
@@ -2041,7 +2226,7 @@ async def _validate_stream_answer_sources(
                 **refreshed_snapshot,
             }
         )
-        answer_pairs.add((identity[0], identity[1]))
+        answer_pairs.add((identity[1], identity[2]))
     return refreshed, answer_pairs, None
 
 
@@ -2440,11 +2625,25 @@ async def _messages_with_current_source_scope(
                     "evidence_status",
                     "coverage_status",
                     "trace_id",
+                    "answer_provenance",
+                    "general_fallback_mode",
                 ):
                     value = counters.get(key)
                     if isinstance(value, (str, int, float, bool)) or value is None:
                         if key == "evidence_status":
                             value = _read_evidence_status(value)
+                        elif key == "answer_provenance":
+                            value = str(value or "").strip().casefold()
+                            if value not in {"knowledge_base", "general_model"}:
+                                continue
+                        elif key == "general_fallback_mode":
+                            value = str(value or "").strip().casefold()
+                            if value not in {
+                                "off",
+                                "no_hit",
+                                "no_hit_or_insufficient",
+                            }:
+                                continue
                         safe_counters[key] = value
 
             def refreshed_snapshot_items(key: str) -> list[dict]:
@@ -3180,6 +3379,8 @@ async def _existing_turn_response(
 
 def _query_analysis_route_context(
     context: ConversationContext,
+    *,
+    kb_ids: list[uuid.UUID],
 ) -> tuple[dict[str, Any], ...]:
     """Expose bounded historical candidates to source-anchored analysis.
 
@@ -3194,11 +3395,10 @@ def _query_analysis_route_context(
     and the backend later reloads sources under current RBAC/KB scope.
     """
 
-    return tuple({
-        "candidate_key": candidate.candidate_key,
-        "user_input": candidate.user_question,
-        "assistant_answer": candidate.assistant_answer or "",
-    } for candidate in context.route_turn_candidates)
+    return tuple(
+        candidate.to_analysis_dict(allowed_kb_ids=kb_ids)
+        for candidate in context.route_turn_candidates
+    )
 
 
 @router.post("/send")
@@ -4110,8 +4310,10 @@ async def send_message(
     v3_revision_fence: QueryUnderstandingV3RevisionFence | None = None
     v3_anchor_prefetch_revision: str | None = None
     v3_anchor_prefetch_enabled = False
+    v3_anchor_prefetch_suppression_reason = "disabled_by_configuration"
     v3_anchor_snapshot = None
     v3_anchor_snapshot_revision: str | None = None
+    knowledge_request = content_knowledge_request()
     analyzer_mode = "off"
     deterministic_analysis_pending = False
     active_analysis_pending = False
@@ -4181,6 +4383,7 @@ async def send_message(
         execution_plan = local_surface_plan
         analysis_route_context = _query_analysis_route_context(
             conversation_context,
+            kb_ids=payload.knowledge_base_ids,
         )
         v3_route_context = analysis_route_context
         execution_baseline = build_execution_baseline(
@@ -4234,11 +4437,24 @@ async def send_message(
                 )
             elif v3_mode == "active":
                 v3_active_pending = True
-                v3_anchor_prefetch_enabled = bool(getattr(
+                configured_anchor_prefetch = bool(getattr(
                     settings,
                     "rag_query_understanding_v3_anchor_prefetch_enabled",
                     True,
                 ))
+                catalog_surface_operation = document_catalog_surface_operation(
+                    execution_question
+                )
+                v3_anchor_prefetch_enabled = bool(
+                    configured_anchor_prefetch
+                    and catalog_surface_operation is None
+                )
+                v3_anchor_prefetch_suppression_reason = (
+                    "catalog_surface_preflight"
+                    if configured_anchor_prefetch
+                    and catalog_surface_operation is not None
+                    else "disabled_by_configuration"
+                )
             else:
                 v3_shadow_pending = True
         # `intent` is the client-visible routing envelope.  Keep the final V2
@@ -4645,6 +4861,7 @@ async def send_message(
         nonlocal effective_retrieval_query, semantic_context_applied
         nonlocal v2_execution_context, execution_baseline, query_execution_gate
         nonlocal v3_anchor_snapshot, v3_anchor_snapshot_revision
+        nonlocal knowledge_request, rag_stream_runner
         full_response = []
         sources = []
         tokens = None
@@ -4773,11 +4990,7 @@ async def send_message(
                         trace_id=trace_id,
                         conversation_id=str(conv.id),
                         user_id=str(user.id),
-                        timeout_seconds=float(getattr(
-                            settings,
-                            "rag_query_understanding_v3_active_timeout_seconds",
-                            2.5,
-                        )),
+                        timeout_seconds=_v3_active_timeout_seconds(settings),
                         maximum_inflight=int(getattr(
                             settings,
                             "rag_query_understanding_v3_active_max_inflight",
@@ -4818,11 +5031,7 @@ async def send_message(
                     trace_id=trace_id,
                     conversation_id=str(conv.id),
                     user_id=str(user.id),
-                    timeout_seconds=float(getattr(
-                        settings,
-                        "rag_query_understanding_v3_active_timeout_seconds",
-                        2.5,
-                    )),
+                    timeout_seconds=_v3_active_timeout_seconds(settings),
                     maximum_inflight=int(getattr(
                         settings,
                         "rag_query_understanding_v3_active_max_inflight",
@@ -4865,7 +5074,7 @@ async def send_message(
                     trace_id=trace_id,
                     conversation_id=conv.id,
                     user_id=user.id,
-                    reason="disabled_by_configuration",
+                    reason=v3_anchor_prefetch_suppression_reason,
             )
             v3_decision = None
             v3_adopted = False
@@ -4984,6 +5193,14 @@ async def send_message(
                     execution_baseline = v3_decision.selected_baseline
                     execution_bundle = v3_decision.execution_bundle
                     query_execution_gate = v3_decision.query_execution_gate
+                    if v3_decision.applied:
+                        if v3_decision.compilation is None:
+                            raise ValueError(
+                                "accepted V3 decision lacks a compilation"
+                            )
+                        knowledge_request = (
+                            v3_decision.compilation.knowledge_request
+                        )
                     if resolved_v3_context is not None and resolved_v3_execution_context is not None:
                         conversation_context = resolved_v3_context
                         v2_execution_context = resolved_v3_execution_context
@@ -5065,7 +5282,11 @@ async def send_message(
             # Only a finished prefetch can be reused.  Waiting after the
             # semantic barrier would recreate the old "thinking" stall; a
             # late cache is cancelled and V2 performs its ordinary anchor read.
-            if v3_adopted:
+            if (
+                v3_adopted
+                and not knowledge_request.is_catalog_operation
+                and not knowledge_request.is_result_operation
+            ):
                 if v3_anchor_task is not None and v3_anchor_task.done():
                     try:
                         v3_anchor_snapshot = await v3_anchor_task
@@ -5115,7 +5336,14 @@ async def send_message(
                     trace_id=trace_id,
                     conversation_id=conv.id,
                     user_id=user.id,
-                    reason="semantic_decision_not_adopted",
+                    reason=(
+                        "direct_knowledge_capability_selected"
+                        if (
+                            knowledge_request.is_catalog_operation
+                            or knowledge_request.is_result_operation
+                        )
+                        else "semantic_decision_not_adopted"
+                    ),
                 )
             v3_revision_fence.seal()
             trace_event(
@@ -5236,7 +5464,32 @@ async def send_message(
                 _turn_state_event(durable_turn), ensure_ascii=False
             ) + "\n\n"
         try:
-            if pipeline_version == "v2":
+            catalog_execution = knowledge_request.is_catalog_operation
+            result_execution = knowledge_request.is_result_operation
+            result_sources: tuple[dict[str, Any], ...] = ()
+            if catalog_execution or result_execution:
+                if pipeline_version != "v2" or not v3_adopted:
+                    raise ValueError(
+                        "direct knowledge execution requires an adopted V3 capability"
+                    )
+                if result_execution:
+                    result_sources = resolve_result_reference_sources(
+                        context=conversation_context,
+                        handles=knowledge_request.result_handles,
+                        kb_ids=payload.knowledge_base_ids,
+                    )
+                    rag_stream_runner = run_knowledge_result_stream
+                else:
+                    rag_stream_runner = run_knowledge_catalog_stream
+                trace_event(
+                    "knowledge.capability.dispatch_selected",
+                    trace_id=trace_id,
+                    conversation_id=conv.id,
+                    user_id=user.id,
+                    capability=knowledge_request.safe_summary(),
+                    selected_kb_count=len(set(payload.knowledge_base_ids)),
+                )
+            if pipeline_version == "v2" and not (catalog_execution or result_execution):
                 if v2_execution_context is None:
                     raise ValueError("V2 pipeline is missing an execution context")
                 if (
@@ -5303,7 +5556,11 @@ async def send_message(
                 ),
                 "evidence_scope_filter": evidence_filter,
             }
-            if pipeline_version == "v2" and execution_bundle is not None:
+            if catalog_execution or result_execution:
+                rag_stream_kwargs["knowledge_request"] = knowledge_request
+                if result_execution:
+                    rag_stream_kwargs["result_sources"] = result_sources
+            elif pipeline_version == "v2" and execution_bundle is not None:
                 # This single immutable handoff makes the compiled DAG the
                 # production execution authority.  V1/direct callers retain
                 # their historical signatures during the rollout.
