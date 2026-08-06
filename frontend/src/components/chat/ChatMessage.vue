@@ -1,22 +1,22 @@
 <template>
-  <div class="flex gap-3 mb-4" :class="isUser ? 'justify-end' : 'justify-start'">
+  <article class="chat-message" :class="isUser ? 'chat-message--user' : 'chat-message--assistant'">
     <!-- AI avatar -->
-    <div v-if="!isUser" class="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center text-white text-sm shrink-0 mt-1">
+    <div v-if="!isUser" class="chat-message__avatar chat-message__avatar--assistant">
       <n-icon><HardwareChipOutline /></n-icon>
     </div>
 
-    <div class="max-w-[85%] sm:max-w-[75%] min-w-0">
+    <div class="chat-message__content">
       <!-- User bubble -->
       <div
         v-if="isUser"
-        class="chat-message__user-bubble px-4 py-3 rounded-2xl rounded-tr-sm text-sm leading-relaxed break-words"
+        class="chat-message__user-bubble"
         @copy="handleUserCopy"
       >
         {{ message.content }}
       </div>
 
       <!-- AI card -->
-      <div v-else class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
+      <div v-else class="chat-message__assistant-card">
         <div
           v-if="isGeneralModelAnswer"
           class="message-general-fallback"
@@ -234,19 +234,20 @@
         </section>
 
         <!-- Actions -->
-        <div v-if="message.content" class="flex items-center gap-3 mt-3 pt-2 border-t border-gray-100 dark:border-gray-700">
-          <n-button text size="tiny" @click="copy">
+        <div v-if="message.content" class="chat-message__actions">
+          <n-button class="chat-message__action" quaternary size="tiny" @click="copy">
             <template #icon><n-icon><CopyOutline /></n-icon></template>
             复制
           </n-button>
-          <n-button text size="tiny" :disabled="chatStore.isStreaming" @click="$emit('retry', message)">
+          <n-button class="chat-message__action" quaternary size="tiny" :disabled="chatStore.isStreaming" @click="$emit('retry', message)">
             <template #icon><n-icon><RefreshOutline /></n-icon></template>
             {{ retryActionLabel }}
           </n-button>
           <n-button
             v-if="canInspectSearch"
-            text
+            quaternary
             size="tiny"
+            class="chat-message__action"
             aria-label="查看本条回答的检索摘要"
             @click="$emit('inspect', message)"
           >
@@ -276,7 +277,7 @@
         </div>
       </div>
 
-      <div class="text-xs text-gray-400 mt-1 px-1">
+      <div class="chat-message__meta">
         {{ formatTime(message.created_at) }}
         <span v-if="!isUser && responseDurationText"> · 思考回答耗时 {{ responseDurationText }}</span>
         <span v-if="message.tokens"> · {{ message.tokens }} tokens</span>
@@ -284,10 +285,10 @@
     </div>
 
     <!-- User avatar -->
-    <div v-if="isUser" class="w-8 h-8 rounded-full bg-gray-300 flex items-center justify-center text-gray-600 shrink-0 mt-1">
+    <div v-if="isUser" class="chat-message__avatar chat-message__avatar--user">
       <n-icon><PersonOutline /></n-icon>
     </div>
-  </div>
+  </article>
 </template>
 
 <script setup>
@@ -684,6 +685,84 @@ function formatTime(t) {
 </script>
 
 <style scoped>
+.chat-message {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.chat-message--user { justify-content: flex-end; }
+.chat-message--assistant { justify-content: flex-start; }
+
+.chat-message__avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  place-items: center;
+  margin-top: 2px;
+  border-radius: 11px;
+  font-size: 15px;
+}
+
+.chat-message__avatar--assistant {
+  background: linear-gradient(180deg, var(--ui-primary) 0%, var(--ui-primary-hover) 100%);
+  box-shadow: 0 7px 18px color-mix(in srgb, var(--ui-primary) 18%, transparent);
+  color: var(--ui-text-on-primary);
+}
+
+.chat-message__avatar--user {
+  border: 1px solid var(--ui-border);
+  background: var(--ui-surface);
+  color: var(--ui-text-secondary);
+}
+
+.chat-message__content {
+  min-width: 0;
+  max-width: min(82%, 760px);
+}
+
+.chat-message--user .chat-message__content { max-width: min(76%, 680px); }
+
+.chat-message__assistant-card {
+  border: 1px solid var(--ui-border);
+  border-radius: 4px var(--ui-radius-card) var(--ui-radius-card) var(--ui-radius-card);
+  background: var(--ui-surface);
+  box-shadow: 0 7px 24px color-mix(in srgb, var(--ui-text) 4%, transparent);
+  padding: 15px 16px;
+}
+
+.chat-message__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  margin-top: 13px;
+  border-top: 1px solid var(--ui-divider);
+  padding-top: 9px;
+}
+
+:deep(.chat-message__action.n-button) {
+  --n-height: 30px !important;
+  --n-border-radius: 9px !important;
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-color-pressed: var(--ui-surface-pressed) !important;
+  --n-text-color: var(--ui-text-tertiary) !important;
+  --n-text-color-hover: var(--ui-primary) !important;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.chat-message__meta {
+  margin-top: 6px;
+  padding: 0 3px;
+  color: var(--ui-text-tertiary);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.chat-message--user .chat-message__meta { text-align: right; }
+
 .message-general-fallback {
   display: flex;
   align-items: flex-start;
@@ -1104,6 +1183,12 @@ function formatTime(t) {
 }
 
 @media (max-width: 639px) {
+  .chat-message { gap: 8px; margin-bottom: 18px; }
+  .chat-message__avatar { width: 30px; height: 30px; flex-basis: 30px; border-radius: 9px; }
+  .chat-message__content,
+  .chat-message--user .chat-message__content { max-width: calc(100% - 38px); }
+  .chat-message__assistant-card { padding: 13px 14px; }
+
   .message-clarification__choice {
     min-height: 40px;
   }
@@ -1154,7 +1239,14 @@ function formatTime(t) {
 <style scoped>
 .chat-message__user-bubble {
   color: var(--ui-text-on-primary);
-  background: var(--ui-primary);
+  border-radius: var(--ui-radius-card) 4px var(--ui-radius-card) var(--ui-radius-card);
+  background: linear-gradient(180deg, var(--ui-primary) 0%, var(--ui-primary-hover) 100%);
+  box-shadow: 0 7px 20px color-mix(in srgb, var(--ui-primary) 16%, transparent);
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 /* 用户气泡本身已经是蓝色，使用更深的品牌色标记选区，并保持白字。 */

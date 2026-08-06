@@ -6,16 +6,18 @@
  * CSS token values when the current color mode changes instead; the CSS file
  * remains the single palette source for normal DOM and teleported overlays.
  */
-function readToken(name) {
+function readToken(name, namespace = 'ui') {
   if (typeof window === 'undefined' || !document.documentElement) {
-    return `var(--ui-${name})`
+    return `var(--${namespace}-${name})`
   }
 
-  return getComputedStyle(document.documentElement).getPropertyValue(`--ui-${name}`).trim()
+  const value = getComputedStyle(document.documentElement).getPropertyValue(`--${namespace}-${name}`).trim()
+  if (value || namespace === 'ui') return value || `var(--ui-${name})`
+  return readToken(name)
 }
 
-export function createNaiveThemeOverrides() {
-  const token = readToken
+export function createNaiveThemeOverrides(namespace = 'ui') {
+  const token = name => readToken(name, namespace)
   const border = (name = 'border') => `1px solid ${token(name)}`
   const popoverTheme = {
     borderRadius: token('radius-popover'),
@@ -270,6 +272,10 @@ export function createNaiveThemeOverrides() {
       borderRadius: token('radius-pill')
     }
   }
+}
+
+export function createAdminNaiveThemeOverrides() {
+  return createNaiveThemeOverrides('admin-ui')
 }
 
 export default createNaiveThemeOverrides

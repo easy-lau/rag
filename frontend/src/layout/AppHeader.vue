@@ -1,10 +1,11 @@
 <template>
-  <header class="h-12 flex items-center justify-between px-4 bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 shrink-0">
-    <div class="flex items-center gap-2 min-w-0">
+  <header class="app-header">
+    <div class="app-header__leading">
       <n-button
         v-if="ui.isCompact"
         text
         size="small"
+        class="app-header__icon-button"
         title="打开会话菜单"
         aria-label="打开会话菜单"
         :aria-expanded="ui.mobileNavOpen"
@@ -25,7 +26,7 @@
         {{ currentPageTitle }}
       </div>
     </div>
-    <div class="flex items-center gap-2 sm:gap-3">
+    <div class="app-header__actions">
       <n-button
         v-if="isChatRoute"
         class="app-header__chat-search"
@@ -40,7 +41,7 @@
         <span class="hidden sm:inline">{{ ui.chatSearchOpen ? '收起检索' : '检索结果' }}</span>
       </n-button>
 
-      <n-button text size="small" title="切换深浅色主题" aria-label="切换深浅色主题" @click="ui.toggleTheme()">
+      <n-button class="app-header__icon-button" text size="small" title="切换深浅色主题" aria-label="切换深浅色主题" @click="ui.toggleTheme()">
         <template #icon>
           <n-icon><MoonOutline v-if="ui.mode !== 'dark'" /><SunnyOutline v-else /></n-icon>
         </template>
@@ -54,14 +55,14 @@
       >
         <button
           type="button"
-          class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg px-2 py-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60"
+          class="app-header__user"
           aria-label="打开用户菜单"
         >
-          <div class="w-7 h-7 rounded-full bg-blue-500 flex items-center justify-center text-white text-xs">
+          <div class="app-header__avatar">
             {{ (authStore.user?.display_name || authStore.user?.username || '用')[0] }}
           </div>
-          <span class="max-w-32 truncate">{{ authStore.user?.display_name || authStore.user?.username || '用户' }}</span>
-          <n-icon :size="14" class="text-gray-400"><ChevronDownOutline /></n-icon>
+          <span class="app-header__user-name">{{ authStore.user?.display_name || authStore.user?.username || '用户' }}</span>
+          <n-icon :size="14" class="app-header__user-chevron"><ChevronDownOutline /></n-icon>
         </button>
       </n-dropdown>
     </div>
@@ -175,20 +176,42 @@ async function handleChangePassword() {
 </script>
 
 <style scoped>
+.app-header {
+  display: flex;
+  min-height: 64px;
+  flex: 0 0 64px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--ui-divider);
+  background: color-mix(in srgb, var(--ui-surface) 92%, transparent);
+  padding: 0 22px;
+}
+
+.app-header__leading,
+.app-header__actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.app-header__actions { flex: 0 0 auto; }
+
 .app-header__chat-context {
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  gap: 8px;
-  color: var(--ui-text-secondary);
-  font-size: 13px;
-  font-weight: 650;
+  gap: 10px;
+  color: var(--ui-text);
+  font-size: 14px;
+  font-weight: 680;
   line-height: 1;
 }
 
 .app-header__chat-context-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--ui-primary);
@@ -196,7 +219,7 @@ async function handleChangePassword() {
 }
 
 :deep(.app-header__chat-search.n-button) {
-  height: var(--ui-control-height-compact);
+  height: var(--ui-control-height);
   border-radius: var(--ui-radius-control);
   font-size: 12px;
   font-weight: 650;
@@ -211,6 +234,60 @@ async function handleChangePassword() {
   --n-text-color-pressed: var(--ui-primary-pressed) !important;
 }
 
+:deep(.app-header__icon-button.n-button) {
+  --n-width: var(--ui-control-height) !important;
+  --n-height: var(--ui-control-height) !important;
+  --n-color-hover: var(--ui-surface-hover) !important;
+  --n-color-pressed: var(--ui-surface-pressed) !important;
+  --n-icon-color: var(--ui-icon) !important;
+  --n-icon-color-hover: var(--ui-primary) !important;
+  border-radius: var(--ui-radius-control);
+}
+
+.app-header__user {
+  display: flex;
+  height: 40px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-popover);
+  background: transparent;
+  padding: 3px 7px 3px 4px;
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  transition: border-color .18s ease, background .18s ease, color .18s ease;
+}
+
+.app-header__user:hover {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.app-header__avatar {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  place-items: center;
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--ui-primary) 0%, var(--ui-primary-hover) 100%);
+  color: var(--ui-text-on-primary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.app-header__user-name {
+  max-width: 128px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-header__user-chevron { color: var(--ui-icon); }
+
 :deep(.app-header__chat-search.is-active.n-button) {
   --n-color: var(--ui-primary-subtle) !important;
   --n-color-hover: var(--ui-surface-hover) !important;
@@ -219,7 +296,11 @@ async function handleChangePassword() {
 }
 
 @media (max-width: 639px) {
+  .app-header { min-height: 56px; flex-basis: 56px; padding: 0 12px; }
   .app-header__chat-context { max-width: 38vw; font-size: 12px; }
   :deep(.app-header__chat-search.n-button) { min-width: var(--ui-control-height-compact); padding: 0 8px; }
+  .app-header__user { width: 40px; padding: 3px; }
+  .app-header__user-name,
+  .app-header__user-chevron { display: none; }
 }
 </style>

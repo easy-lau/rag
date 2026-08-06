@@ -61,7 +61,7 @@
           :data="runs"
           :loading="loading"
           :pagination="pagination"
-          :scroll-x="1160"
+          :scroll-x="1132"
           class="admin-data-table"
         />
       </SurfaceCard>
@@ -766,7 +766,9 @@ onMounted(loadRuns)
 }
 
 .trace-page__inner {
-  max-width: 1440px;
+  /* 与用户、角色、文档等后台列表页保持 max-w-6xl 的内容基线，
+     避免调用链表格在宽屏上横向铺满。 */
+  max-width: 72rem;
   margin: 0 auto;
   display: grid;
   gap: 20px;
@@ -895,6 +897,10 @@ onMounted(loadRuns)
 @media (max-width: 1279px) {
   .trace-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .trace-filters__actions { grid-column: span 2; justify-content: flex-end; }
+}
+
+@media (min-width: 640px) {
+  .trace-page { padding: 24px; }
 }
 
 @media (max-width: 639px) {

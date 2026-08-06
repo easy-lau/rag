@@ -23,7 +23,7 @@
             <button type="button" class="composer-setting composer-setting--kb" aria-label="配置知识库范围">
               <n-icon :size="16"><FolderOpenOutline /></n-icon>
               <span class="composer-setting__content">
-                <span class="composer-setting__label">知识库</span>
+                <span class="composer-setting__label">知识范围</span>
                 <span class="composer-setting__value">{{ knowledgeBaseSummary }}</span>
               </span>
               <n-icon :size="14" class="composer-setting__chevron"><ChevronDownOutline /></n-icon>
@@ -53,7 +53,7 @@
             <button type="button" class="composer-setting composer-setting--method" aria-label="配置检索方式">
               <n-icon :size="16"><SearchOutline /></n-icon>
               <span class="composer-setting__content">
-                <span class="composer-setting__label">检索方式</span>
+                <span class="composer-setting__label">检索</span>
                 <span class="composer-setting__value">{{ methodSummary }}</span>
               </span>
               <n-icon :size="14" class="composer-setting__chevron"><ChevronDownOutline /></n-icon>
@@ -83,7 +83,7 @@
               <n-icon :size="16"><SparklesOutline /></n-icon>
               <span class="composer-setting__content">
                 <span class="composer-setting__label">智能重排</span>
-                <span class="composer-setting__value">{{ chatStore.searchConfig.rerank ? '已开启' : '已关闭' }}</span>
+                <span class="composer-setting__value">{{ chatStore.searchConfig.rerank ? '开启' : '关闭' }}</span>
               </span>
             </button>
           </template>
@@ -99,11 +99,12 @@
           停止
         </n-button>
         <n-button
-          class="chat-composer__send" type="primary" circle size="medium" :disabled="!text.trim() || chatStore.isStreaming"
+          class="chat-composer__send" type="primary" size="medium" :disabled="!text.trim() || chatStore.isStreaming"
           aria-label="发送问题"
           @click="handleSend"
         >
           <template #icon><n-icon><SendOutline /></n-icon></template>
+          <span>发送</span>
         </n-button>
       </div>
     </div>
@@ -208,10 +209,10 @@ defineExpose({ setText, focus })
 <style scoped>
 .chat-composer {
   border: 1px solid var(--ui-border);
-  border-radius: var(--ui-radius-card);
+  border-radius: var(--ui-radius-dialog);
   background: var(--ui-surface);
-  box-shadow: var(--ui-shadow-card);
-  padding: 14px 14px 11px;
+  box-shadow: 0 12px 34px color-mix(in srgb, var(--ui-text) 7%, transparent);
+  padding: 15px 15px 12px;
   transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
 }
 
@@ -230,8 +231,8 @@ defineExpose({ setText, focus })
 .chat-composer__input :deep(.n-input__textarea-el),
 .chat-composer__input :deep(.n-input__textarea-mirror),
 .chat-composer__input :deep(.n-input__placeholder) {
-  padding: 1px 2px 6px;
-  font-size: 14px;
+  padding: 2px 3px 8px;
+  font-size: 15px;
   line-height: 1.75;
 }
 
@@ -248,8 +249,8 @@ defineExpose({ setText, focus })
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 9px;
-  padding-top: 10px;
+  margin-top: 8px;
+  padding-top: 11px;
   border-top: 1px solid var(--ui-divider);
 }
 
@@ -265,14 +266,14 @@ defineExpose({ setText, focus })
 .composer-setting {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   min-width: 0;
-  height: 38px;
-  padding: 0 9px;
+  height: var(--ui-control-height);
+  padding: 0 10px;
   border: 1px solid var(--ui-border);
   border-radius: var(--ui-radius-control);
   color: var(--ui-text-secondary);
-  background: var(--ui-surface-muted);
+  background: transparent;
   cursor: pointer;
   font: inherit;
   text-align: left;
@@ -280,8 +281,8 @@ defineExpose({ setText, focus })
 }
 
 .composer-setting:hover {
-  border-color: var(--ui-border-strong);
-  background: var(--ui-surface-hover);
+  border-color: var(--ui-border-focus);
+  background: var(--ui-primary-subtle);
 }
 
 .composer-setting:focus-visible {
@@ -291,24 +292,23 @@ defineExpose({ setText, focus })
 }
 
 .composer-setting > :deep(.n-icon) { flex: 0 0 auto; color: var(--ui-primary); }
-.composer-setting--kb { flex: 0 1 182px; max-width: 220px; }
-.composer-setting--method { flex: 0 1 164px; max-width: 195px; }
+.composer-setting--kb { flex: 0 1 196px; max-width: 230px; }
+.composer-setting--method { flex: 0 1 172px; max-width: 200px; }
 .composer-setting--tag { flex: 0 1 150px; max-width: 185px; }
 .composer-setting--rerank { flex: 0 0 auto; }
 
 .composer-setting__content {
-  display: flex;
+  display: inline-flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 1px;
+  align-items: center;
+  gap: 5px;
 }
 
 .composer-setting__label {
-  color: var(--ui-text-tertiary);
-  font-size: 10px;
-  font-weight: 680;
-  letter-spacing: .035em;
-  line-height: 1;
+  color: var(--ui-text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.2;
   white-space: nowrap;
 }
 
@@ -316,7 +316,7 @@ defineExpose({ setText, focus })
   overflow: hidden;
   color: var(--ui-text-secondary);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 550;
   line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -362,7 +362,11 @@ defineExpose({ setText, focus })
 }
 
 .chat-composer__send {
-  box-shadow: var(--ui-shadow-card);
+  min-width: 78px;
+  height: 40px;
+  border-radius: var(--ui-radius-control);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--ui-primary) 22%, transparent);
+  font-weight: 650;
   transition: transform .18s ease, box-shadow .18s ease;
 }
 
@@ -388,5 +392,6 @@ defineExpose({ setText, focus })
   .composer-setting--tag,
   .composer-setting--rerank { flex: 0 0 auto; max-width: 180px; }
   .chat-composer__actions { justify-content: flex-end; }
+  .chat-composer__send { min-width: 86px; height: 42px; }
 }
 </style>

@@ -1,7 +1,7 @@
 <template>
-  <div class="flex h-screen overflow-hidden bg-gray-50 dark:bg-gray-900">
+  <div class="chat-workspace">
     <!-- 宽屏保留常驻会话栏；1024px 以下改为抽屉，避免主对话区被两侧栏挤压。 -->
-    <div v-if="!ui.isCompact" class="w-64 shrink-0">
+    <div v-if="!ui.isCompact" class="chat-workspace__sidebar">
       <ChatSidebar />
     </div>
     <n-drawer
@@ -15,14 +15,14 @@
       <ChatSidebar in-drawer @close-drawer="closeNavDrawer" />
     </n-drawer>
 
-    <div class="flex flex-col flex-1 min-w-0">
+    <div class="chat-workspace__main">
       <AppHeader />
-      <main class="flex-1 overflow-hidden">
+      <main class="chat-workspace__content">
         <router-view />
       </main>
       <footer
         v-if="siteStore.site_copyright"
-        class="shrink-0 py-2 px-4 text-center text-xs text-gray-400 dark:text-gray-500 border-t border-gray-100 dark:border-gray-800"
+        class="chat-workspace__footer"
       >
         {{ siteStore.site_copyright }}
       </footer>
@@ -66,3 +66,43 @@ function closeNavDrawer() {
   ui.mobileNavOpen = false
 }
 </script>
+
+<style scoped>
+.chat-workspace {
+  display: flex;
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 72% -8%, color-mix(in srgb, var(--ui-primary) 7%, transparent), transparent 34%),
+    var(--ui-bg-subtle);
+}
+
+.chat-workspace__sidebar {
+  width: 276px;
+  flex: 0 0 276px;
+}
+
+.chat-workspace__main {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.chat-workspace__content {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.chat-workspace__footer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--ui-divider);
+  background: color-mix(in srgb, var(--ui-surface) 88%, transparent);
+  padding: 7px 16px;
+  color: var(--ui-text-tertiary);
+  font-size: 11px;
+  text-align: center;
+}
+</style>

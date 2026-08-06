@@ -67,6 +67,73 @@
   --ui-control-height-compact: 32px;
   --ui-control-height: 36px;
   --ui-control-height-large: 42px;
+
+  /* Admin console palette, inspired by Authine / 奥哲's blue product language.
+   * The admin layout aliases its local --ui-* values to these tokens so chat
+   * and login keep their existing visual language. */
+  --admin-ui-bg: #f5f6f9;
+  --admin-ui-bg-subtle: #f8f9fc;
+  --admin-ui-surface: #ffffff;
+  --admin-ui-surface-raised: #ffffff;
+  --admin-ui-surface-muted: #f5f6f9;
+  --admin-ui-surface-hover: #f3f5fc;
+  --admin-ui-surface-pressed: #e6f1ff;
+  --admin-ui-surface-disabled: #f2f4f7;
+  --admin-ui-text: #121933;
+  --admin-ui-text-secondary: #707481;
+  --admin-ui-text-tertiary: #9299a8;
+  --admin-ui-text-disabled: #b6bdc9;
+  --admin-ui-placeholder: #a7afbc;
+  --admin-ui-icon: #707481;
+  --admin-ui-border: #e6ebf2;
+  --admin-ui-border-strong: #d3d9e5;
+  --admin-ui-border-focus: #366ef4;
+  --admin-ui-divider: #edf0f5;
+  --admin-ui-primary: #004bff;
+  --admin-ui-primary-hover: #003ad9;
+  --admin-ui-primary-pressed: #0032bd;
+  --admin-ui-primary-subtle: #e6f1ff;
+  --admin-ui-text-on-primary: #ffffff;
+  --admin-ui-info: #366ef4;
+  --admin-ui-info-hover: #004bff;
+  --admin-ui-info-pressed: #003ad9;
+  --admin-ui-success: #209a6b;
+  --admin-ui-success-hover: #17855a;
+  --admin-ui-success-pressed: #126e4a;
+  --admin-ui-warning: #d9891c;
+  --admin-ui-warning-hover: #bd7212;
+  --admin-ui-warning-pressed: #9d5d0e;
+  --admin-ui-danger: #d84e5b;
+  --admin-ui-danger-hover: #c53d4b;
+  --admin-ui-danger-pressed: #ab303d;
+  --admin-ui-danger-subtle: #fff0f1;
+  --admin-ui-focus-outline: rgba(0, 75, 255, 0.72);
+  --admin-ui-focus-ring: 0 0 0 3px rgba(0, 75, 255, 0.16);
+  --admin-ui-overlay-mask: rgba(18, 25, 51, 0.42);
+  --admin-ui-shadow-card: 0 1px 2px rgba(18, 25, 51, 0.03), 0 8px 22px rgba(18, 25, 51, 0.035);
+  --admin-ui-shadow-float: 0 14px 36px rgba(18, 25, 51, 0.13), 0 2px 7px rgba(18, 25, 51, 0.05);
+  --admin-ui-shadow-dialog: 0 28px 76px rgba(18, 25, 51, 0.2), 0 5px 18px rgba(18, 25, 51, 0.08);
+  --admin-ui-radius-control: 10px;
+  --admin-ui-radius-popover: 12px;
+  --admin-ui-radius-card: 16px;
+  --admin-ui-radius-dialog: 20px;
+  --admin-ui-radius-pill: 999px;
+  --admin-ui-control-height-tiny: 28px;
+  --admin-ui-control-height-compact: 32px;
+  --admin-ui-control-height: 36px;
+  --admin-ui-control-height-large: 42px;
+
+  --admin-sidebar-bg: #ffffff;
+  --admin-sidebar-hover: #f5f6f9;
+  --admin-sidebar-active: #e6f1ff;
+  --admin-sidebar-text: #4e5969;
+  --admin-sidebar-text-strong: #121933;
+  --admin-sidebar-muted: #707481;
+  --admin-sidebar-divider: #e6ebf2;
+  --admin-sidebar-accent: #004bff;
+  --admin-sidebar-logo-bg: #e6f1ff;
+  --admin-sidebar-logo-text: #004bff;
+  --admin-sidebar-logo-border: #d9e1ff;
 }
 
 /* VueUse's useColorMode applies .dark to <html>. The body selector also keeps
@@ -124,4 +191,58 @@ body.dark,
   --ui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.14), 0 8px 24px rgba(0, 0, 0, 0.12);
   --ui-shadow-float: 0 16px 38px rgba(0, 0, 0, 0.32), 0 2px 8px rgba(0, 0, 0, 0.18);
   --ui-shadow-dialog: 0 30px 82px rgba(0, 0, 0, 0.46), 0 5px 18px rgba(0, 0, 0, 0.28);
+
+  --admin-ui-bg: #111827;
+  --admin-ui-bg-subtle: #151f31;
+  --admin-ui-surface: #182337;
+  --admin-ui-surface-raised: #1e2b41;
+  --admin-ui-surface-muted: #19263a;
+  --admin-ui-surface-hover: #223451;
+  --admin-ui-surface-pressed: #294063;
+  --admin-ui-surface-disabled: #1c293d;
+  --admin-ui-text: #f1f5fb;
+  --admin-ui-text-secondary: #b8c4d5;
+  --admin-ui-text-tertiary: #91a0b5;
+  --admin-ui-text-disabled: #687990;
+  --admin-ui-placeholder: #7f90a7;
+  --admin-ui-icon: #a7b5c8;
+  --admin-ui-border: #33445e;
+  --admin-ui-border-strong: #465b79;
+  --admin-ui-border-focus: #78a1ff;
+  --admin-ui-divider: #2b3a52;
+  --admin-ui-primary: #165dff;
+  --admin-ui-primary-hover: #2467e8;
+  --admin-ui-primary-pressed: #004bff;
+  --admin-ui-primary-subtle: #213962;
+  --admin-ui-info: #6b9bff;
+  --admin-ui-info-hover: #85adff;
+  --admin-ui-info-pressed: #4f83ee;
+  --admin-ui-success: #49bf8d;
+  --admin-ui-success-hover: #63ce9f;
+  --admin-ui-success-pressed: #35a979;
+  --admin-ui-warning: #eab35a;
+  --admin-ui-warning-hover: #f0c470;
+  --admin-ui-warning-pressed: #d59839;
+  --admin-ui-danger: #ed727d;
+  --admin-ui-danger-hover: #f18a92;
+  --admin-ui-danger-pressed: #d95b67;
+  --admin-ui-danger-subtle: #482a35;
+  --admin-ui-focus-outline: rgba(126, 175, 250, 0.9);
+  --admin-ui-focus-ring: 0 0 0 3px rgba(111, 162, 238, 0.22);
+  --admin-ui-overlay-mask: rgba(3, 10, 21, 0.62);
+  --admin-ui-shadow-card: 0 1px 2px rgba(0, 0, 0, 0.14), 0 8px 24px rgba(0, 0, 0, 0.12);
+  --admin-ui-shadow-float: 0 16px 38px rgba(0, 0, 0, 0.32), 0 2px 8px rgba(0, 0, 0, 0.18);
+  --admin-ui-shadow-dialog: 0 30px 82px rgba(0, 0, 0, 0.46), 0 5px 18px rgba(0, 0, 0, 0.28);
+
+  --admin-sidebar-bg: #161d2d;
+  --admin-sidebar-hover: #202b40;
+  --admin-sidebar-active: #243a66;
+  --admin-sidebar-text: #c1ccdc;
+  --admin-sidebar-text-strong: #f5f8ff;
+  --admin-sidebar-muted: #94a4ba;
+  --admin-sidebar-divider: #2c3a52;
+  --admin-sidebar-accent: #85adff;
+  --admin-sidebar-logo-bg: #213962;
+  --admin-sidebar-logo-text: #8db1ff;
+  --admin-sidebar-logo-border: #38527c;
 }

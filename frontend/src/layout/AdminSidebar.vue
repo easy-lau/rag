@@ -6,21 +6,21 @@
         <img
           v-if="siteStore.site_logo"
           :src="siteStore.site_logo"
-          class="w-10 h-10 rounded-xl object-cover shrink-0 ring-1 ring-white/20"
+          class="admin-sidebar__logo w-10 h-10 object-cover shrink-0"
           alt="站点 Logo"
         />
         <div
           v-else
-          class="w-10 h-10 rounded-xl shrink-0 flex items-center justify-center text-white font-bold bg-gradient-to-br from-blue-400 via-indigo-500 to-violet-600 shadow-lg shadow-indigo-950/40"
+          class="admin-sidebar__logo admin-sidebar__logo--fallback w-10 h-10 shrink-0 flex items-center justify-center font-bold"
         >
           {{ (siteStore.site_title || 'R')[0] }}
         </div>
         <div class="min-w-0">
-          <div class="text-sm font-semibold text-white truncate group-hover:text-blue-100 transition-colors">
+          <div class="admin-sidebar__brand-title text-sm font-semibold truncate transition-colors">
             {{ siteStore.site_title || 'RAG 检索系统' }}
           </div>
-          <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-300/80">
-            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          <div class="admin-sidebar__brand-caption mt-0.5 flex items-center gap-1.5 text-[11px]">
+            <span class="admin-sidebar__brand-status w-1.5 h-1.5 rounded-full"></span>
             管理后台
           </div>
         </div>
@@ -29,19 +29,19 @@
         <img
           v-if="siteStore.site_logo"
           :src="siteStore.site_logo"
-          class="w-10 h-10 rounded-xl object-cover shrink-0 ring-1 ring-white/20"
+          class="admin-sidebar__logo w-10 h-10 object-cover shrink-0"
           alt="站点 Logo"
         />
         <div
           v-else
-          class="w-10 h-10 rounded-xl shrink-0 flex items-center justify-center text-white font-bold bg-gradient-to-br from-blue-400 via-indigo-500 to-violet-600 shadow-lg shadow-indigo-950/40"
+          class="admin-sidebar__logo admin-sidebar__logo--fallback w-10 h-10 shrink-0 flex items-center justify-center font-bold"
         >
           {{ (siteStore.site_title || 'R')[0] }}
         </div>
         <div class="min-w-0">
-          <div class="text-sm font-semibold text-white truncate">{{ siteStore.site_title || 'RAG 检索系统' }}</div>
-          <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-300/80">
-            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          <div class="admin-sidebar__brand-title text-sm font-semibold truncate">{{ siteStore.site_title || 'RAG 检索系统' }}</div>
+          <div class="admin-sidebar__brand-caption mt-0.5 flex items-center gap-1.5 text-[11px]">
+            <span class="admin-sidebar__brand-status w-1.5 h-1.5 rounded-full"></span>
             管理后台
           </div>
         </div>
@@ -59,27 +59,22 @@
             v-for="item in group.items"
             :key="item.to"
             :to="item.to"
-            class="admin-sidebar__item group flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm transition-all duration-150"
+            class="admin-sidebar__item group flex items-center gap-3 px-3 py-2.5 text-sm transition-all duration-150"
             :class="isActive(item)
               ? 'admin-sidebar__item--active'
               : 'admin-sidebar__item--idle'"
             :aria-current="isActive(item) ? 'page' : undefined"
             @click="closeMobileNav"
           >
-            <n-icon :size="18" :class="isActive(item) ? 'text-white' : 'text-slate-300/75 group-hover:text-white'">
+            <n-icon :size="18" class="admin-sidebar__item-icon">
               <component :is="item.icon" />
             </n-icon>
             <span class="truncate">{{ item.label }}</span>
-            <span
-              v-if="isActive(item)"
-              class="ml-auto w-1.5 h-1.5 rounded-full bg-white/90 shadow-sm"
-              aria-hidden="true"
-            ></span>
           </router-link>
         </div>
       </section>
 
-      <div v-if="!groupedMenus.length" class="px-3 py-8 text-center text-xs leading-6 text-slate-300/70">
+      <div v-if="!groupedMenus.length" class="admin-sidebar__empty px-3 py-8 text-center text-xs leading-6">
         当前账号暂无后台管理权限
       </div>
     </nav>
@@ -123,59 +118,76 @@ function closeMobileNav() {
 
 <style scoped>
 .admin-sidebar {
-  color: rgb(226 232 240);
-  background:
-    radial-gradient(circle at 16% -8%, rgb(96 165 250 / 0.22), transparent 34%),
-    linear-gradient(180deg, #314963 0%, #253c54 52%, #20364c 100%);
+  color: var(--admin-sidebar-text);
+  background: var(--admin-sidebar-bg);
 }
 
 .admin-sidebar__brand {
-  border-color: rgb(226 232 240 / 0.16);
+  border-bottom: 1px solid var(--admin-sidebar-divider);
+}
+
+.admin-sidebar__logo {
+  overflow: hidden;
+  border: 1px solid var(--admin-sidebar-logo-border);
+  border-radius: var(--admin-ui-radius-control);
+}
+
+.admin-sidebar__logo--fallback {
+  background: var(--admin-sidebar-logo-bg);
+  color: var(--admin-sidebar-logo-text);
+}
+
+.admin-sidebar__brand-title { color: var(--admin-sidebar-text-strong); }
+.group:hover .admin-sidebar__brand-title { color: var(--admin-sidebar-accent); }
+.admin-sidebar__brand-caption { color: var(--admin-sidebar-muted); }
+.admin-sidebar__brand-status {
+  background: var(--admin-sidebar-accent);
+  box-shadow: 0 0 0 3px var(--admin-sidebar-active);
 }
 
 /* 业务域之间用分隔线和留白区分，避免「智能路由」与系统管理项视觉上连成一组。 */
 .admin-sidebar__group + .admin-sidebar__group {
   padding-top: 14px;
-  border-top: 1px solid rgb(226 232 240 / 0.14);
+  border-top: 1px solid var(--admin-sidebar-divider);
 }
 
 .admin-sidebar__group-title {
-  color: rgb(203 213 225 / 0.72);
+  color: var(--admin-sidebar-muted);
 }
 
 .admin-sidebar__item {
   position: relative;
   min-height: 42px;
-  color: rgb(226 232 240);
+  color: var(--admin-sidebar-text);
   border: 1px solid transparent;
+  border-radius: var(--admin-ui-radius-control);
 }
 
 .admin-sidebar__item--idle:hover {
-  color: #fff;
-  background: rgb(255 255 255 / 0.1);
+  color: var(--admin-sidebar-accent);
+  background: var(--admin-sidebar-hover);
 }
 
 .admin-sidebar__item--active {
-  color: #fff;
-  background: linear-gradient(135deg, rgb(96 165 250 / 0.96), rgb(79 70 229 / 0.9));
-  border-color: rgb(191 219 254 / 0.32);
-  box-shadow: 0 8px 18px rgb(15 23 42 / 0.22), inset 3px 0 0 rgb(255 255 255 / 0.72);
+  color: var(--admin-sidebar-accent);
+  background: var(--admin-sidebar-active);
+  border-color: color-mix(in srgb, var(--admin-sidebar-accent) 12%, var(--admin-sidebar-divider));
+  font-weight: 650;
 }
 
-.admin-sidebar__item--active::after {
+.admin-sidebar__item--active::before {
   content: '';
   position: absolute;
-  top: 50%;
-  right: 10px;
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: rgb(255 255 255 / 0.95);
-  box-shadow: 0 0 0 3px rgb(255 255 255 / 0.12);
-  transform: translateY(-50%);
+  top: 10px;
+  bottom: 10px;
+  left: 0;
+  width: 3px;
+  border-radius: var(--admin-ui-radius-pill);
+  background: var(--admin-sidebar-accent);
 }
 
-.admin-sidebar__item--active > span:last-child {
-  display: none;
-}
+.admin-sidebar__item-icon { color: var(--admin-sidebar-muted); }
+.admin-sidebar__item--idle:hover .admin-sidebar__item-icon,
+.admin-sidebar__item--active .admin-sidebar__item-icon { color: var(--admin-sidebar-accent); }
+.admin-sidebar__empty { color: var(--admin-sidebar-muted); }
 </style>

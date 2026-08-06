@@ -1,12 +1,12 @@
 <template>
-  <div class="flex h-full">
+  <div class="chat-page">
     <!-- Main chat area -->
-    <div class="flex flex-col flex-1 min-w-0">
+    <div class="chat-page__main">
       <!-- 空会话以欢迎态引导提问；首条消息发送后切换到正常消息流。 -->
       <div
         ref="msgList"
-        class="flex-1 overflow-y-auto px-4 sm:px-6 py-4"
-        :class="showWelcome ? 'flex items-center' : ''"
+        class="chat-page__messages"
+        :class="{ 'chat-page__messages--welcome': showWelcome }"
         @scroll.passive="handleMessageScroll"
       >
         <ChatWelcome
@@ -37,7 +37,7 @@
         </div>
 
         <!-- 与底部输入区共用内容宽度，避免消息流在宽屏贴近页面两侧。 -->
-        <div v-else class="w-full max-w-4xl mx-auto">
+        <div v-else class="chat-page__message-list">
           <ChatMessage
             v-for="msg in chatStore.messages"
             :key="msg.id"
@@ -51,8 +51,8 @@
       </div>
 
       <!-- 已开始的会话固定使用底部输入框，避免与欢迎态的输入框重复。 -->
-      <div v-if="!showWelcome && !chatStore.isConversationLoading && !chatStore.conversationLoadError" class="px-4 sm:px-6 py-4 border-t border-gray-200 dark:border-gray-700">
-        <div class="max-w-4xl mx-auto">
+      <div v-if="!showWelcome && !chatStore.isConversationLoading && !chatStore.conversationLoadError" class="chat-page__composer-dock">
+        <div class="chat-page__composer-inner">
           <ChatInput />
         </div>
       </div>
@@ -541,6 +541,46 @@ function setWelcomeQuestion(question) {
 </script>
 
 <style scoped>
+.chat-page {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  background: transparent;
+}
+
+.chat-page__main {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+
+.chat-page__messages {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 28px clamp(16px, 3vw, 40px);
+  overscroll-behavior: contain;
+}
+
+.chat-page__messages--welcome {
+  display: flex;
+  align-items: center;
+}
+
+.chat-page__message-list,
+.chat-page__composer-inner {
+  width: min(100%, 920px);
+  margin: 0 auto;
+}
+
+.chat-page__composer-dock {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--ui-divider);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--ui-surface) 74%, transparent), var(--ui-surface));
+  padding: 14px clamp(16px, 3vw, 40px) 16px;
+}
+
 .chat-conversation-load-error {
   width: min(100%, 480px);
   padding: 24px;
@@ -689,6 +729,10 @@ function setWelcomeQuestion(question) {
 }
 
 @media (max-width: 639px) {
+  .chat-page__messages { padding: 18px 12px; }
+  .chat-page__messages--welcome { align-items: flex-start; }
+  .chat-page__composer-dock { padding: 10px 10px 12px; }
+
   .source-preview__body {
     min-height: min(52dvh, 460px);
   }

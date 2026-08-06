@@ -1,21 +1,21 @@
 <template>
-  <aside class="w-full h-full flex flex-col bg-white dark:bg-gray-800 border-r border-gray-200 dark:border-gray-700">
+  <aside class="chat-sidebar">
     <!-- 品牌 -->
-    <div class="px-4 py-4 border-b border-gray-200 dark:border-gray-700">
-      <div class="flex items-center justify-between gap-2">
-        <div class="flex min-w-0 items-center gap-2">
+    <div class="chat-sidebar__brand-bar">
+      <div class="chat-sidebar__brand-row">
+        <div class="chat-sidebar__brand">
           <img
             v-if="siteStore.site_logo"
             :src="siteStore.site_logo"
-            class="w-8 h-8 rounded-lg object-cover shrink-0"
+            class="chat-sidebar__logo"
             alt="logo"
           />
-          <div v-else class="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center text-white font-bold text-sm shrink-0">
+          <div v-else class="chat-sidebar__logo chat-sidebar__logo--fallback">
             {{ (siteStore.site_title || 'R')[0] }}
           </div>
-          <div class="min-w-0">
-            <div class="font-bold text-gray-800 dark:text-white text-sm truncate">{{ siteStore.site_title }}</div>
-            <div class="text-xs text-gray-500 dark:text-gray-400 truncate">问答工作台</div>
+          <div class="chat-sidebar__brand-copy">
+            <div class="chat-sidebar__brand-title">{{ siteStore.site_title }}</div>
+            <div class="chat-sidebar__brand-caption">KNOWLEDGE CENTER</div>
           </div>
         </div>
         <n-button
@@ -34,16 +34,16 @@
     </div>
 
     <!-- 会话功能：问答工作台不渲染其他业务菜单。 -->
-    <section class="px-3 py-3 flex-1 min-h-0 flex flex-col">
+    <section class="chat-sidebar__body">
       <n-button class="chat-sidebar__new" type="primary" block :disabled="chatStore.isStreaming" @click="startNewConversation">
         <template #icon><n-icon><AddOutline /></n-icon></template>
         新对话
       </n-button>
 
-      <div class="flex items-center justify-between mt-5 mb-2 shrink-0">
-        <span class="text-xs font-medium text-gray-500 dark:text-gray-400">对话历史</span>
-        <div v-if="chatStore.conversations.length" class="flex items-center gap-1.5">
-          <span class="text-xs text-gray-400">{{ chatStore.conversations.length }}</span>
+      <div class="chat-sidebar__section-heading">
+        <span>最近对话</span>
+        <div v-if="chatStore.conversations.length" class="chat-sidebar__section-actions">
+          <span class="chat-sidebar__history-count">{{ chatStore.conversations.length }}</span>
           <n-button
             v-if="!isSelectionMode"
             quaternary
@@ -88,16 +88,16 @@
         </n-button>
       </div>
 
-      <div class="overflow-y-auto space-y-0.5 flex-1 pr-0.5">
-        <div v-if="!chatStore.conversations.length" class="text-xs text-gray-400 text-center py-8">暂无历史对话</div>
+      <div class="chat-sidebar__history">
+        <div v-if="!chatStore.conversations.length" class="chat-sidebar__empty">暂无历史对话</div>
         <div
           v-for="conv in chatStore.conversations"
           :key="conv.id"
-          class="group flex items-center gap-1 rounded-lg text-sm"
+          class="group chat-sidebar__history-row"
           :class="[
             conv.id === chatStore.currentConvId
-              ? 'bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400'
-            : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700',
+              ? 'chat-sidebar__history-row--active'
+            : '',
             { 'chat-sidebar__history-row--selected': isConversationSelected(conv.id) },
             { 'cursor-not-allowed opacity-50': chatStore.isStreaming },
           ]"
@@ -112,12 +112,12 @@
           />
           <button
             type="button"
-            class="min-w-0 flex-1 rounded-lg px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/60"
+            class="chat-sidebar__history-button"
             :disabled="chatStore.isStreaming"
             :aria-current="conv.id === chatStore.currentConvId ? 'page' : undefined"
             @click="handleConversationClick(conv)"
           >
-            <span class="block truncate">{{ conv.title || '未命名对话' }}</span>
+            <span>{{ conv.title || '未命名对话' }}</span>
           </button>
           <n-dropdown
             v-if="!isSelectionMode"
@@ -138,22 +138,22 @@
     </section>
 
     <!-- 侧栏底部：唯一的后台入口与构建时注入的版本信息。 -->
-    <div class="px-3 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
+    <div class="chat-sidebar__footer">
       <button
         v-if="canEnterAdmin"
         type="button"
-        class="group flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left transition-colors hover:bg-blue-50 dark:hover:bg-blue-900/20"
+        class="group chat-sidebar__admin"
         :title="ui.isCompact ? '进入管理后台' : '在新标签打开管理后台'"
         @click="openAdmin"
       >
-        <span class="w-7 h-7 rounded-lg flex items-center justify-center bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-300 group-hover:bg-white dark:group-hover:bg-gray-700 group-hover:text-blue-500 transition-colors">
+        <span class="chat-sidebar__admin-icon">
           <n-icon :size="16"><SettingsOutline /></n-icon>
         </span>
-        <span class="min-w-0 flex-1">
-          <span class="block text-sm font-medium text-gray-600 dark:text-gray-300 group-hover:text-blue-600 dark:group-hover:text-blue-300 transition-colors">管理后台</span>
-          <span class="block mt-0.5 text-[11px] text-gray-400 dark:text-gray-500 truncate">知识运营与系统管理</span>
+        <span class="chat-sidebar__admin-copy">
+          <span>管理后台</span>
+          <small>知识运营与系统管理</small>
         </span>
-        <n-icon :size="15" class="text-gray-300 dark:text-gray-600 group-hover:text-blue-400 transition-colors"><ChevronForwardOutline /></n-icon>
+        <n-icon :size="15" class="chat-sidebar__admin-arrow"><ChevronForwardOutline /></n-icon>
       </button>
       <AppVersion :class="{ 'mt-2': canEnterAdmin }" />
     </div>
@@ -473,13 +473,227 @@ function closeDrawer() {
 </script>
 
 <style scoped>
+.chat-sidebar {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  flex-direction: column;
+  border-right: 1px solid var(--ui-divider);
+  background: color-mix(in srgb, var(--ui-surface) 96%, var(--ui-primary-subtle));
+}
+
+.chat-sidebar__brand-bar {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--ui-divider);
+  padding: 18px 16px;
+}
+
+.chat-sidebar__brand-row,
+.chat-sidebar__brand {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.chat-sidebar__brand-row { justify-content: space-between; gap: 8px; }
+.chat-sidebar__brand { gap: 11px; }
+
+.chat-sidebar__logo {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  overflow: hidden;
+  border-radius: 11px;
+  object-fit: cover;
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--ui-primary) 18%, transparent);
+}
+
+.chat-sidebar__logo--fallback {
+  display: grid;
+  place-items: center;
+  background: linear-gradient(180deg, var(--ui-primary) 0%, var(--ui-primary-hover) 100%);
+  color: var(--ui-text-on-primary);
+  font-size: 15px;
+  font-weight: 750;
+}
+
+.chat-sidebar__brand-copy { min-width: 0; }
+
+.chat-sidebar__brand-title {
+  overflow: hidden;
+  color: var(--ui-text);
+  font-size: 14px;
+  font-weight: 720;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__brand-caption {
+  overflow: hidden;
+  margin-top: 4px;
+  color: var(--ui-text-tertiary);
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: .12em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__body {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  padding: 16px 12px 12px;
+}
+
+.chat-sidebar__section-heading {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  margin: 22px 4px 9px;
+  color: var(--ui-text-tertiary);
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: .06em;
+}
+
+.chat-sidebar__section-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.chat-sidebar__history-count {
+  display: grid;
+  min-width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: var(--ui-radius-pill);
+  background: var(--ui-surface-muted);
+  color: var(--ui-text-tertiary);
+  font-size: 10px;
+}
+
+.chat-sidebar__history {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
+}
+
+.chat-sidebar__empty {
+  padding: 34px 10px;
+  color: var(--ui-text-tertiary);
+  font-size: 12px;
+  text-align: center;
+}
+
+.chat-sidebar__history-row {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 3px;
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-popover);
+  color: var(--ui-text-secondary);
+  font-size: 13px;
+  transition: border-color .18s ease, background .18s ease, color .18s ease;
+}
+
+.chat-sidebar__history-row:not(.chat-sidebar__history-row--active):hover {
+  background: var(--ui-surface-hover);
+  color: var(--ui-text);
+}
+
+.chat-sidebar__history-row--active {
+  border-color: color-mix(in srgb, var(--ui-primary) 20%, var(--ui-border));
+  background: var(--ui-primary-subtle);
+  color: var(--ui-primary);
+}
+
+.chat-sidebar__history-button {
+  min-width: 0;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: var(--ui-radius-control);
+  background: transparent;
+  padding: 10px 11px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.chat-sidebar__history-button span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-sidebar__history-button:disabled { cursor: not-allowed; }
+
+.chat-sidebar__footer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--ui-divider);
+  padding: 12px;
+}
+
+.chat-sidebar__admin {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid transparent;
+  border-radius: var(--ui-radius-popover);
+  background: transparent;
+  padding: 9px;
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color .18s ease, background .18s ease, color .18s ease;
+}
+
+.chat-sidebar__admin:hover {
+  border-color: var(--ui-border);
+  background: var(--ui-surface-hover);
+  color: var(--ui-primary);
+}
+
+.chat-sidebar__admin-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--ui-surface-muted);
+  color: var(--ui-icon);
+}
+
+.chat-sidebar__admin:hover .chat-sidebar__admin-icon {
+  background: var(--ui-primary-subtle);
+  color: var(--ui-primary);
+}
+
+.chat-sidebar__admin-copy { min-width: 0; flex: 1 1 auto; }
+.chat-sidebar__admin-copy > span { display: block; font-size: 13px; font-weight: 650; }
+.chat-sidebar__admin-copy small { display: block; overflow: hidden; margin-top: 2px; color: var(--ui-text-tertiary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.chat-sidebar__admin-arrow { color: var(--ui-icon); }
+
 :deep(.chat-sidebar__new.n-button) {
-  --n-height: 40px !important;
-  border-radius: 12px;
+  --n-height: 42px !important;
+  border-radius: var(--ui-radius-control);
   font-size: 13px;
   font-weight: 650;
   letter-spacing: .015em;
-  box-shadow: var(--ui-shadow-card);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--ui-primary) 18%, transparent);
   transition: transform .18s ease, box-shadow .18s ease;
 }
 
