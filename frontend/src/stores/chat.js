@@ -18,14 +18,14 @@ import {
 } from '@/utils/chatHistory'
 import {
   applyClarificationLifecycleEvent,
-  attachEvidenceClarification,
+  attachClarification,
   clarificationFromSearchEvent,
-  invalidateEvidenceClarification,
+  invalidateClarification,
   isClarificationActive,
   isClarificationSubmittable,
-  lockMessageClarificationEvidence,
+  lockMessageClarification,
   markClarificationSubmitted,
-  normalizeEvidenceClarification,
+  normalizeClarification,
   restoreClarificationSubmissionForRetry,
 } from '@/utils/chatClarification'
 import {
@@ -94,19 +94,19 @@ export const useChatStore = defineStore('chat', () => {
   function latestPendingClarificationMessage() {
     return [...messages.value].reverse().find(message => {
       if (message?.role !== 'assistant') return false
-      const clarification = normalizeEvidenceClarification(message.clarification)
+      const clarification = normalizeClarification(message.clarification)
       return isClarificationActive(clarification)
     }) || null
   }
 
-  function lockClarificationEvidence(aiMsg, searchStore, clarification) {
-    const lockedClarification = lockMessageClarificationEvidence(aiMsg, clarification)
+  function lockClarificationState(aiMsg, searchStore, clarification) {
+    const lockedClarification = lockMessageClarification(aiMsg, clarification)
     if (lockedClarification) searchStore.setClarification(lockedClarification)
   }
 
-  function invalidateClarification(aiMsg, searchStore, reason) {
-    const clarification = invalidateEvidenceClarification(aiMsg, reason)
-    if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
+  function invalidateClarificationState(aiMsg, searchStore, reason) {
+    const clarification = invalidateClarification(aiMsg, reason)
+    if (clarification) lockClarificationState(aiMsg, searchStore, clarification)
     return clarification
   }
 
@@ -131,7 +131,7 @@ export const useChatStore = defineStore('chat', () => {
       reuseRequestId ? context?.requestId : '',
       reason,
     )
-    if (clarification) lockClarificationEvidence(context.clarificationSource, searchStore, clarification)
+    if (clarification) lockClarificationState(context.clarificationSource, searchStore, clarification)
     return clarification
   }
 
@@ -147,7 +147,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function maybeRestoreClarificationFromEvent(context, searchStore, event, reason) {
-    const sourceClarification = normalizeEvidenceClarification(context?.clarificationSource?.clarification)
+    const sourceClarification = normalizeClarification(context?.clarificationSource?.clarification)
     if (!eventConfirmsPendingClarification(event, sourceClarification)) return false
     return Boolean(restoreSubmittedClarification(context, searchStore, reason))
   }
@@ -159,7 +159,7 @@ export const useChatStore = defineStore('chat', () => {
     { reuseRequestId = true } = {},
   ) {
     const source = context?.clarificationSource
-    const attempted = normalizeEvidenceClarification(source?.clarification)
+    const attempted = normalizeClarification(source?.clarification)
     const conversationId = currentConvId.value == null ? '' : String(currentConvId.value)
     if (!source || !attempted?.submission_pending || !conversationId) return false
     try {
@@ -167,7 +167,7 @@ export const useChatStore = defineStore('chat', () => {
       const authoritative = (Array.isArray(rows) ? rows : [])
         .map(restoreHistoryMessageState)
         .find(message => {
-          const clarification = normalizeEvidenceClarification(message?.clarification)
+          const clarification = normalizeClarification(message?.clarification)
           return Boolean(
             clarification
             && isClarificationActive(clarification)
@@ -185,7 +185,7 @@ export const useChatStore = defineStore('chat', () => {
           invalidated: true,
           invalid_reason: 'pending_state_not_active',
         }
-        lockClarificationEvidence(source, searchStore, source.clarification)
+        lockClarificationState(source, searchStore, source.clarification)
         return false
       }
       // The history endpoint has rechecked current KB/document permissions and
@@ -259,7 +259,7 @@ export const useChatStore = defineStore('chat', () => {
       if (!marked && explicitSource) return
       if (marked) clarificationSource = pendingClarification
     }
-    const clarificationIdentity = normalizeEvidenceClarification(clarificationSource?.clarification)
+    const clarificationIdentity = normalizeClarification(clarificationSource?.clarification)
     const turnContext = { requestId, clarificationSource }
     activeTurnContext = turnContext
     activeRequestId.value = requestId
@@ -329,7 +329,7 @@ export const useChatStore = defineStore('chat', () => {
     // variable created above still points at the original plain object.  SSE
     // writes through that raw reference do not invalidate computed consumers
     // such as ChatMessage's clarification picker.  Reuse Vue's cached proxy so
-    // live clarification -> ack -> done mutations render immediately, just as
+    // proposed -> active -> done mutations render immediately, just as
     // the same message does after a history reload.
     aiMsg = reactive(aiMsg)
 
@@ -416,7 +416,7 @@ export const useChatStore = defineStore('chat', () => {
           data = parseSseDataEvent(rawEvent)
         } catch (error) {
           console.warn('[chat] SSE 数据解析失败', { error })
-          invalidateClarification(aiMsg, searchStore, 'protocol_parse_error')
+          invalidateClarificationState(aiMsg, searchStore, 'protocol_parse_error')
           markTurnFailed(aiMsg, turnContext, searchStore, 'protocol_parse_error')
           appendUniqueStreamError(aiMsg, SSE_PARSE_ERROR_MESSAGE)
           return
@@ -436,7 +436,7 @@ export const useChatStore = defineStore('chat', () => {
           }
         } catch (error) {
           console.error('[chat] SSE 事件处理失败', { eventType: data.type || 'unknown', error })
-          invalidateClarification(aiMsg, searchStore, 'protocol_handler_error')
+          invalidateClarificationState(aiMsg, searchStore, 'protocol_handler_error')
           markTurnFailed(aiMsg, turnContext, searchStore, 'protocol_handler_error')
           appendUniqueStreamError(aiMsg, SSE_HANDLER_ERROR_MESSAGE)
         }
@@ -481,7 +481,7 @@ export const useChatStore = defineStore('chat', () => {
         aiMsg.retry_with_new_request_id = true
         aiMsg.same_request_recoverable = false
       }
-      invalidateClarification(
+      invalidateClarificationState(
         aiMsg,
         searchStore,
         failureReason,
@@ -504,9 +504,9 @@ export const useChatStore = defineStore('chat', () => {
                   : '请求未能完成，请重试。'))
         appendUniqueStreamError(aiMsg, retryNotice)
       }
-      const clarification = normalizeEvidenceClarification(aiMsg.clarification)
-      if (clarification && !clarification.acknowledged && !clarification.invalidated) {
-        invalidateClarification(aiMsg, searchStore, 'missing_persistence_ack')
+      const clarification = normalizeClarification(aiMsg.clarification)
+      if (clarification && clarification.status !== 'active' && !clarification.invalidated) {
+        invalidateClarificationState(aiMsg, searchStore, 'missing_active_state')
       }
       if (
         aiMsg.retryable
@@ -600,7 +600,7 @@ export const useChatStore = defineStore('chat', () => {
     } else if (data.type === 'search_results') {
       // 搜索事件现在会返回实际执行与证据状态；搜索配置只作为旧版本接口
       // 未携带 method/top_k 时的展示兜底，不能代替服务端执行结论。
-      const existingClarification = normalizeEvidenceClarification(aiMsg.clarification)
+      const existingClarification = normalizeClarification(aiMsg.clarification)
       const incomingClarification = clarificationFromSearchEvent(data)
       const clarification = existingClarification || incomingClarification
       searchStore.setResults(
@@ -626,6 +626,10 @@ export const useChatStore = defineStore('chat', () => {
         retrieval_executed: aiMsg.retrieval_executed,
         evidence_status: aiMsg.evidence_status,
         answer_provenance: aiMsg.answer_provenance,
+        model_adjudication_state: data.model_adjudication_state ?? eventMeta.model_adjudication_state,
+        model_adjudication_error: data.model_adjudication_error ?? eventMeta.model_adjudication_error,
+        unverified_generation: Boolean(data.unverified_generation ?? eventMeta.unverified_generation),
+        source_verification: data.source_verification ?? eventMeta.source_verification ?? null,
       }
       aiMsg.search_snapshot = searchSnapshotFromEvent(data, {
         trace_id: aiMsg.trace_id,
@@ -635,27 +639,28 @@ export const useChatStore = defineStore('chat', () => {
         intent_decision: aiMsg.intent_decision,
       })
       if (clarification) {
-        const attached = attachEvidenceClarification(aiMsg, clarification)
-        lockClarificationEvidence(aiMsg, searchStore, attached)
+        const attached = attachClarification(aiMsg, clarification)
+        lockClarificationState(aiMsg, searchStore, attached)
       }
-    } else if (data.type === 'evidence_clarification') {
-      const clarification = applyClarificationLifecycleEvent(aiMsg, data)
-      if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
-    } else if (data.type === 'evidence_clarification_ack') {
+    } else if (data.type === 'clarification_state') {
       const ackConversationId = typeof data.conversation_id === 'string'
         ? data.conversation_id.trim()
         : ''
       const currentConversationId = currentConvId.value == null
         ? ''
         : String(currentConvId.value)
-      if (currentConversationId && ackConversationId !== currentConversationId) {
-        invalidateClarification(aiMsg, searchStore, 'ack_conversation_mismatch')
+      if (
+        data.status === 'active'
+        && currentConversationId
+        && ackConversationId !== currentConversationId
+      ) {
+        invalidateClarificationState(aiMsg, searchStore, 'ack_conversation_mismatch')
         return
       }
       const clarification = applyClarificationLifecycleEvent(aiMsg, data)
       if (clarification) {
-        if (!currentConversationId) currentConvId.value = ackConversationId
-        lockClarificationEvidence(aiMsg, searchStore, clarification)
+        if (!currentConversationId && ackConversationId) currentConvId.value = ackConversationId
+        lockClarificationState(aiMsg, searchStore, clarification)
       }
     } else if (data.type === 'text_delta') {
       if (typeof data.content !== 'string') throw new TypeError('text_delta.content must be a string')
@@ -673,7 +678,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       if (data.conversation_id) currentConvId.value = data.conversation_id
       const clarification = applyClarificationLifecycleEvent(aiMsg, data)
-      if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
+      if (clarification) lockClarificationState(aiMsg, searchStore, clarification)
       applyTurnLifecycleState(aiMsg, data)
       if (isPendingTurnReplay(data)) {
         aiMsg.failure_reason = 'turn_in_progress'
@@ -700,7 +705,7 @@ export const useChatStore = defineStore('chat', () => {
         }, searchConfig.value)
       }
       const clarification = applyClarificationLifecycleEvent(aiMsg, data)
-      if (clarification) lockClarificationEvidence(aiMsg, searchStore, clarification)
+      if (clarification) lockClarificationState(aiMsg, searchStore, clarification)
       if (typeof data.error_code === 'string' && data.error_code) aiMsg.error_code = data.error_code
       const persistenceFailed = isPersistenceFailureEvent(data)
       applyTurnLifecycleState(aiMsg, persistenceFailed
@@ -720,7 +725,7 @@ export const useChatStore = defineStore('chat', () => {
       item === message || (message?.id != null && item?.id === message.id)
     ))
     if (!target || target !== latestPendingClarificationMessage()) return false
-    const clarification = normalizeEvidenceClarification(target.clarification)
+    const clarification = normalizeClarification(target.clarification)
     if (!isClarificationSubmittable(clarification)) return false
     const selected = clarification.choices.find(choice => choice.reply === reply)
     const displayContent = reply === '都对比'
@@ -757,7 +762,7 @@ export const useChatStore = defineStore('chat', () => {
     const searchStore = useSearchStore()
     if (lastAssistantMessage) {
       lastAssistantMessage.stopped = true
-      invalidateClarification(lastAssistantMessage, searchStore, 'stream_aborted')
+      invalidateClarificationState(lastAssistantMessage, searchStore, 'stream_aborted')
       applyTurnLifecycleState(lastAssistantMessage, {
         type: 'error',
         turn_status: 'failed',

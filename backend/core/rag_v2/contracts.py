@@ -2306,6 +2306,12 @@ class EvidenceBundle:
         for item in self.context_items:
             if item.role not in {"direct", "bridge", "complement"}:
                 continue
+            # Requirement bindings on an unverified fallback source partition
+            # candidates by answer target; they are not proof that the target
+            # is covered.  Coverage remains empty until normal adjudication and
+            # graph closure succeed.
+            if str(item.metadata.get("source_verification") or "").casefold() == "unverified":
+                continue
             for requirement_id in item.supports_requirement_ids:
                 if requirement_id in seen:
                     continue

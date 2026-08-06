@@ -1,6 +1,8 @@
 """Ensure every knowledge/document mutation uses its exact CRUD capability."""
 
+import ast
 import inspect
+import textwrap
 import unittest
 
 from fastapi.routing import APIRoute
@@ -83,6 +85,28 @@ class CrudRouteAuthorizationTests(unittest.TestCase):
                     _required_permission_keys(_route(document_router, "GET", path)),
                     {DOC_READ},
                 )
+
+    def test_every_document_mutation_enforces_object_action(self) -> None:
+        expected = {
+            ("PUT", "/knowledge/{kb_id}/documents/{doc_id}"): "update",
+            ("PATCH", "/knowledge/{kb_id}/documents/{doc_id}/tags"): "update",
+            ("PATCH", "/knowledge/{kb_id}/documents/{doc_id}/toggle"): "update",
+            ("DELETE", "/knowledge/{kb_id}/documents/{doc_id}"): "delete",
+        }
+        for (method, path), action in expected.items():
+            with self.subTest(method=method, path=path):
+                endpoint = _route(document_router, method, path).endpoint
+                tree = ast.parse(textwrap.dedent(inspect.getsource(endpoint)))
+                enforced_actions = {
+                    node.args[2].value
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "_require_document_action"
+                    and len(node.args) >= 3
+                    and isinstance(node.args[2], ast.Constant)
+                }
+                self.assertEqual(enforced_actions, {action})
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -15,6 +15,7 @@ from typing import Any, Sequence
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.clarification import ClarificationContract
 from core.evidence_ambiguity import query_requests_all_scopes
 from core.query_constraints import (
     canonical_product_name,
@@ -61,10 +62,9 @@ class AuthorizedScopeChoice:
 
 @dataclass(frozen=True)
 class AuthorizedScopeClarification:
-    """A non-executable clarification derived from authorized scope only."""
+    """Structured ambiguity facts derived from authorized scope only."""
 
     dimension: str
-    question: str
     choices: tuple[AuthorizedScopeChoice, ...]
     reason: str = "multiple_authorized_versions"
 
@@ -72,10 +72,18 @@ class AuthorizedScopeClarification:
         return {
             "schema_version": "authorized_scope_clarification.v1",
             "dimension": self.dimension,
-            "question": self.question,
             "reason": self.reason,
             "choices": [choice.to_dict() for choice in self.choices],
         }
+
+    def to_contract(self) -> ClarificationContract:
+        return ClarificationContract(
+            adapter="semantic",
+            dimension=self.dimension,
+            reason_code=self.reason,
+            selection_mode="choice" if self.choices else "refine",
+            choices=tuple(choice.to_dict() for choice in self.choices),
+        )
 
 
 def _version_sort_key(value: str) -> tuple[tuple[int, int | str], ...]:
@@ -282,10 +290,6 @@ async def resolve_authorized_scope_clarification(
     if len(entries) > _MAX_SCOPE_CHOICES:
         return AuthorizedScopeClarification(
             dimension="product_version",
-            question=(
-                "当前授权资料中存在多个版本，无法安全默认选择。"
-                "请直接补充要查询的产品版本。"
-            ),
             choices=(),
             reason="too_many_authorized_versions",
         )
@@ -299,14 +303,8 @@ async def resolve_authorized_scope_clarification(
         )
         for index, item in enumerate(entries, start=1)
     )
-    lines = [
-        "当前授权知识库中存在多个适用版本，请先选择版本：",
-        *(f"{index}. {choice.label}" for index, choice in enumerate(choices, start=1)),
-        "请回复版本号或完整版本名称；如果要比较全部版本，请明确说“全部版本”。",
-    ]
     return AuthorizedScopeClarification(
         dimension="product_version",
-        question="\n".join(lines),
         choices=choices,
     )
 

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from core.reranker import (
     AnswerRequirement,
     RerankOutcome,
+    _joint_rerank_attempt_budgets,
     clear_rerank_circuit_breakers,
     joint_rerank_with_coverage,
     rerank_with_status,
@@ -63,6 +64,15 @@ def _settings():
         rag_trace_include_content=True,
         rag_trace_include_candidate_details=False,
     )
+
+
+class JointRerankBudgetTests(unittest.TestCase):
+    def test_first_attempt_receives_the_complete_stage_budget(self) -> None:
+        first_attempt, repair_cap = _joint_rerank_attempt_budgets(8)
+
+        self.assertEqual(first_attempt, 8)
+        self.assertGreater(repair_cap, 0)
+        self.assertLess(repair_cap, first_attempt)
 
 
 def _assessment(
@@ -366,7 +376,17 @@ class FirstPassPlanningTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
-    async def _run(self, payload, *, eligible=(1, 2, 3), anchors=(1,)):
+    def setUp(self) -> None:
+        clear_structured_output_capability_cache()
+
+    async def _run(
+        self,
+        payload,
+        *,
+        eligible=(1, 2, 3),
+        anchors=(1,),
+        timeout_seconds=None,
+    ):
         results = [
             {"id": "grade", "doc_id": "travel", "content": "普通员工属于D级。"},
             {"id": "train", "doc_id": "travel", "content": "D级乘高铁二等座。"},
@@ -394,6 +414,7 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
                 bridge_requirement_ids=("r2",),
                 eligible_candidate_indexes=eligible,
                 anchor_candidate_indexes=anchors,
+                timeout_seconds=timeout_seconds,
             )
         return outcome, client
 
@@ -463,6 +484,125 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(grade["contribution_role"], "bridge")
         self.assertEqual(grade["bridge_facts"][0]["object"], "D级")
         self.assertEqual(train["contribution_role"], "complement")
+
+    async def test_explicit_stage_timeout_is_not_capped_by_a_hidden_constant(self) -> None:
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [{
+                        "subject": "普通员工",
+                        "relation": "属于",
+                        "object": "D级",
+                    }],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        outcome, client = await self._run(payload, timeout_seconds=27.0)
+
+        self.assertTrue(outcome.succeeded)
+        request_timeout = client.chat.completions.create.await_args.kwargs[
+            "timeout"
+        ]
+        self.assertGreater(request_timeout, 26.9)
+        self.assertLessEqual(request_timeout, 27.0)
+
+    async def test_response_format_rejection_negotiates_to_plain_json(self) -> None:
+        class ProviderContractError(Exception):
+            status_code = 400
+
+        payload = {
+            "selected": [
+                {
+                    "index": 1,
+                    "role": "bridge",
+                    "supports_requirement_ids": ["r2"],
+                    "bridge_facts": [{
+                        "subject": "普通员工",
+                        "relation": "属于",
+                        "object": "D级",
+                    }],
+                },
+                {
+                    "index": 2,
+                    "role": "answer",
+                    "supports_requirement_ids": ["r1"],
+                    "bridge_facts": [],
+                },
+            ],
+            "coverage_complete": True,
+        }
+
+        async def create(**kwargs):
+            if "response_format" in kwargs:
+                raise ProviderContractError(
+                    "Request failed: Bad Request, error: "
+                    "This response_format type is unavailable now"
+                )
+            return _payload_response(payload)
+
+        create_mock = AsyncMock(side_effect=create)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock))
+        )
+        results = [
+            {"id": "grade", "doc_id": "travel", "content": "普通员工属于D级。"},
+            {"id": "train", "doc_id": "travel", "content": "D级乘高铁二等座。"},
+        ]
+        requirements = [
+            _requirement("r1", "回答普通员工出差标准"),
+            _requirement(
+                "r2",
+                "确认普通员工对应职级",
+                importance="helpful",
+                source="inferred",
+            ),
+        ]
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            llm_base_url="https://provider.example/v1",
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=settings),
+        ):
+            outcome = await select_small_document_evidence_with_coverage(
+                "普通员工的出差标准是什么",
+                results,
+                requirements,
+                bridge_requirement_ids=("r2",),
+                eligible_candidate_indexes=(1, 2),
+                anchor_candidate_indexes=(1,),
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.structured_output_mode, "plain_json")
+        self.assertEqual(
+            outcome.structured_output_attempted_modes,
+            ("json_schema", "json_object", "plain_json"),
+        )
+        self.assertEqual(create_mock.await_count, 3)
+        self.assertNotIn(
+            "response_format",
+            create_mock.await_args_list[-1].kwargs,
+        )
+        self.assertIn(
+            "valid JSON object",
+            "\n".join(
+                message["content"]
+                for message in create_mock.await_args_list[-1].kwargs["messages"]
+            ),
+        )
 
     async def test_complete_claim_without_required_bridge_fails_closed(self) -> None:
         payload = {
@@ -1109,7 +1249,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
             "selected_set_id": "set_1",
         }
         invalid_payload = json.loads(json.dumps(valid_payload))
-        invalid_payload["evidence_sets"][0]["coverage_status"] = "fully_covered"
+        invalid_payload["evidence_sets"][0]["coverage_status"] = "full"
         client = _client_with_payload_sequence(invalid_payload)
         with (
             patch("core.reranker.get_client", return_value=client),
@@ -1125,6 +1265,59 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.coverage_status, "complete")
         self.assertEqual(client.chat.completions.create.await_count, 1)
         self.assertFalse(outcome.repair_attempted)
+        self.assertEqual(
+            outcome.evidence_sets[0].model_coverage_status_original,
+            "full",
+        )
+        self.assertEqual(
+            outcome.evidence_sets[0].model_coverage_status_resolution,
+            "normalized_alias",
+        )
+
+    async def test_unknown_coverage_diagnostic_does_not_discard_verified_bindings(self) -> None:
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{
+            "id": "hotel",
+            "content": "D级一线城市住宿450元/天。",
+            "score": 0.02,
+        }]
+        payload = {
+            "results": [_assessment(
+                1,
+                role="direct",
+                contribution="standalone_answer",
+                supports=["r1"],
+                bridge_facts=[],
+            )],
+            "evidence_sets": [{
+                "id": "set_1",
+                "candidate_indexes": [1],
+                "joint_answer_support": 0.9,
+                "coverage": [{"requirement_id": "r1", "candidate_indexes": [1]}],
+                "coverage_status": "future_provider_label",
+                "missing_requirement_ids": [],
+                "reason": "住宿标准片段覆盖必要需求",
+            }],
+            "selected_set_id": "set_1",
+        }
+        client = _client_with_payload(payload)
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "普通员工住宿标准是什么",
+                results,
+                requirements,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(client.chat.completions.create.await_count, 1)
+        self.assertEqual(
+            outcome.evidence_sets[0].model_coverage_status_resolution,
+            "unknown_diagnostic",
+        )
 
     async def test_schema_fallback_repair_uses_lowercase_json_contract(self) -> None:
         class ProviderContractError(Exception):
@@ -1614,7 +1807,8 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
             [AnswerRequirement(id="r1", description="答案")],
         )
 
-        self.assertTrue(outcome.succeeded)
+        self.assertFalse(outcome.succeeded)
+        self.assertEqual(outcome.error, "no_candidates")
         self.assertEqual(outcome.coverage_status, "insufficient")
         self.assertEqual(outcome.missing_requirement_ids, ("r1",))
 

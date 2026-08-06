@@ -159,7 +159,7 @@ class DocumentRelevanceAdmissionTests(unittest.TestCase):
         self.assertEqual(decision.admitted_doc_ids, ("second", "first"))
         self.assertEqual(decision.to_dict()["admitted_doc_ids"], ["second", "first"])
 
-    def test_query_topic_gate_rejects_generic_lexical_hit_for_unseen_subject(self) -> None:
+    def test_high_recall_admission_keeps_generic_lexical_hits_for_evidence_graph(self) -> None:
         decision = assess_document_relevance(
             [
                 _candidate(
@@ -177,11 +177,8 @@ class DocumentRelevanceAdmissionTests(unittest.TestCase):
             ],
             query="不存在的火星基地量子补贴标准是什么",
         )
-        self.assertEqual(decision.admitted_doc_ids, ())
-        self.assertEqual(
-            decision.reason,
-            "no_document_met_lexical_or_vector_gate",
-        )
+        self.assertEqual(decision.admitted_doc_ids, ("travel", "leave"))
+        self.assertEqual(decision.reason, "admitted_by_lexical_evidence")
 
     def test_unscoped_product_query_keeps_one_representative_per_version(self) -> None:
         decision = assess_document_relevance(

@@ -64,12 +64,13 @@
               <n-form-item>
                 <template #label>
                   <span class="inline-flex items-center gap-1">
-                    知识库未命中策略
+                    非强制来源兜底策略
                     <n-tooltip trigger="hover" placement="top">
                       <template #trigger>
                         <n-icon :size="15" class="text-gray-400 cursor-help"><HelpCircleOutline /></n-icon>
                       </template>
                       <div class="max-w-xs text-xs leading-relaxed">
+                        仅对来源策略为“优先”或“不要求”的请求生效；明确要求企业知识库依据的请求始终禁止通用模型猜测。<br>
                         通用大模型回答不会被标记为知识库命中，也不会展示或保存为回答依据。<br>
                         · 严格模式：未命中时只提示没有知识库依据。<br>
                         · 仅完全未命中：知识库没有可用资料时自动使用通用大模型。<br>
@@ -166,7 +167,7 @@ const saving = ref(false)
 const form = ref({ ...settingsStore.data })
 const canWrite = computed(() => authStore.hasPerm('settings:write'))
 const generalFallbackOptions = [
-  { label: '严格知识库模式', value: 'off' },
+  { label: '关闭通用模型兜底', value: 'off' },
   { label: '仅完全未命中时兜底', value: 'no_hit' },
   { label: '未命中或证据不足时兜底', value: 'no_hit_or_insufficient' },
 ]

@@ -16,6 +16,7 @@ from core.audit import AuditLogger, get_audit
 from core.deps import require_permission
 from core.openai_client import get_service_credentials
 from core.permissions import SETTINGS_READ, SETTINGS_WRITE
+from core.reranker import clear_rerank_circuit_breakers
 from core.settings_crypto import (
     SECRET_SETTING_KEYS,
     SettingsEncryptionError,
@@ -69,6 +70,7 @@ class SettingsOut(BaseModel):
     rerank_model: str
     temperature: float
     max_tokens: int
+    rerank_timeout_seconds: float
     embedding_api_key: str
     embedding_base_url: str
     embedding_model: str
@@ -102,6 +104,7 @@ class SettingsUpdate(BaseModel):
     rerank_model: str | None = Field(None, max_length=255)
     temperature: float | None = None
     max_tokens: int | None = None
+    rerank_timeout_seconds: float | None = Field(None, ge=1.0, le=120.0)
     embedding_api_key: str | None = None
     embedding_base_url: str | None = None
     embedding_model: str | None = None
@@ -379,6 +382,11 @@ async def _load(db: AsyncSession) -> dict:
         "rerank_model": _value_from_database(db_map, "rerank_model", settings),
         "temperature": _value_from_database(db_map, "temperature", settings),
         "max_tokens": _value_from_database(db_map, "max_tokens", settings),
+        "rerank_timeout_seconds": _value_from_database(
+            db_map,
+            "rerank_timeout_seconds",
+            settings,
+        ),
         "embedding_api_key": _secret_status(db_map.get("embedding_api_key"), settings.embedding_api_key),
         "embedding_base_url": _value_from_database(db_map, "embedding_base_url", settings),
         "embedding_model": _value_from_database(db_map, "embedding_model", settings),
@@ -869,5 +877,18 @@ async def update_settings(
     ):
         # 端点、模型或管理员选择变化后，旧能力结论不能污染新配置。
         clear_structured_output_capability_cache()
+    if any(
+        key in updates
+        for key in (
+            "llm_base_url",
+            "chat_model",
+            "rerank_model",
+            "llm_structured_output_mode",
+            "rerank_timeout_seconds",
+        )
+    ):
+        # 熔断键虽然包含端点、模型和合同，但旧进程状态没有配置 revision。
+        # 配置变化时整体清理，避免新模型继承旧模型的失败窗口。
+        clear_rerank_circuit_breakers()
 
     return await _load(db)

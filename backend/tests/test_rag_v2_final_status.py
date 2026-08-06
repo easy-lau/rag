@@ -38,7 +38,6 @@ class FinalClarificationPriorityTests(unittest.TestCase):
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension="document",
-            question="请在两份制度中选择一份。",
             reason="multiple_mutually_exclusive_assessed_scopes",
             relevant_document_count=2,
             allowed_doc_ids=("policy-a", "policy-b"),
@@ -57,7 +56,7 @@ class FinalClarificationPriorityTests(unittest.TestCase):
         self.assertEqual(adjudication.evidence_status, "error")
         self.assertFalse(adjudication.ambiguity.needs_clarification)
         self.assertEqual(adjudication.suppression_reason, "base_status_error")
-        self.assertEqual(adjudication.ambiguity.question, "")
+        self.assertEqual(adjudication.ambiguity.choices, ())
         self.assertEqual(adjudication.ambiguity.allowed_doc_ids, ())
 
     def test_partial_never_becomes_clarification(self) -> None:

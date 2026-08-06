@@ -7,6 +7,7 @@ log() 只是把一条 OperationLog 加入会话，随业务 commit 一起落库�
 红线：detail 绝不写入密码 / API Key / Token 等敏感值，密钥类只记"哪些键被改"。
 """
 
+import logging
 from ipaddress import ip_address
 
 from fastapi import Depends, Request
@@ -14,6 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.deps import get_current_user
 from models.db_models import OperationLog, User
+
+
+logger = logging.getLogger(__name__)
 
 
 def client_ip(request: Request) -> str | None:
@@ -65,6 +69,41 @@ class AuditLogger:
             ip=self.ip,
             user_agent=self.user_agent,
         ))
+
+    async def log_independent(
+        self,
+        action: str,
+        *,
+        target_type: str | None = None,
+        target_id=None,
+        target_name: str | None = None,
+        detail: dict | None = None,
+    ) -> bool:
+        """Persist a rejection/security event outside the failing request transaction.
+
+        A normal ``log`` followed by an HTTP exception would be rolled back when
+        the request session closes.  Rejection audit therefore needs its own
+        short transaction.  Audit storage failure must never turn a deliberate
+        authorization denial into a 500 response.
+        """
+
+        from database import AsyncSessionLocal
+
+        try:
+            async with AsyncSessionLocal() as db:
+                self.log(
+                    db,
+                    action,
+                    target_type=target_type,
+                    target_id=target_id,
+                    target_name=target_name,
+                    detail=detail,
+                )
+                await db.commit()
+            return True
+        except Exception:
+            logger.exception("failed to persist independent audit event: %s", action)
+            return False
 
 
 async def get_audit(request: Request, user: User = Depends(get_current_user)) -> AuditLogger:

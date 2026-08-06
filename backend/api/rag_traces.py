@@ -113,9 +113,10 @@ _TRACE_CORE_EVENTS = {
     # request.  It is part of the causal spine, not optional diagnostics.
     "intent.semantic_entry_gate",
     "intent.routing_decision",
-    "intent.clarification_created",
-    "intent.clarification_resolved",
-    "intent.clarification_expired",
+    "clarification.created",
+    "clarification.repeated",
+    "clarification.resolved",
+    "clarification.expired",
     "direct.plan",
     "query.plan",
     "knowledge.capability.selected",
@@ -126,10 +127,6 @@ _TRACE_CORE_EVENTS = {
     *_TRACE_QUERY_UNDERSTANDING_V3_EVENTS,
     "evidence.ambiguity_assessed",
     "evidence.explicit_comparison_resolved",
-    "evidence.clarification_required",
-    "evidence.clarification_created",
-    "evidence.clarification_repeated",
-    "evidence.clarification_resolved",
     "evidence.route_contract_built",
     "evidence.route_contract_failed",
     "evidence.scope_filter_applied",
@@ -148,6 +145,8 @@ _TRACE_CORE_EVENTS = {
     "retrieval.error",
     "retrieval.expansion_error",
     "rerank.completed",
+    "evidence.model_adjudication",
+    "evidence.unverified_fallback",
     "evidence.selection",
     "generation.context",
     "generation.general_fallback",
@@ -560,12 +559,10 @@ def _clarification_lifecycle_snapshot(
     """Summarize clarification transitions without copying task or user text."""
 
     transition_names = {
-        "intent.clarification_created": "created",
-        "intent.clarification_resolved": "resolved",
-        "intent.clarification_expired": "expired",
-        "evidence.clarification_created": "created",
-        "evidence.clarification_repeated": "repeated",
-        "evidence.clarification_resolved": "resolved",
+        "clarification.created": "created",
+        "clarification.repeated": "repeated",
+        "clarification.resolved": "resolved",
+        "clarification.expired": "expired",
     }
     counts = {f"{transition}_count": 0 for transition in transition_names.values()}
     history: list[dict[str, Any]] = []

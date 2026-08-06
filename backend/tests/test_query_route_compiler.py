@@ -666,6 +666,26 @@ class RagTaskCompilerContractTests(unittest.TestCase):
         self.assertEqual(summary["bridge_requirement_count"], 0)
         self.assertEqual(contract.safe_summary(), summary)
 
+    def test_task_contract_derives_source_and_version_policy(self) -> None:
+        exact = _compile(
+            _route(evidence_scope="enterprise_kb"),
+            question="云枢8.6如何修改登录参数",
+        )
+        partition = _compile(
+            _route(evidence_scope="mixed"),
+            question="云枢如何修改登录参数",
+        )
+        all_versions = _compile(
+            _route(evidence_scope="mixed"),
+            question="对比云枢所有版本的登录参数",
+        )
+
+        self.assertEqual(exact.grounding_policy, "required")
+        self.assertEqual(exact.version_resolution_mode, "exact")
+        self.assertEqual(partition.grounding_policy, "preferred")
+        self.assertEqual(partition.version_resolution_mode, "partition")
+        self.assertEqual(all_versions.version_resolution_mode, "all")
+
     def test_category_and_source_mismatch_fail_before_contract_creation(self) -> None:
         route = _route()
         wrong_category = RouteCategoryPolicy(

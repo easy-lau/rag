@@ -95,6 +95,34 @@ class RagRouteDecisionSchemaTests(unittest.TestCase):
 
 
 class RagRouteDecisionParserTests(unittest.TestCase):
+    def test_current_query_may_omit_redundant_empty_context_keys(self) -> None:
+        payload = _payload(query_resolution={"mode": "current"})
+
+        decision = parse_rag_route_decision(
+            payload,
+            allowed_intent_codes=["knowledge_qa"],
+            available_turn_keys=["t1"],
+        )
+
+        self.assertEqual(decision.query_resolution.mode, "current")
+        self.assertEqual(decision.query_resolution.context_turn_keys, ())
+
+    def test_contextualize_must_not_omit_context_keys(self) -> None:
+        payload = _payload(
+            relation="followup",
+            query_resolution={"mode": "contextualize"},
+        )
+
+        with self.assertRaisesRegex(
+            RouteDecisionValidationError,
+            "context_turn_keys",
+        ):
+            parse_rag_route_decision(
+                payload,
+                allowed_intent_codes=["knowledge_qa"],
+                available_turn_keys=["t1"],
+            )
+
     def test_parses_exact_followup_contract_and_round_trips(self) -> None:
         payload = _payload(
             relation="followup",

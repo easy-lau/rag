@@ -1,9 +1,58 @@
 import unittest
 
-from core.rag_v2.query_plan import plan_query_locally
+from core.query_constraints import ApplicabilityScope
+from core.rag_v2.query_plan import (
+    partition_plan_by_applicability_scopes,
+    plan_query_locally,
+)
 
 
 class ConservativeLocalQueryPlannerTests(unittest.TestCase):
+    def test_scope_partitions_clone_answer_contract_not_scope_labels(self) -> None:
+        question = "如何完成这项操作"
+        base = plan_query_locally(question)
+        plan = partition_plan_by_applicability_scopes(
+            base,
+            (
+                ApplicabilityScope(product="平台A", version="6"),
+                ApplicabilityScope(product="平台A", version="7"),
+            ),
+            comparison=True,
+        )
+
+        self.assertEqual(plan.answer_shape, "comparison")
+        self.assertEqual(
+            [item.description for item in plan.requirements],
+            [question, question],
+        )
+        self.assertEqual(
+            [item.applicability_scope.version for item in plan.requirements],
+            ["6", "7"],
+        )
+        self.assertTrue(all(
+            item.coverage_contract == base.requirements[0].coverage_contract
+            for item in plan.requirements
+        ))
+
+    def test_scope_partitions_clone_bridge_graph_per_partition(self) -> None:
+        base = plan_query_locally("普通员工的餐补是多少")
+        plan = partition_plan_by_applicability_scopes(
+            base,
+            (
+                ApplicabilityScope(product="平台A", version="6"),
+                ApplicabilityScope(product="平台A", version="7"),
+            ),
+        )
+
+        self.assertEqual(len(plan.requirements), 4)
+        for offset in (0, 2):
+            answer, bridge = plan.requirements[offset:offset + 2]
+            self.assertEqual(answer.augmentation_requirement_ids, (bridge.id,))
+            self.assertEqual(
+                answer.applicability_scope.fingerprint,
+                bridge.applicability_scope.fingerprint,
+            )
+
     def test_recognizes_generic_answer_shapes(self) -> None:
         cases = {
             "某项制度是什么": "overview",

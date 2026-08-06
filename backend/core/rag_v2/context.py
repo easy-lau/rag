@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Sequence
 
 from core.rag_v2.contracts import EvidenceBundle, EvidenceItem
 
@@ -40,6 +41,34 @@ def _validate_budget(max_chunks: int, max_chars: int) -> None:
         raise ValueError("max_chars must be a positive integer")
 
 
+def order_evidence_context_items(
+    items: Sequence[EvidenceItem],
+) -> tuple[EvidenceItem, ...]:
+    """Return the one canonical document/chunk order used by all layers.
+
+    Candidate ranking decides *which* complete blocks enter the prompt. Once
+    admitted, rendering groups blocks by first-seen document and restores
+    source chunk order within that document. Assemblers must call this helper
+    before publishing ``context_item_ids`` so a harmless ordering difference
+    cannot be mistaken for a renderer safety mismatch.
+    """
+
+    selected = tuple(items)
+    if any(not isinstance(item, EvidenceItem) for item in selected):
+        raise ValueError("items must contain EvidenceItem values")
+    first_document_position: dict[tuple[str, str], int] = {}
+    for position, item in enumerate(selected):
+        first_document_position.setdefault((item.kb_id, item.doc_id), position)
+    return tuple(sorted(
+        selected,
+        key=lambda item: (
+            first_document_position[(item.kb_id, item.doc_id)],
+            item.chunk_index,
+            item.chunk_id,
+        ),
+    ))
+
+
 def _ordered_context_items(bundle: EvidenceBundle) -> tuple[EvidenceItem, ...]:
     allowed_ids = set(bundle.context_item_ids)
     # The generation prompt and the public ``answer_sources`` list must have
@@ -54,17 +83,7 @@ def _ordered_context_items(bundle: EvidenceBundle) -> tuple[EvidenceItem, ...]:
         and item.role in {"direct", "bridge", "complement"}
         and item.supports_requirement_ids
     ]
-    first_document_position: dict[tuple[str, str], int] = {}
-    for position, item in enumerate(selected):
-        first_document_position.setdefault((item.kb_id, item.doc_id), position)
-    return tuple(sorted(
-        selected,
-        key=lambda item: (
-            first_document_position[(item.kb_id, item.doc_id)],
-            item.chunk_index,
-            item.chunk_id,
-        ),
-    ))
+    return order_evidence_context_items(selected)
 
 
 def _source_name(item: EvidenceItem) -> str:
@@ -199,5 +218,6 @@ __all__ = [
     "build_evidence_context",
     "evidence_block_char_cost",
     "evidence_context_char_cost",
+    "order_evidence_context_items",
     "render_evidence_context",
 ]

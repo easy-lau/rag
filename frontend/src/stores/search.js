@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { normalizeEvidenceClarification } from '../utils/chatClarification.js'
+import { normalizeClarification } from '../utils/chatClarification.js'
 import {
   evidenceCandidatePolicy,
   isExecutedEvidenceStatus,
@@ -19,7 +19,7 @@ const STEPS = [
 const STEP_STATUS = new Set(['pending', 'active', 'done', 'skipped', 'error'])
 const STEP_LABELS = Object.fromEntries(STEPS.map(step => [step.key, step.label]))
 
-const EVIDENCE_ROLES = new Set(['direct', 'related', 'irrelevant'])
+const EVIDENCE_ROLES = new Set(['direct', 'related', 'unverified', 'irrelevant'])
 
 function firstDefined(...values) {
   return values.find(value => value !== undefined && value !== null)
@@ -117,6 +117,17 @@ function normalizeIntentDecision(decision) {
     intent_name: decision.intent_name || operation,
     response_mode: responseMode,
     retrieval_policy: retrievalPolicy,
+    grounding_policy: firstDefined(
+      taskContract?.grounding_policy,
+      taskContract?.evidence_policy,
+      decision.grounding_policy,
+      '',
+    ) || '',
+    version_resolution_mode: firstDefined(
+      taskContract?.version_resolution_mode,
+      decision.version_resolution_mode,
+      '',
+    ) || '',
     need_retrieval: needRetrieval,
     decision_reason: taskContract?.decision_reason || taskContract?.reason || decision.decision_reason || decision.reason || '',
   }
@@ -208,12 +219,12 @@ export const useSearchStore = defineStore('search', () => {
     hasResultEvent.value = true
 
     const eventMeta = data?.search_meta || data?.meta || {}
-    const previousClarification = normalizeEvidenceClarification(searchMeta.value.clarification)
+    const previousClarification = normalizeClarification(searchMeta.value.clarification)
       ? searchMeta.value.clarification
       : null
     const incomingClarification = firstDefined(data.clarification, eventMeta.clarification, null)
     const effectiveClarification = previousClarification
-      || (normalizeEvidenceClarification(incomingClarification) ? incomingClarification : null)
+      || (normalizeClarification(incomingClarification) ? incomingClarification : null)
     // Once a stream has entered clarification, later/out-of-order result
     // events cannot promote candidates back into answer evidence.
     const clarificationLocked = Boolean(effectiveClarification)
@@ -337,6 +348,13 @@ export const useSearchStore = defineStore('search', () => {
       method: firstDefined(data.method, eventMeta.method, fallbackMeta.method, searchMeta.value.method),
       top_k: firstDefined(data.top_k, eventMeta.top_k, fallbackMeta.top_k, searchMeta.value.top_k),
       rerank: firstDefined(data.rerank, eventMeta.rerank, fallbackMeta.rerank, searchMeta.value.rerank),
+      grounding_policy: firstDefined(data.grounding_policy, eventMeta.grounding_policy, searchMeta.value.grounding_policy, intentDecision.value?.grounding_policy, ''),
+      version_resolution_mode: firstDefined(data.version_resolution_mode, eventMeta.version_resolution_mode, searchMeta.value.version_resolution_mode, intentDecision.value?.version_resolution_mode, ''),
+      evidence_execution_strategy: firstDefined(data.evidence_execution_strategy, eventMeta.evidence_execution_strategy, searchMeta.value.evidence_execution_strategy, ''),
+      model_adjudication_state: firstDefined(data.model_adjudication_state, eventMeta.model_adjudication_state, searchMeta.value.model_adjudication_state, ''),
+      model_adjudication_error: firstDefined(data.model_adjudication_error, eventMeta.model_adjudication_error, searchMeta.value.model_adjudication_error, ''),
+      unverified_generation: Boolean(firstDefined(data.unverified_generation, eventMeta.unverified_generation, false)),
+      source_verification: firstDefined(data.source_verification, eventMeta.source_verification, searchMeta.value.source_verification, ''),
       trace_id: firstDefined(data.trace_id, eventMeta.trace_id, searchMeta.value.trace_id),
       query_constraints: firstDefined(
         data.query_constraints,

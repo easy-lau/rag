@@ -415,6 +415,39 @@ def _exact_object(
     return value
 
 
+def _query_resolution_object(value: Any) -> Mapping[str, Any]:
+    """Normalize only the semantically redundant current-query binding.
+
+    Strict JSON Schema providers are still asked to return both fields. Some
+    JSON-object/plain transports omit an empty ``context_turn_keys`` array.
+    The omission is deterministic only for ``mode=current``: contextualized
+    routes must continue to provide an explicit, request-local history key.
+    Unknown fields and a missing mode remain hard contract failures.
+    """
+
+    if not isinstance(value, Mapping):
+        raise RouteDecisionValidationError("query_resolution 必须是对象")
+    actual = set(value.keys())
+    extra = sorted(actual - _QUERY_RESOLUTION_KEYS)
+    missing_required = [] if "mode" in value else ["mode"]
+    if extra or missing_required:
+        raise RouteDecisionValidationError(
+            "query_resolution 字段不完整或包含额外字段: "
+            f"missing={missing_required}, extra={extra}"
+        )
+    if "context_turn_keys" in value:
+        return _exact_object(
+            value,
+            _QUERY_RESOLUTION_KEYS,
+            "query_resolution",
+        )
+    if value.get("mode") != "current":
+        raise RouteDecisionValidationError(
+            "query_resolution.context_turn_keys 仅可在 mode=current 时省略"
+        )
+    return {**value, "context_turn_keys": []}
+
+
 def _string(
     value: Any,
     field: str,
@@ -494,11 +527,7 @@ def parse_rag_route_decision(
             f"无效 evidence_scope: {evidence_scope}"
         )
 
-    query_payload = _exact_object(
-        payload["query_resolution"],
-        _QUERY_RESOLUTION_KEYS,
-        "query_resolution",
-    )
+    query_payload = _query_resolution_object(payload["query_resolution"])
     query_mode = query_payload["mode"]
     if query_mode not in VALID_QUERY_MODES:
         raise RouteDecisionValidationError(f"无效 query_resolution.mode: {query_mode}")

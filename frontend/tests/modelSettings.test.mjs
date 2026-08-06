@@ -38,6 +38,13 @@ test('模型管理页把重排模型接入 LLM 模型列表、连接测试和保
   assert.match(modelManagementSource, /rerank_model: normalizeOptionalModel\(form\.value\.rerank_model\)/)
 })
 
+test('模型管理页在生成参数同一行提供独立重排超时并随设置保存', () => {
+  assert.match(modelManagementSource, /v-model:value="form\.rerank_timeout_seconds"/)
+  assert.match(modelManagementSource, /rerank_timeout_seconds: form\.value\.rerank_timeout_seconds/)
+  assert.match(modelManagementSource, /重排超时（秒）/)
+  assert.match(modelManagementSource, /待验证的部分回答/)
+})
+
 test('重排模型操作继续服从 settings write 权限', () => {
   assert.match(modelManagementSource, /authStore\.hasPerm\('settings:write'\)/)
   assert.match(modelManagementSource, /:disabled="!canWrite \|\| connectionTests\.rerank\.loading"/)

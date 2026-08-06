@@ -4,6 +4,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.document_content import (
+    DOCUMENT_CONTENT_FORMAT_VERSION,
+    normalize_document_markdown,
+)
+
 
 CHUNK_SIZE = 500      # CJK 目标字符数（中文字≈token）
 CHUNK_OVERLAP = 50
@@ -210,6 +215,7 @@ def _structured_chunk_metadata(
         # 保留旧字段，老检索逻辑和历史前端仍可读取 heading/type。
         "heading": _ctx_prefix(title, heading_path),
         "metadata_version": CHUNK_METADATA_VERSION,
+        "content_format_version": DOCUMENT_CONTENT_FORMAT_VERSION,
         "section_path": path,
         "section_key": section_key,
         "section_chunk_index": section_chunk_index,
@@ -227,6 +233,7 @@ def _with_ctx(ctx: str, content: str) -> str:
 
 def parse_markdown_content(content: str, source: str) -> list[dict]:
     """按标题层级切分，保留 Markdown 表格完整，并给每个 chunk 带上标题路径上下文。"""
+    content = normalize_document_markdown(content)
     heading_re = re.compile(r'^(#{1,6})\s+(.*)$')
     table_row_re = re.compile(r'^\s*\|.*\|\s*$')
 

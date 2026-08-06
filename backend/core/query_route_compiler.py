@@ -26,9 +26,47 @@ from core.query_route_contract import (
     normalize_turn_candidate_keys,
 )
 from core.rag_v2.query_plan import infer_implicit_bridge
+from core.query_constraints import extract_applicability_scopes, extract_query_constraints
 
 
 TASK_CONTRACT_SCHEMA_VERSION = "rag_task_contract.v1"
+
+GroundingPolicy = Literal["required", "preferred", "none"]
+VersionResolutionMode = Literal["exact", "partition", "compare", "all", "unknown"]
+
+
+def grounding_policy_for_scope(scope: str) -> GroundingPolicy:
+    """Derive one source policy from the route scope.
+
+    Intent classification can choose a route, but it cannot silently turn a
+    source-bound enterprise request into a general-model answer.  Keeping this
+    derivation beside the task contract gives the API, runner and Trace one
+    policy instead of separate fallback checks.
+    """
+
+    normalized = str(scope or "").strip().casefold()
+    if normalized == "enterprise_kb":
+        return "required"
+    if normalized == "mixed":
+        return "preferred"
+    return "none"
+
+
+def version_resolution_mode_for_query(question: str) -> VersionResolutionMode:
+    """Classify version intent without choosing a version for the user."""
+
+    text = str(question or "").strip().casefold()
+    if re.search(r"全部版本|所有版本|各个版本|各版本|所有适用版本", text):
+        return "all"
+    scopes = tuple(extract_applicability_scopes(text))
+    if len(scopes) > 1:
+        return "compare"
+    constraints = extract_query_constraints(text)
+    if constraints.has_version_constraint:
+        return "exact"
+    if constraints.has_product_constraint:
+        return "partition"
+    return "unknown"
 
 VALID_CATEGORY_ACTIONS = {"retrieve", "chat", "writing", "system_help"}
 VALID_RESPONSE_MODES = {"grounded_qa", "general_chat", "writing", "platform_help"}
@@ -239,6 +277,13 @@ class RagTaskContract:
     selected_kb_count: int
     requirements: tuple[CompiledAnswerRequirement, ...]
     clarification: RouteClarification
+    version_resolution_mode: VersionResolutionMode = "unknown"
+
+    @property
+    def grounding_policy(self) -> GroundingPolicy:
+        """Whether generation must remain bound to authorized evidence."""
+
+        return grounding_policy_for_scope(self.evidence_scope)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -252,6 +297,8 @@ class RagTaskContract:
             "source": self.source,
             "relation": self.relation,
             "evidence_scope": self.evidence_scope,
+            "grounding_policy": self.grounding_policy,
+            "version_resolution_mode": self.version_resolution_mode,
             "query_mode": self.query_mode,
             "context_turn_keys": list(self.context_turn_keys),
             "response_mode": self.response_mode,
@@ -615,6 +662,7 @@ def compile_rag_task_contract(
             require_implicit_bridge=need_retrieval,
         ),
         clarification=clarification,
+        version_resolution_mode=version_resolution_mode_for_query(question),
     )
 
     # Compilation must never emit a contract that claims authorization but
@@ -1001,6 +1049,8 @@ def safe_rag_task_contract_summary(contract: RagTaskContract) -> dict[str, Any]:
         "source": contract.source,
         "relation": contract.relation,
         "evidence_scope": contract.evidence_scope,
+        "grounding_policy": contract.grounding_policy,
+        "version_resolution_mode": contract.version_resolution_mode,
         "query_mode": contract.query_mode,
         "context_turn_count": len(contract.context_turn_keys),
         "response_mode": contract.response_mode,
@@ -1025,6 +1075,8 @@ def safe_rag_task_contract_summary(contract: RagTaskContract) -> dict[str, Any]:
 __all__ = [
     "TASK_CONTRACT_SCHEMA_VERSION",
     "CompiledAnswerRequirement",
+    "GroundingPolicy",
+    "VersionResolutionMode",
     "RagTaskContract",
     "RagSemanticEntryGate",
     "RouteCategoryPolicy",
@@ -1032,6 +1084,8 @@ __all__ = [
     "TaskContractCompilationError",
     "TaskContractDispatchError",
     "compile_rag_task_contract",
+    "grounding_policy_for_scope",
+    "version_resolution_mode_for_query",
     "assess_rag_semantic_entry_gate",
     "is_rag_task_contract_dispatchable",
     "rag_task_contract_gate_reason",

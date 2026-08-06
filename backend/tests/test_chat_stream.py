@@ -17,6 +17,7 @@ from api.chat import (
     send_message,
 )
 from core.conversation_context import ConversationContext, RouteTurnCandidate
+from core.clarification import ClarificationContract, build_clarification_state
 from core.query_route_compiler import (
     RouteCategoryPolicy,
     RouteCompilerConfig,
@@ -75,50 +76,46 @@ def _history_pending_state(
     first_doc_id: uuid.UUID,
     second_doc_id: uuid.UUID,
 ) -> dict:
-    now = datetime.now(UTC)
-    return {
-        "schema_version": "rag_pending_clarification.v2",
-        "kind": "evidence_scope",
-        "state_id": str(uuid.uuid4()),
-        "base_user_message_id": str(uuid.uuid4()),
-        "clarification_message_id": str(clarification_message_id),
-        "original_query": "普通员工的出差标准是什么",
-        "dimension": "version",
-        "selection_mode": "choice",
-        "choices": [
-            {
-                "key": "c1",
-                "label": "2025 版差旅标准",
-                "products": ["差旅制度"],
-                "canonical_products": ["差旅制度"],
-                "versions": ["2025"],
-                "projects": [],
-                "filenames": ["差旅标准-2025.md"],
-                "kb_ids": [str(kb_id)],
-                "doc_ids": [str(first_doc_id)],
-                "anchor_doc_ids": [str(first_doc_id)],
-                "companion_doc_ids": [],
-            },
-            {
-                "key": "c2",
-                "label": "2026 版差旅标准",
-                "products": ["差旅制度"],
-                "canonical_products": ["差旅制度"],
-                "versions": ["2026"],
-                "projects": [],
-                "filenames": ["差旅标准-2026.md"],
-                "kb_ids": [str(kb_id)],
-                "doc_ids": [str(second_doc_id)],
-                "anchor_doc_ids": [str(second_doc_id)],
-                "companion_doc_ids": [],
-            },
-        ],
-        "clarification_message": "检索到两个版本，请选择 2025 版或 2026 版。",
-        "selected_kb_ids_snapshot": [str(kb_id)],
-        "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(hours=1)).isoformat(),
-        "dispatch_authorized": False,
-    }
+    return build_clarification_state(
+        contract=ClarificationContract(
+            adapter="evidence",
+            dimension="version",
+            reason_code="multiple_authorized_versions",
+            selection_mode="choice",
+            choices=(
+                {
+                    "key": "c1",
+                    "label": "2025 版差旅标准",
+                    "products": ["差旅制度"],
+                    "canonical_products": ["差旅制度"],
+                    "versions": ["2025"],
+                    "projects": [],
+                    "filenames": ["差旅标准-2025.md"],
+                    "kb_ids": [str(kb_id)],
+                    "doc_ids": [str(first_doc_id)],
+                    "anchor_doc_ids": [str(first_doc_id)],
+                    "companion_doc_ids": [],
+                },
+                {
+                    "key": "c2",
+                    "label": "2026 版差旅标准",
+                    "products": ["差旅制度"],
+                    "canonical_products": ["差旅制度"],
+                    "versions": ["2026"],
+                    "projects": [],
+                    "filenames": ["差旅标准-2026.md"],
+                    "kb_ids": [str(kb_id)],
+                    "doc_ids": [str(second_doc_id)],
+                    "anchor_doc_ids": [str(second_doc_id)],
+                    "companion_doc_ids": [],
+                },
+            ),
+        ),
+        original_query="普通员工的出差标准是什么",
+        selected_kb_ids=[kb_id],
+        base_user_message_id=uuid.uuid4(),
+        clarification_message_id=clarification_message_id,
+    )
 
 
 def _routing_result(
@@ -521,7 +518,7 @@ class ChatHistoricalClarificationTests(unittest.IsolatedAsyncioTestCase):
 
         clarification = messages[0].clarification
         self.assertIsNotNone(clarification)
-        self.assertTrue(clarification["acknowledged"])
+        self.assertEqual(clarification["status"], "active")
         self.assertTrue(clarification["persisted"])
         self.assertEqual(clarification["pending_state_id"], pending["state_id"])
         self.assertEqual(clarification["clarification_message_id"], str(message_id))
@@ -531,17 +528,18 @@ class ChatHistoricalClarificationTests(unittest.IsolatedAsyncioTestCase):
             {
                 "key",
                 "label",
+                "value",
                 "products",
+                "canonical_products",
                 "versions",
                 "projects",
                 "filenames",
             },
         )
-        public_payload = json.dumps(clarification, ensure_ascii=False)
-        self.assertNotIn("doc_ids", public_payload)
-        self.assertNotIn("kb_ids", public_payload)
-        self.assertNotIn("anchor_doc_ids", public_payload)
-        self.assertNotIn("canonical_products", public_payload)
+        for choice in clarification["choices"]:
+            self.assertNotIn("doc_ids", choice)
+            self.assertNotIn("kb_ids", choice)
+            self.assertNotIn("anchor_doc_ids", choice)
 
     async def test_history_does_not_restore_invalid_or_unauthorized_clarification(self) -> None:
         conversation_id = uuid.uuid4()
@@ -672,12 +670,13 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
             raw_results,
             selected_kb_ids,
             read_session_factory=None,
+            allow_unverified=False,
         ):
             # These tests exercise persistence/event accounting.  The dedicated
             # source-validation tests cover the real DB refresh boundary; use a
             # trusted fixture here so arbitrary UUID snapshots do not need a
             # database row for every case.
-            del raw_results, selected_kb_ids, read_session_factory
+            del raw_results, selected_kb_ids, read_session_factory, allow_unverified
             sources = list(raw_sources or [])
             pairs = {
                 (uuid.UUID(str(source["kb_id"])), uuid.UUID(str(source["doc_id"])))
@@ -863,6 +862,55 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
                     len(answer_sources),
                 )
 
+    async def test_unverified_partial_sources_keep_their_label_in_history(self) -> None:
+        source = self._source(role="unverified", filename="待验证参考.md")
+        source["id"] = source["chunk_id"]
+        source["source_verification"] = "unverified"
+        event = {
+            "type": "search_results",
+            "results": [source],
+            "answer_sources": [source],
+            "total": 1,
+            "displayed_result_count": 1,
+            "context_evidence_count": 1,
+            "hit_count": 0,
+            "retrieval_executed": True,
+            "evidence_status": "partial",
+            "direct_evidence_count": 0,
+            "related_reference_count": 0,
+            "unverified_reference_count": 1,
+            "unverified_generation": True,
+            "source_verification": "unverified",
+        }
+
+        payloads, assistant, route_log, response_trace = (
+            await self._run_successful_stream(event)
+        )
+
+        search_event = next(
+            item for item in payloads if item and item["type"] == "search_results"
+        )
+        self.assertEqual(search_event["evidence_status"], "partial")
+        self.assertEqual(search_event["direct_evidence_count"], 0)
+        self.assertEqual(search_event["hit_count"], 0)
+        self.assertEqual(len(assistant.sources), 1)
+        self.assertEqual(
+            assistant.sources[0]["source_verification"],
+            "unverified",
+        )
+        snapshot = _bounded_search_snapshot(search_event)
+        self.assertTrue(snapshot["counters"]["unverified_generation"])
+        self.assertEqual(
+            snapshot["counters"]["source_verification"],
+            "unverified",
+        )
+        self.assertEqual(
+            snapshot["answer_sources"][0]["evidence_role"],
+            "unverified",
+        )
+        self.assertEqual(route_log.evidence_status, "partial")
+        self.assertEqual(response_trace.kwargs["hit_count"], 0)
+
     async def test_positive_status_without_valid_sources_locks_generation(self) -> None:
         event = {
             "type": "search_results",
@@ -1046,8 +1094,13 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertFalse(result["retrieval_executed"])
         self.assertEqual(result["decision_reason"], "unresolved_reference")
-        answer = next(item for item in payloads if item["type"] == "text_delta")
-        self.assertIn("无法确定", answer["content"])
+        clarification = next(
+            item
+            for item in payloads
+            if item["type"] == "clarification_state" and item["status"] == "active"
+        )
+        self.assertEqual(clarification["adapter"], "semantic")
+        self.assertFalse(any(item["type"] == "text_delta" for item in payloads))
 
     async def test_missing_object_followup_passes_current_turn_and_route_candidate_separately(
         self,
@@ -1257,12 +1310,20 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
         async def cancelled_stream(**_kwargs):
             yield "data: " + json.dumps(
                 {
-                    "type": "evidence_clarification",
-                    "schema_version": "rag_evidence_clarification.v1",
+                    "type": "clarification_state",
+                    "schema_version": "rag_clarification_state.v1",
+                    "status": "proposed",
+                    "persisted": False,
                     "needs_clarification": True,
+                    "adapter": "semantic",
                     "dimension": "document",
-                    "question": "请选择需要查询的资料。",
+                    "reason_code": "missing_document",
+                    "selection_mode": "refine",
                     "choices": [],
+                    "allowed_actions": ["refine", "cancel", "new_question"],
+                    "pending_state_id": None,
+                    "clarification_message_id": None,
+                    "route_state_revision": None,
                 },
                 ensure_ascii=False,
             ) + "\n\n"
@@ -1300,8 +1361,7 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
             for chunk in chunks
         ]
         event_types = [item["type"] for item in payloads if item]
-        self.assertIn("evidence_clarification", event_types)
-        self.assertNotIn("evidence_clarification_ack", event_types)
+        self.assertIn("clarification_state", event_types)
         self.assertEqual(trace.call_args_list[-1].args[0], "chat.cancelled")
         self.assertEqual(trace.call_args_list[-1].kwargs["stage"], "streaming")
 

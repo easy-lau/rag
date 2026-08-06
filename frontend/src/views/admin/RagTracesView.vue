@@ -270,9 +270,6 @@ const EVENT_LABELS = {
   'intent.contract_compiled': '编译路由执行合同',
   'intent.routing_decision': '确定智能路由策略',
   'intent.semantic_entry_gate': '校验 V3 语义入口闸门',
-  'intent.clarification_created': '保存待澄清任务',
-  'intent.clarification_resolved': '完成待澄清任务',
-  'intent.clarification_expired': '待澄清任务已过期',
   'direct.plan': '制定直答计划',
   'query.plan': '制定查询与证据计划',
   'query.execution': '校验查询执行基线',
@@ -297,10 +294,10 @@ const EVENT_LABELS = {
   'query.understanding.v3.fallback': 'V3 回退确定性计划',
   'query.understanding.v3.cancelled': '取消 V3 结构理解',
   'evidence.ambiguity_assessed': '检查证据适用范围',
-  'evidence.clarification_required': '要求选择证据范围',
-  'evidence.clarification_created': '保存证据范围选项',
-  'evidence.clarification_repeated': '重复证据范围选项',
-  'evidence.clarification_resolved': '完成证据范围选择',
+  'clarification.created': '保存待澄清状态',
+  'clarification.repeated': '重复待澄清状态',
+  'clarification.resolved': '完成澄清',
+  'clarification.expired': '待澄清状态已过期',
   'evidence.route_contract_built': '构建证据范围合同',
   'evidence.route_contract_failed': '证据范围合同校验失败',
   'evidence.scope_filter_applied': '应用证据范围过滤',
@@ -327,6 +324,9 @@ const EVENT_LABELS = {
   'retrieval.anchor_preflight.rejected': '拒绝不匹配的原问题锚点预取',
   'rerank.candidate': '评估候选证据',
   'rerank.completed': '完成重排',
+  'evidence.model_adjudication': '执行证据裁决策略',
+  'evidence.related_admission': '准入相关证据进行部分回答',
+  'evidence.unverified_fallback': '保留待验证候选上下文',
   'rerank.fast_path_skipped': '跳过模型重排',
   'rerank.joint_completed': '完成联合证据评估',
   'evidence.selection': '筛选回答证据',
@@ -595,9 +595,8 @@ function eventTone(event) {
   if (
     name === 'generation.general_fallback'
     || name === 'chat.cancelled'
-    || name === 'intent.clarification_expired'
-    || name === 'evidence.clarification_required'
-    || name === 'evidence.clarification_repeated'
+    || name === 'clarification.expired'
+    || name === 'clarification.repeated'
   ) return 'is-warning'
   if (
     name.endsWith('completed')
@@ -617,8 +616,7 @@ function eventTone(event) {
       && event?.payload?.decision === 'applied'
     )
     || name === 'chat.response'
-    || name === 'intent.clarification_resolved'
-    || name === 'evidence.clarification_resolved'
+    || name === 'clarification.resolved'
   ) return 'is-success'
   return 'is-info'
 }

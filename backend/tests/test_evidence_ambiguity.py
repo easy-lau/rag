@@ -161,8 +161,9 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             {choice.doc_ids for choice in decision.choices},
             {("doc-leave",), ("doc-travel",)},
         )
-        self.assertIn("员工请假管理办法.docx", decision.question)
-        self.assertIn("公司出差管理标准.docx", decision.question)
+        labels = " ".join(choice.label for choice in decision.choices)
+        self.assertIn("员工请假管理办法.docx", labels)
+        self.assertIn("公司出差管理标准.docx", labels)
 
     def test_applicability_only_mode_never_emits_document_topic_choices(
         self,
@@ -900,9 +901,9 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             {choice.versions for choice in decision.choices},
             {("6.0.1",), ("8.2.75",)},
         )
-        self.assertIn("中青建安", decision.question)
-        self.assertIn("都对比", decision.question)
-        self.assertNotIn("云枢7配置", decision.question)
+        labels = " ".join(choice.label for choice in decision.choices)
+        self.assertIn("中青建安", labels)
+        self.assertNotIn("云枢7配置", labels)
         self.assertEqual(decision.allowed_doc_ids, ())
         self.assertEqual(decision.to_dict()["allowed_doc_ids"], [])
 

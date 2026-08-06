@@ -187,7 +187,12 @@ test('仅握手或进度 SSE 后断流仍保留旧回答，权威展示事件才
     { type: 'turn_state', status: 'completed' },
     { type: 'turn_state', status: 'failed' },
     { type: 'error', message: '生成失败' },
-    { type: 'evidence_clarification_ack', persisted: true },
+    {
+      type: 'clarification_state',
+      schema_version: 'rag_clarification_state.v1',
+      status: 'active',
+      persisted: true,
+    },
     { type: 'done', status: 'generating', replayed: true },
   ]) {
     assert.equal(streamEventConfirmsAssistantPresentation(authoritativeEvent), true)

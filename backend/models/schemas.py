@@ -25,6 +25,12 @@ class KnowledgeBaseOut(BaseModel):
 
 
 # ── Document ─────────────────────────────────────────────────────
+class DocumentPermissions(BaseModel):
+    read: bool
+    update: bool
+    delete: bool
+
+
 class DocumentOut(BaseModel):
     id: uuid.UUID
     kb_id: uuid.UUID
@@ -41,6 +47,7 @@ class DocumentOut(BaseModel):
     updated_at: datetime | None = None
     created_by_name: str | None = None
     updated_by_name: str | None = None
+    permissions: DocumentPermissions
 
     model_config = {"from_attributes": True}
 

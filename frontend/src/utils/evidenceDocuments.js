@@ -1,6 +1,7 @@
 const EVIDENCE_ROLE_PRIORITY = {
   direct: 3,
   related: 2,
+  unverified: 1,
   '': 1,
   irrelevant: 0,
 }

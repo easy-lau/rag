@@ -9,7 +9,6 @@ anchor its document without allowing a weaker document to borrow that signal.
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -29,32 +28,6 @@ MAX_DOC_VECTOR_GAP = 0.035
 MIN_KEYWORD_SCORE = 1e-4
 MIN_TRIGRAM_SCORE = 0.12
 _FLOAT_COMPARISON_EPSILON = 1e-12
-MIN_TOPIC_COVERAGE = 0.30
-STRONG_VECTOR_TOPIC_BYPASS = 0.84
-_TOPIC_STOP_TERMS = frozenset({
-    "什么",
-    "如何",
-    "怎么",
-    "怎样",
-    "哪些",
-    "哪个",
-    "是否",
-    "能否",
-    "可否",
-    "请问",
-    "查询",
-    "查一下",
-    "标准",
-    "制度",
-    "政策",
-    "规定",
-    "办法",
-    "规范",
-    "要求",
-    "信息",
-    "内容",
-    "相关",
-})
 
 
 @dataclass(frozen=True)
@@ -107,48 +80,6 @@ def _has_lexical_hit(candidate: Mapping[str, Any]) -> bool:
         _number_at_least(candidate.get("keyword_score"), MIN_KEYWORD_SCORE)
         or _number_at_least(candidate.get("trigram_score"), MIN_TRIGRAM_SCORE)
     )
-
-
-def _topic_terms(value: object) -> set[str]:
-    """Extract bounded CJK n-grams/ASCII words for a query coverage check."""
-
-    text = str(value or "").casefold()
-    terms: set[str] = set()
-    for match in re.finditer(r"[a-z0-9][a-z0-9_.+/-]{1,}|[\u3400-\u9fff]+", text):
-        token = match.group(0)
-        if re.fullmatch(r"[\u3400-\u9fff]+", token):
-            for size in (2, 3):
-                if len(token) >= size:
-                    terms.update(
-                        token[index:index + size]
-                        for index in range(len(token) - size + 1)
-                    )
-        else:
-            terms.add(token)
-    return {
-        term
-        for term in terms
-        if term not in _TOPIC_STOP_TERMS
-        and not any(char in term for char in "的是否以及与和为请问查询")
-    }
-
-
-def _topic_coverage(query: object, candidate: Mapping[str, Any]) -> float | None:
-    """Estimate lexical subject coverage without treating RRF as confidence."""
-
-    query_terms = _topic_terms(query)
-    if len(query_terms) <= 2:
-        return None
-    content = "\n".join(
-        str(candidate.get(field) or "")
-        for field in ("filename", "content", "heading", "title", "source")
-    ).strip()
-    if not content:
-        return None
-    candidate_terms = _topic_terms(content)
-    if not candidate_terms:
-        return 0.0
-    return len(query_terms & candidate_terms) / max(len(query_terms), 1)
 
 
 def _validated_threshold(value: object, *, field_name: str) -> float:
@@ -224,7 +155,6 @@ def assess_document_relevance(
     rejected: list[str] = []
     admitted_by_lexical = False
     admitted_by_vector = False
-    admitted_by_topic = False
     admitted_by_version = False
     query_constraints = extract_query_constraints(query or "") if query else None
     version_representatives: dict[str, tuple[str, float]] = {}
@@ -263,33 +193,20 @@ def assess_document_relevance(
             gap = global_best_vector - signals.best_vector_score
             vector_admitted = gap <= maximum_gap + _FLOAT_COMPARISON_EPSILON
 
-        topic_coverage_values = [
-            _topic_coverage(query, candidate)
-            for candidate in candidates
-            if isinstance(candidate, Mapping)
-            and str(candidate.get("doc_id") or "").strip() == doc_id
-        ]
-        topic_coverage_values = [
-            value for value in topic_coverage_values if value is not None
-        ]
-        topic_admitted = (
-            query is None
-            or not topic_coverage_values
-            or max(topic_coverage_values) >= MIN_TOPIC_COVERAGE
-            or (
-                signals.best_vector_score is not None
-                and signals.best_vector_score >= STRONG_VECTOR_TOPIC_BYPASS
-            )
-        )
         version_representative = any(
             representative_doc_id == doc_id
             for representative_doc_id, _ in version_representatives.values()
         )
-        if (signals.lexical_hit or vector_admitted or version_representative) and topic_admitted:
+        # Admission is a recall decision, not a one-chunk proof decision.  A
+        # long natural-language question may be supported by several chunks
+        # in one document, so a lexical n-gram coverage ratio over each
+        # individual chunk cannot safely veto a calibrated retrieval hit.
+        # Scope, evidence binding and citation validity remain strict in the
+        # downstream evidence graph.
+        if signals.lexical_hit or vector_admitted or version_representative:
             admitted.append(doc_id)
             admitted_by_lexical = admitted_by_lexical or signals.lexical_hit
             admitted_by_vector = admitted_by_vector or vector_admitted
-            admitted_by_topic = admitted_by_topic or bool(topic_coverage_values)
             admitted_by_version = admitted_by_version or version_representative
         else:
             rejected.append(doc_id)
@@ -300,8 +217,6 @@ def assess_document_relevance(
         reason = "admitted_by_lexical_or_vector_evidence"
     elif admitted_by_version:
         reason = "admitted_by_each_explicit_version_representative"
-    elif admitted_by_lexical and admitted_by_topic:
-        reason = "admitted_by_lexical_and_topic_evidence"
     elif admitted_by_lexical:
         reason = "admitted_by_lexical_evidence"
     else:
@@ -319,6 +234,5 @@ __all__ = [
     "MIN_KEYWORD_SCORE",
     "MIN_TRIGRAM_SCORE",
     "MIN_VECTOR_SCORE",
-    "MIN_TOPIC_COVERAGE",
     "assess_document_relevance",
 ]

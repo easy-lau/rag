@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 from api.chat import _select_rag_pipeline_version, send_message
+from core.clarification import ClarificationContract, build_clarification_state
 from core.conversation_context import ConversationContext
 from core.query_analysis_execution import QueryAnalysisExecutionResult
 from core.query_route_compiler import (
@@ -94,50 +95,46 @@ def _ledgered_bundle(question: str) -> RagExecutionBundle:
 def _evidence_pending_state(*, kb_id: uuid.UUID) -> dict:
     first_doc_id = uuid.uuid4()
     second_doc_id = uuid.uuid4()
-    now = datetime.now(timezone.utc)
-    return {
-        "schema_version": "rag_pending_clarification.v2",
-        "kind": "evidence_scope",
-        "state_id": str(uuid.uuid4()),
-        "base_user_message_id": str(uuid.uuid4()),
-        "clarification_message_id": str(uuid.uuid4()),
-        "original_query": "登录用户名枚举要配置什么",
-        "dimension": "version",
-        "selection_mode": "choice",
-        "choices": [
-            {
-                "key": "c1",
-                "label": "云枢 6.0.1",
-                "products": ["云枢"],
-                "canonical_products": ["云枢"],
-                "versions": ["6.0.1"],
-                "projects": [],
-                "kb_ids": [str(kb_id)],
-                "doc_ids": [str(first_doc_id)],
-                "anchor_doc_ids": [str(first_doc_id)],
-                "companion_doc_ids": [],
-                "filenames": ["云枢6.md"],
-            },
-            {
-                "key": "c2",
-                "label": "云枢 8.2.75",
-                "products": ["云枢"],
-                "canonical_products": ["云枢"],
-                "versions": ["8.2.75"],
-                "projects": [],
-                "kb_ids": [str(kb_id)],
-                "doc_ids": [str(second_doc_id)],
-                "anchor_doc_ids": [str(second_doc_id)],
-                "companion_doc_ids": [],
-                "filenames": ["云枢8.md"],
-            },
-        ],
-        "clarification_message": "请问需要查询云枢 6.0.1 还是 8.2.75？",
-        "selected_kb_ids_snapshot": [str(kb_id)],
-        "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(hours=1)).isoformat(),
-        "dispatch_authorized": False,
-    }
+    return build_clarification_state(
+        contract=ClarificationContract(
+            adapter="evidence",
+            dimension="version",
+            reason_code="multiple_authorized_versions",
+            selection_mode="choice",
+            choices=(
+                {
+                    "key": "c1",
+                    "label": "云枢 6.0.1",
+                    "products": ["云枢"],
+                    "canonical_products": ["云枢"],
+                    "versions": ["6.0.1"],
+                    "projects": [],
+                    "kb_ids": [str(kb_id)],
+                    "doc_ids": [str(first_doc_id)],
+                    "anchor_doc_ids": [str(first_doc_id)],
+                    "companion_doc_ids": [],
+                    "filenames": ["云枢6.md"],
+                },
+                {
+                    "key": "c2",
+                    "label": "云枢 8.2.75",
+                    "products": ["云枢"],
+                    "canonical_products": ["云枢"],
+                    "versions": ["8.2.75"],
+                    "projects": [],
+                    "kb_ids": [str(kb_id)],
+                    "doc_ids": [str(second_doc_id)],
+                    "anchor_doc_ids": [str(second_doc_id)],
+                    "companion_doc_ids": [],
+                    "filenames": ["云枢8.md"],
+                },
+            ),
+        ),
+        original_query="登录用户名枚举要配置什么",
+        selected_kb_ids=[kb_id],
+        base_user_message_id=uuid.uuid4(),
+        clarification_message_id=uuid.uuid4(),
+    )
 
 
 class RagPipelineSelectionTests(unittest.TestCase):
@@ -1034,7 +1031,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         save_db = _SaveDB()
         carryover_source = {
             "id": str(uuid.uuid4()),
-            "doc_id": pending["choices"][0]["doc_ids"][0],
+            "doc_id": pending["contract"]["choices"][0]["doc_ids"][0],
             "kb_id": str(kb_id),
             "content": "上一轮范围候选",
         }
@@ -1171,7 +1168,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         classify = AsyncMock(
             side_effect=AssertionError("有效证据序号不应再次调用意图模型")
         )
-        anchor_doc_id = pending["choices"][1]["anchor_doc_ids"][0]
+        anchor_doc_id = pending["contract"]["choices"][1]["anchor_doc_ids"][0]
         anchor_chunk_id = str(uuid.uuid4())
         answer_source = {
             "id": anchor_chunk_id,
@@ -1210,8 +1207,9 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
             raw_results,
             selected_kb_ids,
             read_session_factory=None,
+            allow_unverified=False,
         ):
-            del raw_results, selected_kb_ids, read_session_factory
+            del raw_results, selected_kb_ids, read_session_factory, allow_unverified
             return (
                 list(raw_sources or []),
                 {
@@ -1344,16 +1342,24 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selection.kwargs["version"], "v2")
         self.assertEqual(selection.kwargs["reason"], "eligible_grounded_followup")
 
-    async def test_evidence_scope_refinement_dispatches_v2_with_refined_query(
+    async def test_semantic_refinement_dispatches_v2_with_refined_query(
         self,
     ) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
-        pending = _evidence_pending_state(kb_id=kb_id)
-        pending["selection_mode"] = "refine"
-        pending["choices"] = []
-        pending["clarification_message"] = "请补充具体产品或版本。"
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="semantic",
+                dimension="product_version",
+                reason_code="missing_context",
+                selection_mode="refine",
+            ),
+            original_query="登录用户名枚举要配置什么",
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
         conversation = SimpleNamespace(
             id=conversation_id,
             user_id=user_id,
@@ -1414,7 +1420,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selection.kwargs["version"], "v2")
         self.assertEqual(
             selection.kwargs["reason"],
-            "eligible_evidence_scope_refinement",
+            "eligible_grounded_qa",
         )
 
 

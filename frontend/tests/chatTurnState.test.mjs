@@ -166,7 +166,7 @@ test('生命周期保留服务端判定的 request id 恢复边界', () => {
 
 test('只有明确确认同一 pending revision 的事件才允许恢复澄清', () => {
   const clarification = {
-    acknowledged: true,
+    status: 'active',
     persisted: true,
     pending_state_id: 'pending-travel',
     clarification_message_id: 'assistant-travel',

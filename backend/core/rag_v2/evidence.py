@@ -45,6 +45,7 @@ from core.rag_v2.context import (
     EvidenceContext,
     build_evidence_context,
     evidence_context_char_cost,
+    order_evidence_context_items,
 )
 from core.rag_v2.evidence_snapshots import (
     complete_document_keys as complete_snapshot_document_keys,
@@ -71,6 +72,8 @@ EvidenceCompletenessValue = Literal["complete", "partial", "unknown"]
 
 DEFAULT_CONTEXT_MAX_CHUNKS = 16
 DEFAULT_CONTEXT_MAX_CHARS = 16_000
+RELATED_EVIDENCE_REASON = "related_evidence_admitted"
+LEGACY_UNVERIFIED_REASON = "unverified_candidates_after_adjudication_failure"
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,7 @@ class FinalizedVisibleEvidence:
     answer_claim_item_ids: tuple[str, ...] = ()
     route_item_ids: tuple[str, ...] = ()
     generation_allowed: bool = False
+    unverified_generation_allowed: bool = False
     renderer_dropped_item_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -125,10 +129,46 @@ class FinalizedVisibleEvidence:
             raise ValueError(
                 "answer claim item ids must belong to final answer sources"
             )
-        if self.generation_allowed and not self.answer_claim_item_ids:
+        if self.unverified_generation_allowed:
+            if (
+                not self.generation_allowed
+                or self.assessment is not None
+                or self.answer_claim_item_ids
+                or not self.bundle.answer_source_ids
+                or self.bundle.state.confidence != "retrieved"
+                or self.bundle.state.completeness != "unknown"
+                or not any(
+                    reason in {
+                        RELATED_EVIDENCE_REASON,
+                        LEGACY_UNVERIFIED_REASON,
+                    }
+                    or reason.startswith(f"{RELATED_EVIDENCE_REASON}:")
+                    for reason in self.bundle.state.reasons
+                )
+            ):
+                raise ValueError(
+                    "unverified generation requires bounded retrieved candidates"
+                )
+        if (
+            self.generation_allowed
+            and not self.answer_claim_item_ids
+            and not self.unverified_generation_allowed
+        ):
             raise ValueError(
                 "generation requires at least one closed answer claim item"
             )
+
+
+@dataclass(frozen=True)
+class UnverifiedCandidateBundleResult:
+    """Content-free admission diagnostics plus the optional degraded bundle."""
+
+    bundle: EvidenceBundle | None
+    input_candidate_count: int
+    converted_candidate_count: int
+    selected_candidate_count: int
+    exclusion_reason_counts: tuple[tuple[str, int], ...] = ()
+
 
 _OVERVIEW_QUERY_RE = re.compile(
     r"(?:总则|适用范围|适用于谁|适用对象|术语(?:和|与)?定义|定义(?:是什么|为)?|"
@@ -632,6 +672,218 @@ def _to_evidence_item(
         )
     except (TypeError, ValueError, AttributeError):
         return None, "invalid_candidate_excluded"
+
+
+def assemble_unverified_candidate_bundle_with_diagnostics(
+    *,
+    candidates: Sequence[Mapping[str, Any] | EvidenceItem],
+    allowed_requirement_ids: Sequence[str],
+    constraints: QueryConstraints | None = None,
+    max_context_chunks: int = DEFAULT_CONTEXT_MAX_CHUNKS,
+    max_context_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
+    admission_reason: str = RELATED_EVIDENCE_REASON,
+) -> UnverifiedCandidateBundleResult:
+    """Build a bounded, scope-safe snapshot for related-evidence generation.
+
+    This path deliberately does not run requirement mapping, claim creation or
+    coverage reconciliation.  The caller must first bind every candidate to
+    the current request and attach ``supports_requirement_ids``; this boundary
+    then performs the same candidate validation, authorization and hard-scope
+    admission used by normal evidence assembly.
+
+    ``admission_reason`` is diagnostic only; it never grants authorization or
+    scope. Requirement-aware round-robin selection prevents one comparison side from
+    consuming the complete prompt budget.  The returned sources remain
+    retrieved/unverified and all requirements stay missing: this artifact is a
+    labelled generation aid, never an alternate proof result.
+    """
+
+    _validate_budget(max_context_chunks, max_context_chars)
+    admission_reason = re.sub(r"[^a-z0-9_:.-]+", "_", str(admission_reason or "").casefold()).strip("_")
+    if not admission_reason or len(admission_reason) > 120:
+        raise ValueError("admission_reason is invalid")
+    if isinstance(allowed_requirement_ids, (str, bytes)):
+        raise ValueError("allowed_requirement_ids must be a sequence")
+    allowed_ids = tuple(dict.fromkeys(
+        str(value or "").strip()
+        for value in allowed_requirement_ids
+    ))
+    if (
+        len(allowed_ids) > 8
+        or any(not _REQUIREMENT_ID_RE.fullmatch(value) for value in allowed_ids)
+    ):
+        raise ValueError("allowed_requirement_ids contains an invalid id")
+    if not allowed_ids:
+        return UnverifiedCandidateBundleResult(
+            bundle=None,
+            input_candidate_count=len(candidates),
+            converted_candidate_count=0,
+            selected_candidate_count=0,
+            exclusion_reason_counts=(("no_allowed_requirement_ids", len(candidates)),),
+        )
+    allowed_id_set = set(allowed_ids)
+
+    converted: list[EvidenceItem] = []
+    seen_chunk_ids: set[str] = set()
+    exclusion_counts: dict[str, int] = defaultdict(int)
+    for candidate in candidates:
+        item, reason = _to_evidence_item(
+            candidate,
+            constraints=constraints,
+            rerank_succeeded=False,
+            force_retrieved=True,
+        )
+        if item is None:
+            exclusion_counts[reason or "candidate_conversion_failed"] += 1
+            continue
+        if item.chunk_id in seen_chunk_ids:
+            exclusion_counts["duplicate_candidate_excluded"] += 1
+            continue
+        support_ids = tuple(
+            requirement_id
+            for requirement_id in item.supports_requirement_ids
+            if requirement_id in allowed_id_set
+        )
+        if not support_ids:
+            exclusion_counts["requirement_binding_excluded"] += 1
+            continue
+        seen_chunk_ids.add(item.chunk_id)
+        converted.append(replace(
+            item,
+            confidence="retrieved",
+            role="complement",
+            contribution_kind=None,
+            supports_requirement_ids=support_ids,
+            metadata={
+                **dict(item.metadata),
+                "supports_requirement_ids": list(support_ids),
+                "evidence_role_v2": "complement",
+                "source_verification": "unverified",
+                "rerank_status": "unverified",
+                "unverified_generation_fallback": True,
+            },
+        ))
+    if not converted:
+        return UnverifiedCandidateBundleResult(
+            bundle=None,
+            input_candidate_count=len(candidates),
+            converted_candidate_count=0,
+            selected_candidate_count=0,
+            exclusion_reason_counts=tuple(sorted(exclusion_counts.items())),
+        )
+
+    queues = {
+        requirement_id: [
+            item
+            for item in converted
+            if requirement_id in item.supports_requirement_ids
+        ]
+        for requirement_id in allowed_ids
+    }
+    queue_indexes = {requirement_id: 0 for requirement_id in allowed_ids}
+    selected: list[EvidenceItem] = []
+    selected_ids: set[str] = set()
+    budget_rejected_ids: set[str] = set()
+
+    def try_add(item: EvidenceItem) -> bool:
+        if item.chunk_id in selected_ids:
+            return False
+        prospective = [*selected, item]
+        if (
+            len(prospective) > max_context_chunks
+            or evidence_context_char_cost(prospective) > max_context_chars
+        ):
+            budget_rejected_ids.add(item.chunk_id)
+            return False
+        selected.append(item)
+        selected_ids.add(item.chunk_id)
+        return True
+
+    # Give each answer partition a chance before filling remaining capacity in
+    # retrieval order.  Oversized candidates are skipped as complete blocks;
+    # partial chunk text is never exposed to generation.
+    while len(selected) < max_context_chunks:
+        progressed = False
+        exhausted = True
+        for requirement_id in allowed_ids:
+            queue = queues[requirement_id]
+            index = queue_indexes[requirement_id]
+            while index < len(queue) and queue[index].chunk_id in selected_ids:
+                index += 1
+            while index < len(queue):
+                exhausted = False
+                item = queue[index]
+                index += 1
+                if try_add(item):
+                    progressed = True
+                    break
+            queue_indexes[requirement_id] = index
+        if exhausted or not progressed:
+            break
+
+    for item in converted:
+        if len(selected) >= max_context_chunks:
+            break
+        try_add(item)
+    if budget_rejected_ids:
+        exclusion_counts["context_budget_excluded"] += len(budget_rejected_ids)
+    if not selected:
+        return UnverifiedCandidateBundleResult(
+            bundle=None,
+            input_candidate_count=len(candidates),
+            converted_candidate_count=len(converted),
+            selected_candidate_count=0,
+            exclusion_reason_counts=tuple(sorted(exclusion_counts.items())),
+        )
+
+    selected = list(order_evidence_context_items(selected))
+    item_ids = tuple(item.chunk_id for item in selected)
+    bundle = EvidenceBundle(
+        state=EvidenceState(
+            availability="degraded",
+            confidence="retrieved",
+            completeness="unknown",
+            reasons=(admission_reason,),
+        ),
+        items=tuple(selected),
+        context_item_ids=item_ids,
+        answer_source_ids=item_ids,
+        missing_requirement_ids=allowed_ids,
+    )
+    context = build_evidence_context(
+        bundle,
+        max_chunks=max_context_chunks,
+        max_chars=max_context_chars,
+    )
+    if context.truncated or tuple(context.item_ids) != item_ids:
+        exclusion_counts["rendered_context_mismatch"] += len(selected)
+        bundle = None
+    return UnverifiedCandidateBundleResult(
+        bundle=bundle,
+        input_candidate_count=len(candidates),
+        converted_candidate_count=len(converted),
+        selected_candidate_count=(len(selected) if bundle is not None else 0),
+        exclusion_reason_counts=tuple(sorted(exclusion_counts.items())),
+    )
+
+
+def assemble_unverified_candidate_bundle(
+    *,
+    candidates: Sequence[Mapping[str, Any] | EvidenceItem],
+    allowed_requirement_ids: Sequence[str],
+    constraints: QueryConstraints | None = None,
+    max_context_chunks: int = DEFAULT_CONTEXT_MAX_CHUNKS,
+    max_context_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
+) -> EvidenceBundle | None:
+    """Compatibility wrapper returning only the bounded degraded bundle."""
+
+    return assemble_unverified_candidate_bundle_with_diagnostics(
+        candidates=candidates,
+        allowed_requirement_ids=allowed_requirement_ids,
+        constraints=constraints,
+        max_context_chunks=max_context_chunks,
+        max_context_chars=max_context_chars,
+    ).bundle
 
 
 def _normalize_requirements(
@@ -4937,7 +5189,10 @@ __all__ = [
     "DEFAULT_CONTEXT_MAX_CHARS",
     "DEFAULT_CONTEXT_MAX_CHUNKS",
     "FinalizedVisibleEvidence",
+    "UnverifiedCandidateBundleResult",
     "assemble_evidence_bundle",
+    "assemble_unverified_candidate_bundle",
+    "assemble_unverified_candidate_bundle_with_diagnostics",
     "finalize_visible_evidence_bundle",
     "reconcile_evidence_coverage_graph",
 ]

@@ -136,10 +136,12 @@ def _runtime_settings(**overrides):
         "llm_api_key": "",
         "llm_base_url": "https://llm.example.test/v1",
         "chat_model": "chat-model",
+        "llm_structured_output_mode": "auto",
         "intent_model": "",
         "rerank_model": "",
         "temperature": 0.7,
         "max_tokens": 2048,
+        "rerank_timeout_seconds": 15.0,
         "embedding_api_key": "",
         "embedding_base_url": "https://embedding.example.test/v1",
         "embedding_model": "embedding-model",
@@ -334,6 +336,69 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
             result = await _load(session)
 
         self.assertEqual(result["rerank_model"], "fast-reranker")
+
+    async def test_rerank_timeout_is_saved_loaded_and_applied_immediately(self) -> None:
+        session = _Session()
+        audit = Mock()
+        settings = _runtime_settings()
+
+        with (
+            patch("api.settings.get_settings", return_value=settings),
+            patch(
+                "api.settings._load",
+                new=AsyncMock(return_value={"rerank_timeout_seconds": 22.5}),
+            ),
+            patch("api.settings.clear_rerank_circuit_breakers") as clear_circuit,
+        ):
+            result = await update_settings(
+                SettingsUpdate(rerank_timeout_seconds=22.5),
+                db=session,
+                audit=audit,
+                _=None,
+            )
+
+        self.assertEqual(result["rerank_timeout_seconds"], 22.5)
+        self.assertEqual(settings.rerank_timeout_seconds, 22.5)
+        self.assertEqual(session.added[0].key, "rerank_timeout_seconds")
+        self.assertEqual(session.added[0].value, "22.5")
+        clear_circuit.assert_called_once_with()
+
+        loaded_session = _Session([
+            SystemSetting(key="rerank_timeout_seconds", value="18.25"),
+        ])
+        with patch("api.settings.get_settings", return_value=_runtime_settings()):
+            loaded = await _load(loaded_session)
+        self.assertEqual(loaded["rerank_timeout_seconds"], 18.25)
+
+    async def test_rerank_contract_changes_clear_existing_circuit_state(self) -> None:
+        for field, value in (
+            ("llm_base_url", "https://other.example.test/v1"),
+            ("chat_model", "next-chat"),
+            ("rerank_model", "next-reranker"),
+            ("llm_structured_output_mode", "plain_json"),
+        ):
+            with self.subTest(field=field):
+                session = _Session()
+                settings = _runtime_settings()
+                update = {field: value}
+                if field == "llm_base_url":
+                    update["llm_api_key"] = "new-secret"
+                with (
+                    patch("api.settings.get_settings", return_value=settings),
+                    patch(
+                        "api.settings._load",
+                        new=AsyncMock(return_value={field: value}),
+                    ),
+                    patch("api.settings.clear_structured_output_capability_cache"),
+                    patch("api.settings.clear_rerank_circuit_breakers") as clear_circuit,
+                ):
+                    await update_settings(
+                        SettingsUpdate(**update),
+                        db=session,
+                        audit=Mock(),
+                        _=None,
+                    )
+                clear_circuit.assert_called_once_with()
 
     async def test_general_fallback_mode_is_saved_and_applied_immediately(self) -> None:
         session = _Session()

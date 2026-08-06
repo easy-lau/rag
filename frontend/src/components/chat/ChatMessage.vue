@@ -53,18 +53,17 @@
         <section
           v-if="clarification"
           class="message-clarification"
-          aria-label="选择知识库适用范围"
+          aria-label="补充问题条件"
         >
           <div class="message-clarification__heading">
             <span class="message-clarification__eyebrow">{{ clarificationEyebrow }}</span>
-            <strong>{{ clarification.question || '请选择本次查询的适用范围' }}</strong>
           </div>
 
           <p
-            v-if="clarification.acknowledged && !clarification.invalidated && !clarification.submitted"
+            v-if="clarification.status === 'active' && !clarification.invalidated && !clarification.submitted"
             class="message-clarification__hint"
           >
-            选择后会沿用当前问题重新检索；系统不会把未选择的资料混入答案。
+            {{ clarificationHint }}
           </p>
           <p
             v-if="clarification.submitted"
@@ -119,11 +118,11 @@
           </template>
 
           <p
-            v-else-if="clarification.acknowledged && !clarification.invalidated && !clarification.submitted"
+            v-else-if="clarification.status === 'active' && !clarification.invalidated && !clarification.submitted"
             class="message-clarification__refinement"
             aria-live="polite"
           >
-            当前候选范围较多，无法安全列成有限选项。请在输入框补充具体产品、版本、项目或制度名称。
+            可直接在输入框补充条件。
           </p>
         </section>
 
@@ -163,14 +162,14 @@
             :id="evidencePanelId"
             class="message-evidence__panel"
             role="region"
-            :aria-label="`本条回答实际使用了 ${sourceDocumentCount} 篇知识库文档、${sources.length} 个片段`"
+            :aria-label="`本条回答实际使用了 ${sourceDocumentCount} 篇知识库文章`"
           >
             <div class="message-evidence__panel-head">
               <div>
-                <p class="message-evidence__panel-title">本条回答使用的知识库片段</p>
-                <p class="message-evidence__panel-hint">这里仅展示实际进入回答上下文的片段；右侧候选可能更多。</p>
+                <p class="message-evidence__panel-title">本条回答使用的知识库文章</p>
+                <p class="message-evidence__panel-hint">这里只展示实际进入回答上下文的文章，不展开命中片段。</p>
               </div>
-              <span class="message-evidence__count">{{ sourceDocumentCount }} 篇 · {{ sources.length }} 个片段</span>
+              <span class="message-evidence__count">{{ sourceDocumentCount }} 篇文章</span>
             </div>
 
             <div class="message-evidence__results">
@@ -180,8 +179,7 @@
                 :group="group"
                 :rank="index + 1"
                 :preview-enabled="canPreviewSources"
-                :default-expanded="index === 0"
-                fragment-label="采用片段"
+                document-only
                 :id-prefix="`message-${message.id || 'streaming'}`"
                 @preview="openSource"
               />
@@ -204,6 +202,36 @@
             </div>
           </section>
         </div>
+
+        <section
+          v-if="relatedCandidateGroups.length"
+          class="message-related-discovery"
+          role="status"
+          aria-label="本轮找到的相近文章，未作为回答依据"
+        >
+          <n-icon :size="16" aria-hidden="true"><DocumentTextOutline /></n-icon>
+          <div class="message-related-discovery__content">
+            <strong>找到 {{ relatedCandidateGroups.length }} 篇相近文章</strong>
+            <span>这些资料未作为本条回答的已验证依据。</span>
+            <ul class="message-related-discovery__titles">
+              <li v-for="group in visibleRelatedCandidateGroups" :key="group.key">
+                {{ group.filename }}
+              </li>
+            </ul>
+            <span v-if="hiddenRelatedCandidateCount" class="message-related-discovery__more">
+              还有 {{ hiddenRelatedCandidateCount }} 篇
+            </span>
+          </div>
+          <n-button
+            text
+            size="tiny"
+            class="message-related-discovery__action"
+            aria-label="查看本条回答找到的相近文章"
+            @click="$emit('inspect', message)"
+          >
+            查看文章
+          </n-button>
+        </section>
 
         <!-- Actions -->
         <div v-if="message.content" class="flex items-center gap-3 mt-3 pt-2 border-t border-gray-100 dark:border-gray-700">
@@ -274,9 +302,10 @@ import { useAuthStore } from '@/stores/auth'
 import DocumentEvidenceGroup from '@/components/search/DocumentEvidenceGroup.vue'
 import { persistedAnswerSources } from '@/utils/chatEvidence'
 import { groupEvidenceByDocument, safeExternalSourceUrl } from '@/utils/evidenceDocuments'
-import { isClarificationSubmittable, normalizeEvidenceClarification } from '@/utils/chatClarification'
+import { isClarificationSubmittable, normalizeClarification } from '@/utils/chatClarification'
 import { hasSearchSnapshot } from '@/utils/chatHistory'
 import { normalizeTraceId } from '@/utils/chatRequest'
+import { isNonAnswerEvidenceStatus, normalizeEvidenceStatus } from '@/utils/evidenceStatus'
 import { emptyAssistantPresentation } from '@/utils/chatTurnState'
 
 const props = defineProps({ message: Object })
@@ -303,7 +332,7 @@ const emptyPresentation = computed(() => emptyAssistantPresentation(props.messag
   activeRequestId: chatStore.activeRequestId,
 }))
 const clarification = computed(() => (
-  isUser.value ? null : normalizeEvidenceClarification(props.message.clarification)
+  isUser.value ? null : normalizeClarification(props.message.clarification)
 ))
 const clarificationCanSubmit = computed(() => (
   !chatStore.isStreaming && isClarificationSubmittable(clarification.value)
@@ -316,9 +345,14 @@ const clarificationEyebrow = computed(() => {
   if (clarification.value?.submitted) return '已确认'
   if (clarification.value?.retryable) return '可以重试'
   if (clarification.value?.invalidated) return '选择已失效'
-  if (!clarification.value?.acknowledged) return '正在保存'
+  if (clarification.value?.status !== 'active') return '正在保存'
   return '需要你确认'
 })
+const clarificationHint = computed(() => (
+  clarification.value?.adapter === 'evidence'
+    ? '选择后只会在当前授权范围内使用对应资料继续回答。'
+    : '选择或补充后，系统会重新理解原问题并按当前授权范围继续处理。'
+))
 const clarificationStatusText = computed(() => {
   const value = clarification.value
   if (!value || value.submitted) return ''
@@ -331,7 +365,7 @@ const clarificationStatusText = computed(() => {
     }
     return '本次澄清未能完成保存，以下选项已失效。请重新提问。'
   }
-  if (!value.acknowledged) return '正在确认本次澄清是否已保存，确认前不能选择。'
+  if (value.status !== 'active') return '正在确认本次澄清是否已保存，确认前不能选择。'
   if (chatStore.isStreaming) return '范围选择已安全保存，当前处理结束后即可选择。'
   return ''
 })
@@ -420,7 +454,7 @@ function normalizedEvidenceRole(source) {
   const role = typeof source?.evidence_role === 'string'
     ? source.evidence_role.trim().toLowerCase()
     : ''
-  if (['direct', 'related', 'irrelevant'].includes(role)) return role
+  if (['direct', 'related', 'unverified', 'irrelevant'].includes(role)) return role
 
   // 旧消息可能没有 evidence_role；只能把确定性约束冲突降级为相近资料，
   // 不能仅凭一个高相似度分数推断它是回答依据。
@@ -465,6 +499,34 @@ const sources = computed(() => {
 })
 const sourceGroups = computed(() => groupEvidenceByDocument(sources.value))
 const sourceDocumentCount = computed(() => sourceGroups.value.length)
+const relatedCandidateGroups = computed(() => {
+  if (isUser.value || !props.message.content || !showSources.value) return []
+  const snapshot = props.message.search_snapshot
+  const rawCandidates = Array.isArray(snapshot?.results)
+    ? snapshot.results
+    : (Array.isArray(snapshot?.candidates) ? snapshot.candidates : [])
+  if (!rawCandidates.length) return []
+
+  const status = normalizeEvidenceStatus(
+    props.message.evidence_status
+      || props.message.search_meta?.evidence_status
+      || snapshot?.evidence_status,
+  )
+  if (['scope_mismatch', 'error', 'skipped'].includes(status)) return []
+  const answerDocumentKeys = new Set(sourceGroups.value.map(group => group.key))
+  return groupEvidenceByDocument(rawCandidates.filter(candidate => {
+    const role = normalizedEvidenceRole(candidate)
+    if (role === 'irrelevant' || role === 'unverified') return false
+    return role === 'related' || isNonAnswerEvidenceStatus(status)
+  })).filter(group => !answerDocumentKeys.has(group.key))
+})
+const visibleRelatedCandidateGroups = computed(() => (
+  relatedCandidateGroups.value.slice(0, 3)
+))
+const hiddenRelatedCandidateCount = computed(() => Math.max(
+  0,
+  relatedCandidateGroups.value.length - visibleRelatedCandidateGroups.value.length,
+))
 
 const hasPersistedEvidence = computed(() => (
   !isUser.value
@@ -476,61 +538,71 @@ const hasPersistedEvidence = computed(() => (
   && props.message.search_meta?.retrieval_executed !== false
 ))
 
-function sourceSupportScore(source) {
-  // answer_support 是“能否直接支撑答案”的专用指标。effective_score 和
-  // retrieval_score 都只是召回排序，绝不能在回答卡片上伪装成支持度。
-  // 历史数据没有该字段时，展示“已验证”而非杜撰百分比。
-  return finiteScore(source.answer_support)
+function documentCountForSources(items) {
+  return groupEvidenceByDocument(items).length
 }
 
 const evidenceSummary = computed(() => {
+  const unverifiedSources = sources.value.filter(source => (
+    source.source_verification === 'unverified'
+    || source.rerank_status === 'unverified'
+  ))
   const directSources = sources.value.filter(source => source.evidence_role === 'direct')
   const partialSources = sources.value.filter(source => (
     source.jointly_selected && source.coverage_status === 'partial'
   ))
   const relatedSources = sources.value.filter(source => source.evidence_role === 'related')
+  if (unverifiedSources.length) {
+    const documentCount = documentCountForSources(unverifiedSources)
+    return {
+      label: '待验证参考资料',
+      level: `${documentCount} 篇文章`,
+      percent: null,
+      tone: 'warning',
+      actionLabel: '查看参考资料',
+      ariaLabel: `重排模型发生技术故障；本条回答使用了 ${documentCount} 篇经过权限和适用范围过滤、但尚未完成语义验证的知识库文章`,
+    }
+  }
   if (directSources.length) {
-    const scores = directSources.map(sourceSupportScore).filter(score => score !== null)
-    const score = scores.length ? Math.max(...scores) : null
-    const percent = score === null ? null : Math.round(score * 100)
-    const level = score === null ? '已验证' : (score >= 0.8 ? '高匹配' : (score >= 0.6 ? '中匹配' : '低匹配'))
-    const scoreText = percent === null ? '' : `，证据支持分 ${percent}%`
+    const documentCount = documentCountForSources(directSources)
     return {
       label: '知识库依据',
-      level,
-      percent,
-      tone: score !== null && score < 0.6 ? 'warning' : 'success',
+      level: `${documentCount} 篇文章`,
+      percent: null,
+      tone: 'success',
       actionLabel: '查看依据',
-      ariaLabel: `本条回答使用了 ${directSources.length} 个知识库片段${scoreText}。该分数不是答案正确率`,
+      ariaLabel: `本条回答使用了 ${documentCount} 篇知识库文章`,
     }
   }
   if (partialSources.length) {
+    const documentCount = documentCountForSources(partialSources)
     return {
       label: '部分知识库依据',
-      level: `${partialSources.length} 个片段`,
+      level: `${documentCount} 篇文章`,
       percent: null,
       tone: 'warning',
       actionLabel: '查看依据',
-      ariaLabel: `本条回答使用了 ${partialSources.length} 个片段支撑部分内容，但知识库证据尚未完整覆盖问题`,
+      ariaLabel: `本条回答使用了 ${documentCount} 篇文章支撑部分内容，但知识库证据尚未完整覆盖问题`,
     }
   }
   if (relatedSources.length) {
+    const documentCount = documentCountForSources(relatedSources)
     return {
       label: '相近资料',
-      level: `${relatedSources.length} 个片段`,
+      level: `${documentCount} 篇文章`,
       percent: null,
       tone: 'warning',
       actionLabel: '查看资料',
-      ariaLabel: `本条回答仅使用了 ${relatedSources.length} 个相近片段，不能作为直接回答依据`,
+      ariaLabel: `本条回答仅使用了 ${documentCount} 篇相近文章，不能作为直接回答依据`,
     }
   }
   return {
     label: '检索候选',
-    level: `${sources.value.length} 个片段`,
+    level: `${sourceDocumentCount.value} 篇文章`,
     percent: null,
     tone: 'neutral',
     actionLabel: '查看结果',
-    ariaLabel: `本条回答保存了 ${sources.value.length} 个尚待验证的检索片段`,
+    ariaLabel: `本条回答保存了 ${sourceDocumentCount.value} 篇尚待验证的检索文章`,
   }
 })
 
@@ -772,6 +844,63 @@ function formatTime(t) {
   color: var(--ui-primary);
   font-size: 11px;
   font-weight: 700;
+}
+
+.message-related-discovery {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 12px;
+  border: 1px solid color-mix(in srgb, var(--ui-warning) 28%, var(--ui-border));
+  border-radius: var(--ui-radius-popover);
+  background: color-mix(in srgb, var(--ui-warning) 6%, var(--ui-surface));
+  padding: 10px;
+  color: var(--ui-warning);
+}
+
+.message-related-discovery__content {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 2px;
+  color: var(--ui-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.message-related-discovery__content strong {
+  color: var(--ui-text);
+  font-weight: 650;
+}
+
+.message-related-discovery__titles {
+  display: grid;
+  gap: 2px;
+  margin: 5px 0 0;
+  padding-left: 16px;
+  color: var(--ui-text);
+}
+
+.message-related-discovery__titles li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-related-discovery__more {
+  color: var(--ui-text-tertiary);
+}
+
+.message-related-discovery__action {
+  flex: 0 0 auto;
+  color: var(--ui-warning);
+}
+
+.message-related-discovery__action:focus-visible {
+  outline: 2px solid var(--ui-focus-outline);
+  outline-offset: 2px;
+  box-shadow: var(--ui-focus-ring);
 }
 
 .message-evidence {

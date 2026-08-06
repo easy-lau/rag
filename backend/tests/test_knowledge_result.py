@@ -124,6 +124,65 @@ class KnowledgeResultRunnerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(active_steps, ["analyze", "retrieve", "generate"])
 
+    async def test_read_renders_legacy_collapsed_markdown_as_sections_and_code(self):
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        kb = KnowledgeBase(id=kb_id, name="测试知识库")
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="升级说明.docx",
+            file_type="docx",
+            status="ready",
+            is_active=True,
+        )
+        chunk = DocumentChunk(
+            id=uuid.uuid4(),
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content=(
+                "【升级说明.docx › 后端升级】\n"
+                "注意事项 * 复制<code>application.yml</code> * 修改配置。 "
+                "```shell cp -R application-prod.yml application.yml ```"
+            ),
+            chunk_index=0,
+            metadata_={"section_path": ["升级说明.docx", "后端升级"]},
+        )
+        request = KnowledgeRequestSemantics(
+            resource="document_result",
+            operation="read",
+            result_handles=("r_t1_001",),
+            result_labels=("升级说明.docx",),
+        )
+        db = _DB([
+            _Result(rows=[(document, kb)]),
+            _Result(rows=[chunk]),
+        ])
+
+        events = await _events(run_knowledge_result_stream(
+            question="看一下第一个",
+            kb_ids=[kb_id],
+            search_config={},
+            conversation_id=str(uuid.uuid4()),
+            db=db,
+            knowledge_request=request,
+            result_sources=[{
+                "handle": "r_t1_001",
+                "kb_id": str(kb_id),
+                "doc_id": str(doc_id),
+                "filename": "升级说明.docx",
+            }],
+        ))
+
+        answer = "".join(
+            item["content"] for item in events if item["type"] == "text_delta"
+        )
+        self.assertIn("## 《升级说明.docx》", answer)
+        self.assertIn("### 后端升级", answer)
+        self.assertIn("- 复制`application.yml`", answer)
+        self.assertIn("```shell\ncp -R application-prod.yml application.yml\n```", answer)
+        self.assertNotIn("<code>", answer)
+
 
 if __name__ == "__main__":
     unittest.main()

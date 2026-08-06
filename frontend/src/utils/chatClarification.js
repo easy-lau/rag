@@ -1,18 +1,12 @@
-const MAX_CLARIFICATION_CHOICES = 6
-const MAX_QUESTION_CHARS = 2000
+const MAX_CLARIFICATION_CHOICES = 20
 const MAX_LABEL_CHARS = 240
-const MAX_REPLY_CHARS = 32
+const MAX_REPLY_CHARS = 120
 const MAX_IDENTIFIER_CHARS = 160
 const MAX_CHOICE_METADATA_ITEMS = 12
 const MAX_KB_SNAPSHOT_ITEMS = 100
 
-const CLARIFICATION_DIMENSIONS = new Set([
-  'version',
-  'product',
-  'product_version',
-  'project',
-  'document',
-])
+const CLARIFICATION_STATE_SCHEMA = 'rag_clarification_state.v1'
+const CLARIFICATION_DIMENSION_RE = /^[a-z][a-z0-9_]{0,63}$/
 
 function recordValue(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : null
@@ -108,9 +102,13 @@ function normalizeChoices(rawChoices) {
   })
 }
 
-export function normalizeEvidenceClarification(value) {
+export function normalizeClarification(value) {
   const payload = recordValue(value)
-  if (!payload || payload.needs_clarification === false) return null
+  if (
+    !payload
+    || payload.schema_version !== CLARIFICATION_STATE_SCHEMA
+    || payload.needs_clarification === false
+  ) return null
 
   const rawChoices = Array.isArray(payload.choices) ? payload.choices : []
   const choices = normalizeChoices(rawChoices)
@@ -124,26 +122,24 @@ export function normalizeEvidenceClarification(value) {
   const revision = routeStateRevision(payload.route_state_revision)
   const selectedKbIdsSnapshot = boundedIdentifierList(payload.selected_kb_ids_snapshot)
   const persisted = payload.persisted === true
-  // An acknowledgement is only actionable when it identifies a concrete,
-  // persisted route-state revision. Merely receiving choices must never make
-  // a live picker clickable.
-  const acknowledged = payload.acknowledged === true
-    && persisted
-    && Boolean(pendingStateId)
-    && Boolean(clarificationMessageId)
-    && revision !== null
+  const status = ['proposed', 'active'].includes(payload.status)
+    ? payload.status
+    : 'proposed'
 
   return {
     schema_version: boundedText(payload.schema_version, 80) || null,
     needs_clarification: true,
-    dimension: CLARIFICATION_DIMENSIONS.has(dimension) ? dimension : null,
-    question: boundedText(payload.question, MAX_QUESTION_CHARS),
-    reason: boundedText(payload.reason, 160),
+    adapter: ['semantic', 'evidence'].includes(payload.adapter) ? payload.adapter : null,
+    dimension: CLARIFICATION_DIMENSION_RE.test(dimension) ? dimension : null,
+    selection_mode: ['choice', 'refine'].includes(payload.selection_mode)
+      ? payload.selection_mode
+      : null,
+    reason: boundedText(payload.reason_code || payload.reason, 160),
     choices,
     requires_refinement: rawChoices.length > MAX_CLARIFICATION_CHOICES || choices.length === 0,
     submitted: payload.submitted === true,
     submitted_reply: submittedReply || null,
-    acknowledged,
+    status,
     persisted,
     invalidated: payload.invalidated === true,
     invalid_reason: boundedText(payload.invalid_reason, 80) || null,
@@ -152,7 +148,6 @@ export function normalizeEvidenceClarification(value) {
     route_state_revision: revision,
     conversation_id: boundedIdentifier(payload.conversation_id) || null,
     selected_kb_ids_snapshot: selectedKbIdsSnapshot,
-    ack_schema_version: boundedText(payload.ack_schema_version, 80) || null,
     submission_pending: payload.submission_pending === true && payload.submitted === true,
     submission_request_id: submissionRequestId || null,
     retryable: payload.retryable === true && payload.submitted !== true,
@@ -163,10 +158,10 @@ export function normalizeEvidenceClarification(value) {
 }
 
 export function isClarificationActive(value) {
-  const clarification = normalizeEvidenceClarification(value)
+  const clarification = normalizeClarification(value)
   return Boolean(
     clarification
-    && clarification.acknowledged
+    && clarification.status === 'active'
     && clarification.persisted
     && !clarification.invalidated
     && !clarification.submitted,
@@ -174,41 +169,40 @@ export function isClarificationActive(value) {
 }
 
 export function isClarificationSubmittable(value) {
-  const clarification = normalizeEvidenceClarification(value)
+  const clarification = normalizeClarification(value)
   return Boolean(isClarificationActive(clarification) && clarification.choices.length)
 }
 
 export function clarificationFromSearchEvent(data, fallback = null) {
   const event = recordValue(data)
   if (!event) {
-    const normalizedFallback = normalizeEvidenceClarification(fallback)
-    return normalizedFallback?.schema_version === 'rag_evidence_clarification.v1'
+    const normalizedFallback = normalizeClarification(fallback)
+    return normalizedFallback?.schema_version === CLARIFICATION_STATE_SCHEMA
       ? normalizedFallback
       : null
   }
   const eventMeta = recordValue(event.search_meta) || recordValue(event.meta) || {}
   const candidate = event.clarification ?? eventMeta.clarification ?? fallback
-  const clarification = normalizeEvidenceClarification(candidate)
-  return clarification?.schema_version === 'rag_evidence_clarification.v1'
+  const clarification = normalizeClarification(candidate)
+  return clarification?.schema_version === CLARIFICATION_STATE_SCHEMA
     ? clarification
     : null
 }
 
-export function attachEvidenceClarification(message, payload) {
+export function attachClarification(message, payload) {
   const target = recordValue(message)
-  const clarification = normalizeEvidenceClarification(payload)
+  const clarification = normalizeClarification(payload)
   if (!target || !clarification) return null
 
-  const previous = normalizeEvidenceClarification(target.clarification)
+  const previous = normalizeClarification(target.clarification)
   const priorFailureReason = boundedText(target.clarification_failure_reason, 80)
   target.clarification = {
     ...clarification,
     submitted: previous?.submitted === true || clarification.submitted,
     submitted_reply: previous?.submitted_reply || clarification.submitted_reply,
-    // This helper is used for live clarification/search events. Those events
-    // precede persistence, so an acknowledgement embedded in them is ignored.
-    // Only acknowledgeEvidenceClarification() may unlock the picker.
-    acknowledged: previous?.acknowledged === true,
+    // Proposed/search events can attach facts but cannot unlock the picker.
+    // Only activateClarification() may accept a persisted active event.
+    status: previous?.status === 'active' ? 'active' : 'proposed',
     persisted: previous?.persisted === true,
     invalidated: previous?.invalidated === true || Boolean(priorFailureReason),
     invalid_reason: previous?.invalid_reason || priorFailureReason || null,
@@ -216,7 +210,6 @@ export function attachEvidenceClarification(message, payload) {
     clarification_message_id: previous?.clarification_message_id || clarification.clarification_message_id,
     route_state_revision: previous?.route_state_revision ?? clarification.route_state_revision,
     conversation_id: previous?.conversation_id || clarification.conversation_id,
-    ack_schema_version: previous?.ack_schema_version || null,
     submission_pending: previous?.submission_pending === true,
     submission_request_id: previous?.submission_request_id || null,
     retryable: previous?.retryable === true,
@@ -227,29 +220,30 @@ export function attachEvidenceClarification(message, payload) {
   return target.clarification
 }
 
-export function acknowledgeEvidenceClarification(message, payload) {
+export function activateClarification(message, payload) {
   const target = recordValue(message)
-  const clarification = normalizeEvidenceClarification(target?.clarification)
-  const ack = recordValue(payload)
-  if (!target || !clarification || !ack || clarification.invalidated || clarification.submitted) return null
+  const clarification = normalizeClarification(target?.clarification)
+  const stateEvent = recordValue(payload)
+  if (!target || !clarification || !stateEvent || clarification.invalidated || clarification.submitted) return null
 
-  const pendingStateId = boundedIdentifier(ack.pending_state_id)
-  const clarificationMessageId = boundedIdentifier(ack.clarification_message_id)
-  const conversationId = boundedIdentifier(ack.conversation_id)
-  const revision = routeStateRevision(ack.route_state_revision)
-  const selectedKbIdsSnapshot = boundedIdentifierList(ack.selected_kb_ids_snapshot)
+  const pendingStateId = boundedIdentifier(stateEvent.pending_state_id)
+  const clarificationMessageId = boundedIdentifier(stateEvent.clarification_message_id)
+  const conversationId = boundedIdentifier(stateEvent.conversation_id)
+  const revision = routeStateRevision(stateEvent.route_state_revision)
+  const selectedKbIdsSnapshot = boundedIdentifierList(stateEvent.selected_kb_ids_snapshot)
   if (
-    ack.type !== 'evidence_clarification_ack'
-    || ack.schema_version !== 'rag_evidence_clarification_ack.v1'
-    || ack.persisted !== true
+    stateEvent.type !== 'clarification_state'
+    || stateEvent.schema_version !== CLARIFICATION_STATE_SCHEMA
+    || stateEvent.status !== 'active'
+    || stateEvent.persisted !== true
     || !pendingStateId
     || !clarificationMessageId
     || !conversationId
     || revision === null
-    || selectedKbIdsSnapshot.length === 0
+    || (clarification.adapter === 'evidence' && selectedKbIdsSnapshot.length === 0)
   ) return null
 
-  // If the original event already identified a state, a different ack must
+  // If the original event already identified a state, a different active event must
   // not unlock it. Do not compare clarification_message_id with the temporary
   // client message id: repeat events can legitimately point at an older,
   // persisted assistant message.
@@ -266,7 +260,7 @@ export function acknowledgeEvidenceClarification(message, payload) {
 
   target.clarification = {
     ...clarification,
-    acknowledged: true,
+    status: 'active',
     persisted: true,
     invalidated: false,
     invalid_reason: null,
@@ -275,19 +269,18 @@ export function acknowledgeEvidenceClarification(message, payload) {
     route_state_revision: revision,
     conversation_id: conversationId,
     selected_kb_ids_snapshot: selectedKbIdsSnapshot,
-    ack_schema_version: boundedText(ack.schema_version, 80) || null,
   }
   return target.clarification
 }
 
-export function invalidateEvidenceClarification(message, reason = 'stream_failed') {
+export function invalidateClarification(message, reason = 'stream_failed') {
   const target = recordValue(message)
   if (!target) return null
   const normalizedReason = boundedText(reason, 80) || 'stream_failed'
   if (!boundedText(target.clarification_failure_reason, 80)) {
     target.clarification_failure_reason = normalizedReason
   }
-  const clarification = normalizeEvidenceClarification(target?.clarification)
+  const clarification = normalizeClarification(target?.clarification)
   if (!clarification || clarification.submitted) return null
   if (clarification.invalidated) return clarification
 
@@ -299,9 +292,9 @@ export function invalidateEvidenceClarification(message, reason = 'stream_failed
   return target.clarification
 }
 
-export function lockMessageClarificationEvidence(message, value = message?.clarification) {
+export function lockMessageClarification(message, value = message?.clarification) {
   const target = recordValue(message)
-  const clarification = normalizeEvidenceClarification(value)
+  const clarification = normalizeClarification(value)
   if (!target || !clarification) return null
 
   target.clarification = clarification
@@ -323,40 +316,39 @@ export function lockMessageClarificationEvidence(message, value = message?.clari
 
 export function applyClarificationLifecycleEvent(message, event) {
   const payload = recordValue(event)
-  if (!payload) return normalizeEvidenceClarification(message?.clarification)
+  if (!payload) return normalizeClarification(message?.clarification)
 
-  if (payload.type === 'evidence_clarification') {
-    if (payload.schema_version !== 'rag_evidence_clarification.v1') {
-      invalidateEvidenceClarification(message, 'clarification_schema_mismatch')
+  if (payload.type === 'clarification_state') {
+    if (payload.schema_version !== CLARIFICATION_STATE_SCHEMA) {
+      invalidateClarification(message, 'clarification_schema_mismatch')
       return null
     }
-    return attachEvidenceClarification(message, payload)
-  }
-  if (payload.type === 'evidence_clarification_ack') {
-    return acknowledgeEvidenceClarification(message, payload)
+    const attached = attachClarification(message, payload)
+    if (!attached || payload.status !== 'active') return attached
+    return activateClarification(message, payload)
   }
   if (payload.type === 'error') {
-    return invalidateEvidenceClarification(message, 'server_error')
+    return invalidateClarification(message, 'server_error')
   }
   if (payload.type === 'done') {
-    const clarification = normalizeEvidenceClarification(message?.clarification)
-    if (clarification && !clarification.acknowledged) {
-      return invalidateEvidenceClarification(message, 'missing_persistence_ack')
+    const clarification = normalizeClarification(message?.clarification)
+    if (clarification && clarification.status !== 'active') {
+      return invalidateClarification(message, 'missing_active_state')
     }
     return clarification
   }
-  return normalizeEvidenceClarification(message?.clarification)
+  return normalizeClarification(message?.clarification)
 }
 
 export function restoreHistoryMessageClarification(message) {
   const source = recordValue(message)
   if (!source || source.role !== 'assistant') return source
 
-  const clarification = normalizeEvidenceClarification(source.clarification)
+  const clarification = normalizeClarification(source.clarification)
   if (!clarification) return source
 
   const messageId = boundedIdentifier(source.id)
-  const isVerifiedActiveState = clarification.schema_version === 'rag_evidence_clarification.v1'
+  const isVerifiedActiveState = clarification.schema_version === CLARIFICATION_STATE_SCHEMA
     && isClarificationActive(clarification)
     && Boolean(messageId)
     && clarification.clarification_message_id === messageId
@@ -392,7 +384,7 @@ export function markClarificationSubmitted(
   { allowFreeText = false, requestId = null } = {},
 ) {
   const target = recordValue(message)
-  const clarification = normalizeEvidenceClarification(target?.clarification)
+  const clarification = normalizeClarification(target?.clarification)
   const normalizedReply = boundedText(reply, MAX_REPLY_CHARS)
   const canSubmit = allowFreeText
     ? isClarificationActive(clarification)
@@ -428,7 +420,7 @@ export function restoreClarificationSubmissionForRetry(
   reason = 'request_failed',
 ) {
   const target = recordValue(message)
-  const clarification = normalizeEvidenceClarification(target?.clarification)
+  const clarification = normalizeClarification(target?.clarification)
   const expectedRequestId = boundedIdentifier(requestId)
   if (
     !target

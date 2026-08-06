@@ -81,7 +81,10 @@ class AuthorizedScopeClarificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.dimension, "product_version")
         self.assertEqual([choice.version for choice in result.choices], ["6", "7"])
-        self.assertNotIn(str(kb_id), result.question)
+        contract = result.to_contract()
+        self.assertEqual(contract.adapter, "semantic")
+        self.assertEqual(contract.selection_mode, "choice")
+        self.assertNotIn(str(kb_id), str(contract.to_dict(public=True)))
 
     async def test_single_version_and_unselected_rows_do_not_clarify(self):
         selected_kb_id = uuid.uuid4()

@@ -3,7 +3,7 @@ import {
   normalizeEvidenceStatus,
 } from './evidenceStatus.js'
 
-const EVIDENCE_ROLES = new Set(['direct', 'related', 'irrelevant'])
+const EVIDENCE_ROLES = new Set(['direct', 'related', 'unverified', 'irrelevant'])
 
 function normalizedStatus(value) {
   return normalizeEvidenceStatus(value)

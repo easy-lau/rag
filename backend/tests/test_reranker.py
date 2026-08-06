@@ -45,6 +45,13 @@ def _assessment(
 
 
 class QueryConstraintTests(unittest.TestCase):
+    def test_action_word_adjacent_to_version_is_not_product_identity(self) -> None:
+        constraints = extract_query_constraints("升级8.6的步骤")
+
+        self.assertIsNone(constraints.product)
+        self.assertEqual(constraints.version, "8.6")
+        self.assertTrue(constraints.explicit_version)
+
     def test_extracts_product_and_explicit_version_from_user_context(self) -> None:
         constraints = extract_query_constraints(
             "解决登录用户名枚举 要配置什么 我是云枢8.6"

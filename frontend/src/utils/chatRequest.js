@@ -199,7 +199,7 @@ export function streamEventConfirmsAssistantPresentation(event) {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return false
   const type = typeof event.type === 'string' ? event.type.trim() : ''
   if (type === 'text_delta') return typeof event.content === 'string' && event.content.length > 0
-  if (type === 'search_results' || type === 'error' || type === 'evidence_clarification_ack') {
+  if (type === 'search_results' || type === 'error' || type === 'clarification_state') {
     return true
   }
   if (type === 'done') return true

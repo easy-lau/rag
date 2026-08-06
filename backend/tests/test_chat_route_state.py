@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from api.chat import (
     _active_pending_route_state,
-    _evidence_event_pending_state,
+    _clarification_event_pending_state,
     _evidence_scope_reply_display_text,
     _evidence_scope_filter,
     _parse_sse_payload,
@@ -20,11 +20,11 @@ from api.chat import (
     _refined_evidence_query,
     _scope_anchor_coverage_from_sources,
     _validate_stream_answer_sources,
-    _validated_evidence_choices,
     _scoped_evidence_query,
     send_message,
 )
 from core.conversation_context import ConversationContext, RouteTurnCandidate
+from core.clarification import ClarificationContract, build_clarification_state
 from core.authorized_scope import (
     AuthorizedScopeChoice,
     AuthorizedScopeClarification,
@@ -52,6 +52,7 @@ from core.rag_v2.evidence_graph import (
     build_evidence_coverage_graph,
 )
 from core.rag_v2.pipeline import _post_evidence_document_assessments
+from core.rag_shared import _normalize_evidence_scope_filter
 from core.rag_v2.query_plan import plan_query_locally
 from core.rag_v2.task_graph import compile_rag_execution_bundle
 from config import get_settings
@@ -152,6 +153,23 @@ class _FailingSaveStateDB(_SaveStateDB):
         raise RuntimeError("simulated response persistence failure")
 
 
+async def _stub_clarification_presenter(**_kwargs):
+    yield "请补充当前问题缺少的条件。"
+
+
+def _proposed_clarification_event(state: dict) -> dict:
+    return {
+        **state["contract"],
+        "type": "clarification_state",
+        "schema_version": "rag_clarification_state.v1",
+        "status": "proposed",
+        "persisted": False,
+        "pending_state_id": None,
+        "clarification_message_id": None,
+        "route_state_revision": None,
+    }
+
+
 def _evidence_pending_state(
     *,
     kb_id: uuid.UUID | None = None,
@@ -161,20 +179,16 @@ def _evidence_pending_state(
     kb_id = kb_id or uuid.uuid4()
     first_doc_id = first_doc_id or uuid.uuid4()
     second_doc_id = second_doc_id or uuid.uuid4()
-    now = datetime.now(timezone.utc)
-    return {
-        "schema_version": "rag_pending_clarification.v2",
-        "kind": "evidence_scope",
-        "state_id": str(uuid.uuid4()),
-        "base_user_message_id": str(uuid.uuid4()),
-        "clarification_message_id": str(uuid.uuid4()),
-        "original_query": "解决登录用户名枚举要配置什么",
-        "dimension": "version",
-        "selection_mode": "choice",
-        "choices": [
+    contract = ClarificationContract(
+        adapter="evidence",
+        dimension="version",
+        reason_code="multiple_mutually_exclusive_scopes",
+        selection_mode="choice",
+        choices=(
             {
                 "key": "c1",
                 "label": "云枢 6.0.1 —《钉钉》",
+                "value": "6.0.1",
                 "products": ["云枢"],
                 "canonical_products": ["云枢"],
                 "versions": ["6.0.1"],
@@ -188,6 +202,7 @@ def _evidence_pending_state(
             {
                 "key": "c2",
                 "label": "云枢 8.2.75（中青建安）—《二开发送钉钉工作通知》",
+                "value": "8.2.75",
                 "products": ["云枢"],
                 "canonical_products": ["云枢"],
                 "versions": ["8.2.75"],
@@ -198,28 +213,33 @@ def _evidence_pending_state(
                 "companion_doc_ids": [],
                 "filenames": ["二开发送钉钉工作通知.md"],
             },
-        ],
-        "clarification_message": (
-            "检索到与当前问题相关、但适用范围不同的资料：\n"
-            "1. 云枢 6.0.1 —《钉钉》\n"
-            "2. 云枢 8.2.75（中青建安）—《二开发送钉钉工作通知》\n"
-            "请问需要查询哪一项？也可以回复“都对比”。"
         ),
-        "selected_kb_ids_snapshot": [str(kb_id)],
-        "created_at": now.isoformat(),
-        "expires_at": (now + timedelta(hours=1)).isoformat(),
-        "dispatch_authorized": False,
-    }
+    )
+    return build_clarification_state(
+        contract=contract,
+        original_query="解决登录用户名枚举要配置什么",
+        selected_kb_ids=[kb_id],
+        base_user_message_id=uuid.uuid4(),
+        clarification_message_id=uuid.uuid4(),
+        ttl=timedelta(hours=1),
+    )
 
 
 def _broad_evidence_pending_state(*, kb_id: uuid.UUID | None = None):
-    state = _evidence_pending_state(kb_id=kb_id)
-    state["selection_mode"] = "refine"
-    state["choices"] = []
-    state["clarification_message"] = (
-        "检索到多个互不相同的适用范围，请补充具体产品和版本。"
+    kb_id = kb_id or uuid.uuid4()
+    return build_clarification_state(
+        contract=ClarificationContract(
+            adapter="evidence",
+            dimension="version",
+            reason_code="too_many_mutually_exclusive_scopes",
+            selection_mode="refine",
+        ),
+        original_query="解决登录用户名枚举要配置什么",
+        selected_kb_ids=[kb_id],
+        base_user_message_id=uuid.uuid4(),
+        clarification_message_id=uuid.uuid4(),
+        ttl=timedelta(hours=1),
     )
-    return state
 
 
 def _route_and_contract(
@@ -662,6 +682,60 @@ class QuerySemanticApiHandoffTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unverified_source_requires_the_explicit_generation_contract(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="待验证制度.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="数据库中的待验证参考内容",
+            chunk_index=0,
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "producer 快照",
+            "evidence_role": "unverified",
+            "source_verification": "unverified",
+        }
+
+        rejected, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(chunk, document)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(pairs, set())
+        self.assertEqual(error, "unverified_answer_source_not_allowed")
+
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(chunk, document)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+            allow_unverified=True,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(pairs, {(kb_id, doc_id)})
+        self.assertEqual(refreshed[0]["content"], "数据库中的待验证参考内容")
+        self.assertEqual(refreshed[0]["evidence_role"], "unverified")
+        self.assertEqual(refreshed[0]["source_verification"], "unverified")
+
     async def test_refreshes_metadata_for_inactive_and_failed_documents(self) -> None:
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()
@@ -973,6 +1047,26 @@ class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._chat_presenter = patch(
+            "api.chat.stream_clarification_text",
+            _stub_clarification_presenter,
+        )
+        self._pipeline_presenter = patch(
+            "core.rag_v2.pipeline.stream_clarification_text",
+            _stub_clarification_presenter,
+        )
+        self._presentation_persistence = patch(
+            "api.chat._persist_clarification_presentation",
+            new=AsyncMock(),
+        )
+        self._chat_presenter.start()
+        self._pipeline_presenter.start()
+        self._presentation_persistence.start()
+        self.addCleanup(self._chat_presenter.stop)
+        self.addCleanup(self._pipeline_presenter.stop)
+        self.addCleanup(self._presentation_persistence.stop)
+
     def test_same_document_slice_choice_survives_pending_validation_and_selection(self) -> None:
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()
@@ -1005,15 +1099,19 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             )
         ]
 
-        normalized = _validated_evidence_choices(
-            choices,
-            selected_kb_ids=(str(kb_id),),
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="evidence",
+                dimension="version",
+                reason_code="multiple_mutually_exclusive_scopes",
+                selection_mode="choice",
+                choices=tuple(choices),
+            ),
+            original_query="差旅标准是什么",
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
         )
-        self.assertIsNotNone(normalized)
-        pending = {
-            "selection_mode": "choice",
-            "choices": list(normalized or ()),
-        }
         reply = _parse_evidence_scope_reply("第二个", pending)
         scope_filter = _evidence_scope_filter(
             reply,
@@ -1080,13 +1178,26 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "is_anchor": True,
             }],
         }
-        self.assertIsNone(_validated_evidence_choices(
-            [
-                {**base_choice, "key": "c1"},
-                {**base_choice, "key": "c2"},
-            ],
-            selected_kb_ids=(str(kb_id),),
-        ))
+        choices = [
+            {**base_choice, "key": "c1", "value": "2024"},
+            {**base_choice, "key": "c2", "value": "2025"},
+        ]
+        scope_filter = {
+            "mode": "compare_all",
+            "kb_ids": [str(kb_id)],
+            "doc_ids": [str(doc_id)],
+            "choices": choices,
+        }
+        normalized = _normalize_evidence_scope_filter(
+            scope_filter,
+            authorized_kb_ids=[kb_id],
+        )
+        self.assertIsNotNone(normalized)
+        self.assertFalse(normalized.valid)
+        self.assertEqual(
+            normalized.invalid_reason,
+            "anchor_slice_not_choice_exclusive",
+        )
 
     def test_all_public_evidence_statuses_fit_route_log_column(self) -> None:
         statuses = get_args(IntentEvidenceStatus)
@@ -1097,27 +1208,22 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_active_pending_state_rejects_expired_or_malformed_expiry(self) -> None:
-        now = datetime.now(timezone.utc)
-        active = {
-            "schema_version": "rag_pending_clarification.v1",
-            "state_id": "active",
-            "expires_at": (now + timedelta(hours=1)).isoformat(),
-            "dispatch_authorized": False,
-        }
+        active = _evidence_pending_state()
         expired = {
             **active,
-            "state_id": "expired",
-            "expires_at": (now - timedelta(seconds=1)).isoformat(),
+            "expires_at": (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
         }
-        malformed = {**active, "state_id": "malformed", "expires_at": "not-a-date"}
+        malformed = {**active, "expires_at": "not-a-date"}
         missing_expiry = {key: value for key, value in active.items() if key != "expires_at"}
-        unknown_version = {**active, "schema_version": "rag_pending_clarification.v3"}
+        unknown_version = {**active, "schema_version": "rag_clarification_state.v2"}
         authorized = {**active, "dispatch_authorized": True}
         missing_authorization = {
             key: value for key, value in active.items() if key != "dispatch_authorized"
         }
 
-        self.assertIs(_active_pending_route_state(active), active)
+        self.assertEqual(_active_pending_route_state(active), active)
         for value in (
             expired,
             malformed,
@@ -1131,16 +1237,19 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(_active_pending_route_state("not-an-object"))
 
     def test_route_clarification_reply_rebuilds_original_task(self) -> None:
-        pending = {
-            "schema_version": "rag_pending_clarification.v1",
-            "state_id": "route-pending",
-            "original_query": "我现在想改验证码有效期时间",
-            "clarification_answers": [],
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
-            "dispatch_authorized": False,
-        }
+        kb_id = uuid.uuid4()
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="semantic",
+                dimension="product",
+                reason_code="missing_product",
+                selection_mode="refine",
+            ),
+            original_query="我现在想改验证码有效期时间",
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
 
         continuation = _route_clarification_continuation("云枢的", pending)
 
@@ -1156,20 +1265,35 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_route_scope_choice_reply_maps_to_server_label(self) -> None:
-        pending = {
-            "schema_version": "rag_pending_clarification.v1",
-            "state_id": "scope-pending",
-            "original_query": "平台A的登录参数应该怎么修改",
-            "clarification_answers": [],
-            "choices": [
-                {"key": "scope1", "label": "平台A 版本 6", "value": "6"},
-                {"key": "scope2", "label": "平台A 版本 7", "value": "7"},
-            ],
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
-            "dispatch_authorized": False,
-        }
+        kb_id = uuid.uuid4()
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="semantic",
+                dimension="product_version",
+                reason_code="multiple_authorized_versions",
+                selection_mode="choice",
+                choices=(
+                    {
+                        "key": "scope1",
+                        "label": "平台A 版本 6",
+                        "value": "6",
+                        "products": ["平台A"],
+                        "versions": ["6"],
+                    },
+                    {
+                        "key": "scope2",
+                        "label": "平台A 版本 7",
+                        "value": "7",
+                        "products": ["平台A"],
+                        "versions": ["7"],
+                    },
+                ),
+            ),
+            original_query="平台A的登录参数应该怎么修改",
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
 
         for reply in ("2", "scope2", "7", "平台A7"):
             with self.subTest(reply=reply):
@@ -1178,49 +1302,100 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(continuation.original_query, pending["original_query"])
                 self.assertEqual(continuation.current_answer, "平台A 版本 7")
                 self.assertIn("平台A 版本 7", continuation.canonical_retrieval_query)
+                self.assertEqual(
+                    [item.to_dict() for item in continuation.scope_partitions],
+                    [{"product": "平台A", "version": "7", "project": None}],
+                )
 
-    def test_active_v2_state_is_strictly_validated_and_non_executable(self) -> None:
+    def test_route_scope_all_keeps_one_answer_target_across_partitions(self) -> None:
+        kb_id = uuid.uuid4()
+        choices = tuple(
+            {
+                "key": f"scope{index}",
+                "label": f"平台A 版本 {version}",
+                "value": version,
+                "products": ["平台A"],
+                "versions": [version],
+            }
+            for index, version in enumerate(("6", "6.0.1", "7", "8.2.75"), start=1)
+        )
+        original = "在平台A中如何给自定义用户发送通知消息"
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="semantic",
+                dimension="product_version",
+                reason_code="multiple_authorized_versions",
+                selection_mode="choice",
+                choices=choices,
+            ),
+            original_query=original,
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
+
+        continuation = _route_clarification_continuation("都对比", pending)
+
+        self.assertIsNotNone(continuation)
+        self.assertEqual(continuation.semantic_query, original)
+        self.assertEqual(
+            [item.version for item in continuation.scope_partitions],
+            ["6", "6.0.1", "7", "8.2.75"],
+        )
+        self.assertIn("；", continuation.canonical_retrieval_query)
+
+    def test_active_state_is_strictly_validated_and_non_executable(self) -> None:
         active = _evidence_pending_state()
 
         self.assertEqual(_active_pending_route_state(active), active)
         with_untrusted_extras = {
             **active,
             "unexpected": "do not persist",
-            "choices": [
-                {**active["choices"][0], "raw_model_payload": "private"},
-                active["choices"][1],
-            ],
+            "contract": {
+                **active["contract"],
+                "choices": [
+                    {
+                        **active["contract"]["choices"][0],
+                        "raw_model_payload": "private",
+                    },
+                    active["contract"]["choices"][1],
+                ],
+            },
         }
         normalized = _active_pending_route_state(with_untrusted_extras)
         self.assertNotIn("unexpected", normalized)
-        self.assertNotIn("raw_model_payload", normalized["choices"][0])
+        self.assertNotIn("raw_model_payload", normalized["contract"]["choices"][0])
 
         malformed_values = (
-            {**active, "kind": "intent_slot"},
             {**active, "dispatch_authorized": True},
             {**active, "base_user_message_id": "not-a-uuid"},
             {**active, "clarification_message_id": "not-a-uuid"},
             {**active, "created_at": "not-a-date"},
             {**active, "original_query": ""},
-            {**active, "dimension": "unknown"},
+            {**active, "contract": {**active["contract"], "dimension": "unknown-value"}},
             {**active, "selected_kb_ids_snapshot": ["not-a-uuid"]},
-            {**active, "choices": active["choices"][:1]},
             {
                 **active,
-                "choices": [
-                    {**active["choices"][0], "doc_ids": ["not-a-uuid"]},
-                    active["choices"][1],
-                ],
+                "contract": {
+                    **active["contract"],
+                    "choices": [
+                        {**active["contract"]["choices"][0], "doc_ids": ["not-a-uuid"]},
+                        active["contract"]["choices"][1],
+                    ],
+                },
             },
             {
                 **active,
-                "choices": [
-                    {
-                        **active["choices"][0],
-                        "kb_ids": [str(uuid.uuid4())],
-                    },
-                    active["choices"][1],
-                ],
+                "contract": {
+                    **active["contract"],
+                    "choices": [
+                        {
+                            **active["contract"]["choices"][0],
+                            "kb_ids": [str(uuid.uuid4())],
+                        },
+                        active["contract"]["choices"][1],
+                    ],
+                },
             },
         )
         for malformed in malformed_values:
@@ -1230,18 +1405,20 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
     def test_evidence_choice_text_up_to_500_chars_can_be_persisted(self) -> None:
         kb_id = uuid.uuid4()
         template = _evidence_pending_state(kb_id=kb_id)
-        choices = json.loads(json.dumps(template["choices"], ensure_ascii=False))
+        choices = json.loads(json.dumps(template["contract"]["choices"], ensure_ascii=False))
         choices[0]["label"] = "范" * 500
         choices[0]["products"] = ["产" * 500]
         event = {
-            "schema_version": "rag_evidence_clarification.v1",
+            "schema_version": "rag_clarification_state.v1",
             "needs_clarification": True,
+            "adapter": "evidence",
             "dimension": "version",
-            "question": template["clarification_message"],
+            "reason_code": "multiple_mutually_exclusive_scopes",
+            "selection_mode": "choice",
             "choices": choices,
         }
 
-        state = _evidence_event_pending_state(
+        state = _clarification_event_pending_state(
             event,
             original_query=template["original_query"],
             selected_kb_ids=[kb_id],
@@ -1250,8 +1427,8 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(state)
-        self.assertEqual(len(state["choices"][0]["label"]), 500)
-        self.assertEqual(len(state["choices"][0]["products"][0]), 500)
+        self.assertEqual(len(state["contract"]["choices"][0]["label"]), 500)
+        self.assertEqual(len(state["contract"]["choices"][0]["products"][0]), 500)
 
         for field, value in (
             ("label", "范" * 501),
@@ -1262,7 +1439,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                     json.dumps(choices, ensure_ascii=False)
                 )
                 malformed_choices[0][field] = value
-                malformed = _evidence_event_pending_state(
+                malformed = _clarification_event_pending_state(
                     {**event, "choices": malformed_choices},
                     original_query=template["original_query"],
                     selected_kb_ids=[kb_id],
@@ -1271,56 +1448,43 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIsNone(malformed)
 
-    def test_legacy_choices_derive_anchor_and_companion_documents(self) -> None:
+    def test_evidence_adapter_requires_explicit_anchor_partition(self) -> None:
         kb_id = uuid.uuid4()
         first_anchor = uuid.uuid4()
         second_anchor = uuid.uuid4()
         shared_companion = uuid.uuid4()
-        state = _evidence_pending_state(
-            kb_id=kb_id,
-            first_doc_id=first_anchor,
-            second_doc_id=second_anchor,
+        choices = []
+        for index, anchor in enumerate((first_anchor, second_anchor), start=1):
+            choices.append({
+                "key": f"c{index}",
+                "label": f"版本 {index}",
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(anchor), str(shared_companion)],
+                "anchor_doc_ids": [],
+                "companion_doc_ids": [],
+            })
+        normalized = _normalize_evidence_scope_filter(
+            {
+                "mode": "compare_all",
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [
+                    str(first_anchor),
+                    str(second_anchor),
+                    str(shared_companion),
+                ],
+                "choices": choices,
+            },
+            authorized_kb_ids=[kb_id],
         )
-        state.pop("selection_mode")
-        for choice, anchor in zip(
-            state["choices"],
-            (first_anchor, second_anchor),
-            strict=True,
-        ):
-            choice["doc_ids"] = [str(anchor), str(shared_companion)]
-            choice.pop("anchor_doc_ids")
-            choice.pop("companion_doc_ids")
-
-        normalized = _active_pending_route_state(state)
-
-        self.assertEqual(normalized["selection_mode"], "choice")
-        self.assertEqual(
-            normalized["choices"][0]["anchor_doc_ids"],
-            [str(first_anchor)],
-        )
-        self.assertEqual(
-            normalized["choices"][1]["anchor_doc_ids"],
-            [str(second_anchor)],
-        )
-        self.assertEqual(
-            normalized["choices"][0]["companion_doc_ids"],
-            [str(shared_companion)],
-        )
-        self.assertEqual(
-            normalized["choices"][1]["companion_doc_ids"],
-            [str(shared_companion)],
-        )
-
-        malformed = json.loads(json.dumps(normalized, ensure_ascii=False))
-        malformed["choices"][0]["anchor_doc_ids"] = [str(shared_companion)]
-        malformed["choices"][0]["companion_doc_ids"] = [str(first_anchor)]
-        self.assertIsNone(_active_pending_route_state(malformed))
+        self.assertIsNotNone(normalized)
+        self.assertFalse(normalized.valid)
+        self.assertEqual(normalized.invalid_reason, "malformed_filter")
 
     def test_choice_specific_companion_stays_inside_authorized_scope(self) -> None:
         kb_id = uuid.uuid4()
         companion_doc_id = uuid.uuid4()
         pending = _evidence_pending_state(kb_id=kb_id)
-        first_choice = pending["choices"][0]
+        first_choice = pending["contract"]["choices"][0]
         first_choice["doc_ids"].append(str(companion_doc_id))
         first_choice["companion_doc_ids"] = [str(companion_doc_id)]
 
@@ -1328,7 +1492,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(normalized)
         self.assertEqual(
-            normalized["choices"][0]["companion_doc_ids"],
+            normalized["contract"]["choices"][0]["companion_doc_ids"],
             [str(companion_doc_id)],
         )
         reply = _parse_evidence_scope_reply("1", normalized)
@@ -1336,7 +1500,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             set(scope_filter["doc_ids"]),
             {
-                *normalized["choices"][0]["anchor_doc_ids"],
+                *normalized["contract"]["choices"][0]["anchor_doc_ids"],
                 str(companion_doc_id),
             },
         )
@@ -1344,8 +1508,18 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         # omitting it from doc_ids or changing the current KB authorization
         # invalidates the state/filter instead of broadening retrieval.
         malformed = json.loads(json.dumps(normalized, ensure_ascii=False))
-        malformed["choices"][0]["doc_ids"].remove(str(companion_doc_id))
-        self.assertIsNone(_active_pending_route_state(malformed))
+        malformed["contract"]["choices"][0]["doc_ids"].remove(str(companion_doc_id))
+        malformed_reply = _parse_evidence_scope_reply("1", malformed)
+        malformed_filter = _evidence_scope_filter(
+            malformed_reply,
+            current_kb_ids=[kb_id],
+        )
+        adapter_state = _normalize_evidence_scope_filter(
+            malformed_filter,
+            authorized_kb_ids=[kb_id],
+        )
+        self.assertIsNotNone(adapter_state)
+        self.assertFalse(adapter_state.valid)
         self.assertIsNone(
             _evidence_scope_filter(reply, current_kb_ids=[uuid.uuid4()])
         )
@@ -1695,7 +1869,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 requirements=requirements,
             ),
         )
-        event = json.loads(json.dumps(decision.to_dict(), ensure_ascii=False))
+        event = decision.to_contract().to_dict()
         self.assertEqual(event["dimension"], "version")
 
         # This is the pre-fix producer shape.  Chat must keep rejecting it:
@@ -1728,17 +1902,18 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "filenames": ["规则总表.md"],
             },
         ]
-        self.assertIsNone(_validated_evidence_choices(
-            old_overlapping_choices,
-            selected_kb_ids=(str(kb_id),),
-        ))
-
-        validated = _validated_evidence_choices(
-            event["choices"],
-            selected_kb_ids=(str(kb_id),),
+        overlapping = _normalize_evidence_scope_filter(
+            {
+                "mode": "compare_all",
+                "kb_ids": [str(kb_id)],
+                "doc_ids": [str(dependent_doc_id), str(dominant_doc_id)],
+                "choices": old_overlapping_choices,
+            },
+            authorized_kb_ids=[kb_id],
         )
-        self.assertIsNotNone(validated)
-        state = _evidence_event_pending_state(
+        self.assertIsNotNone(overlapping)
+        self.assertFalse(overlapping.valid)
+        state = _clarification_event_pending_state(
             event,
             original_query="当前规则是什么",
             selected_kb_ids=[kb_id],
@@ -1747,11 +1922,19 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(state)
         self.assertEqual(
-            {value for choice in state["choices"] for value in choice["kb_ids"]},
+            {
+                value
+                for choice in state["contract"]["choices"]
+                for value in choice["kb_ids"]
+            },
             {str(kb_id)},
         )
         self.assertEqual(
-            {value for choice in state["choices"] for value in choice["doc_ids"]},
+            {
+                value
+                for choice in state["contract"]["choices"]
+                for value in choice["doc_ids"]
+            },
             {
                 str(dependent_doc_id),
                 str(dominant_doc_id),
@@ -1776,7 +1959,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             "第二个吧": ("single", "c2"),
             "8.2.75": ("single", "c2"),
             "选 8.2.75 版本吧": ("single", "c2"),
-            pending["choices"][0]["label"]: ("single", "c1"),
+            pending["contract"]["choices"][0]["label"]: ("single", "c1"),
             "都要": ("compare_all", "c1"),
             "都对比": ("compare_all", "c1"),
         }
@@ -1792,18 +1975,18 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _parse_evidence_scope_reply("哪个好", pending).action,
-            "repeat",
+            "new_question",
         )
         self.assertEqual(
             _parse_evidence_scope_reply("哪个都行", pending).action,
-            "repeat",
+            "new_question",
         )
         self.assertEqual(
             _parse_evidence_scope_reply("普通员工的出差标准", pending).action,
             "new_question",
         )
         self.assertEqual(
-            _parse_evidence_scope_reply("今天天气", pending).action,
+            _parse_evidence_scope_reply("今天天气怎么样？", pending).action,
             "new_question",
         )
         self.assertEqual(
@@ -1818,18 +2001,14 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             "cancel",
         )
 
-        broad_pending = {
-            **pending,
-            "selection_mode": "refine",
-            "choices": [],
-        }
+        broad_pending = _broad_evidence_pending_state()
         self.assertEqual(
             _parse_evidence_scope_reply("2025版", broad_pending).action,
             "refine",
         )
         self.assertEqual(
             _parse_evidence_scope_reply("随便一个", broad_pending).action,
-            "repeat",
+            "refine",
         )
         self.assertEqual(
             _parse_evidence_scope_reply(
@@ -1864,12 +2043,12 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             _evidence_scope_reply_display_text("c2", single),
-            f"选择：{pending['choices'][1]['label']}",
+            f"选择：{pending['contract']['choices'][1]['label']}",
         )
         self.assertEqual(
             _evidence_scope_reply_display_text("都对比", comparison),
             "选择：都对比（"
-            + "；".join(choice["label"] for choice in pending["choices"])
+            + "；".join(choice["label"] for choice in pending["contract"]["choices"])
             + "）",
         )
         self.assertEqual(
@@ -1880,10 +2059,11 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
     def test_explicit_subset_comparison_does_not_include_unmentioned_choice(self) -> None:
         pending = _evidence_pending_state()
         third_doc_id = uuid.uuid4()
-        pending["choices"].insert(1, {
-            **pending["choices"][0],
+        pending["contract"]["choices"].insert(1, {
+            **pending["contract"]["choices"][0],
             "key": "c3",
             "label": "云枢 7.0 —《中间版本配置》",
+            "value": "7.0",
             "versions": ["7.0"],
             "doc_ids": [str(third_doc_id)],
             "anchor_doc_ids": [str(third_doc_id)],
@@ -1916,15 +2096,15 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scope_filter["kb_ids"], [str(kb_id)])
         self.assertEqual(
             scope_filter["doc_ids"],
-            pending["choices"][1]["doc_ids"],
+            pending["contract"]["choices"][1]["doc_ids"],
         )
         self.assertEqual(
             scope_filter["choices"][0]["anchor_doc_ids"],
-            pending["choices"][1]["anchor_doc_ids"],
+            pending["contract"]["choices"][1]["anchor_doc_ids"],
         )
         self.assertEqual(
             scope_filter["choices"][0]["companion_doc_ids"],
-            pending["choices"][1]["companion_doc_ids"],
+            pending["contract"]["choices"][1]["companion_doc_ids"],
         )
         query = _scoped_evidence_query(pending["original_query"], scope_filter)
         self.assertIn(pending["original_query"], query)
@@ -1935,13 +2115,15 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
     def test_broad_clarification_creates_strict_refinement_pending_state(self) -> None:
         kb_id = uuid.uuid4()
-        state = _evidence_event_pending_state(
+        state = _clarification_event_pending_state(
             {
-                "type": "evidence_clarification",
-                "schema_version": "rag_evidence_clarification.v1",
+                "type": "clarification_state",
+                "schema_version": "rag_clarification_state.v1",
                 "needs_clarification": True,
+                "adapter": "evidence",
                 "dimension": "version",
-                "question": "检索到过多适用范围，请补充具体产品和版本。",
+                "reason_code": "scope_too_broad",
+                "selection_mode": "refine",
                 "choices": [],
             },
             original_query="如何配置登录安全",
@@ -1951,18 +2133,27 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNotNone(state)
-        self.assertEqual(state["selection_mode"], "refine")
-        self.assertEqual(state["choices"], [])
+        self.assertEqual(state["contract"]["selection_mode"], "refine")
+        self.assertEqual(state["contract"]["choices"], [])
         self.assertFalse(state["dispatch_authorized"])
         self.assertEqual(state["selected_kb_ids_snapshot"], [str(kb_id)])
         self.assertEqual(_active_pending_route_state(state), state)
 
         for malformed in (
-            {**state, "selection_mode": "unknown"},
-            {**state, "selection_mode": "choice"},
             {
                 **state,
-                "choices": _evidence_pending_state(kb_id=kb_id)["choices"],
+                "contract": {**state["contract"], "selection_mode": "unknown"},
+            },
+            {
+                **state,
+                "contract": {**state["contract"], "selection_mode": "choice"},
+            },
+            {
+                **state,
+                "contract": {
+                    **state["contract"],
+                    "choices": _evidence_pending_state(kb_id=kb_id)["contract"]["choices"],
+                },
             },
         ):
             with self.subTest(malformed=malformed):
@@ -1993,7 +2184,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 conv=conv,
                 user=user,
                 question="普通员工的出差标准",
-                clarification_message=contract.clarification.question,
                 decision_reason=contract.decision_reason,
                 trace_id="trace-create",
                 selected_kb_ids=[],
@@ -2008,27 +2198,24 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         payloads = [payload for payload in payloads if payload]
 
         state = conv.pending_route_state
-        self.assertEqual(state["schema_version"], "rag_pending_clarification.v1")
+        self.assertEqual(state["schema_version"], "rag_clarification_state.v1")
         self.assertFalse(state["dispatch_authorized"])
-        self.assertEqual(state["intent_code"], "knowledge_qa")
         self.assertEqual(state["original_query"], "普通员工的出差标准")
-        self.assertEqual(state["clarification_answers"], [])
-        self.assertEqual(
-            state["clarification_message"],
-            contract.clarification.question,
-        )
-        self.assertEqual(state["unresolved"][0]["role"], "knowledge_base")
+        self.assertEqual(state["prior_answers"], [])
+        self.assertEqual(state["contract"]["adapter"], "semantic")
+        self.assertEqual(state["contract"]["selection_mode"], "refine")
         self.assertEqual(state["selected_kb_ids_snapshot"], [])
         self.assertIsNotNone(_active_pending_route_state(state))
         self.assertEqual(conv.route_state_revision, 1)
         self.assertEqual(db.commits, 1)
         self.assertEqual([item.role for item in db.added], ["user", "assistant"])
         self.assertIn(
-            "intent.clarification_created",
+            "clarification.created",
             [call.args[0] for call in trace.call_args_list],
         )
         event_types = [payload["type"] for payload in payloads]
         self.assertEqual(event_types[0], "conversation_started")
+        self.assertIn("clarification_state", event_types)
         self.assertLess(event_types.index("intent"), event_types.index("search_results"))
         intent_payload = next(
             payload["decision"] for payload in payloads if payload["type"] == "intent"
@@ -2158,15 +2345,15 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(conv.pending_route_state)
         self.assertEqual(
             conv.pending_route_state["schema_version"],
-            "rag_pending_clarification.v1",
+            "rag_clarification_state.v1",
         )
-        self.assertIn(
-            "请确认你的职级",
+        self.assertEqual(
             "".join(
                 str(item.get("content") or "")
                 for item in payloads
                 if item and item["type"] == "text_delta"
             ),
+            "请补充当前问题缺少的条件。",
         )
         self.assertNotIn("error", [item["type"] for item in payloads if item])
 
@@ -2229,15 +2416,15 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         rag_v2.assert_not_awaited()
         self.assertEqual(
             conv.pending_route_state["schema_version"],
-            "rag_pending_clarification.v1",
+            "rag_clarification_state.v1",
         )
         self.assertEqual(
-            conv.pending_route_state["unresolved"][0]["role"],
+            conv.pending_route_state["contract"]["dimension"],
             "query_execution",
         )
         self.assertEqual(
-            conv.pending_route_state["unresolved"][0]["reason"],
-            "missing",
+            conv.pending_route_state["contract"]["selection_mode"],
+            "refine",
         )
         intent = next(
             item["decision"] for item in payloads if item and item["type"] == "intent"
@@ -2265,8 +2452,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             for item in payloads
             if item and item["type"] == "text_delta"
         )
-        self.assertIn("对应关系", answer)
-        self.assertIn("标准或数值", answer)
+        self.assertEqual(answer, "请补充当前问题缺少的条件。")
         trace_events = [call.args[0] for call in trace.call_args_list if call.args]
         self.assertNotIn("retrieval.plan", trace_events)
         self.assertIn("query.plan", trace_events)
@@ -2308,10 +2494,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         scope_clarification = AuthorizedScopeClarification(
             dimension="product_version",
-            question=(
-                "当前授权知识库中存在多个适用版本，请先选择版本：\n"
-                "1. 平台A 版本 6\n2. 平台A 版本 7"
-            ),
             choices=(
                 AuthorizedScopeChoice(
                     key="scope1",
@@ -2367,24 +2549,38 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         scope_resolver.assert_awaited_once()
         rag_v2.assert_not_awaited()
         state = conv.pending_route_state
-        self.assertEqual(state["unresolved"][0]["role"], "product_version")
-        self.assertEqual(state["unresolved"][0]["reason"], "ambiguous")
+        self.assertEqual(state["contract"]["adapter"], "semantic")
+        self.assertEqual(state["contract"]["dimension"], "product_version")
         self.assertEqual(
-            state["choices"],
+            state["contract"]["reason_code"],
+            "multiple_authorized_versions",
+        )
+        self.assertEqual(
+            [
+                {
+                    key: value
+                    for key, value in choice.items()
+                    if key in {"key", "label", "value"}
+                }
+                for choice in state["contract"]["choices"]
+            ],
             [
                 {"key": "scope1", "label": "平台A 版本 6", "value": "6"},
                 {"key": "scope2", "label": "平台A 版本 7", "value": "7"},
             ],
         )
-        self.assertNotIn("kb_ids", state["choices"][0])
+        active_event = next(
+            item
+            for item in payloads
+            if item and item.get("type") == "clarification_state"
+        )
+        self.assertNotIn("kb_ids", active_event["choices"][0])
         clarification_text = "".join(
             item.get("content", "")
             for item in payloads
             if item and item.get("type") == "text_delta"
         )
-        self.assertIn("当前授权知识库中存在多个适用版本", clarification_text)
-        self.assertIn("平台A 版本 6", clarification_text)
-        self.assertIn("平台A 版本 7", clarification_text)
+        self.assertEqual(clarification_text, "请补充当前问题缺少的条件。")
 
     def test_broad_refinement_remains_one_query_plan(self) -> None:
         refined = _refined_evidence_query("员工标准是什么", "2025版")
@@ -2394,7 +2590,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("员工标准是什么", refined)
         self.assertIn("用户补充的适用范围：2025版", refined)
 
-    async def test_pipeline_evidence_clarification_creates_v2_pending_state(self) -> None:
+    async def test_pipeline_clarification_creates_unified_pending_state(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
@@ -2434,7 +2630,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         routing_result.route_log_id = route_log_id
         contradictory_source = {
             "id": str(uuid.uuid4()),
-            "doc_id": pending_template["choices"][1]["doc_ids"][0],
+            "doc_id": pending_template["contract"]["choices"][1]["doc_ids"][0],
             "kb_id": str(kb_id),
             "filename": "不应恢复为依据.md",
             "content": "只能作为候选展示",
@@ -2456,15 +2652,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 ensure_ascii=False,
             ) + "\n\n"
             yield "data: " + json.dumps(
-                {
-                    "type": "evidence_clarification",
-                    "schema_version": "rag_evidence_clarification.v1",
-                    "needs_clarification": True,
-                    "dimension": pending_template["dimension"],
-                    "question": pending_template["clarification_message"],
-                    "reason": "multiple_mutually_exclusive_relevant_scopes",
-                    "choices": pending_template["choices"],
-                },
+                _proposed_clarification_event(pending_template),
                 ensure_ascii=False,
             ) + "\n\n"
             # 模拟异常/滚动升级生产者在最终澄清门禁之后又发出 hit。
@@ -2487,14 +2675,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             yield "data: " + json.dumps(
                 {
                     "type": "text_delta",
-                    "content": pending_template["clarification_message"],
-                },
-                ensure_ascii=False,
-            ) + "\n\n"
-            yield "data: " + json.dumps(
-                {
-                    "type": "text_delta",
-                    "content": "这是澄清门禁后绝不能输出或保存的答案。",
+                    "content": "模型生成的澄清表达。",
                 },
                 ensure_ascii=False,
             ) + "\n\n"
@@ -2535,8 +2716,8 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
         state = conv.pending_route_state
         self.assertIsNotNone(state)
-        self.assertEqual(state["schema_version"], "rag_pending_clarification.v2")
-        self.assertEqual(state["kind"], "evidence_scope")
+        self.assertEqual(state["schema_version"], "rag_clarification_state.v1")
+        self.assertEqual(state["contract"]["adapter"], "evidence")
         self.assertFalse(state["dispatch_authorized"])
         # No source-anchored semantic context was supplied to this mocked
         # request.  The V2 boundary must preserve the current user text rather
@@ -2544,21 +2725,24 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         # concatenation path.
         self.assertEqual(state["original_query"], raw_followup_question)
         self.assertNotEqual(state["original_query"], pending_template["original_query"])
-        self.assertEqual([item["key"] for item in state["choices"]], ["c1", "c2"])
+        self.assertEqual(
+            [item["key"] for item in state["contract"]["choices"]],
+            ["c1", "c2"],
+        )
         self.assertEqual(conv.route_state_revision, 1)
         self.assertEqual(_active_pending_route_state(state), state)
         assistant = next(item for item in save_db.added if item.role == "assistant")
         self.assertEqual(assistant.sources, [])
         self.assertEqual(
             assistant.content,
-            pending_template["clarification_message"],
+            "模型生成的澄清表达。",
         )
         streamed_text = "".join(
             str(item.get("content") or "")
             for item in payloads
             if item and item["type"] == "text_delta"
         )
-        self.assertEqual(streamed_text, pending_template["clarification_message"])
+        self.assertEqual(streamed_text, "模型生成的澄清表达。")
         self.assertNotIn("绝不能输出", streamed_text)
         self.assertNotIn("error", [item["type"] for item in payloads if item])
         self.assertTrue(route_log.retrieval_executed)
@@ -2575,22 +2759,35 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(locked_payload["hit_count"], 0)
         self.assertEqual(locked_payload["results"][0]["evidence_role"], "related")
         event_types = [item["type"] for item in payloads if item]
-        self.assertLess(
-            event_types.index("evidence_clarification"),
-            event_types.index("evidence_clarification_ack"),
+        clarification_events = [
+            item
+            for item in payloads
+            if item and item["type"] == "clarification_state"
+        ]
+        self.assertEqual(
+            [item["status"] for item in clarification_events],
+            ["proposed", "active"],
         )
         self.assertLess(
-            event_types.index("evidence_clarification_ack"),
+            max(
+                index
+                for index, item in enumerate(payloads)
+                if item
+                and item.get("type") == "clarification_state"
+                and item.get("status") == "active"
+            ),
             event_types.index("done"),
         )
         ack = next(
             item
             for item in payloads
-            if item and item["type"] == "evidence_clarification_ack"
+            if item
+            and item["type"] == "clarification_state"
+            and item["status"] == "active"
         )
         self.assertEqual(
             ack["schema_version"],
-            "rag_evidence_clarification_ack.v1",
+            "rag_clarification_state.v1",
         )
         self.assertTrue(ack["persisted"])
         self.assertEqual(ack["pending_state_id"], state["state_id"])
@@ -2602,10 +2799,10 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             state["selected_kb_ids_snapshot"],
         )
         events = [call.args[0] for call in trace.call_args_list]
-        self.assertIn("evidence.clarification_created", events)
-        self.assertNotIn("evidence.clarification_resolved", events)
+        self.assertIn("clarification.created", events)
+        self.assertNotIn("clarification.resolved", events)
 
-    async def test_pipeline_evidence_clarification_save_failure_has_no_ack(self) -> None:
+    async def test_pipeline_clarification_save_failure_has_no_active_state(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
@@ -2635,14 +2832,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
         async def clarification_stream(**_kwargs):
             yield "data: " + json.dumps(
-                {
-                    "type": "evidence_clarification",
-                    "schema_version": "rag_evidence_clarification.v1",
-                    "needs_clarification": True,
-                    "dimension": pending_template["dimension"],
-                    "question": pending_template["clarification_message"],
-                    "choices": pending_template["choices"],
-                },
+                _proposed_clarification_event(pending_template),
                 ensure_ascii=False,
             ) + "\n\n"
             yield "data: " + json.dumps(
@@ -2680,14 +2870,28 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         event_types = [item["type"] for item in payloads if item]
-        self.assertIn("evidence_clarification", event_types)
-        self.assertNotIn("evidence_clarification_ack", event_types)
+        proposed = [
+            item
+            for item in payloads
+            if item
+            and item.get("type") == "clarification_state"
+            and item.get("status") == "proposed"
+        ]
+        active = [
+            item
+            for item in payloads
+            if item
+            and item.get("type") == "clarification_state"
+            and item.get("status") == "active"
+        ]
+        self.assertEqual(len(proposed), 1)
+        self.assertEqual(active, [])
         self.assertEqual(event_types[-2:], ["error", "done"])
         self.assertIsNone(conv.pending_route_state)
         self.assertEqual(conv.route_state_revision, 0)
         events = [call.args[0] for call in trace.call_args_list]
         self.assertIn("chat.persistence_error", events)
-        self.assertNotIn("evidence.clarification_created", events)
+        self.assertNotIn("clarification.created", events)
 
     async def test_v2_selection_keeps_pending_when_answer_context_is_empty(self) -> None:
         conversation_id = uuid.uuid4()
@@ -2721,7 +2925,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                     "direct_evidence_count": 1,
                     "related_reference_count": 0,
                     "evidence_scope_anchor_hit": True,
-                    "evidence_scope_anchor_doc_ids": pending["choices"][1][
+                    "evidence_scope_anchor_doc_ids": pending["contract"]["choices"][1][
                         "anchor_doc_ids"
                     ],
                 }
@@ -2781,7 +2985,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 4)
         self.assertNotIn(
-            "evidence.clarification_resolved",
+            "clarification.resolved",
             [call.args[0] for call in trace.call_args_list],
         )
 
@@ -2790,7 +2994,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
         pending = _evidence_pending_state(kb_id=kb_id)
-        selected_doc_id = uuid.UUID(pending["choices"][1]["doc_ids"][0])
+        selected_doc_id = uuid.UUID(pending["contract"]["choices"][1]["doc_ids"][0])
         chunk_id = uuid.uuid4()
         document = Document(
             id=selected_doc_id,
@@ -2939,7 +3143,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         resolved = next(
             call
             for call in trace.call_args_list
-            if call.args[0] == "evidence.clarification_resolved"
+            if call.args[0] == "clarification.resolved"
         )
         self.assertEqual(resolved.kwargs["resolution"], "selected")
         self.assertEqual(resolved.kwargs["selected_choice_keys"], ["c2"])
@@ -2949,7 +3153,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
         pending = _evidence_pending_state(kb_id=kb_id)
-        selected_doc_id = uuid.UUID(pending["choices"][1]["doc_ids"][0])
+        selected_doc_id = uuid.UUID(pending["contract"]["choices"][1]["doc_ids"][0])
         chunk_id = uuid.uuid4()
         document = Document(
             id=selected_doc_id,
@@ -3076,7 +3280,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         events = [call.args[0] for call in trace.call_args_list]
         self.assertIn("chat.persistence_error", events)
-        self.assertNotIn("evidence.clarification_resolved", events)
+        self.assertNotIn("clarification.resolved", events)
         self.assertNotIn("chat.response", events)
 
     async def test_v2_selection_builds_route_without_intent_model(self) -> None:
@@ -3110,7 +3314,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "direct_evidence_count": 1,
                 "related_reference_count": 0,
                 "evidence_scope_anchor_hit": True,
-                "evidence_scope_anchor_doc_ids": pending["choices"][1][
+                "evidence_scope_anchor_doc_ids": pending["contract"]["choices"][1][
                     "anchor_doc_ids"
                 ],
             }) + "\n\n"
@@ -3279,7 +3483,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         resolved = next(
             call
             for call in trace.call_args_list
-            if call.args[0] == "evidence.clarification_resolved"
+            if call.args[0] == "clarification.resolved"
         )
         self.assertEqual(resolved.kwargs["resolution"], "refined")
 
@@ -3323,20 +3527,13 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 }
             ) + "\n\n"
             yield "data: " + json.dumps(
-                {
-                    "type": "evidence_clarification",
-                    "schema_version": "rag_evidence_clarification.v1",
-                    "needs_clarification": True,
-                    "dimension": "version",
-                    "question": bounded["clarification_message"],
-                    "choices": bounded["choices"],
-                },
+                _proposed_clarification_event(bounded),
                 ensure_ascii=False,
             ) + "\n\n"
             yield "data: " + json.dumps(
                 {
                     "type": "text_delta",
-                    "content": bounded["clarification_message"],
+                    "content": "模型生成的澄清表达。",
                 },
                 ensure_ascii=False,
             ) + "\n\n"
@@ -3370,13 +3567,13 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             [chunk async for chunk in response.body_iterator]
 
         replacement = conv.pending_route_state
-        self.assertEqual(replacement["selection_mode"], "choice")
-        self.assertEqual([item["key"] for item in replacement["choices"]], ["c1", "c2"])
+        self.assertEqual(replacement["contract"]["selection_mode"], "choice")
+        self.assertEqual([item["key"] for item in replacement["contract"]["choices"]], ["c1", "c2"])
         self.assertNotEqual(replacement["state_id"], pending["state_id"])
         self.assertEqual(conv.route_state_revision, 10)
         events = [call.args[0] for call in trace.call_args_list]
-        self.assertIn("evidence.clarification_resolved", events)
-        self.assertIn("evidence.clarification_created", events)
+        self.assertIn("clarification.resolved", events)
+        self.assertIn("clarification.created", events)
 
     async def test_invalid_short_v2_reply_repeats_choices_without_dispatch(self) -> None:
         conversation_id = uuid.uuid4()
@@ -3424,19 +3621,14 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 2)
         event_types = [item["type"] for item in payloads if item]
-        self.assertLess(
-            event_types.index("evidence_clarification"),
-            event_types.index("evidence_clarification_ack"),
-        )
-        self.assertLess(
-            event_types.index("evidence_clarification_ack"),
-            event_types.index("done"),
-        )
         ack = next(
             item
             for item in payloads
-            if item and item["type"] == "evidence_clarification_ack"
+            if item
+            and item["type"] == "clarification_state"
+            and item["status"] == "active"
         )
+        self.assertLess(event_types.index("clarification_state"), event_types.index("done"))
         self.assertTrue(ack["persisted"])
         self.assertEqual(ack["pending_state_id"], pending["state_id"])
         self.assertEqual(
@@ -3445,7 +3637,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(ack["route_state_revision"], 2)
         self.assertIn(
-            "evidence.clarification_repeated",
+            "clarification.repeated",
             [call.args[0] for call in trace.call_args_list],
         )
 
@@ -3503,10 +3695,10 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             )
             [chunk async for chunk in response.body_iterator]
 
-        self.assertIs(conv.pending_route_state, pending)
+        self.assertEqual(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 7)
         self.assertNotIn(
-            "evidence.clarification_resolved",
+            "clarification.resolved",
             [call.args[0] for call in trace.call_args_list],
         )
 
@@ -3606,7 +3798,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(assistant.sources, [])
                 self.assertNotIn(
-                    "evidence.clarification_resolved",
+                    "clarification.resolved",
                     [call.args[0] for call in trace.call_args_list],
                 )
 
@@ -3616,7 +3808,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         kb_id = uuid.uuid4()
         shared_companion = uuid.uuid4()
         pending = _evidence_pending_state(kb_id=kb_id)
-        for choice in pending["choices"]:
+        for choice in pending["contract"]["choices"]:
             choice["doc_ids"].append(str(shared_companion))
             choice["companion_doc_ids"] = [str(shared_companion)]
         conv = SimpleNamespace(
@@ -3696,7 +3888,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 14)
         self.assertNotIn(
-            "evidence.clarification_resolved",
+            "clarification.resolved",
             [call.args[0] for call in trace.call_args_list],
         )
 
@@ -3743,10 +3935,11 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("8.2.75", serialized)
         self.assertNotIn("二开发送钉钉工作通知", serialized)
         self.assertNotIn(
-            "evidence_clarification",
+            "clarification_state",
             [item["type"] for item in payloads if item],
         )
-        self.assertIs(conv.pending_route_state, pending)
+        self.assertIsNone(conv.pending_route_state)
+        self.assertEqual(conv.route_state_revision, 3)
 
     async def test_broad_refinement_does_not_search_newly_added_kb(self) -> None:
         conversation_id = uuid.uuid4()
@@ -3789,15 +3982,15 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
 
         classify.assert_not_awaited()
         rag_stream.assert_not_called()
-        self.assertIs(conv.pending_route_state, pending)
-        self.assertEqual(conv.route_state_revision, 3)
-        self.assertIn(
-            "知识库范围不一致",
+        self.assertIsNone(conv.pending_route_state)
+        self.assertEqual(conv.route_state_revision, 4)
+        self.assertEqual(
             "".join(
                 str(item.get("content") or "")
                 for item in payloads
                 if item and item.get("type") == "text_delta"
             ),
+            "请补充当前问题缺少的条件。",
         )
 
     async def test_v2_cancel_clears_state_without_router_dispatch(self) -> None:
@@ -3840,7 +4033,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         resolved = next(
             call
             for call in trace.call_args_list
-            if call.args[0] == "evidence.clarification_resolved"
+            if call.args[0] == "clarification.resolved"
         )
         self.assertEqual(resolved.kwargs["resolution"], "cancelled")
 
@@ -3905,23 +4098,25 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         resolved = next(
             call
             for call in trace.call_args_list
-            if call.args[0] == "evidence.clarification_resolved"
+            if call.args[0] == "clarification.resolved"
         )
         self.assertEqual(resolved.kwargs["resolution"], "new_question")
 
     async def test_pending_reply_reenters_full_router_then_clears_state(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
-        pending = {
-            "schema_version": "rag_pending_clarification.v1",
-            "state_id": "pending-state",
-            "original_query": "我现在想改验证码有效期时间",
-            "clarification_answers": [],
-            "expires_at": (
-                datetime.now(timezone.utc) + timedelta(hours=1)
-            ).isoformat(),
-            "dispatch_authorized": False,
-        }
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="semantic",
+                dimension="query",
+                reason_code="missing_context",
+                selection_mode="refine",
+            ),
+            original_query="我现在想改验证码有效期时间",
+            selected_kb_ids=[],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
         conv = SimpleNamespace(
             id=conversation_id,
             user_id=user_id,
@@ -3961,7 +4156,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 user=user,
             )
 
-        self.assertIs(prepare.await_args.kwargs["pending_route_state"], pending)
+        self.assertEqual(prepare.await_args.kwargs["pending_route_state"], pending)
         self.assertTrue(classify.await_args.kwargs["has_pending_clarification"])
         routed_question = classify.await_args.args[1]
         self.assertIn("我现在想改验证码有效期时间", routed_question)
@@ -3973,21 +4168,30 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         resolved = next(
             call
             for call in trace.call_args_list
-            if call.args[0] == "intent.clarification_resolved"
+            if call.args[0] == "clarification.resolved"
         )
-        self.assertEqual(resolved.kwargs["pending_state_id"], "pending-state")
+        self.assertEqual(resolved.kwargs["pending_state_id"], pending["state_id"])
         self.assertEqual(resolved.kwargs["relation"], "continuation")
 
     async def test_expired_pending_state_is_cleared_before_routing(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         expired = {
-            "schema_version": "rag_pending_clarification.v1",
-            "state_id": "expired-state",
+            **build_clarification_state(
+                contract=ClarificationContract(
+                    adapter="semantic",
+                    dimension="query",
+                    reason_code="missing_context",
+                    selection_mode="refine",
+                ),
+                original_query="旧问题",
+                selected_kb_ids=[],
+                base_user_message_id=uuid.uuid4(),
+                clarification_message_id=uuid.uuid4(),
+            ),
             "expires_at": (
                 datetime.now(timezone.utc) - timedelta(seconds=1)
             ).isoformat(),
-            "dispatch_authorized": False,
         }
         conv = SimpleNamespace(
             id=conversation_id,
@@ -4033,9 +4237,9 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(conv.route_state_revision, 9)
         events = [call.args[0] for call in trace.call_args_list]
         self.assertEqual(events[0], "chat.request")
-        self.assertIn("intent.clarification_expired", events)
-        self.assertGreater(events.index("intent.clarification_expired"), 0)
-        self.assertNotIn("intent.clarification_resolved", events)
+        self.assertIn("clarification.expired", events)
+        self.assertGreater(events.index("clarification.expired"), 0)
+        self.assertNotIn("clarification.resolved", events)
 
 
 if __name__ == "__main__":

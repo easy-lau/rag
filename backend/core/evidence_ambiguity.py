@@ -14,6 +14,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Literal, Mapping
 
+from core.clarification import ClarificationContract
 from core.query_constraints import (
     QueryConstraints,
     candidate_section_key,
@@ -276,7 +277,6 @@ class DocumentEvidenceAssessment:
 class EvidenceAmbiguityDecision:
     needs_clarification: bool
     dimension: str | None = None
-    question: str = ""
     reason: str = ""
     choices: tuple[EvidenceScopeChoice, ...] = ()
     relevant_document_count: int = 0
@@ -288,15 +288,24 @@ class EvidenceAmbiguityDecision:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "rag_evidence_clarification.v1",
             "needs_clarification": self.needs_clarification,
             "dimension": self.dimension,
-            "question": self.question,
             "reason": self.reason,
             "choices": [choice.to_dict() for choice in self.choices],
             "relevant_document_count": self.relevant_document_count,
             "allowed_doc_ids": list(self.allowed_doc_ids),
         }
+
+    def to_contract(self) -> ClarificationContract:
+        if not self.needs_clarification or not self.dimension or not self.reason:
+            raise ValueError("non-clarification decision has no contract")
+        return ClarificationContract(
+            adapter="evidence",
+            dimension=self.dimension,
+            reason_code=self.reason,
+            selection_mode="choice" if self.choices else "refine",
+            choices=tuple(choice.to_dict() for choice in self.choices),
+        )
 
 
 @dataclass(frozen=True)
@@ -2089,11 +2098,6 @@ def detect_post_evidence_document_ambiguity(
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension="scope",
-            question=(
-                "同一份资料中存在多个可能的规则，但现有证据无法可靠判断"
-                "它们分别适用于什么范围。请补充产品、版本、项目、章节或"
-                "制度范围后再查询。"
-            ),
             reason="same_document_unbound_scope_declarations",
             relevant_document_count=len({
                 (str(row["kb_id"]), str(row["doc_id"]))
@@ -2149,10 +2153,6 @@ def detect_post_evidence_document_ambiguity(
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension="document",
-            question=(
-                "检索到多个问题部分分别存在不同的有效答案来源。"
-                "请补充需要核对的具体问题部分或适用范围。"
-            ),
             reason="multiple_assessed_document_ambiguity_groups",
             relevant_document_count=competing_document_count,
         )
@@ -2173,18 +2173,9 @@ def detect_post_evidence_document_ambiguity(
         rows=choice_rows,
     )
     if scope_dimension is not None and len(scope_choices) >= 2:
-        lines = [
-            "检索到与当前问题相关、但适用范围不同的资料：",
-            *(
-                f"{index}. {choice.label}"
-                for index, choice in enumerate(scope_choices, start=1)
-            ),
-            "请问需要查询哪一项？也可以回复“都对比”。",
-        ]
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension=scope_dimension,
-            question="\n".join(lines),
             reason="multiple_mutually_exclusive_assessed_scopes",
             choices=scope_choices,
             relevant_document_count=len({
@@ -2195,27 +2186,14 @@ def detect_post_evidence_document_ambiguity(
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension="document",
-            question=(
-                "检索到超过 6 篇经过评估且能回答当前问题的资料。"
-                "请补充具体主题、适用范围或文档名称。"
-            ),
             reason="too_many_assessed_answer_documents",
             relevant_document_count=len(choice_rows),
         )
 
     choices = _post_evidence_graph_choices(choice_rows)
-    question = (
-        "检索到多篇均能支持当前问题、但答案来源不同的资料：\n"
-        + "\n".join(
-            f"{index}. {choice.label}"
-            for index, choice in enumerate(choices, start=1)
-        )
-        + "\n请问需要查询哪一篇？也可以回复“都要”。"
-    )
     return EvidenceAmbiguityDecision(
         needs_clarification=True,
         dimension="document",
-        question=question,
         reason="multiple_assessed_answer_documents",
         choices=choices,
         relevant_document_count=len(choice_rows),
@@ -2328,10 +2306,6 @@ def _detect_topic_document_ambiguity(
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension="document",
-            question=(
-                "检索到多篇可能相关的资料，但当前问题范围较宽。"
-                "请补充具体主题或文档名称后再查询。"
-            ),
             reason="too_many_mutually_relevant_documents",
             relevant_document_count=len(rows),
         )
@@ -2380,14 +2354,6 @@ def _detect_topic_document_ambiguity(
     return EvidenceAmbiguityDecision(
         needs_clarification=True,
         dimension="document",
-        question=(
-            "检索到多篇可能相关的资料，但当前问题范围较宽：\n"
-            + "\n".join(
-                f"{index}. 《{row['filename'][:MAX_CHOICE_TEXT_CHARS]}》"
-                for index, row in enumerate(rows, start=1)
-            )
-            + "\n请问需要查询哪一篇？也可以回复“都要”。"
-        ),
         reason="multiple_mutually_relevant_documents",
         choices=_topic_groups_to_choices(rows),
         relevant_document_count=len(rows),
@@ -2749,10 +2715,6 @@ def detect_evidence_scope_ambiguity(
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension=comparison_plan.dimension,
-            question=(
-                "检索到超过 6 个互不相同的适用范围，无法在一次选择中完整列出。"
-                "请补充具体产品、版本或项目，以缩小查询范围。"
-            ),
             reason="too_many_mutually_exclusive_scopes",
             choices=(),
             relevant_document_count=len({
@@ -2850,7 +2812,6 @@ def detect_evidence_scope_ambiguity(
         return EvidenceAmbiguityDecision(
             needs_clarification=True,
             dimension=dimension,
-            question="检索到多个互不相同的适用范围，请补充具体产品和版本。",
             reason="too_many_mutually_exclusive_scopes",
             relevant_document_count=len(documents),
             allowed_doc_ids=allowed_doc_ids,
@@ -2858,15 +2819,9 @@ def detect_evidence_scope_ambiguity(
 
     choices = _scope_groups_to_choices(groups, constraints)
 
-    lines = [
-        "检索到与当前问题相关、但适用范围不同的资料：",
-        *(f"{index}. {choice.label}" for index, choice in enumerate(choices, start=1)),
-        "请问需要查询哪一项？也可以回复“都对比”。",
-    ]
     return EvidenceAmbiguityDecision(
         needs_clarification=True,
         dimension=dimension,
-        question="\n".join(lines),
         reason="multiple_mutually_exclusive_relevant_scopes",
         choices=choices,
         relevant_document_count=len(documents),

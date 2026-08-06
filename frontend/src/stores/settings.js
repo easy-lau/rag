@@ -12,6 +12,7 @@ export const useSettingsStore = defineStore('settings', () => {
     rerank_model: '',
     temperature: 0.7,
     max_tokens: 2048,
+    rerank_timeout_seconds: 15,
     embedding_api_key: '',
     embedding_base_url: 'https://api.openai.com/v1',
     embedding_model: 'text-embedding-3-small',

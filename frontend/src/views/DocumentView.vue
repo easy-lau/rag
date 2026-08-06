@@ -363,6 +363,7 @@ import { useRoute } from 'vue-router'
 import { NButton, NIcon, NSelect, NDataTable, NModal, NUpload, NUploadDragger, NTag, NInput, NSpin, NSwitch, NImage, useMessage } from 'naive-ui'
 import { CloudUploadOutline, TrashOutline, CreateOutline, CloseOutline, PencilOutline, LibraryOutline, ArrowBackOutline, ImageOutline, PricetagsOutline, EyeOutline } from '@vicons/ionicons5'
 import { renderDocMarkdown } from '@/utils/markdown'
+import { canReadDocumentRow, canUpdateDocumentRow, canDeleteDocumentRow } from '@/utils/documentPermissions'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useAuthStore } from '@/stores/auth'
 import { getAllDocuments, uploadDocument, uploadImageDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, getDocumentImage, updateTextDocument, updateDocumentTags } from '@/api/document'
@@ -456,6 +457,7 @@ const editingImageUrl = ref(null)
 const sourceUrlEnabled = ref(false)
 const sourceUrl = ref('')
 const editTags = ref([])
+const editingDocument = ref(null)
 
 const renderedMarkdown = computed(() => renderDocMarkdown(textContent.value || ''))
 const isViewingDocument = computed(() => editorMode.value === 'view')
@@ -476,7 +478,10 @@ function clearEditingImageUrl() {
 }
 
 watch(showTextEditor, (shown) => {
-  if (!shown) clearEditingImageUrl()
+  if (!shown) {
+    clearEditingImageUrl()
+    editingDocument.value = null
+  }
 })
 onUnmounted(clearEditingImageUrl)
 
@@ -546,7 +551,12 @@ const fmtTime = value => value ? new Intl.DateTimeFormat('zh-CN', {
 }).format(new Date(value)).replaceAll('/', '-') : '—'
 
 const columns = computed(() => [
-  ...(canDeleteDocument.value ? [{ type: 'selection', align: 'center', titleAlign: 'center' }] : []),
+  ...(canDeleteDocument.value ? [{
+    type: 'selection',
+    align: 'center',
+    titleAlign: 'center',
+    disabled: row => !canDeleteDocumentRow(row),
+  }] : []),
   { title: '文件名', key: 'filename', minWidth: 190, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
   {
     title: '标签', key: 'tags', minWidth: 150, align: 'left', titleAlign: 'left',
@@ -563,6 +573,8 @@ const columns = computed(() => [
     render: row => h(NSwitch, {
       value: row.is_active,
       size: 'small',
+      disabled: !canUpdateDocumentRow(row),
+      title: canUpdateDocumentRow(row) ? '切换文档启用状态' : '仅文档创建者或超级管理员可以修改',
       onUpdateValue: () => handleToggle(row),
     })
   }] : []),
@@ -576,19 +588,19 @@ const columns = computed(() => [
     title: '操作', key: 'actions', width: 132, fixed: 'right', align: 'center', titleAlign: 'center',
     render: row => h(RowActions, { label: `文档 ${row.filename} 操作` }, {
       default: () => [
-        canReadDocument.value
+        canReadDocumentRow(row)
           ? h(NButton, { text: true, size: 'small', 'aria-label': '查看文档', title: '查看文档', onClick: () => openViewEditor(row) },
               { icon: () => h(NIcon, null, () => h(EyeOutline)) })
           : null,
-        canUpdateDocument.value
+        canUpdateDocumentRow(row)
           ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑标签', title: '编辑标签', onClick: () => openTagEditor(row) },
               { icon: () => h(NIcon, null, () => h(PricetagsOutline)) })
           : null,
-        canUpdateDocument.value
+        canUpdateDocumentRow(row)
           ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑内容', title: '编辑内容', onClick: () => openEditEditor(row) },
               { icon: () => h(NIcon, null, () => h(PencilOutline)) })
           : null,
-        canDeleteDocument.value
+        canDeleteDocumentRow(row)
           ? h(NButton, { text: true, type: 'error', size: 'small', 'aria-label': '删除文档', title: '删除文档', onClick: () => openDelete(row) },
               { icon: () => h(NIcon, null, () => h(TrashOutline)) })
           : null,
@@ -617,19 +629,19 @@ watch(selectedKbId, async (id) => {
 })
 
 async function handleToggle(row) {
-  if (!canUpdateDocument.value) {
-    msg.warning('当前角色没有修改文档的权限')
+  if (!canUpdateDocumentRow(row)) {
+    msg.warning('只有文档创建者或超级管理员可以修改该文档')
     return
   }
   const updated = await toggleDocument(selectedKbId.value, row.id)
   const idx = docs.value.findIndex(d => d.id === row.id)
-  if (idx !== -1) docs.value[idx] = { ...docs.value[idx], is_active: updated.is_active }
+  if (idx !== -1) docs.value[idx] = { ...docs.value[idx], ...updated }
   msg.success(updated.is_active ? '文档已启用' : '文档已停用')
 }
 
 function openDelete(row) {
-  if (!canDeleteDocument.value) {
-    msg.warning('当前角色没有删除文档的权限')
+  if (!canDeleteDocumentRow(row)) {
+    msg.warning('只有文档创建者或超级管理员可以删除该文档')
     return
   }
   deleteTarget.value = { kind: 'single', row }
@@ -641,7 +653,10 @@ function openBatchDelete() {
     msg.warning('当前角色没有删除文档的权限')
     return
   }
-  const ids = [...checkedRowKeys.value]
+  const ids = checkedRowKeys.value.filter(id => {
+    const document = docs.value.find(row => row.id === id)
+    return canDeleteDocumentRow(document)
+  })
   if (!ids.length) return
   deleteTarget.value = { kind: 'batch', ids }
   showDeleteConfirm.value = true
@@ -652,6 +667,10 @@ async function confirmDelete() {
   if (!target || !selectedKbId.value) return
   if (!canDeleteDocument.value) {
     msg.warning('当前角色没有删除文档的权限')
+    return
+  }
+  if (target.kind === 'single' && !canDeleteDocumentRow(target.row)) {
+    msg.warning('只有文档创建者或超级管理员可以删除该文档')
     return
   }
   deleting.value = true
@@ -707,11 +726,11 @@ async function submitUpload() {
     await loadKbTags()
     if (failed > 0) {
       msg.warning(`${uploaded.length - failed} 个成功，${failed} 个处理失败`)
-    } else if (uploaded.length === 1 && canUpdateDocument.value) {
+    } else if (uploaded.length === 1 && canUpdateDocumentRow(uploaded[0])) {
       // 单文件：自动打开审阅编辑器
       await openEditEditor(uploaded[0])
     } else {
-      msg.success(canUpdateDocument.value
+      msg.success(canUpdateDocumentRow(uploaded[0])
         ? `${uploaded.length} 个文档处理完成，可点击编辑操作审阅内容`
         : `${uploaded.length} 个文档创建成功`)
     }
@@ -731,6 +750,7 @@ function openTextEditor() {
     return
   }
   editingDocId.value = null
+  editingDocument.value = null
   editorMode.value = 'create'
   mobileEditorPane.value = 'editor'
   clearEditingImageUrl()
@@ -751,17 +771,22 @@ function openEditEditor(row) {
 }
 
 async function openDocumentEditor(row, mode) {
-  if (!canReadDocument.value) {
+  if (!canReadDocument.value || !canReadDocumentRow(row)) {
     msg.warning('当前角色没有查看文档的权限')
     return
   }
-  if (mode === 'edit' && !canUpdateDocument.value) {
-    msg.warning('当前角色没有修改文档的权限')
+  if (mode === 'edit' && !canUpdateDocumentRow(row)) {
+    msg.warning('只有文档创建者或超级管理员可以修改该文档')
     return
   }
   try {
     const doc = await getDocument(selectedKbId.value, row.id)
+    if (mode === 'edit' && !canUpdateDocumentRow(doc)) {
+      msg.warning('文档权限已变化，请刷新后重试')
+      return
+    }
     editingDocId.value = row.id
+    editingDocument.value = doc
     editorMode.value = mode === 'edit' ? 'edit' : 'view'
     mobileEditorPane.value = 'editor'
     clearEditingImageUrl()
@@ -787,8 +812,8 @@ async function openDocumentEditor(row, mode) {
 }
 
 function openTagEditor(row) {
-  if (!canUpdateDocument.value) {
-    msg.warning('当前角色没有修改文档的权限')
+  if (!canUpdateDocumentRow(row)) {
+    msg.warning('只有文档创建者或超级管理员可以修改该文档')
     return
   }
   tagEditDoc.value = row
@@ -798,15 +823,15 @@ function openTagEditor(row) {
 
 async function saveTags() {
   if (!tagEditDoc.value) return
-  if (!canUpdateDocument.value) {
-    msg.warning('当前角色没有修改文档的权限')
+  if (!canUpdateDocumentRow(tagEditDoc.value)) {
+    msg.warning('只有文档创建者或超级管理员可以修改该文档')
     return
   }
   savingTags.value = true
   try {
     const updated = await updateDocumentTags(selectedKbId.value, tagEditDoc.value.id, tagEditValue.value)
     const idx = docs.value.findIndex(d => d.id === tagEditDoc.value.id)
-    if (idx !== -1) docs.value[idx] = { ...docs.value[idx], tags: updated.tags }
+    if (idx !== -1) docs.value[idx] = { ...docs.value[idx], ...updated }
     msg.success('标签已更新')
     showTagEditor.value = false
     await loadKbTags()
@@ -842,11 +867,11 @@ async function submitImageUpload() {
     await loadKbTags()
     if (failed > 0) {
       msg.warning(`${uploaded.length - failed} 张识别成功，${failed} 张失败（请检查「设置 → 多模态模型」配置）`)
-    } else if (uploaded.length === 1 && canUpdateDocument.value) {
+    } else if (uploaded.length === 1 && canUpdateDocumentRow(uploaded[0])) {
       // 单张：自动打开审阅编辑器，对照原图校对识别结果
       await openEditEditor(uploaded[0])
     } else {
-      msg.success(canUpdateDocument.value
+      msg.success(canUpdateDocumentRow(uploaded[0])
         ? `${uploaded.length} 张图片识别完成，可点击编辑操作审阅识别内容`
         : `${uploaded.length} 张图片文档创建成功`)
     }
@@ -878,8 +903,8 @@ async function submitText() {
     msg.warning('当前为只读查看模式')
     return
   }
-  if (isUpdate ? !canUpdateDocument.value : !canCreateDocument.value) {
-    msg.warning(isUpdate ? '当前角色没有修改文档的权限' : '当前角色没有新增文档的权限')
+  if (isUpdate ? !canUpdateDocumentRow(editingDocument.value) : !canCreateDocument.value) {
+    msg.warning(isUpdate ? '只有文档创建者或超级管理员可以修改该文档' : '当前角色没有新增文档的权限')
     return
   }
   submittingText.value = true

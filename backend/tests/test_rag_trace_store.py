@@ -1198,9 +1198,9 @@ class RagTraceStoreTests(unittest.TestCase):
             id=uuid.uuid4(),
             trace_id=run.trace_id,
             sequence=1,
-            event="intent.clarification_expired",
+            event="clarification.expired",
             payload={
-                "event": "intent.clarification_expired",
+                "event": "clarification.expired",
                 "route_state_revision": 3,
                 # Imported or legacy rows must not copy arbitrary fields into the
                 # compact diagnostic snapshot.
@@ -1234,13 +1234,13 @@ class RagTraceStoreTests(unittest.TestCase):
             _TraceEventsResult([expired, terminal]),
         ]))
 
-        self.assertIn("intent.clarification_expired", _TRACE_CORE_EVENTS)
+        self.assertIn("clarification.expired", _TRACE_CORE_EVENTS)
         with patch("api.rag_traces.TRACE_EXPORT_MAX_EVENTS", 2):
             selected, stats = asyncio.run(_load_bounded_export_events(db, run.trace_id))
 
         self.assertEqual(
             [event.event for event in selected],
-            ["intent.clarification_expired", "chat.response"],
+            ["clarification.expired", "chat.response"],
         )
         self.assertTrue(stats["truncated"])
 
@@ -1256,7 +1256,7 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertEqual(lifecycle["resolved_count"], 0)
         self.assertEqual(lifecycle["expired_count"], 1)
         self.assertEqual(lifecycle["events"], [{
-            "event": "intent.clarification_expired",
+            "event": "clarification.expired",
             "route_state_revision": 3,
         }])
         self.assertNotIn("clarification", lifecycle["events"][0])
@@ -1316,10 +1316,10 @@ class RagTraceStoreTests(unittest.TestCase):
         )
         self.assertTrue(stats["truncated"])
 
-    def test_trace_export_summarizes_evidence_clarification_lifecycle(self) -> None:
+    def test_trace_export_summarizes_unified_clarification_lifecycle(self) -> None:
         events = [
             {
-                "event": "evidence.clarification_created",
+                "event": "clarification.created",
                 "payload": {
                     "route_state_revision": 4,
                     "selected_kb_count": 2,
@@ -1328,15 +1328,14 @@ class RagTraceStoreTests(unittest.TestCase):
                 },
             },
             {
-                "event": "evidence.clarification_repeated",
+                "event": "clarification.repeated",
                 "payload": {
                     "route_state_revision": 4,
                     "choice_count": 2,
-                    "clarification_message": "不应进入摘要",
                 },
             },
             {
-                "event": "evidence.clarification_resolved",
+                "event": "clarification.resolved",
                 "payload": {
                     "route_state_revision": 5,
                     "selected_choice_keys": ["c2"],
@@ -1353,7 +1352,7 @@ class RagTraceStoreTests(unittest.TestCase):
         self.assertEqual(
             lifecycle["events"][0],
             {
-                "event": "evidence.clarification_created",
+                "event": "clarification.created",
                 "route_state_revision": 4,
                 "selected_kb_count": 2,
                 "choice_count": 2,
@@ -1361,9 +1360,10 @@ class RagTraceStoreTests(unittest.TestCase):
         )
         self.assertNotIn("original_query", lifecycle["events"][0])
         for event_name in (
-            "evidence.clarification_created",
-            "evidence.clarification_repeated",
-            "evidence.clarification_resolved",
+            "clarification.created",
+            "clarification.repeated",
+            "clarification.resolved",
+            "clarification.expired",
             "evidence.scope_filter_applied",
             "generation.general_fallback",
             "generation.skipped",

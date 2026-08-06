@@ -17,6 +17,7 @@ from core.openai_client import get_client
 from core.query_semantics import KnowledgeRequestSemantics
 from core.rag_trace import content_fields, json_safe, trace_event
 from core.structured_output import create_stream_completion
+from core.document_content import render_document_chunks
 from models.db_models import Document, DocumentChunk, KnowledgeBase
 
 
@@ -83,15 +84,15 @@ def _bounded_document_text(
     remaining = _MAX_CONTEXT_CHARS
     truncated = False
     for document in ordered_documents:
-        chunks = chunks_by_document.get(document.id, [])
-        body = "\n\n".join(str(item.content or "").strip() for item in chunks).strip()
-        section = f"《{document.filename}》\n{body}".strip()
-        if len(section) > remaining:
-            section = section[:remaining].rstrip()
-            truncated = True
-        if section:
-            sections.append(section)
-            remaining -= len(section)
+        rendered, section_truncated = render_document_chunks(
+            document.filename,
+            chunks_by_document.get(document.id, []),
+            max_chars=remaining,
+        )
+        if rendered:
+            sections.append(rendered)
+            remaining -= len(rendered)
+        truncated = truncated or section_truncated
         if remaining <= 0:
             truncated = True
             break

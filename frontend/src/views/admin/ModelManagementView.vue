@@ -163,12 +163,30 @@
                 </n-form-item>
               </div>
 
-              <div v-if="service.key === 'llm'" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <div v-if="service.key === 'llm'" class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <n-form-item label="Temperature">
                   <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.1" class="w-full" />
                 </n-form-item>
                 <n-form-item label="Max Tokens">
                   <n-input-number v-model:value="form.max_tokens" :min="256" :max="8192" :step="256" class="w-full" />
+                </n-form-item>
+                <n-form-item>
+                  <template #label>
+                    <span class="inline-flex items-center gap-1">
+                      重排超时（秒）
+                      <n-tooltip trigger="hover" placement="top">
+                        <template #trigger>
+                          <n-icon :size="15" class="text-gray-400 cursor-help" aria-label="重排超时说明">
+                            <HelpCircleOutline />
+                          </n-icon>
+                        </template>
+                        <div class="max-w-xs text-xs leading-relaxed">
+                          仅控制检索重排模型的单阶段截止时间。超时后系统会保留授权且范围匹配的候选，转为待验证的部分回答，不影响问答模型自身的生成超时。
+                        </div>
+                      </n-tooltip>
+                    </span>
+                  </template>
+                  <n-input-number v-model:value="form.rerank_timeout_seconds" :min="1" :max="120" :step="1" class="w-full" />
                 </n-form-item>
                 <n-form-item>
                   <template #label>
@@ -427,6 +445,7 @@ async function handleSave() {
       rerank_model: normalizeOptionalModel(form.value.rerank_model),
       temperature: form.value.temperature,
       max_tokens: form.value.max_tokens,
+      rerank_timeout_seconds: form.value.rerank_timeout_seconds,
       embedding_model: form.value.embedding_model,
       vision_model: form.value.vision_model,
       llm_base_url: form.value.llm_base_url,

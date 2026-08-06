@@ -9,7 +9,8 @@ single-chunk evidence path.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Sequence
 
 from core.query_constraints import (
     ApplicabilityScope,
@@ -1459,6 +1460,135 @@ def _explicit_scope_comparison_plan(question: str) -> QueryPlanV2 | None:
         reason="explicit_multi_scope_comparison",
         retrieval_queries=tuple(_unique for _unique in (question, *descriptions)),
         requirements=tuple(requirements),
+    )
+
+
+def _scope_identity_value(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _merge_clarified_scope(
+    base: ApplicabilityScope | None,
+    selected: ApplicabilityScope,
+) -> ApplicabilityScope:
+    """Conjoin one task scope with a server-resolved clarification scope."""
+
+    current = base or ApplicabilityScope()
+    for dimension in ("product", "version", "project"):
+        current_value = getattr(current, dimension)
+        selected_value = getattr(selected, dimension)
+        if (
+            current_value
+            and selected_value
+            and _scope_identity_value(current_value)
+            != _scope_identity_value(selected_value)
+        ):
+            raise ValueError(
+                f"clarification scope conflicts with answer {dimension} scope"
+            )
+    product = selected.product or current.product
+    version = selected.version or current.version
+    project = selected.project or current.project
+    return ApplicabilityScope(
+        product=product,
+        version=version,
+        project=project,
+        explicit_version=bool(version),
+        explicit_project=bool(
+            project
+            and (
+                selected.project_source is not None
+                or current.project_source is not None
+            )
+        ),
+        product_source=(selected.product_source or current.product_source),
+        version_source=(selected.version_source or current.version_source),
+        project_source=(selected.project_source or current.project_source),
+        matched_text=(selected.matched_text or current.matched_text),
+        extraction_reason="server_resolved_clarification_scope",
+    )
+
+
+def partition_plan_by_applicability_scopes(
+    plan: QueryPlanV2,
+    scopes: Sequence[ApplicabilityScope],
+    *,
+    comparison: bool = False,
+) -> QueryPlanV2:
+    """Apply resolved scopes without reparsing retrieval-rendered text.
+
+    The answer target and its coverage contract are cloned unchanged for each
+    applicability partition. Only IDs, graph edges and task-local scopes are
+    rewritten. A list of selected versions/projects therefore cannot become a
+    list of answer targets merely because its display rendering uses
+    punctuation.
+    """
+
+    if not isinstance(plan, QueryPlanV2):
+        raise ValueError("scope partitioning requires a QueryPlanV2")
+    normalized_scopes = tuple(scopes)
+    if not normalized_scopes or len(normalized_scopes) > 8:
+        raise ValueError("scope partitioning requires one to eight scopes")
+    if any(not isinstance(scope, ApplicabilityScope) for scope in normalized_scopes):
+        raise ValueError("scope partitions must be ApplicabilityScope values")
+    if any(not scope.has_scope_constraint for scope in normalized_scopes):
+        raise ValueError("scope partitions must constrain applicability")
+    fingerprints = tuple(scope.fingerprint for scope in normalized_scopes)
+    if len(set(fingerprints)) != len(fingerprints):
+        raise ValueError("scope partitions must be unique")
+    if not plan.requirements:
+        raise ValueError("scope partitioning requires typed answer requirements")
+    if len(plan.requirements) * len(normalized_scopes) > 8:
+        raise ValueError("scope-partitioned plan exceeds requirement capacity")
+
+    id_maps: list[dict[str, str]] = []
+    next_id = 1
+    for _scope in normalized_scopes:
+        mapping: dict[str, str] = {}
+        for requirement in plan.requirements:
+            mapping[requirement.id] = (
+                requirement.id
+                if len(normalized_scopes) == 1
+                else f"r{next_id}"
+            )
+            next_id += 1
+        id_maps.append(mapping)
+
+    requirements: list[AnswerRequirementV2] = []
+    for scope, id_map in zip(normalized_scopes, id_maps):
+        for requirement in plan.requirements:
+            requirements.append(replace(
+                requirement,
+                id=id_map[requirement.id],
+                depends_on_requirement_ids=(
+                    tuple(id_map[value] for value in requirement.depends_on_requirement_ids)
+                    if requirement.depends_on_requirement_ids is not None
+                    else None
+                ),
+                augmentation_requirement_ids=(
+                    tuple(id_map[value] for value in requirement.augmentation_requirement_ids)
+                    if requirement.augmentation_requirement_ids is not None
+                    else None
+                ),
+                applicability_scope=_merge_clarified_scope(
+                    requirement.applicability_scope,
+                    scope,
+                ),
+                scope_product=None,
+                scope_version=None,
+                scope_explicit_version=False,
+            ))
+
+    answer_shape = plan.answer_shape
+    if len(normalized_scopes) > 1:
+        answer_shape = "comparison" if comparison else "multi_part"
+    return replace(
+        plan,
+        answer_shape=answer_shape,
+        requirements=tuple(requirements),
+        reason=(
+            f"{plan.reason}; clarification_scope_partition_applied"
+        ).strip("; ")[:500],
     )
 
 

@@ -19,11 +19,16 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from itertools import product
-from typing import Any, AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from typing import Any, AsyncGenerator, AsyncIterator, Callable, Literal, Mapping, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
+from core.clarification import (
+    ClarificationContract,
+    proposed_clarification_event,
+)
+from core.clarification_presenter import stream_clarification_text
 from core.evidence_ambiguity import (
     DocumentEvidenceAssessment,
     EvidenceAmbiguityDecision,
@@ -41,12 +46,14 @@ from core.query_constraints import (
     candidate_section_key,
     extract_document_applicability_declaration,
     extract_query_constraints,
+    evaluate_candidate_constraints,
     inherit_document_constraint_metadata,
 )
 from core.evidence_status import canonical_evidence_status
 from core.query_route_compiler import (
     RagTaskContract,
     require_rag_task_contract_dispatchable,
+    version_resolution_mode_for_query,
 )
 from core.rag_shared import (
     _normalize_evidence_scope_filter,
@@ -56,7 +63,10 @@ from core.rag_shared import (
 )
 from core.rag_trace import content_fields, json_safe, trace_event
 from core.read_sessions import ReadSessionFactory, isolated_read_session
-from core.reranker import joint_rerank_with_coverage
+from core.reranker import (
+    joint_rerank_with_coverage,
+    select_small_document_evidence_with_coverage,
+)
 from core.active_task_state import ResolvedActiveTask
 from core.rag_v2.bridge_resolution import (
     BridgeFactConflict,
@@ -80,8 +90,10 @@ from core.rag_v2.contracts import (
 from core.rag_v2.evidence import (
     FinalizedVisibleEvidence,
     assemble_evidence_bundle,
+    assemble_unverified_candidate_bundle_with_diagnostics,
     finalize_visible_evidence_bundle,
 )
+from core.rag_v2.context import build_evidence_context
 from core.rag_v2.task_graph import (
     AnswerBridgePath,
     RagExecutionBundle,
@@ -117,6 +129,7 @@ MAX_EXPANSION_DOCUMENTS = 3
 MAX_DISPLAY_RESULTS = 20
 MAX_CONTEXT_CHUNKS = 16
 MAX_CONTEXT_CHARS = 16_000
+MAX_BOUNDED_ADJUDICATION_CHARS = 12_000
 DEFAULT_RETRIEVAL_TIMEOUT_SECONDS = 15.0
 DEFAULT_EXPANSION_TIMEOUT_SECONDS = 8.0
 DEFAULT_RETRIEVAL_WORKFLOW_TIMEOUT_SECONDS = 22.0
@@ -129,6 +142,29 @@ _GENERAL_FALLBACK_MODES = frozenset({
     "no_hit",
     "no_hit_or_insufficient",
 })
+
+EvidenceExecutionStrategy = Literal[
+    "deterministic",
+    "bounded_small_document",
+    "joint_adjudication",
+    "no_candidates",
+]
+ModelAdjudicationState = Literal[
+    "not_requested",
+    "skipped",
+    "no_candidates",
+    "succeeded",
+    "failed",
+]
+
+
+@dataclass(frozen=True)
+class _EvidenceExecutionDecision:
+    strategy: EvidenceExecutionStrategy
+    eligible_candidate_indexes: tuple[int, ...] = ()
+    anchor_candidate_indexes: tuple[int, ...] = ()
+    document_id: str | None = None
+    reason: str = ""
 # 企业知识问答优先保证证据忠实度。后台通用 temperature 仍可用于普通聊天，
 # RAG 生成单独使用低温度；显式设置为 0 时保持 0。
 RAG_GENERATION_TEMPERATURE = 0.1
@@ -171,17 +207,25 @@ def _should_model_adjudicate_evidence(
 
 
 def _model_evidence_adjudication_timeout_seconds(settings: Any) -> float:
-    """Resolve the optional stage deadline while retaining LLM safety."""
+    """Resolve the independently managed adjudication deadline.
+
+    The legacy attribute is read only for test/deployment compatibility. New
+    runtime settings persist ``rerank_timeout_seconds`` in the settings table.
+    """
 
     configured = getattr(
         settings,
-        "rag_v2_model_evidence_adjudication_timeout_seconds",
+        "rerank_timeout_seconds",
         None,
     )
     if configured is None:
-        configured = getattr(settings, "llm_request_timeout_seconds", 60.0)
+        configured = getattr(
+            settings,
+            "rag_v2_model_evidence_adjudication_timeout_seconds",
+            15.0,
+        )
     if isinstance(configured, bool):
-        raise ValueError("evidence adjudication timeout must be numeric or None")
+        raise ValueError("evidence adjudication timeout must be numeric")
     return max(0.1, float(configured))
 
 
@@ -248,15 +292,19 @@ def _should_use_general_model_fallback(
     *,
     evidence_status: str,
     configured_mode: object,
+    model_adjudication_succeeded: bool | None = None,
 ) -> bool:
     """Allow only explicitly configured terminal evidence states to fall back.
 
-    Retrieval errors, explicit scope conflicts, clarifications and permission
-    failures remain closed.  The fallback changes only answer provenance; it
-    never promotes the evidence status or creates answer sources.
+    Retrieval errors, explicit scope conflicts, clarifications, permission
+    failures and evidence-adjudication failures remain closed. The fallback
+    changes only answer provenance; it never promotes the evidence status or
+    creates answer sources.
     """
 
     mode = _normalise_general_fallback_mode(configured_mode)
+    if model_adjudication_succeeded is False:
+        return False
     if mode == "no_hit":
         return evidence_status == "no_hit"
     if mode == "no_hit_or_insufficient":
@@ -869,17 +917,21 @@ def _step_event(step: str, status: str) -> str:
     return _sse({"type": "search_step", "step": step, "status": status})
 
 
-def _process_event(*, clarification: bool = False) -> str:
-    steps = [
-        ("analyze", "问题分析"),
-        ("generate", "生成"),
-    ] if clarification else [
-        ("analyze", "问题分析"),
-        ("expand", "查询扩展"),
-        ("retrieve", "检索"),
-        ("rerank", "重排"),
-        ("generate", "生成"),
-    ]
+def _process_event(
+    *,
+    clarification: bool = False,
+    include_rerank: bool = True,
+) -> str:
+    steps = [("analyze", "问题分析"), ("generate", "生成")]
+    if not clarification:
+        steps = [
+            ("analyze", "问题分析"),
+            ("expand", "查询扩展"),
+            ("retrieve", "检索"),
+        ]
+        if include_rerank:
+            steps.append(("rerank", "重排"))
+        steps.append(("generate", "生成"))
     return _sse({
         "type": "search_process",
         "schema_version": "search_process.v1",
@@ -4440,6 +4492,257 @@ def _full_document_ids(candidates: Sequence[Mapping[str, Any]]) -> set[str]:
     return complete
 
 
+def _evidence_execution_decision(
+    *,
+    deterministic_closed: bool,
+    candidates: Sequence[Mapping[str, Any]],
+    full_document_candidates: Sequence[Mapping[str, Any]],
+) -> _EvidenceExecutionDecision:
+    """Choose an adjudication path from evidence topology, not question text.
+
+    A complete, bounded, current-query-anchored document needs only the small
+    binding contract.  Multi-document or incomplete evidence keeps the full
+    joint adjudicator.  This removes the previous all-questions-pay-the-same
+    latency path without introducing business-term branches.
+    """
+
+    if deterministic_closed:
+        return _EvidenceExecutionDecision(
+            strategy="deterministic",
+            reason="deterministic_evidence_closed",
+        )
+    if not candidates:
+        return _EvidenceExecutionDecision(
+            strategy="no_candidates",
+            reason="no_authorized_candidates",
+        )
+
+    complete_document_ids = _full_document_ids(full_document_candidates)
+    if len(complete_document_ids) == 1:
+        document_id = next(iter(complete_document_ids))
+        eligible_indexes = tuple(
+            index
+            for index, candidate in enumerate(candidates, start=1)
+            if str(candidate.get("doc_id") or "").strip() == document_id
+        )
+        anchor_indexes = tuple(
+            index
+            for index in eligible_indexes
+            if "initial_retrieval" in _merge_origins(candidates[index - 1])
+        )
+        content_chars = sum(
+            len(str(candidates[index - 1].get("content") or ""))
+            for index in eligible_indexes
+        )
+        if (
+            eligible_indexes
+            and anchor_indexes
+            and content_chars <= MAX_BOUNDED_ADJUDICATION_CHARS
+        ):
+            return _EvidenceExecutionDecision(
+                strategy="bounded_small_document",
+                eligible_candidate_indexes=eligible_indexes,
+                anchor_candidate_indexes=anchor_indexes,
+                document_id=document_id,
+                reason="complete_bounded_document",
+            )
+
+    return _EvidenceExecutionDecision(
+        strategy="joint_adjudication",
+        reason="multi_document_or_incomplete_evidence",
+    )
+
+
+def _unverified_candidate_requirement_ids(
+    candidate: Mapping[str, Any],
+    *,
+    requirements: Sequence[AnswerRequirementV2],
+    task_graph: RetrievalTaskGraph,
+    task_ledger: TaskExecutionLedger,
+) -> tuple[str, ...]:
+    """Bind one retrieved candidate to request requirements without claiming proof.
+
+    Current-run task lineage and immutable applicability scope are admission
+    boundaries. They can decide which version/project may see a candidate,
+    but never promote it to a verified answer claim. The answer model performs
+    the soft semantic selection only after these hard bindings are complete.
+    """
+
+    required_answers = tuple(
+        requirement
+        for requirement in requirements
+        if requirement.is_required_answer
+    )
+    if not required_answers:
+        return ()
+    # A model adjudicator may return only a semantic role annotation while the
+    # candidate already carries the request-local requirement binding produced
+    # by the route compiler.  Reuse that binding first; it is still checked
+    # against the immutable scope below and is never treated as proof.
+    declared = candidate.get("supports_requirement_ids")
+    if declared is None and isinstance(candidate.get("metadata"), Mapping):
+        declared = candidate["metadata"].get("supports_requirement_ids")
+    if isinstance(declared, Sequence) and not isinstance(declared, (str, bytes)):
+        declared_ids = tuple(dict.fromkeys(
+            str(value or "").strip()
+            for value in declared
+            if str(value or "").strip() in {
+                requirement.id for requirement in required_answers
+            }
+        ))
+        if declared_ids:
+            valid_declared: list[str] = []
+            for requirement_id in declared_ids:
+                requirement = next(
+                    item for item in required_answers if item.id == requirement_id
+                )
+                scope = requirement.applicability_scope
+                if scope is None or not scope.has_scope_constraint:
+                    valid_declared.append(requirement_id)
+                    continue
+                evaluation = evaluate_candidate_constraints(scope, dict(candidate))
+                if evaluation.status in {"exact", "compatible"}:
+                    valid_declared.append(requirement_id)
+            if valid_declared:
+                return tuple(valid_declared)
+    requirement_by_id = {
+        requirement.id: requirement for requirement in required_answers
+    }
+    lineage = task_ledger.lineage_for_candidate(candidate)
+    lineage_ids = (
+        set(task_graph.requirement_ids_reachable_from(lineage.task_ids))
+        if lineage is not None and lineage.task_ids
+        else set()
+    )
+    eligible = [
+        requirement
+        for requirement in required_answers
+        if not lineage_ids or requirement.id in lineage_ids
+    ]
+
+    matched: list[str] = []
+    for requirement in eligible:
+        scope = requirement.applicability_scope
+        if scope is not None and scope.has_scope_constraint:
+            evaluation = evaluate_candidate_constraints(scope, dict(candidate))
+            if evaluation.status not in {"exact", "compatible"}:
+                continue
+        matched.append(requirement.id)
+
+    if lineage_ids:
+        return tuple(matched)
+    if len(required_answers) == 1:
+        return tuple(matched)
+    # Without current-run task ownership, a multi-target candidate is safe
+    # only when its hard source scope identifies exactly one target partition.
+    return tuple(matched) if len(matched) == 1 else ()
+
+
+def _build_related_generation_bundle(
+    *,
+    candidates: Sequence[Mapping[str, Any]],
+    requirements: Sequence[AnswerRequirementV2],
+    task_graph: RetrievalTaskGraph,
+    task_ledger: TaskExecutionLedger,
+    constraints: QueryConstraints,
+    admission_reason: str = "related_evidence_admitted",
+) -> tuple[EvidenceBundle | None, dict[str, Any]]:
+    """Admit bounded, scope-safe related candidates for partial generation.
+
+    This is not a second proof system. Every candidate was already authorized,
+    admitted by retrieval, bound to the current task ledger and checked against
+    immutable requirement scope. The bundle is explicitly retrieved/unverified
+    and carries no coverage graph or closed claim. It may support a labelled
+    partial answer, never a verified hit.
+    """
+
+    required_ids = tuple(
+        requirement.id
+        for requirement in requirements
+        if requirement.importance == "required"
+    )
+    if not required_ids:
+        return None, {
+            "input_candidate_count": len(candidates),
+            "authorized_candidate_count": 0,
+            "global_scope_admitted_candidate_count": 0,
+            "requirement_bound_candidate_count": 0,
+            "converted_candidate_count": 0,
+            "selected_candidate_count": 0,
+            "exclusion_reason_counts": {"no_required_requirements": len(candidates)},
+        }
+    bounded: list[dict[str, Any]] = []
+    authorized_candidate_count = 0
+    global_scope_admitted_candidate_count = 0
+    pipeline_exclusions: dict[str, int] = {}
+
+    def exclude(reason: str) -> None:
+        pipeline_exclusions[reason] = pipeline_exclusions.get(reason, 0) + 1
+
+    for raw in candidates:
+        if raw.get("authorized") is False:
+            exclude("unauthorized_candidate_excluded")
+            continue
+        authorized_candidate_count += 1
+        if evaluate_candidate_constraints(constraints, dict(raw)).status == "mismatch":
+            exclude("global_scope_mismatch_excluded")
+            continue
+        global_scope_admitted_candidate_count += 1
+        candidate_requirement_ids = _unverified_candidate_requirement_ids(
+            raw,
+            requirements=requirements,
+            task_graph=task_graph,
+            task_ledger=task_ledger,
+        )
+        if not candidate_requirement_ids:
+            exclude("request_requirement_binding_excluded")
+            continue
+        item = dict(raw)
+        metadata = dict(item.get("metadata") or {})
+        metadata.update({
+            "supports_requirement_ids": list(candidate_requirement_ids),
+            "contribution_role": "complement",
+            "evidence_role": "unverified",
+            "rerank_status": "unverified",
+            "jointly_selected": True,
+            "source_verification": "unverified",
+            "unverified_generation_fallback": True,
+        })
+        item.update({
+            "metadata": metadata,
+            "supports_requirement_ids": list(candidate_requirement_ids),
+            "contribution_role": "complement",
+            "evidence_role": "unverified",
+            "rerank_status": "unverified",
+            "jointly_selected": True,
+            "source_verification": "unverified",
+            "authorized": True,
+        })
+        bounded.append(item)
+    assembly = assemble_unverified_candidate_bundle_with_diagnostics(
+        candidates=bounded,
+        allowed_requirement_ids=required_ids,
+        constraints=constraints,
+        max_context_chunks=MAX_CONTEXT_CHUNKS,
+        max_context_chars=MAX_CONTEXT_CHARS,
+        admission_reason=admission_reason,
+    )
+    exclusion_counts = dict(pipeline_exclusions)
+    for reason, count in assembly.exclusion_reason_counts:
+        exclusion_counts[reason] = exclusion_counts.get(reason, 0) + count
+    return assembly.bundle, {
+        "input_candidate_count": len(candidates),
+        "authorized_candidate_count": authorized_candidate_count,
+        "global_scope_admitted_candidate_count": (
+            global_scope_admitted_candidate_count
+        ),
+        "requirement_bound_candidate_count": len(bounded),
+        "converted_candidate_count": assembly.converted_candidate_count,
+        "selected_candidate_count": assembly.selected_candidate_count,
+        "exclusion_reason_counts": exclusion_counts,
+    }
+
+
 
 
 def _unavailable_bundle(reason: str) -> EvidenceBundle:
@@ -4530,6 +4833,9 @@ def _final_evidence_status(
     bundle = finalized.bundle
     if retrieval_failed or bundle.state.availability == "unavailable":
         return "error"
+    # High-recall neighbors remain visible diagnostics.  They cannot become
+    # answer sources without requirement/claim closure, but their presence is
+    # still different from a true zero-recall request.
     has_related_evidence = bool(had_relevant_candidates or bundle.items)
     if not finalized.generation_allowed:
         if _required_scope_rejections_exhausted_without_closed_path(
@@ -4541,6 +4847,12 @@ def _final_evidence_status(
         if has_related_evidence:
             return "insufficient_evidence"
         return "no_hit"
+
+    if finalized.unverified_generation_allowed:
+        # A provider/contract failure may degrade already authorized and
+        # scope-bound candidates into a labelled partial answer. It is never a
+        # verified hit, even when the generator can extract useful facts.
+        return "partial"
 
     assessment = finalized.assessment
     if assessment is not None and (
@@ -4634,7 +4946,7 @@ def _apply_final_clarification_priority(
             ambiguity=ambiguity,
         )
 
-    # Do not leave choices, scope allow-lists, or a question attached to a
+    # Do not leave choices, scope allow-lists, or an interactive contract attached to a
     # suppressed decision: downstream SSE/UI code treats any of those fields
     # as an interactive branch.  The original decision is retained in the
     # dedicated trace event below rather than leaking it into the response.
@@ -5147,6 +5459,14 @@ def _source_from_item(item: EvidenceItem, *, direct: bool) -> dict[str, Any]:
     metadata = dict(item.metadata)
     retrieval_score = metadata.get("retrieval_score")
     score = item.score if item.score is not None else retrieval_score
+    source_verification = str(
+        metadata.get("source_verification") or "verified"
+    ).strip().casefold()
+    evidence_role = (
+        "unverified"
+        if source_verification == "unverified"
+        else ("direct" if direct else "related")
+    )
     return {
         "id": item.chunk_id,
         "chunk_id": item.chunk_id,
@@ -5161,7 +5481,8 @@ def _source_from_item(item: EvidenceItem, *, direct: bool) -> dict[str, Any]:
         "doc_tags": metadata.get("doc_tags") or [],
         "score": score,
         "retrieval_score": retrieval_score,
-        "evidence_role": "direct" if direct else "related",
+        "evidence_role": evidence_role,
+        "source_verification": source_verification,
         # ``evidence_role`` remains the UI-facing direct/related classification.
         # The V2 contribution role and explicit coverage mapping are separate so
         # a bridge/complement can be shown as used evidence without being
@@ -5260,8 +5581,13 @@ def _result_payload(
         max(top_k, len(answer_sources)),
     )
     results = ordered_results[:display_limit]
-    direct_count = len(answer_sources)
+    direct_count = sum(
+        item.get("evidence_role") == "direct" for item in answer_sources
+    )
     related_count = sum(item.get("evidence_role") == "related" for item in results)
+    unverified_count = sum(
+        item.get("source_verification") == "unverified" for item in results
+    )
     coverage = _coverage_status(bundle)
     payload = {
         "type": "search_results",
@@ -5277,6 +5603,7 @@ def _result_payload(
         "decision_reason": decision_reason,
         "direct_evidence_count": direct_count,
         "related_reference_count": related_count,
+        "unverified_reference_count": unverified_count,
         "query_constraints": constraints.as_dict(),
         "trace_id": trace_id,
         "method": method,
@@ -5316,6 +5643,7 @@ def _system_prompt(
     evidence_status: str,
     answer_shape: str,
     response_mode: str = "grounded_qa",
+    unverified_generation: bool = False,
 ) -> str:
     if evidence_status == "error":
         return (
@@ -5351,9 +5679,13 @@ def _system_prompt(
         "multi_hop": "答案依赖映射或关系链，应先依据证据确认关系，再给出对应事实。",
     }.get(answer_shape, "只回答证据能够直接支持的事实。")
     confidence_rule = (
-        "证据只完成确定性检索、未经过生成式重排验证；仍可提取原文明示事实，"
-        "但不得把推测写成结论。"
-        if evidence_status == "unverified"
+        "本次资料属于已授权、已通过文档状态和适用范围硬过滤的相关证据，"
+        "但完整语义覆盖尚未闭合（语义支持关系尚未由重排模型验证）。"
+        "请直接从原文明示内容中选择能够回答的部分，"
+        "自然作答，并明确说明其余部分当前缺少可核验证据；"
+        "不得把候选资料称为已验证依据。若 requirements 含多个版本或项目范围，"
+        "必须逐个范围独立回答，禁止把一个范围的实现复制到其他范围。"
+        if unverified_generation
         else ""
     )
     partial_rule = (
@@ -5393,53 +5725,6 @@ def _rag_generation_temperature(settings: Any) -> float:
     return min(max(configured, 0.0), RAG_GENERATION_TEMPERATURE)
 
 
-def _deterministic_evidence_answer(
-    evidence_status: str,
-    *,
-    query: str,
-    display_query: str | None = None,
-) -> str | None:
-    """Return a safe local answer for terminal evidence states.
-
-    A model has no useful work to do when the evidence gate produced no
-    context.  Calling it in those states only adds latency and makes the
-    failure/no-hit boundary vulnerable to paraphrasing or hallucination.  Keep
-    the wording short and stable so the API, history and trace all agree on
-    what happened.  ``query`` is display-only and is bounded/normalized before
-    interpolation; it is never sent to a model in this branch.
-    """
-
-    status = str(evidence_status or "").strip().casefold()
-    if status == "error":
-        return "目前检索或验证服务暂时不可用，无法可靠确认该问题。请稍后重试。"
-    if status == "scope_mismatch":
-        return (
-            "知识库中未找到与指定产品、版本或适用范围匹配的资料，"
-            "无法可靠确认该问题。请确认目标范围或补充对应文档。"
-        )
-    if status == "no_hit":
-        # ``query`` may be a standalone/contextualized retrieval query such as
-        # ``那住宿呢。普通员工的出差标准是什么``.  It is useful internally for
-        # retrieval, but exposing it in a terminal fallback makes the answer
-        # look as if the conversation context was leaked or duplicated.  Keep
-        # the user-facing text tied to the raw current question when available.
-        display_value = query if display_query is None else display_query
-        normalized_query = re.sub(r"\s+", " ", str(display_value or "")).strip()
-        normalized_query = normalized_query[:160]
-        if normalized_query:
-            return (
-                f"知识库中未找到与“{normalized_query}”相关的内容，"
-                "暂时无法提供准确答案。请补充相关资料或换种问法。"
-            )
-        return "知识库中未找到相关内容，暂时无法提供准确答案。请补充相关资料或换种问法。"
-    if status == "insufficient_evidence":
-        return (
-            "已检索到相关资料，但当前资料无法形成可核验的完整答案链，"
-            "因此不能可靠回答该问题。请补充适用对象、范围或对应制度内容后再试。"
-        )
-    return None
-
-
 def _context_message(
     *,
     context: str,
@@ -5460,31 +5745,31 @@ def _context_message(
     )
 
 
-def _clarification_event(decision: EvidenceAmbiguityDecision) -> str:
-    return _sse({"type": "evidence_clarification", **decision.to_dict()})
+def _clarification_event(contract: ClarificationContract) -> str:
+    return _sse(proposed_clarification_event(contract, include_private=True))
 
 
-def _query_plan_clarification_decision(
+def _query_plan_clarification_contract(
     plan: QueryPlanV2,
-) -> EvidenceAmbiguityDecision:
-    """Convert an unresolved local plan into the existing durable gate shape.
+) -> ClarificationContract:
+    """Return a semantic refinement contract for an unresolved local plan.
 
-    An empty document-choice list is the established free-form refinement
-    protocol: the API persists it, the frontend renders a text clarification,
-    and the next user message is combined with the original query.  No source
-    identifiers are invented because retrieval has intentionally not run.
+    Retrieval has not run, so the next answer must re-enter semantic
+    compilation.  Treating this as an evidence adapter would incorrectly
+    bypass the ordinary intent/task compiler on the next user message.
     """
 
-    return EvidenceAmbiguityDecision(
-        needs_clarification=True,
-        dimension="document",
-        question=(
-            plan.clarification_question
-            or "请补充需要查询或了解的具体问题。"
-        ),
-        reason=f"query_plan:{plan.reason or 'unresolved'}"[:500],
+    reason_code = "query_plan_" + re.sub(
+            r"[^a-z0-9_]+",
+            "_",
+            str(plan.reason or "unresolved").casefold(),
+        )[:48]
+    return ClarificationContract(
+        adapter="semantic",
+        dimension="query",
+        reason_code=reason_code.rstrip("_") or "query_plan_unresolved",
+        selection_mode="refine",
         choices=(),
-        relevant_document_count=0,
     )
 
 
@@ -5656,7 +5941,10 @@ async def run_rag_v2_stream(
         if active_task_graph is not None
         else None
     )
-    yield _process_event(clarification=bool(plan.needs_clarification))
+    yield _process_event(
+        clarification=bool(plan.needs_clarification),
+        include_rerank=bool(search_config.get("rerank", False)),
+    )
     yield _step_event("analyze", "active")
     if intent:
         yield _intent_event(intent)
@@ -5702,7 +5990,7 @@ async def run_rag_v2_stream(
     )
     yield _step_event("analyze", "done")
     if plan.needs_clarification:
-        clarification = _query_plan_clarification_decision(plan)
+        clarification_contract = _query_plan_clarification_contract(plan)
         constraints = (
             QueryConstraints()
             if normalized_scope_filter is not None
@@ -5733,7 +6021,7 @@ async def run_rag_v2_stream(
             is_followup=is_followup,
             carryover_source_count=len(carryover_sources),
             expansion_attempted=False,
-            clarification=clarification.to_dict(),
+            clarification=clarification_contract.to_dict(public=True),
             retrieval_executed=False,
         )
         trace_event(
@@ -5762,8 +6050,8 @@ async def run_rag_v2_stream(
             trace_id=trace_id,
             pipeline_version=PIPELINE_VERSION,
             needs_clarification=True,
-            dimension=clarification.dimension,
-            reason=clarification.reason,
+            dimension=clarification_contract.dimension,
+            reason=clarification_contract.reason_code,
             choice_count=0,
             relevant_document_count=0,
             choices=[],
@@ -5792,9 +6080,14 @@ async def run_rag_v2_stream(
             rerank_executed=False,
         )
         yield _sse(result_payload)
-        yield _clarification_event(clarification)
+        yield _clarification_event(clarification_contract)
         yield _step_event("generate", "active")
-        yield _delta_event(clarification.question)
+        async for delta in stream_clarification_text(
+            contract=clarification_contract,
+            original_query=query,
+            trace_id=trace_id,
+        ):
+            yield _delta_event(delta)
         trace_event(
             "generation.skipped",
             trace_id=trace_id,
@@ -6648,7 +6941,6 @@ async def run_rag_v2_stream(
         )
     yield _step_event("retrieve", "done")
 
-    yield _step_event("rerank", "active")
     result_constraints = constraints
     model_adjudication_attempted = False
     model_adjudication_succeeded: bool | None = None
@@ -6657,6 +6949,11 @@ async def run_rag_v2_stream(
     model_adjudication_candidate_count = 0
     model_adjudication_skip_reason: str | None = None
     model_adjudication_outcome: Any = None
+    evidence_execution_strategy: EvidenceExecutionStrategy = "deterministic"
+    model_adjudication_state: ModelAdjudicationState = "not_requested"
+    unverified_generation_bundle: EvidenceBundle | None = None
+    unverified_generation_context = None
+    bundle_candidates: list[dict[str, Any]] = []
     if retrieval_failed:
         bundle = _unavailable_bundle("retrieval_unavailable")
         ambiguity = EvidenceAmbiguityDecision(
@@ -6795,100 +7092,128 @@ async def run_rag_v2_stream(
             settings=settings,
             search_config=search_config,
         )
-        if model_adjudication_requested and not deterministic_probe.generation_allowed:
-            # The model is a semantic evidence adjudicator, not a retrieval
-            # authority. Its input has already passed authorization, task
-            # retrieval and any exact KB/document scope filter, while its
-            # output remains subject to the normal graph, coverage, source
-            # and renderer validations below.
-            model_adjudication_attempted = True
-            model_adjudication_candidate_count = len(bundle_candidates)
-            adjudication_started = time.perf_counter()
-            try:
-                outcome = await asyncio.wait_for(
-                    joint_rerank_with_coverage(
-                        query,
-                        list(bundle_candidates),
-                        [requirement.to_dict() for requirement in plan.requirements],
-                        timeout_seconds=(
-                            _model_evidence_adjudication_timeout_seconds(settings)
-                        ),
-                    ),
-                    timeout=_model_evidence_adjudication_timeout_seconds(settings),
+        if model_adjudication_requested:
+            execution_decision = _evidence_execution_decision(
+                deterministic_closed=deterministic_probe.generation_allowed,
+                candidates=bundle_candidates,
+                full_document_candidates=full_document_candidates,
+            )
+            evidence_execution_strategy = execution_decision.strategy
+            model_adjudication_skip_reason = (
+                execution_decision.reason
+                if execution_decision.strategy in {"deterministic", "no_candidates"}
+                else None
+            )
+            if execution_decision.strategy == "deterministic":
+                model_adjudication_state = "skipped"
+            elif execution_decision.strategy == "no_candidates":
+                model_adjudication_state = "no_candidates"
+            else:
+                # The model receives only the already-authorized, scope-bound
+                # candidate set.  It may bind candidate IDs to requirements;
+                # it cannot add documents, widen ACL, or decide applicability.
+                yield _step_event("rerank", "active")
+                model_adjudication_attempted = True
+                model_adjudication_candidate_count = len(bundle_candidates)
+                adjudication_started = time.perf_counter()
+                adjudication_timeout = (
+                    _model_evidence_adjudication_timeout_seconds(settings)
                 )
-                model_adjudication_outcome = outcome
-                model_adjudication_elapsed_ms = round(
-                    (time.perf_counter() - adjudication_started) * 1000
-                )
-                if outcome.succeeded:
-                    # A successful response is schema-validated by the
-                    # reranker and revalidated against source constraints
-                    # there.  Retain only its annotations; scope remains the
-                    # immutable filter already applied to this candidate set.
-                    bundle_candidates = outcome.results
-                    model_adjudication_succeeded = True
-                else:
-                    # A failed/invalid model response must never erase a
-                    # deterministic answer path.  Keep the original bounded
-                    # candidates and record the degradation for operators.
+                try:
+                    if execution_decision.strategy == "bounded_small_document":
+                        outcome = await asyncio.wait_for(
+                            select_small_document_evidence_with_coverage(
+                                query,
+                                list(bundle_candidates),
+                                [
+                                    requirement.to_dict()
+                                    for requirement in plan.requirements
+                                ],
+                                bridge_requirement_ids=tuple(
+                                    requirement.id
+                                    for requirement in plan.requirements
+                                    if requirement.role == "bridge"
+                                ),
+                                eligible_candidate_indexes=(
+                                    execution_decision.eligible_candidate_indexes
+                                ),
+                                anchor_candidate_indexes=(
+                                    execution_decision.anchor_candidate_indexes
+                                ),
+                                timeout_seconds=adjudication_timeout,
+                            ),
+                            timeout=adjudication_timeout,
+                        )
+                    else:
+                        outcome = await asyncio.wait_for(
+                            joint_rerank_with_coverage(
+                                query,
+                                list(bundle_candidates),
+                                [
+                                    requirement.to_dict()
+                                    for requirement in plan.requirements
+                                ],
+                                timeout_seconds=adjudication_timeout,
+                            ),
+                            timeout=adjudication_timeout,
+                        )
+                    model_adjudication_outcome = outcome
+                    if outcome.succeeded:
+                        bundle_candidates = outcome.results
+                        model_adjudication_succeeded = True
+                        model_adjudication_state = "succeeded"
+                    else:
+                        model_adjudication_succeeded = False
+                        model_adjudication_state = "failed"
+                        model_adjudication_error = outcome.error or "unverified"
+                except Exception as exc:
                     model_adjudication_succeeded = False
-                    model_adjudication_error = outcome.error or "unverified"
-            except Exception as exc:
-                model_adjudication_elapsed_ms = round(
-                    (time.perf_counter() - adjudication_started) * 1000
-                )
-                model_adjudication_succeeded = False
-                model_adjudication_error = type(exc).__name__
+                    model_adjudication_state = "failed"
+                    model_adjudication_error = type(exc).__name__
+                finally:
+                    model_adjudication_elapsed_ms = round(
+                        (time.perf_counter() - adjudication_started) * 1000
+                    )
+
+                if model_adjudication_succeeded is True:
+                    bundle = assemble_evidence_bundle(
+                        query=query,
+                        candidates=outcome.results,
+                        requirements=plan.requirements,
+                        retrieval_queries=plan.retrieval_queries,
+                        task_graph=active_task_graph,
+                        task_ledger=task_execution_ledger,
+                        terminology_resolution=terminology_resolution,
+                        constraints=bundle_constraints,
+                        overview_candidates=overview_candidates,
+                        answer_shape=plan.answer_shape,
+                        rerank_succeeded=True,
+                        expansion_succeeded=expansion_succeeded,
+                        retrieval_degraded=retrieval_degraded,
+                        completeness=completeness,
+                        missing_requirement_ids=missing_requirement_ids,
+                        max_context_chunks=MAX_CONTEXT_CHUNKS,
+                        max_context_chars=MAX_CONTEXT_CHARS,
+                    )
+
             trace_event(
                 "evidence.model_adjudication",
                 trace_id=trace_id,
                 pipeline_version=PIPELINE_VERSION,
-                attempted=True,
+                attempted=model_adjudication_attempted,
                 succeeded=model_adjudication_succeeded,
-                candidate_count=model_adjudication_candidate_count,
+                state=model_adjudication_state,
+                execution_strategy=evidence_execution_strategy,
+                execution_reason=execution_decision.reason,
+                document_id=execution_decision.document_id,
+                candidate_count=len(bundle_candidates),
                 elapsed_ms=model_adjudication_elapsed_ms,
                 error=model_adjudication_error,
+                skip_reason=model_adjudication_skip_reason,
                 **_model_evidence_adjudication_diagnostics(
                     model_adjudication_outcome,
                     fallback_error=model_adjudication_error,
                 ),
-                scope_selected=bool(
-                    normalized_scope_filter is not None
-                    and normalized_scope_filter.valid
-                ),
-            )
-            if model_adjudication_succeeded is True:
-                bundle = assemble_evidence_bundle(
-                    query=query,
-                    candidates=outcome.results,
-                    requirements=plan.requirements,
-                    retrieval_queries=plan.retrieval_queries,
-                    task_graph=active_task_graph,
-                    task_ledger=task_execution_ledger,
-                    terminology_resolution=terminology_resolution,
-                    constraints=bundle_constraints,
-                    overview_candidates=overview_candidates,
-                    answer_shape=plan.answer_shape,
-                    rerank_succeeded=True,
-                    expansion_succeeded=expansion_succeeded,
-                    retrieval_degraded=retrieval_degraded,
-                    completeness=completeness,
-                    missing_requirement_ids=missing_requirement_ids,
-                    max_context_chunks=MAX_CONTEXT_CHUNKS,
-                    max_context_chars=MAX_CONTEXT_CHARS,
-                )
-        elif model_adjudication_requested:
-            model_adjudication_skip_reason = "deterministic_evidence_closed"
-            trace_event(
-                "evidence.model_adjudication",
-                trace_id=trace_id,
-                pipeline_version=PIPELINE_VERSION,
-                attempted=False,
-                succeeded=None,
-                candidate_count=len(bundle_candidates),
-                elapsed_ms=0,
-                error=None,
-                skip_reason=model_adjudication_skip_reason,
                 scope_selected=bool(
                     normalized_scope_filter is not None
                     and normalized_scope_filter.valid
@@ -6924,7 +7249,13 @@ async def run_rag_v2_stream(
         succeeded=model_adjudication_succeeded,
         skip_reason=model_adjudication_skip_reason,
     )
-    yield _step_event("rerank", "done")
+    if bool(search_config.get("rerank", False)):
+        yield _step_event(
+            "rerank",
+            "error"
+            if model_adjudication_state == "failed"
+            else ("done" if model_adjudication_attempted else "skipped"),
+        )
 
     # The finalizer owns both route closure and the exact renderer budget.  The
     # pipeline never crops context or reconstructs answer sources on its own.
@@ -6937,6 +7268,122 @@ async def run_rag_v2_stream(
         max_context_chunks=MAX_CONTEXT_CHUNKS,
         max_context_chars=MAX_CONTEXT_CHARS,
     )
+    # A failed model adjudicator may degrade already-authorized, request-bound
+    # candidates into an explicitly unverified partial answer.  A successful
+    # adjudicator that reports insufficient coverage remains authoritative and
+    # must stay fail-closed; ordinary expansion/budget failures must not enter
+    # this provider-failure recovery path either.
+    unverified_fallback_diagnostics: dict[str, Any] = {
+        "input_candidate_count": 0,
+        "authorized_candidate_count": 0,
+        "global_scope_admitted_candidate_count": 0,
+        "requirement_bound_candidate_count": 0,
+        "converted_candidate_count": 0,
+        "selected_candidate_count": 0,
+        "exclusion_reason_counts": {},
+    }
+    if (
+        model_adjudication_state == "failed"
+        and not finalized_evidence.generation_allowed
+        and bundle_candidates
+    ):
+        scoped_comparison_plan = bool(
+            plan.answer_shape == "comparison"
+            and len([
+                item for item in plan.requirements if item.is_required_answer
+            ]) > 1
+            and all(
+                item.applicability_scope is not None
+                and item.applicability_scope.has_scope_constraint
+                for item in plan.requirements
+                if item.is_required_answer
+            )
+        )
+        related_ambiguity = detect_evidence_scope_ambiguity(
+            query=query,
+            constraints=bundle_constraints,
+            candidates=[dict(item) for item in bundle_candidates],
+            requirements=plan.requirements,
+            mode="applicability_only",
+        )
+        if related_ambiguity.needs_clarification and not scoped_comparison_plan:
+            ambiguity = related_ambiguity
+        elif not ambiguity.needs_clarification or scoped_comparison_plan:
+            reason_suffix = (
+                "adjudication_failure"
+                if model_adjudication_state == "failed"
+                else "semantic_coverage_incomplete"
+            )
+            (
+                unverified_generation_bundle,
+                unverified_fallback_diagnostics,
+            ) = _build_related_generation_bundle(
+                candidates=bundle_candidates,
+                requirements=plan.requirements,
+                task_graph=active_task_graph,
+                task_ledger=task_execution_ledger,
+                constraints=bundle_constraints,
+                admission_reason=f"related_evidence_admitted:{reason_suffix}",
+            )
+            if unverified_generation_bundle is not None:
+                unverified_generation_context = build_evidence_context(
+                    unverified_generation_bundle,
+                    max_chunks=MAX_CONTEXT_CHUNKS,
+                    max_chars=MAX_CONTEXT_CHARS,
+                )
+    trace_event(
+        "evidence.related_admission",
+        trace_id=trace_id,
+        pipeline_version=PIPELINE_VERSION,
+        activated=bool(
+            unverified_generation_bundle is not None
+            and unverified_generation_context is not None
+            and unverified_generation_context.item_ids
+        ),
+        reason=(
+            "adjudication_failure"
+            if model_adjudication_state == "failed"
+            else "not_applicable"
+        ),
+        **unverified_fallback_diagnostics,
+    )
+    if model_adjudication_state == "failed":
+        # Retain the established diagnostic event name for trace consumers;
+        # the admission contract itself is now shared with semantic coverage
+        # degradation and is no longer limited to provider failures.
+        trace_event(
+            "evidence.unverified_fallback",
+            trace_id=trace_id,
+            pipeline_version=PIPELINE_VERSION,
+            activated=bool(
+                unverified_generation_bundle is not None
+                and unverified_generation_context is not None
+                and unverified_generation_context.item_ids
+            ),
+            **unverified_fallback_diagnostics,
+        )
+    if (
+        unverified_generation_bundle is not None
+        and unverified_generation_context is not None
+        and unverified_generation_context.item_ids
+        and not ambiguity.needs_clarification
+    ):
+        # Keep the source snapshot visible, but explicitly remove any claim
+        # closure produced by the relaxed mapping.  The generation prompt is
+        # allowed to summarize the real document only under an unverified
+        # status; citations remain the exact rendered source items.
+        finalized_evidence = replace(
+            finalized_evidence,
+            bundle=unverified_generation_bundle,
+            context=unverified_generation_context,
+            assessment=None,
+            closed_answer_claim_ids=(),
+            answer_claim_item_ids=(),
+            route_item_ids=tuple(unverified_generation_context.item_ids),
+            generation_allowed=True,
+            unverified_generation_allowed=True,
+            renderer_dropped_item_ids=(),
+        )
     bundle = finalized_evidence.bundle
     context = finalized_evidence.context
     final_answer_conflicts = (
@@ -7042,24 +7489,24 @@ async def run_rag_v2_stream(
     general_fallback_requested = _should_use_general_model_fallback(
         evidence_status=evidence_status,
         configured_mode=general_fallback_mode,
+        model_adjudication_succeeded=model_adjudication_succeeded,
     )
-    # A general model can help with an unscoped public question, but it cannot
-    # replace missing evidence for a source-bound product/version/project or a
-    # previously selected document scope.  This is a provenance boundary, not
-    # a product-name rule: without authorized evidence, any concrete setting,
-    # menu path or policy value would be a guess.
-    has_bound_applicability_scope = bool(
-        result_constraints.has_scope_constraint
-        or (
-            normalized_scope_filter is not None
-            and normalized_scope_filter.valid
-        )
-        or active_task_scope is not None
-    )
+    # The route contract, not ad-hoc product/version checks, owns source
+    # provenance. Enterprise KB requests stay closed; mixed routes may use a
+    # separately labelled general answer when the administrator enabled it.
+    grounding_policy = getattr(task_contract, "grounding_policy", "required")
     general_fallback_blocked_reason = (
-        "source_bound_scope_requires_knowledge_evidence"
-        if general_fallback_requested and has_bound_applicability_scope
-        else None
+        "evidence_adjudication_failed"
+        if (
+            not general_fallback_requested
+            and model_adjudication_succeeded is False
+            and evidence_status in {"no_hit", "insufficient_evidence"}
+        )
+        else (
+            "source_bound_scope_requires_knowledge_evidence"
+            if general_fallback_requested and grounding_policy == "required"
+            else None
+        )
     )
     general_model_fallback = bool(
         general_fallback_requested
@@ -7204,7 +7651,11 @@ async def run_rag_v2_stream(
         carryover_seed_used=carryover_seed_used,
         carryover_anchor_succeeded=carryover_anchor_succeeded,
         answer_source_ids=effective_source_ids,
-        clarification=(ambiguity.to_dict() if ambiguity.needs_clarification else None),
+        clarification=(
+            ambiguity.to_contract().to_dict(public=True)
+            if ambiguity.needs_clarification
+            else None
+        ),
         evidence_scope_anchor_hit=scope_anchor_hit,
         evidence_scope_anchor_doc_ids=scope_anchor_doc_ids,
         rerank_executed=model_adjudication_attempted,
@@ -7214,6 +7665,19 @@ async def run_rag_v2_stream(
     result_payload["general_fallback_mode"] = general_fallback_mode
     result_payload["general_fallback_blocked_reason"] = (
         general_fallback_blocked_reason
+    )
+    result_payload["grounding_policy"] = grounding_policy
+    result_payload["version_resolution_mode"] = version_resolution_mode_for_query(query)
+    result_payload["evidence_execution_strategy"] = evidence_execution_strategy
+    result_payload["model_adjudication_state"] = model_adjudication_state
+    result_payload["model_adjudication_error"] = model_adjudication_error
+    result_payload["unverified_generation"] = bool(
+        finalized_evidence.unverified_generation_allowed
+    )
+    result_payload["source_verification"] = (
+        "unverified"
+        if finalized_evidence.unverified_generation_allowed
+        else "verified"
     )
     trace_event(
         "evidence.selection",
@@ -7247,6 +7711,7 @@ async def run_rag_v2_stream(
         retrieval_elapsed_ms=round((time.perf_counter() - retrieval_started) * 1000),
         rerank_elapsed_ms=model_adjudication_elapsed_ms,
         rerank_succeeded=model_adjudication_succeeded,
+        unverified_generation=finalized_evidence.unverified_generation_allowed,
         selected=[
             {
                 "doc_id": source.get("doc_id"),
@@ -7297,94 +7762,20 @@ async def run_rag_v2_stream(
         )
 
     if ambiguity.needs_clarification:
-        yield _clarification_event(ambiguity)
-        yield _delta_event(ambiguity.question)
+        clarification_contract = ambiguity.to_contract()
+        yield _clarification_event(clarification_contract)
+        async for delta in stream_clarification_text(
+            contract=clarification_contract,
+            original_query=question,
+            trace_id=trace_id,
+        ):
+            yield _delta_event(delta)
         trace_event(
             "generation.skipped",
             trace_id=trace_id,
             pipeline_version=PIPELINE_VERSION,
             reason="evidence_scope_ambiguous",
             evidence_status=evidence_status,
-        )
-        yield _done_event(conversation_id)
-        return
-
-    deterministic_answer = (
-        _deterministic_evidence_answer(
-            evidence_status,
-            query=query,
-            display_query=question,
-        )
-        if not general_model_fallback
-        else None
-    )
-    if deterministic_answer is not None:
-        # Terminal evidence states are deliberately answered locally.  Keep
-        # the normal generation progress events so existing clients do not
-        # need a second rendering path, but never open a chat-model request.
-        # Terminal evidence states do not open a model request, but they still
-        # publish the same minimum generation-context trace as the normal path.
-        # This makes a no-hit/timeout run auditable without pretending that an
-        # empty context was sent to the model.
-        trace_event(
-            "generation.context",
-            trace_id=trace_id,
-            pipeline_version=PIPELINE_VERSION,
-            evidence_status=evidence_status,
-            evidence_availability=bundle.state.availability,
-            evidence_confidence=bundle.state.confidence,
-            evidence_completeness=bundle.state.completeness,
-            response_mode=task_contract.response_mode,
-            retrieval_policy=task_contract.retrieval_policy,
-            answer_provenance=answer_provenance,
-            general_fallback_mode=general_fallback_mode,
-            general_model_fallback=False,
-            model=None,
-            temperature=None,
-            max_tokens=0,
-            request_timeout_seconds=0,
-            max_attempts=0,
-            history_message_count=len(history),
-            coverage_status=coverage,
-            requirement_count=len(plan.requirements),
-            covered_requirement_count=len(bundle.covered_requirement_ids),
-            covered_requirement_ids=list(bundle.covered_requirement_ids),
-            missing_requirement_ids=list(bundle.missing_requirement_ids),
-            missing_requirement_count=len(bundle.missing_requirement_ids),
-            expansion_attempted=expansion_attempted,
-            expansion_succeeded=expansion_succeeded,
-            context_budget_dropped_count=0,
-            context_sources=[],
-            deterministic=True,
-            **content_fields("context", ""),
-        )
-        yield _step_event("generate", "active")
-        yield _delta_event(deterministic_answer)
-        yield _step_event("generate", "done")
-        trace_event(
-            "generation.skipped",
-            trace_id=trace_id,
-            pipeline_version=PIPELINE_VERSION,
-            reason="deterministic_evidence_fallback",
-            evidence_status=evidence_status,
-            answer_provenance=answer_provenance,
-            answer_chars=len(deterministic_answer),
-        )
-        trace_event(
-            "generation.completed",
-            trace_id=trace_id,
-            pipeline_version=PIPELINE_VERSION,
-            model=None,
-            deterministic=True,
-            answer_provenance=answer_provenance,
-            general_model_fallback=False,
-            answer_chars=len(deterministic_answer),
-            prompt_tokens=0,
-            completion_tokens=0,
-            total_tokens=0,
-            finish_reason="deterministic",
-            generation_ms=0,
-            total_ms=round((time.perf_counter() - started_at) * 1000),
         )
         yield _done_event(conversation_id)
         return
@@ -7408,6 +7799,9 @@ async def run_rag_v2_stream(
             evidence_status=evidence_status,
             answer_shape=plan.answer_shape,
             response_mode=task_contract.response_mode,
+            unverified_generation=(
+                finalized_evidence.unverified_generation_allowed
+            ),
         )
     )
     messages: list[dict[str, str]] = [
@@ -7461,6 +7855,8 @@ async def run_rag_v2_stream(
         answer_provenance=answer_provenance,
         general_fallback_mode=general_fallback_mode,
         general_model_fallback=general_model_fallback,
+        model_adjudication_state=result_payload["model_adjudication_state"],
+        model_adjudication_error=model_adjudication_error,
         model=generation_model,
         temperature=_rag_generation_temperature(settings),
         max_tokens=settings.max_tokens,

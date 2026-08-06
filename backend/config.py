@@ -51,14 +51,13 @@ class Settings(BaseSettings):
     # 绕过最终证据校验；异常和超时保留确定性候选链。该开关用于在不回滚 V2
     # 的情况下快速降级为纯确定性模式。
     rag_v2_model_evidence_adjudication_enabled: bool = True
-    # Evidence adjudication is an optional enhancement and must not consume the
-    # full answer-model deadline.  Eight seconds bounds tail latency while a
-    # deployment may still set ``None`` explicitly to inherit the ordinary LLM
-    # timeout when accuracy is preferred over latency.
-    rag_v2_model_evidence_adjudication_timeout_seconds: float | None = Field(
-        8.0,
-        ge=0.5,
-        le=300.0,
+    # 重排模型使用独立期限，不继承回答模型的长超时，也不在代码里按供应商写死。
+    # 后台保存后立即生效；数据库字段是唯一运行时配置来源。
+    rerank_timeout_seconds: float = Field(
+        15.0,
+        ge=1.0,
+        le=120.0,
+        validation_alias="__DATABASE_SETTINGS_ONLY_RERANK_TIMEOUT_SECONDS",
     )
     # 当同一模型/角色/合同连续超时或返回不可修复结构时，短暂跳过增强阶段。
     # 确定性证据链仍照常执行；熔断只治理上游故障，不改变权限和证据闸门。

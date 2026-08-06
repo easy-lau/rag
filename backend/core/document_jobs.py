@@ -27,6 +27,7 @@ from core.document_parser import (
     parse_file,
     parse_markdown_content,
 )
+from core.document_content import normalize_document_markdown
 from core.embeddings import embed_batch
 from core.vision import image_to_markdown
 from database import AsyncSessionLocal
@@ -225,6 +226,8 @@ async def _materialize_chunks(job: ClaimedDocumentJob, doc: Document) -> tuple[l
     embeddings = await embed_batch([str(item["content"]) for item in chunks])
     if len(embeddings) != len(chunks):
         raise RuntimeError("文档分块与向量数量不一致")
+    if raw_content is not None:
+        raw_content = normalize_document_markdown(raw_content)
     return [
         {**dict(item), "embedding": embeddings[index]}
         for index, item in enumerate(chunks)

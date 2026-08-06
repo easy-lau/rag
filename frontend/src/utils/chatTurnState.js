@@ -262,7 +262,7 @@ export function eventConfirmsPendingClarification(event, clarification) {
     && Number(eventRevision) !== Number(clarification.route_state_revision)
   ) return false
   return Boolean(
-    clarification.acknowledged
+    clarification.status === 'active'
     && clarification.persisted
     && clarification.pending_state_id
     && clarification.clarification_message_id,

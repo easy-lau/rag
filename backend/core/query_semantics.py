@@ -215,6 +215,40 @@ def _unique(values: list[str]) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class RouteScopePartition:
+    """One server-resolved applicability partition for a clarification reply.
+
+    This is deliberately separate from both the user's answer target and the
+    retrieval rendering.  A selected product/version/project may constrain an
+    answer task, but it can never become a sibling answer requirement merely
+    because several choices are rendered with punctuation.
+    """
+
+    product: str | None = None
+    version: str | None = None
+    project: str | None = None
+
+    def __post_init__(self) -> None:
+        values = {
+            field: (_normalised(getattr(self, field)) or None)
+            for field in ("product", "version", "project")
+        }
+        if not any(values.values()):
+            raise ValueError("route scope partition requires an applicability value")
+        for field, value in values.items():
+            if value is not None and len(value) > 500:
+                raise ValueError("route scope partition value is too long")
+            object.__setattr__(self, field, value)
+
+    def to_dict(self) -> dict[str, str | None]:
+        return {
+            "product": self.product,
+            "version": self.version,
+            "project": self.project,
+        }
+
+
+@dataclass(frozen=True)
 class RouteClarificationContinuation:
     """Structured hand-off for a reply that fills a pending route slot.
 
@@ -229,6 +263,7 @@ class RouteClarificationContinuation:
     current_answer: str
     prior_answers: tuple[str, ...] = ()
     canonical_retrieval_query: str = ""
+    scope_partitions: tuple[RouteScopePartition, ...] = ()
 
     def __post_init__(self) -> None:
         original = _normalised(self.original_query)
@@ -240,6 +275,16 @@ class RouteClarificationContinuation:
             raise ValueError("clarification continuation requires task and answer")
         if any(not value for value in answers):
             raise ValueError("clarification continuation answers cannot be empty")
+        partitions = tuple(self.scope_partitions)
+        if len(partitions) > 8 or any(
+            not isinstance(item, RouteScopePartition) for item in partitions
+        ):
+            raise ValueError("clarification continuation scope partitions are invalid")
+        partition_keys = tuple(
+            (item.product, item.version, item.project) for item in partitions
+        )
+        if len(set(partition_keys)) != len(partition_keys):
+            raise ValueError("clarification continuation scope partitions must be unique")
         canonical = _normalised(self.canonical_retrieval_query)
         if not canonical:
             qualifiers = "、".join(_unique([*answers, current]))
@@ -248,6 +293,7 @@ class RouteClarificationContinuation:
         object.__setattr__(self, "current_answer", current)
         object.__setattr__(self, "prior_answers", answers[-6:])
         object.__setattr__(self, "canonical_retrieval_query", canonical[:16000])
+        object.__setattr__(self, "scope_partitions", partitions)
 
     @property
     def semantic_query(self) -> str:
@@ -266,6 +312,7 @@ class RouteClarificationContinuation:
             "current_answer": self.current_answer,
             "prior_answers": list(self.prior_answers),
             "canonical_retrieval_query": self.canonical_retrieval_query,
+            "scope_partitions": [item.to_dict() for item in self.scope_partitions],
         }
 
     def safe_summary(self) -> dict[str, object]:
@@ -273,6 +320,7 @@ class RouteClarificationContinuation:
             "schema_version": self.schema_version,
             "original_query_length": len(self.original_query),
             "answer_count": len(self.answers),
+            "scope_partition_count": len(self.scope_partitions),
             "canonical_query_length": len(self.canonical_retrieval_query),
         }
 
@@ -791,6 +839,7 @@ __all__ = [
     "ResolvedAnswerUnit",
     "ResolvedTurnSemantics",
     "RouteClarificationContinuation",
+    "RouteScopePartition",
     "answer_shape_for_request_kind",
     "request_kind_for_question",
     "reconcile_answer_form",

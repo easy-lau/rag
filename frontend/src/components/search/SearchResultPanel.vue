@@ -32,20 +32,20 @@
         <span>{{ retrievalPolicyLabel }}</span>
       </div>
       <div v-if="showEvidenceBreakdown" class="mt-2 flex flex-wrap items-center gap-1.5" aria-label="检索证据分类">
-        <n-tag v-if="directHitCount" type="success" size="small" :bordered="false" round>
-          回答片段 {{ directHitCount }}
+        <n-tag v-if="directDocumentCount" type="success" size="small" :bordered="false" round>
+          回答依据 {{ directDocumentCount }} 篇
         </n-tag>
-        <n-tag v-if="partialAdoptedCount" type="warning" size="small" :bordered="false" round>
-          部分采用 {{ partialAdoptedCount }}
+        <n-tag v-if="partialAdoptedDocumentCount" type="warning" size="small" :bordered="false" round>
+          部分采用 {{ partialAdoptedDocumentCount }} 篇
         </n-tag>
-        <n-tag v-if="pureRelatedReferenceCount" type="warning" size="small" :bordered="false" round>
-          相近片段 {{ pureRelatedReferenceCount }}
+        <n-tag v-if="pureRelatedDocumentCount" type="warning" size="small" :bordered="false" round>
+          相近资料 {{ pureRelatedDocumentCount }} 篇
         </n-tag>
-        <n-tag v-if="unverifiedReferenceCount" size="small" :bordered="false" round>
-          待验证片段 {{ unverifiedReferenceCount }}
+        <n-tag v-if="unverifiedDocumentCount" size="small" :bordered="false" round>
+          待验证资料 {{ unverifiedDocumentCount }} 篇
         </n-tag>
-        <n-tag v-if="irrelevantReferenceCount" size="small" :bordered="false" round>
-          非回答片段 {{ irrelevantReferenceCount }}
+        <n-tag v-if="irrelevantDocumentCount" size="small" :bordered="false" round>
+          非回答资料 {{ irrelevantDocumentCount }} 篇
         </n-tag>
       </div>
       <p v-if="evidenceNotice" class="evidence-notice">
@@ -72,8 +72,7 @@
           :group="group"
           :rank="i + 1"
           :preview-enabled="canPreviewSources"
-          :default-expanded="i === 0"
-          fragment-label="候选片段"
+          document-only
           id-prefix="search-panel"
           @preview="$emit('preview', $event)"
         />
@@ -112,8 +111,16 @@
         <div v-if="hasDisplayedCandidates" class="flex justify-between gap-3 text-xs">
           <span class="shrink-0 text-gray-500">展示范围</span>
           <span class="text-right text-gray-700 dark:text-gray-300">
-            {{ displayedDocumentCount }} 篇文档 · {{ displayedCandidateCount }} 个片段
+            {{ displayedDocumentCount }} 篇文章
           </span>
+        </div>
+        <div v-if="executionStrategyLabel" class="flex justify-between gap-3 text-xs">
+          <span class="shrink-0 text-gray-500">证据策略</span>
+          <span class="text-right text-gray-700 dark:text-gray-300">{{ executionStrategyLabel }}</span>
+        </div>
+        <div v-if="groundingPolicyLabel" class="flex justify-between gap-3 text-xs">
+          <span class="shrink-0 text-gray-500">来源约束</span>
+          <span class="text-right text-gray-700 dark:text-gray-300">{{ groundingPolicyLabel }}</span>
         </div>
         <div v-if="traceId" class="flex justify-between gap-3 text-xs">
           <span class="shrink-0 text-gray-500">Trace ID</span>
@@ -134,7 +141,7 @@ import DocumentEvidenceGroup from './DocumentEvidenceGroup.vue'
 import { groupEvidenceByDocument } from '@/utils/evidenceDocuments'
 import SearchProcess from './SearchProcess.vue'
 import { normalizeTraceId } from '@/utils/chatRequest'
-import { normalizeEvidenceClarification } from '@/utils/chatClarification'
+import { normalizeClarification } from '@/utils/chatClarification'
 import { evidenceStatusMeta as getEvidenceStatusMeta } from '@/utils/evidenceStatus'
 
 const searchStore = useSearchStore()
@@ -167,9 +174,29 @@ const retrievalPolicyLabel = computed(() => ({
   skip: '跳过检索',
 })[searchStore.intentDecision?.retrieval_policy] || (searchStore.intentDecision?.need_retrieval ? '需要检索' : '无需检索'))
 
+const groundingPolicyLabel = computed(() => ({
+  required: '必须使用授权知识库证据',
+  preferred: '优先使用知识库，允许标记通用回答',
+  none: '不要求知识库来源',
+})[searchStore.searchMeta.grounding_policy || searchStore.intentDecision?.grounding_policy] || '')
+
+const executionStrategyLabel = computed(() => {
+  const strategy = searchStore.searchMeta.evidence_execution_strategy
+  const state = searchStore.searchMeta.model_adjudication_state
+  const labels = {
+    deterministic: '确定性证据已闭合',
+    bounded_small_document: '单文档快速证据绑定',
+    joint_adjudication: '跨文档联合证据裁决',
+    no_candidates: '无授权候选，未启动裁决',
+  }
+  if (!strategy) return ''
+  const suffix = state === 'failed' ? '（裁决失败，已降级）' : state === 'no_candidates' ? '（无候选）' : ''
+  return `${labels[strategy] || strategy}${suffix}`
+})
+
 const evidenceStatus = computed(() => searchStore.searchMeta.evidence_status || '')
 const evidenceStatusContract = computed(() => getEvidenceStatusMeta(evidenceStatus.value))
-const clarification = computed(() => normalizeEvidenceClarification(
+const clarification = computed(() => normalizeClarification(
   searchStore.searchMeta.clarification,
 ))
 const clarificationRequiresRefinement = computed(() => Boolean(
@@ -186,46 +213,61 @@ const hitCount = computed(() => Number(searchStore.searchMeta.hit_count ?? 0) ||
 const directEvidenceCount = computed(() => Number(searchStore.searchMeta.direct_evidence_count ?? 0) || 0)
 const directHitCount = computed(() => Math.max(directEvidenceCount.value, hitCount.value))
 const relatedReferenceCount = computed(() => Number(searchStore.searchMeta.related_reference_count ?? 0) || 0)
-const contextEvidenceCount = computed(() => Number(searchStore.searchMeta.context_evidence_count ?? 0) || 0)
 const coverageStatus = computed(() => searchStore.searchMeta.coverage_status || '')
 const missingRequirementCount = computed(() => Number(searchStore.searchMeta.missing_requirement_count ?? 0) || 0)
-const partialAdoptedCount = computed(() => (
-  coverageStatus.value === 'partial' ? contextEvidenceCount.value : 0
-))
-const pureRelatedReferenceCount = computed(() => Math.max(
-  0,
-  relatedReferenceCount.value - partialAdoptedCount.value,
-))
-const unverifiedReferenceCount = computed(() => Number(searchStore.searchMeta.unverified_reference_count ?? 0) || 0)
-const irrelevantReferenceCount = computed(() => Number(searchStore.searchMeta.irrelevant_reference_count ?? 0) || 0)
+const documentsByRole = computed(() => documentGroups.value.reduce((counts, group) => {
+  const role = group.evidence_role || 'unverified'
+  if (Object.prototype.hasOwnProperty.call(counts, role)) counts[role] += 1
+  return counts
+}, { direct: 0, related: 0, unverified: 0, irrelevant: 0 }))
+const directDocumentCount = computed(() => documentsByRole.value.direct)
+const relatedDocumentCount = computed(() => documentsByRole.value.related)
+const unverifiedDocumentCount = computed(() => documentsByRole.value.unverified)
+const irrelevantDocumentCount = computed(() => documentsByRole.value.irrelevant)
+const partialAdoptedDocumentCount = computed(() => {
+  if (coverageStatus.value !== 'partial') return 0
+  return documentGroups.value.filter(group => group.items.some(item => (
+    item.source_verification !== 'unverified'
+    && (item.jointly_selected || item.evidence_role === 'direct')
+  ))).length
+})
+const pureRelatedDocumentCount = computed(() => documentGroups.value.filter(group => (
+  group.evidence_role === 'related'
+  && !(
+    coverageStatus.value === 'partial'
+    && group.items.some(item => item.jointly_selected)
+  )
+)).length)
 const hasDisplayedCandidates = computed(() => displayedCandidateCount.value > 0)
 const showEvidenceBreakdown = computed(() => (
   searchStore.hasResultEvent
   && hasDisplayedCandidates.value
   && (
-    directHitCount.value
-    || partialAdoptedCount.value
-    || pureRelatedReferenceCount.value
-    || unverifiedReferenceCount.value
-    || irrelevantReferenceCount.value
+    directDocumentCount.value
+    || partialAdoptedDocumentCount.value
+    || pureRelatedDocumentCount.value
+    || unverifiedDocumentCount.value
+    || irrelevantDocumentCount.value
   )
 ))
 const retrievalState = computed(() => ({
   skipped: { label: '已跳过', type: 'default' },
   hit: {
-    label: directHitCount.value
-      ? `${directHitCount.value} 个回答片段`
-      : (searchStore.searchMeta.evidence_role_known && relatedReferenceCount.value
-        ? '仅相近片段'
-          : `${displayedCandidateCount.value} 个待验证片段`),
-    type: directHitCount.value
+    label: directDocumentCount.value
+      ? `命中 ${directDocumentCount.value} 篇文章`
+      : (searchStore.searchMeta.evidence_role_known && relatedDocumentCount.value
+        ? '仅有相近资料'
+          : `${displayedDocumentCount.value} 篇待验证文章`),
+    type: directDocumentCount.value
       ? 'success'
-      : (searchStore.searchMeta.evidence_role_known && relatedReferenceCount.value ? 'warning' : 'default'),
+      : (searchStore.searchMeta.evidence_role_known && relatedDocumentCount.value ? 'warning' : 'default'),
   },
   partial: {
-    label: partialAdoptedCount.value
-      ? `已采用 ${partialAdoptedCount.value} 个部分依据`
-      : '部分片段可用',
+    label: searchStore.searchMeta.unverified_generation && unverifiedDocumentCount.value
+      ? `待验证参考 ${unverifiedDocumentCount.value} 篇`
+      : partialAdoptedDocumentCount.value
+      ? `已采用 ${partialAdoptedDocumentCount.value} 篇部分依据`
+      : '部分资料可用',
     type: 'warning',
   },
   version_mismatch: { label: '仅相近版本', type: 'warning' },
@@ -240,7 +282,7 @@ const retrievalState = computed(() => ({
   no_hit: { label: '未命中', type: 'warning' },
   insufficient_evidence: { label: '证据不足', type: 'warning' },
   unverified: {
-    label: displayedCandidateCount.value ? `${displayedCandidateCount.value} 个待验证片段` : '状态未验证',
+    label: displayedDocumentCount.value ? `${displayedDocumentCount.value} 篇待验证文章` : '状态未验证',
     type: 'default',
   },
   error: { label: '检索失败', type: 'error' },
@@ -249,8 +291,8 @@ const retrievalState = computed(() => ({
 const evidenceNotice = computed(() => {
   if (evidenceStatus.value === 'needs_clarification') {
     return clarificationRequiresRefinement.value
-      ? '已找到多个可能范围，但无法安全列成有限选项。请在输入框补充具体产品、版本、项目或制度名称；补充前这些片段不能作为回答依据。'
-      : '已找到多个适用范围的候选资料，请先在对话中选择所需范围；选择前这些片段不能作为回答依据。'
+      ? '已找到多个可能范围，但无法安全列成有限选项。请在输入框补充具体产品、版本、项目或制度名称；补充前这些资料不能作为回答依据。'
+      : '已找到多个适用范围的候选资料，请先在对话中选择所需范围；选择前这些资料不能作为回答依据。'
   }
   if (evidenceStatus.value === 'version_mismatch') {
     return '已找到主题相关资料，但没有符合目标版本的直接依据。相近版本内容仅供参考。'
@@ -259,14 +301,17 @@ const evidenceNotice = computed(() => {
     return '已检索到资料，但它们均不符合问题中明确指定的产品、版本或项目范围；这些资料不会展示或作为回答依据。'
   }
   if (evidenceStatus.value === 'insufficient_evidence') {
-    return '已检索到主题相关资料，但无法形成可核验的完整答案链；这些片段仅供定位制度，不会作为回答依据。'
+    return '已检索到主题相关资料，但无法形成可核验的完整答案链；这些文章仅供定位，不会作为回答依据。'
   }
   if (evidenceStatus.value === 'partial') {
-    if (coverageStatus.value === 'partial' && partialAdoptedCount.value > 0) {
+    if (searchStore.searchMeta.unverified_generation) {
+      return '重排模型发生技术故障，系统已保留授权且范围匹配的文章供问答模型提取部分内容；这些文章属于待验证参考资料，不是已验证回答依据。'
+    }
+    if (coverageStatus.value === 'partial' && partialAdoptedDocumentCount.value > 0) {
       const missing = missingRequirementCount.value > 0
         ? `，仍有 ${missingRequirementCount.value} 项必要信息缺少证据`
         : '，但证据尚未完整覆盖问题'
-      return `已采用 ${partialAdoptedCount.value} 个片段支撑部分回答${missing}。`
+      return `已采用 ${partialAdoptedDocumentCount.value} 篇文章支撑部分回答${missing}。`
     }
     return directHitCount.value > 0
       ? '部分资料可作为回答依据，其余结果仅作相近参考，请留意版本或其他关键约束。'
@@ -349,7 +394,7 @@ const emptyResultText = computed(() => {
 
 const emptyResultHint = computed(() => ({
   skipped: '这是后端策略的最终执行结果，并非“检索后无命中”。',
-  partial: '可以查看相近资料，但回答时只应采用已标记为“回答依据”的内容。',
+  partial: '可以查看相近文章，但回答时只应采用已标记为“回答依据”的内容。',
   version_mismatch: '相近版本资料不能直接证明目标版本可用，建议补充对应版本文档。',
   scope_mismatch: '请确认问题中的产品、版本或项目名称，并录入与该范围一致的资料。',
   needs_clarification: clarificationRequiresRefinement.value

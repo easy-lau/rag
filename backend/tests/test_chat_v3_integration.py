@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from api.chat import _v3_active_timeout_seconds, send_message
+from core.clarification import ClarificationContract, build_clarification_state
 from core.conversation_context import ConversationContext, RouteTurnCandidate
 from core.query_analysis_execution import (
     build_execution_baseline,
@@ -682,22 +683,18 @@ class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
         kb_id = uuid.uuid4()
-        pending = {
-            "schema_version": "rag_pending_clarification.v1",
-            "state_id": "route-pending",
-            "base_user_message_id": str(uuid.uuid4()),
-            "clarification_message_id": str(uuid.uuid4()),
-            "intent_code": "knowledge_qa",
-            "original_query": original_query,
-            "clarification_answers": [],
-            "unresolved": [
-                {"role": "system_or_product", "reason": "missing", "candidate_count": 0}
-            ],
-            "selected_kb_ids_snapshot": [str(kb_id)],
-            "created_at": "2026-08-02T00:00:00+00:00",
-            "expires_at": "2099-08-02T00:00:00+00:00",
-            "dispatch_authorized": False,
-        }
+        pending = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="semantic",
+                dimension="system_or_product",
+                reason_code="missing_context",
+                selection_mode="refine",
+            ),
+            original_query=original_query,
+            selected_kb_ids=[kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
         conversation = SimpleNamespace(
             id=conversation_id,
             user_id=user_id,
@@ -1142,7 +1139,12 @@ class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "retrieval_executed"
             ]
         )
-        self.assertTrue(any(event.get("type") == "text_delta" for event in events))
+        self.assertTrue(any(
+            event.get("type") == "clarification_state"
+            and event.get("status") == "active"
+            for event in events
+        ))
+        self.assertFalse(any(event.get("type") == "text_delta" for event in events))
         self.assertIsNotNone(conversation.pending_route_state)
 
     async def test_v3_contextual_safety_closure_is_adopted_before_v2_dispatch(self) -> None:

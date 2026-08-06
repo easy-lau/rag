@@ -336,7 +336,6 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
                 conv=conversation,
                 user=SimpleNamespace(id=user_id, is_superadmin=False),
                 question="那这个指什么",
-                clarification_message="请说明你指的是哪一项配置。",
                 decision_reason="unresolved_reference",
                 trace_id="retry-trace",
                 selected_kb_ids=[],
@@ -358,7 +357,9 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
             sorted(message.role for message in db.messages.values()),
             ["assistant", "user"],
         )
-        self.assertIn("请说明你指的是哪一项配置", body)
+        self.assertIn('"type": "clarification_state"', body)
+        self.assertIn('"status": "active"', body)
+        self.assertIn('"reason_code": "unresolved_reference"', body)
 
     def test_request_fingerprint_binds_scope_config_and_pending_identity(self) -> None:
         conversation_id = uuid.uuid4()
@@ -760,7 +761,8 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(turn.status, "completed")
         self.assertEqual(turn.execution_attempts, 2)
-        self.assertIn("无法确定", body)
+        self.assertIn('"type": "clarification_state"', body)
+        self.assertIn('"status": "active"', body)
         classify.assert_not_awaited()
         self.assertGreaterEqual(db.commits, 2)
 

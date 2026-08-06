@@ -2,6 +2,7 @@
   <article class="evidence-document">
     <div class="evidence-document__header">
       <button
+        v-if="!documentOnly"
         type="button"
         class="evidence-document__toggle"
         :aria-expanded="expanded"
@@ -28,6 +29,17 @@
         </n-icon>
       </button>
 
+      <div
+        v-else
+        class="evidence-document__toggle evidence-document__toggle--static"
+      >
+        <span class="evidence-document__rank">{{ rank }}</span>
+        <FileTypeIcon :type="group.file_type" class="evidence-document__file-icon" />
+        <span class="evidence-document__identity">
+          <span class="evidence-document__title" :title="filename">{{ filename }}</span>
+        </span>
+      </div>
+
       <n-button
         v-if="canPreviewDocument"
         quaternary
@@ -41,6 +53,7 @@
     </div>
 
     <div
+      v-if="!documentOnly"
       v-show="expanded"
       :id="panelId"
       class="evidence-document__fragments"
@@ -75,6 +88,7 @@ const props = defineProps({
   defaultExpanded: { type: Boolean, default: false },
   fragmentLabel: { type: String, default: '命中片段' },
   idPrefix: { type: String, default: 'evidence' },
+  documentOnly: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['preview'])
@@ -128,7 +142,7 @@ function previewFragment(source) {
 .evidence-document__header {
   display: flex;
   min-width: 0;
-  align-items: stretch;
+  align-items: center;
   background: var(--ui-bg-subtle);
 }
 
@@ -149,6 +163,10 @@ function previewFragment(source) {
 
 .evidence-document__toggle:hover {
   background: var(--ui-surface-hover);
+}
+
+.evidence-document__toggle--static:hover {
+  background: transparent;
 }
 
 .evidence-document__toggle:focus-visible,
@@ -212,10 +230,15 @@ function previewFragment(source) {
 }
 
 .evidence-document__full-button {
-  min-width: 46px;
-  align-self: stretch;
-  border-left: 1px solid var(--ui-divider);
-  border-radius: 0;
+  display: inline-flex;
+  min-width: 48px;
+  min-height: 32px;
+  flex: 0 0 auto;
+  align-self: center;
+  align-items: center;
+  justify-content: center;
+  margin: 0 8px 0 4px;
+  border-radius: var(--ui-radius-control);
   color: var(--ui-primary);
 }
 
@@ -231,6 +254,7 @@ function previewFragment(source) {
 
   .evidence-document__full-button {
     min-width: 54px;
+    min-height: 36px;
   }
 }
 

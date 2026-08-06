@@ -11,7 +11,15 @@ from models.db_models import Document, DocumentChunk, KnowledgeBase, User, now_u
 from models.schemas import DocumentOut
 from core.audit import AuditLogger, get_audit
 from core.deps import require_kb_access
+from core.document_access import (
+    DocumentAccessDenied,
+    DocumentAction,
+    evaluate_document_permissions,
+    is_document_owner,
+    require_document_action,
+)
 from core.document_jobs import enqueue_document_processing_job
+from core.document_content import normalize_document_markdown
 from core.permissions import DOC_CREATE, DOC_DELETE, DOC_READ, DOC_UPDATE
 from config import get_settings
 
@@ -53,13 +61,105 @@ def _ext_of(name: str | None) -> str | None:
     return ext or None
 
 
+async def _load_document(
+    db: AsyncSession,
+    kb_id: uuid.UUID,
+    doc_id: uuid.UUID,
+) -> Document | None:
+    """Load a document together with display-only actor relationships."""
+
+    return (await db.execute(
+        select(Document)
+        .options(selectinload(Document.creator), selectinload(Document.updater))
+        .where(Document.id == doc_id, Document.kb_id == kb_id)
+    )).scalar_one_or_none()
+
+
+def _actor_name(document: Document, relationship: str, user: User, actor_id) -> str | None:
+    # A mutation may update the foreign-key id while the previously loaded
+    # relationship still points at the old updater.  The current actor is the
+    # authoritative name for that just-written id.
+    if actor_id == user.id:
+        return _name(user)
+    loaded_actor = document.__dict__.get(relationship)
+    if loaded_actor is not None:
+        return _name(loaded_actor)
+    return None
+
+
+def _document_out(document: Document, user: User) -> DocumentOut:
+    """Single response adapter for persisted fields and computed capabilities."""
+
+    return DocumentOut(
+        id=document.id,
+        kb_id=document.kb_id,
+        filename=document.filename,
+        file_type=document.file_type,
+        raw_content=document.raw_content,
+        source_url=document.source_url,
+        image_url=document.image_url,
+        chunk_count=document.chunk_count,
+        status=document.status,
+        is_active=document.is_active,
+        tags=_normalize_tags(document.tags),
+        created_at=document.created_at,
+        updated_at=document.updated_at,
+        created_by_name=_actor_name(document, "creator", user, document.created_by),
+        updated_by_name=_actor_name(document, "updater", user, document.updated_by),
+        permissions=evaluate_document_permissions(user, document).as_dict(),
+    )
+
+
+def _document_audit_detail(
+    document: Document,
+    user: User,
+    **extra,
+) -> dict:
+    return {
+        "kb_id": str(document.kb_id),
+        "document_owner_id": str(document.created_by) if document.created_by else None,
+        "actor_is_owner": is_document_owner(user, document),
+        "actor_is_superadmin": bool(user.is_superadmin),
+        **extra,
+    }
+
+
+async def _require_document_action(
+    user: User,
+    document: Document,
+    action: DocumentAction,
+    audit: AuditLogger,
+) -> None:
+    """Enforce and independently persist rejected object-level mutations."""
+
+    try:
+        require_document_action(user, document, action)
+    except DocumentAccessDenied as exc:
+        await audit.log_independent(
+            "doc.access_denied",
+            target_type="document",
+            target_id=document.id,
+            target_name=document.filename,
+            detail=_document_audit_detail(
+                document,
+                user,
+                requested_action=exc.action,
+                reason=exc.reason,
+            ),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="只有文档创建者或超级管理员可以执行此操作",
+        ) from exc
+
+
 @router.get("/{kb_id}/documents", response_model=list[DocumentOut])
 async def list_documents(
     kb_id: uuid.UUID,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_kb_access(DOC_READ)),
+    user: User = Depends(require_kb_access(DOC_READ)),
 ):
     offset = (page - 1) * page_size
     rows = (await db.execute(
@@ -69,10 +169,7 @@ async def list_documents(
         .order_by(Document.created_at.desc())
         .offset(offset).limit(page_size)
     )).scalars().all()
-    for d in rows:
-        d.created_by_name = _name(d.creator)
-        d.updated_by_name = _name(d.updater)
-    return rows
+    return [_document_out(document, user) for document in rows]
 
 
 @router.post("/{kb_id}/documents", response_model=DocumentOut)
@@ -110,10 +207,10 @@ async def upload_document(
         original_name=file.filename,
     )
     audit.log(db, "doc.upload", target_type="document", target_id=doc.id, target_name=doc.filename,
-              detail={"kb_id": str(kb_id), "file_type": ext})
+              detail=_document_audit_detail(doc, user, file_type=ext))
     await db.commit()
     await db.refresh(doc)
-    return doc
+    return _document_out(doc, user)
 
 
 @router.post("/{kb_id}/documents/image", response_model=DocumentOut)
@@ -160,10 +257,10 @@ async def upload_image_document(
         original_name=file.filename,
     )
     audit.log(db, "doc.upload_image", target_type="document", target_id=doc.id, target_name=doc.filename,
-              detail={"kb_id": str(kb_id), "file_type": ext})
+              detail=_document_audit_detail(doc, user, file_type=ext))
     await db.commit()
     await db.refresh(doc)
-    return doc
+    return _document_out(doc, user)
 
 
 class TextDocumentIn(BaseModel):
@@ -189,17 +286,18 @@ async def create_text_document(
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
-    doc = Document(kb_id=kb_id, filename=body.title, file_type="md", raw_content=body.content,
+    canonical_content = normalize_document_markdown(body.content)
+    doc = Document(kb_id=kb_id, filename=body.title, file_type="md", raw_content=canonical_content,
                    source_url=body.source_url, status="processing",
                    tags=_normalize_tags(body.tags), created_by=user.id)
     db.add(doc)
     await db.flush()
     enqueue_document_processing_job(db, document=doc, job_type="text")
     audit.log(db, "doc.create_text", target_type="document", target_id=doc.id, target_name=doc.filename,
-              detail={"kb_id": str(kb_id)})
+              detail=_document_audit_detail(doc, user))
     await db.commit()
     await db.refresh(doc)
-    return doc
+    return _document_out(doc, user)
 
 
 @router.get("/{kb_id}/documents/{doc_id}", response_model=DocumentOut)
@@ -207,10 +305,10 @@ async def get_document(
     kb_id: uuid.UUID,
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_kb_access(DOC_READ)),
+    user: User = Depends(require_kb_access(DOC_READ)),
 ):
-    doc = await db.get(Document, doc_id)
-    if not doc or doc.kb_id != kb_id:
+    doc = await _load_document(db, kb_id, doc_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
     if not doc.raw_content:
         chunks = (await db.execute(
@@ -218,8 +316,8 @@ async def get_document(
             .where(DocumentChunk.doc_id == doc_id)
             .order_by(DocumentChunk.chunk_index)
         )).scalars().all()
-        doc.raw_content = "\n\n".join(chunks)
-    return doc
+        doc.raw_content = normalize_document_markdown("\n\n".join(chunks))
+    return _document_out(doc, user)
 
 
 @router.put("/{kb_id}/documents/{doc_id}", response_model=DocumentOut)
@@ -231,14 +329,15 @@ async def update_text_document(
     audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_kb_access(DOC_UPDATE)),
 ):
-    doc = await db.get(Document, doc_id)
-    if not doc or doc.kb_id != kb_id:
+    doc = await _load_document(db, kb_id, doc_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
+    await _require_document_action(user, doc, "update", audit)
 
     # 新任务拥有新的 revision。旧分块只有在新 revision 完整解析、向量化并
     # 原子写入后才会被替换；失败任务不会留下“先清空、后失败”的半成品状态。
     doc.filename = body.title
-    doc.raw_content = body.content
+    doc.raw_content = normalize_document_markdown(body.content)
     doc.source_url = body.source_url
     # 保留原始类型：编辑内容不应把 pdf/docx/xlsx 等改写成 md。
     # 优先按文件名扩展名识别（可自愈历史误标），无扩展名则维持原类型，最后兜底 md。
@@ -251,10 +350,10 @@ async def update_text_document(
     doc.updated_at = now_utc()
     enqueue_document_processing_job(db, document=doc, job_type="text")
     audit.log(db, "doc.update", target_type="document", target_id=doc.id, target_name=doc.filename,
-              detail={"kb_id": str(kb_id)})
+              detail=_document_audit_detail(doc, user))
     await db.commit()
     await db.refresh(doc)
-    return doc
+    return _document_out(doc, user)
 
 
 @router.patch("/{kb_id}/documents/{doc_id}/tags", response_model=DocumentOut)
@@ -267,9 +366,10 @@ async def update_document_tags(
     user: User = Depends(require_kb_access(DOC_UPDATE)),
 ):
     """仅更新标签，不触发重新解析/嵌入——改标签不应让文档重新入库。"""
-    doc = await db.get(Document, doc_id)
-    if not doc or doc.kb_id != kb_id:
+    doc = await _load_document(db, kb_id, doc_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
+    await _require_document_action(user, doc, "update", audit)
     doc.tags = _normalize_tags(body.tags)
     doc.updated_by = user.id
     doc.updated_at = now_utc()
@@ -279,13 +379,10 @@ async def update_document_tags(
         target_type="document",
         target_id=doc.id,
         target_name=doc.filename,
-        detail={"kb_id": str(kb_id), "tag_count": len(doc.tags)},
+        detail=_document_audit_detail(doc, user, tag_count=len(doc.tags)),
     )
     await db.commit()
-    await db.refresh(doc, attribute_names=["creator", "updater"])
-    doc.created_by_name = _name(doc.creator)
-    doc.updated_by_name = _name(doc.updater)
-    return doc
+    return _document_out(doc, user)
 
 
 @router.patch("/{kb_id}/documents/{doc_id}/toggle", response_model=DocumentOut)
@@ -294,23 +391,26 @@ async def toggle_document(
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    _: User = Depends(require_kb_access(DOC_UPDATE)),
+    user: User = Depends(require_kb_access(DOC_UPDATE)),
 ):
-    doc = await db.get(Document, doc_id)
-    if not doc or doc.kb_id != kb_id:
+    doc = await _load_document(db, kb_id, doc_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
+    await _require_document_action(user, doc, "update", audit)
     doc.is_active = not doc.is_active
+    doc.updated_by = user.id
+    doc.updated_at = now_utc()
     audit.log(
         db,
         "doc.toggle",
         target_type="document",
         target_id=doc.id,
         target_name=doc.filename,
-        detail={"kb_id": str(kb_id), "is_active": doc.is_active},
+        detail=_document_audit_detail(doc, user, is_active=doc.is_active),
     )
     await db.commit()
     await db.refresh(doc)
-    return doc
+    return _document_out(doc, user)
 
 
 @router.delete("/{kb_id}/documents/{doc_id}")
@@ -319,13 +419,14 @@ async def delete_document(
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     audit: AuditLogger = Depends(get_audit),
-    _: User = Depends(require_kb_access(DOC_DELETE)),
+    user: User = Depends(require_kb_access(DOC_DELETE)),
 ):
-    doc = await db.get(Document, doc_id)
-    if not doc or doc.kb_id != kb_id:
+    doc = await _load_document(db, kb_id, doc_id)
+    if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
+    await _require_document_action(user, doc, "delete", audit)
     audit.log(db, "doc.delete", target_type="document", target_id=doc.id, target_name=doc.filename,
-              detail={"kb_id": str(kb_id)})
+              detail=_document_audit_detail(doc, user))
     await db.delete(doc)
     await db.commit()
     return {"message": "删除成功"}

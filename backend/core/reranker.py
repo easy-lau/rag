@@ -29,6 +29,12 @@ from core.query_constraints import (
     inherit_document_constraint_metadata,
 )
 from core.rag_trace import exception_log_text
+from core.evidence_contract import (
+    COVERAGE_STATUSES,
+    CoverageStatus,
+    coverage_status_protocol_text,
+    normalize_coverage_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +47,6 @@ ContributionRole = Literal[
     "background",
     "irrelevant",
 ]
-CoverageStatus = Literal["complete", "partial", "insufficient"]
 _CONSTRAINT_STATUSES = {"exact", "compatible", "unknown", "mismatch", "neutral"}
 # Providers often emit a one-to-one wire spelling such as ``exact_match``.
 # Normalize only unambiguous aliases; an unknown value falls back to the
@@ -90,18 +95,6 @@ _CONTRIBUTION_ROLE_ALIASES: dict[str, ContributionRole] = {
     "无关": "irrelevant",
     "不相关": "irrelevant",
 }
-_COVERAGE_STATUSES = {"complete", "partial", "insufficient"}
-_COVERAGE_STATUS_ALIASES: dict[str, CoverageStatus] = {
-    # These are one-to-one wire-vocabulary variants, not weaker semantic
-    # guesses.  The backend still recomputes final coverage from candidate
-    # indexes, requirement bindings and hard constraints below.
-    "fully_covered": "complete",
-    "complete_coverage": "complete",
-    "partially_covered": "partial",
-    "partial_coverage": "partial",
-    "not_covered": "insufficient",
-    "insufficient_coverage": "insufficient",
-}
 _REQUIREMENT_IMPORTANCE = {"required", "helpful"}
 _REQUIREMENT_SOURCES = {"explicit", "inferred"}
 _SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,47}$")
@@ -132,7 +125,6 @@ _JOINT_MAX_BRIDGE_FACTS = 2
 _SMALL_DOCUMENT_MAX_SELECTED_CANDIDATES = 12
 _SMALL_DOCUMENT_MAX_ELIGIBLE_CONTENT_CHARS = 12_000
 _SMALL_DOCUMENT_MAX_COMPETITOR_CONTENT_CHARS = 240
-_SMALL_DOCUMENT_TIMEOUT_SECONDS = 15.0
 _JOINT_REPAIR_MAX_SECONDS = 2.5
 _JOINT_REPAIR_MIN_SECONDS = 0.5
 _JOINT_REPAIR_BUDGET_RATIO = 0.25
@@ -214,16 +206,19 @@ def _record_rerank_circuit_failure(
 
 
 def _joint_rerank_attempt_budgets(total_seconds: float) -> tuple[float, float]:
-    """Reserve part of one absolute stage budget for contract repair."""
+    """Give the valid first response the full absolute stage budget.
+
+    A repair is attempted only when an invalid response arrives early enough
+    to leave time before the same deadline.  Reserving repair time up front
+    previously cancelled otherwise valid provider responses prematurely.
+    """
 
     total = max(0.1, float(total_seconds))
     repair = min(
         _JOINT_REPAIR_MAX_SECONDS,
         max(_JOINT_REPAIR_MIN_SECONDS, total * _JOINT_REPAIR_BUDGET_RATIO),
     )
-    if repair >= total:
-        repair = max(0.0, total - 0.1)
-    return max(0.1, total - repair), repair
+    return total, min(repair, max(0.0, total - 0.1))
 
 
 def _rerank_failure_kind(exc: BaseException) -> str:
@@ -299,6 +294,7 @@ _JOINT_RERANK_SYSTEM_PROMPT = (
     "bridge_facts、reason，reason 使用不超过80个汉字的短句。evidence_sets 最多 2 组，"
     "优先只返回最佳 1 组；每组返回 id、candidate_indexes、"
     "joint_answer_support、coverage、coverage_status、missing_requirement_ids、reason。"
+    f"{coverage_status_protocol_text()}"
     "coverage 中每项包含 requirement_id 和真正支撑它的 candidate_indexes。"
     "不得用主题相似片段填充覆盖，不得把版本冲突或适用范围未知的片段作为直接证据。"
     "selected_set_id 可为 null。完整格式示例："
@@ -415,6 +411,8 @@ class EvidenceSetAssessment:
     covered_requirement_ids: tuple[str, ...]
     missing_requirement_ids: tuple[str, ...]
     reason: str
+    model_coverage_status_original: str | None = None
+    model_coverage_status_resolution: str = "exact"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -428,6 +426,8 @@ class EvidenceSetAssessment:
             "covered_requirement_ids": list(self.covered_requirement_ids),
             "missing_requirement_ids": list(self.missing_requirement_ids),
             "reason": self.reason,
+            "model_coverage_status_original": self.model_coverage_status_original,
+            "model_coverage_status_resolution": self.model_coverage_status_resolution,
         }
 
 
@@ -465,6 +465,8 @@ class _ModelEvidenceSet:
     model_coverage_status: CoverageStatus
     missing_requirement_ids: tuple[str, ...]
     reason: str
+    model_coverage_status_original: str | None = None
+    model_coverage_status_resolution: str = "exact"
 
 
 @dataclass(frozen=True)
@@ -571,16 +573,12 @@ def _parse_identifier(value: Any, field: str) -> str:
     return text
 
 
-def _parse_model_coverage_status(value: Any) -> CoverageStatus:
-    if not isinstance(value, str):
-        raise ValueError("coverage_status 必须为字符串")
-    normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
-    if normalized in _COVERAGE_STATUSES:
-        return normalized  # type: ignore[return-value]
-    alias = _COVERAGE_STATUS_ALIASES.get(normalized)
-    if alias is not None:
-        return alias
-    raise ValueError(f"coverage_status 无效: {value[:80]}")
+def _parse_model_coverage_status(
+    value: Any,
+) -> tuple[CoverageStatus, str | None, str]:
+    """Parse a non-authoritative diagnostic without rejecting the batch."""
+
+    return normalize_coverage_status(value)
 
 
 def _parse_unique_indexes(
@@ -1304,7 +1302,11 @@ def _parse_model_evidence_sets(
             candidate_indexes=candidate_indexes,
             result_count=result_count,
         )
-        model_status = _parse_model_coverage_status(item.get("coverage_status"))
+        (
+            model_status,
+            model_status_original,
+            model_status_resolution,
+        ) = _parse_model_coverage_status(item.get("coverage_status"))
         missing_raw = item.get("missing_requirement_ids", [])
         if not isinstance(missing_raw, list) or len(missing_raw) > _MAX_REQUIREMENTS:
             raise ValueError("missing_requirement_ids 数量无效")
@@ -1330,6 +1332,8 @@ def _parse_model_evidence_sets(
                 model_coverage_status=model_status,
                 missing_requirement_ids=tuple(missing),
                 reason=reason,
+                model_coverage_status_original=model_status_original,
+                model_coverage_status_resolution=model_status_resolution,
             )
         )
     return tuple(sets)
@@ -1710,7 +1714,7 @@ def _build_joint_response_format(
             },
             "coverage_status": {
                 "type": "string",
-                "enum": sorted(_COVERAGE_STATUSES),
+                "enum": sorted(COVERAGE_STATUSES),
             },
             "missing_requirement_ids": requirement_id_array,
             "reason": bounded_text,
@@ -1753,48 +1757,6 @@ def _build_joint_response_format(
             "schema": schema,
         },
     }
-
-
-def _strict_json_schema_is_unsupported(exc: BaseException) -> bool:
-    """仅在提供方明确拒绝 strict JSON Schema 时允许降级一次。"""
-
-    status_code = getattr(exc, "status_code", None)
-    if status_code is None:
-        response = getattr(exc, "response", None)
-        status_code = getattr(response, "status_code", None)
-    if status_code not in {400, 422}:
-        return False
-
-    body = getattr(exc, "body", None)
-    try:
-        body_text = json.dumps(body, ensure_ascii=False, default=str) if body else ""
-    except (TypeError, ValueError):
-        body_text = str(body or "")
-    detail = f"{exc} {body_text}".casefold()
-    parameter_markers = ("json_schema", "response_format")
-    rejection_markers = (
-        "unsupported",
-        "not supported",
-        "does not support",
-        "unknown parameter",
-        "unrecognized",
-        "unexpected",
-        "extra inputs are not permitted",
-        "only json_object",
-        "must be one of",
-        "不支持",
-        "未知参数",
-    )
-    enumerated_format_rejection = (
-        "json_schema" in detail
-        and "json_object" in detail
-        and "invalid value" in detail
-        and "supported values" in detail
-    )
-    return enumerated_format_rejection or (
-        any(marker in detail for marker in parameter_markers)
-        and any(marker in detail for marker in rejection_markers)
-    )
 
 
 def _parse_joint_response(
@@ -1854,7 +1816,7 @@ def _build_joint_repair_prompt(
                 "constraint_status": sorted(_CONSTRAINT_STATUSES),
                 "evidence_role": sorted(_EVIDENCE_ROLES),
                 "contribution_role": sorted(_CONTRIBUTION_ROLES),
-                "coverage_status": sorted(_COVERAGE_STATUSES),
+                "coverage_status": sorted(COVERAGE_STATUSES),
             },
             "original_response": raw,
         },
@@ -2595,6 +2557,8 @@ def _recompute_evidence_sets(
                 ),
                 missing_requirement_ids=missing_required,
                 reason=model_set.reason,
+                model_coverage_status_original=model_set.model_coverage_status_original,
+                model_coverage_status_resolution=model_set.model_coverage_status_resolution,
             )
         )
     return tuple(recomputed)
@@ -2884,6 +2848,7 @@ async def select_small_document_evidence_with_coverage(
     bridge_requirement_ids: Sequence[str] = (),
     eligible_candidate_indexes: Sequence[int] | None = None,
     anchor_candidate_indexes: Sequence[int],
+    timeout_seconds: float | None = None,
 ) -> RerankOutcome:
     """Select a complete evidence set using a deliberately tiny contract.
 
@@ -2901,6 +2866,9 @@ async def select_small_document_evidence_with_coverage(
     model: str | None = None
     constraints = extract_query_constraints(query)
     normalized_requirements: tuple[AnswerRequirement, ...] = ()
+    structured_output_mode: str | None = None
+    attempted_modes: tuple[str, ...] = ()
+    first_attempt_elapsed_ms: int | None = None
     try:
         normalized_requirements = _coerce_requirements(requirements)
         required_ids = tuple(
@@ -2911,7 +2879,12 @@ async def select_small_document_evidence_with_coverage(
         if not results:
             return RerankOutcome(
                 results=[],
-                succeeded=True,
+                # Empty input means the adjudication stage did not run; it is
+                # not a successful evidence decision.  Keeping this explicit
+                # prevents callers from opening a general fallback or writing
+                # a misleading "裁决成功" Trace event.
+                succeeded=False,
+                error="no_candidates",
                 constraints=constraints,
                 requirements=normalized_requirements,
                 coverage_status="insufficient",
@@ -2919,6 +2892,7 @@ async def select_small_document_evidence_with_coverage(
                 prompt_version=SMALL_DOCUMENT_RERANK_PROMPT_VERSION,
                 elapsed_ms=round((time.perf_counter() - started_at) * 1000),
                 candidate_count=0,
+                failure_kind="no_candidates",
             )
         if not required_ids:
             raise ValueError("小文档快速选择要求至少一个 explicit+required 目标")
@@ -2966,17 +2940,23 @@ async def select_small_document_evidence_with_coverage(
         if hasattr(client, "with_options"):
             client = client.with_options(max_retries=0)
         model = _configured_rerank_model(settings)
-        configured_timeout = float(
-            getattr(
+        configured_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else getattr(
                 settings,
-                "rerank_request_timeout_seconds",
-                getattr(settings, "llm_request_timeout_seconds", 60.0),
+                "rerank_timeout_seconds",
+                getattr(
+                    settings,
+                    "rerank_request_timeout_seconds",
+                    getattr(settings, "llm_request_timeout_seconds", 15.0),
+                ),
             )
         )
-        timeout = max(
-            0.1,
-            min(configured_timeout, _SMALL_DOCUMENT_TIMEOUT_SECONDS),
-        )
+        if isinstance(configured_timeout, bool):
+            raise ValueError("小文档重排 timeout_seconds 必须为数字")
+        timeout = max(0.1, float(configured_timeout))
+        provider_identity = getattr(settings, "llm_base_url", "")
         request = {
             "model": model,
             "messages": [
@@ -3006,28 +2986,26 @@ async def select_small_document_evidence_with_coverage(
             requirements=normalized_requirements,
             eligible_candidate_indexes=eligible_indexes,
         )
-        request_started_at = time.perf_counter()
-        async with asyncio.timeout(timeout):
-            try:
-                response = await client.chat.completions.create(
-                    **request,
-                    response_format=strict_response_format,
-                )
-            except Exception as schema_error:
-                if not _strict_json_schema_is_unsupported(schema_error):
-                    raise
-                remaining_timeout = timeout - (
-                    time.perf_counter() - request_started_at
-                )
-                if remaining_timeout <= 0.1:
-                    raise TimeoutError(
-                        "小文档证据选择 JSON 契约降级期限已耗尽"
-                    ) from schema_error
-                request["timeout"] = remaining_timeout
-                response = await client.chat.completions.create(
-                    **request,
-                    response_format={"type": "json_object"},
-                )
+        first_attempt_started = time.perf_counter()
+        try:
+            structured = await asyncio.wait_for(
+                create_structured_completion(
+                    client,
+                    request=request,
+                    strict_response_format=strict_response_format,
+                    timeout_seconds=timeout,
+                    provider_identity=provider_identity,
+                    model=model,
+                ),
+                timeout=timeout,
+            )
+        finally:
+            first_attempt_elapsed_ms = round(
+                (time.perf_counter() - first_attempt_started) * 1000
+            )
+        structured_output_mode = structured.mode
+        attempted_modes = tuple(structured.attempted_modes)
+        response = structured.response
         choices = list(getattr(response, "choices", None) or [])
         choice = choices[0] if choices else None
         message = getattr(choice, "message", None) if choice is not None else None
@@ -3077,8 +3055,20 @@ async def select_small_document_evidence_with_coverage(
             prompt_version=SMALL_DOCUMENT_RERANK_PROMPT_VERSION,
             elapsed_ms=round((time.perf_counter() - started_at) * 1000),
             candidate_count=len(results),
+            structured_output_mode=structured_output_mode,
+            structured_output_attempted_modes=attempted_modes,
+            first_attempt_elapsed_ms=first_attempt_elapsed_ms,
         )
     except Exception as exc:
+        if not attempted_modes:
+            attempted_modes = tuple(
+                str(value)
+                for value in getattr(
+                    exc,
+                    "structured_output_attempted_modes",
+                    (),
+                )
+            )
         error = f"{type(exc).__name__}: {exc}"
         logger.warning(
             "[小文档证据选择] 调用失败，不提升候选: %s",
@@ -3101,6 +3091,10 @@ async def select_small_document_evidence_with_coverage(
             prompt_version=SMALL_DOCUMENT_RERANK_PROMPT_VERSION,
             elapsed_ms=round((time.perf_counter() - started_at) * 1000),
             candidate_count=len(results),
+            failure_kind=_rerank_failure_kind(exc),
+            structured_output_mode=structured_output_mode,
+            structured_output_attempted_modes=attempted_modes,
+            first_attempt_elapsed_ms=first_attempt_elapsed_ms,
         )
 
 
@@ -3139,7 +3133,8 @@ async def joint_rerank_with_coverage(
         if not results:
             return RerankOutcome(
                 results=[],
-                succeeded=True,
+                succeeded=False,
+                error="no_candidates",
                 constraints=constraints,
                 requirements=normalized_requirements,
                 coverage_status="insufficient",
@@ -3151,6 +3146,7 @@ async def joint_rerank_with_coverage(
                 prompt_version=JOINT_RERANK_PROMPT_VERSION,
                 elapsed_ms=round((time.perf_counter() - started_at) * 1000),
                 candidate_count=0,
+                failure_kind="no_candidates",
             )
 
         settings = get_settings()
@@ -3163,8 +3159,12 @@ async def joint_rerank_with_coverage(
             if timeout_seconds is not None
             else getattr(
                 settings,
-                "rerank_request_timeout_seconds",
-                getattr(settings, "llm_request_timeout_seconds", 60.0),
+                "rerank_timeout_seconds",
+                getattr(
+                    settings,
+                    "rerank_request_timeout_seconds",
+                    getattr(settings, "llm_request_timeout_seconds", 15.0),
+                ),
             )
         )
         if isinstance(configured_timeout, bool):

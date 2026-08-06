@@ -8,9 +8,36 @@ from core.document_parser import (
     _parse_docx,
     parse_markdown_content,
 )
+from core.document_content import normalize_document_markdown
 
 
 class MarkdownParserShortContentTests(unittest.TestCase):
+    def test_normalizes_collapsed_export_blocks_without_rewriting_facts(self) -> None:
+        content = (
+            "注意事项 * 复制<code>application.yml</code> * 修改配置。 "
+            "```shell cp -R application-prod.yml application.yml ```"
+        )
+
+        normalized = normalize_document_markdown(content)
+
+        self.assertIn("注意事项", normalized)
+        self.assertIn("- 复制`application.yml`", normalized)
+        self.assertIn("- 修改配置。", normalized)
+        self.assertIn("```shell\ncp -R application-prod.yml application.yml\n```", normalized)
+
+    def test_malformed_fence_language_is_kept_as_code_content(self) -> None:
+        normalized = normalize_document_markdown("```shellmv portal portal8.6.6 && unzip portal.zip```")
+
+        self.assertIn("```\nshellmv portal portal8.6.6 && unzip portal.zip\n```", normalized)
+
+    def test_parser_records_canonical_content_version(self) -> None:
+        chunks = parse_markdown_content("# 标题\n正文", "测试文档")
+
+        self.assertEqual(
+            chunks[0]["metadata"]["content_format_version"],
+            "markdown-canonical.v1",
+        )
+
     def test_preserves_short_cjk_content(self) -> None:
         chunks = parse_markdown_content("测试", "测试文档")
 

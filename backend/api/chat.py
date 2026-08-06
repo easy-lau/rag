@@ -5,7 +5,6 @@ import json
 import re
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -62,15 +61,29 @@ from core.knowledge_result import run_knowledge_result_stream
 from core.query_semantics import (
     ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION,
     RouteClarificationContinuation,
+    RouteScopePartition,
     content_knowledge_request,
     document_catalog_request_for_question,
     document_catalog_surface_operation,
 )
 from core.authorized_scope import resolve_authorized_scope_clarification
+from core.clarification import (
+    ClarificationContract,
+    build_clarification_state,
+    contract_from_dict,
+    proposed_clarification_event,
+    public_clarification_event,
+    resolve_clarification_reply,
+    validate_clarification_state,
+)
+from core.clarification_presenter import stream_clarification_text
 # Transitional test/import alias only; it points at V2 and is not a legacy
 # execution path.
 run_rag_stream = run_rag_v2_stream
-from core.rag_v2.query_plan import plan_query_locally
+from core.rag_v2.query_plan import (
+    partition_plan_by_applicability_scopes,
+    plan_query_locally,
+)
 from core.rag_v2.task_graph import (
     RagExecutionBundle,
 )
@@ -101,7 +114,6 @@ from core.intent_router import (
 )
 from core.conversation_context import (
     ConversationContext,
-    UNRESOLVED_REFERENCE_MESSAGE,
     apply_active_task_context,
     apply_resolved_turn_semantics,
     apply_v3_catalog_context_selection,
@@ -124,7 +136,12 @@ from core.query_route_compiler import (
 )
 from core.rag_dispatch import select_rag_runner as _select_rag_pipeline_version
 from core.query_route_contract import RouteClarification, RouteUnresolvedSlot
-from core.query_constraints import candidate_section_key, extract_query_constraints
+from core.query_constraints import (
+    ApplicabilityScope,
+    ScopeSourceSpan,
+    candidate_section_key,
+    extract_query_constraints,
+)
 from core.evidence_ambiguity import query_requests_all_scopes
 from core.evidence_status import (
     ANSWER_SOURCE_REQUIRED_EVIDENCE_STATUSES,
@@ -151,13 +168,6 @@ _EVIDENCE_SOURCE_VALIDATION_FAILURE_MESSAGE = (
     "回答依据校验失败，无法可靠生成知识库答案。请稍后重试。"
 )
 _SUCCESSFUL_EVIDENCE_SCOPE_STATUSES = SUCCESSFUL_EVIDENCE_SCOPE_STATUSES
-_EVIDENCE_PENDING_SCHEMA = "rag_pending_clarification.v2"
-_EVIDENCE_PENDING_KIND = "evidence_scope"
-_ROUTE_PENDING_SCHEMA = "rag_pending_clarification.v1"
-_EVIDENCE_EVENT_SCHEMA = "rag_evidence_clarification.v1"
-_EVIDENCE_ACK_SCHEMA = "rag_evidence_clarification_ack.v1"
-
-
 def _search_process_event(
     execution_path: str,
     steps: tuple[tuple[str, str], ...],
@@ -172,14 +182,6 @@ def _search_process_event(
     }
 
 
-_EVIDENCE_DIMENSIONS = {
-    "version",
-    "product",
-    "product_version",
-    "project",
-    "document",
-}
-_EVIDENCE_SELECTION_MODES = {"choice", "refine"}
 _CHOICE_TEXT_FIELDS = (
     "products",
     "canonical_products",
@@ -187,9 +189,6 @@ _CHOICE_TEXT_FIELDS = (
     "projects",
     "filenames",
 )
-_CHOICE_UUID_FIELDS = ("kb_ids", "doc_ids")
-
-
 def _v3_active_timeout_seconds(settings: Any) -> float:
     """Resolve V3's optional per-stage deadline without removing LLM safety.
 
@@ -210,57 +209,119 @@ def _v3_active_timeout_seconds(settings: Any) -> float:
     return max(0.1, float(configured))
 
 
-_PUBLIC_CHOICE_FIELDS = (
-    "key",
-    "label",
-    "products",
-    "versions",
-    "projects",
-    "filenames",
-)
-_ALL_EVIDENCE_SCOPES_RE = re.compile(
-    r"^(?:全部|全都|都要|都查|都看|都对比|全部对比|全部都要|分别对比|"
-    r"所有版本|全部版本|两个都要|两个都看|两个都对比)(?:一下|吧|。|！|!)?$",
-    re.IGNORECASE,
-)
-_CANCEL_EVIDENCE_SCOPE_RE = re.compile(
-    r"^(?:取消|算了|不用了|不查了|先不查|停止|退出)(?:吧|。|！|!)?$",
-    re.IGNORECASE,
-)
-_EXPLICIT_NEW_QUESTION_RE = re.compile(
-    r"[?？]|(?:重新问|新问题|另外|还有个问题|请问|帮我|告诉我|查询|查一下|"
-    r"怎么|如何|为什么|为何|什么|哪些|哪个|哪里|是否|能否|可以吗|标准|规定|"
-    r"配置|解决|介绍|说明|分析|流程|方法|要求)",
-    re.IGNORECASE,
-)
-_SUBSTANTIVE_NEW_QUESTION_RE = re.compile(
-    r"[?？]|(?:重新问|新问题|另外|还有个问题|怎么|如何|为什么|为何|什么|"
-    r"哪些|哪个|哪里|是否|能否|可以吗|标准|规定|配置|解决|介绍|说明|"
-    r"分析|流程|方法|要求)",
-    re.IGNORECASE,
-)
-_INVALID_EVIDENCE_SELECTION_RE = re.compile(
-    r"^(?:随便(?:一个)?|都行|都可以|不知道|不清楚|你看|你决定|任选|任意|"
-    r"选一个|哪个好|哪个都行|这个|那个|上面|下面|版本呢|高版本|低版本|"
-    r"新版本|旧版本|最新版|最新版本|任意版本|某个版本|默认)(?:吧|。|！|!)?$",
-    re.IGNORECASE,
-)
-_EVIDENCE_REFINEMENT_HINT_RE = re.compile(
-    r"(?:\d{2,4}(?:\.\d+){0,4}\s*(?:版|版本)?)|"
-    r"(?:产品|版本|项目|范围|系统|平台|环境|地区|部门|职级)",
-    re.IGNORECASE,
-)
-_ROUTE_CLARIFICATION_CANCEL_RE = re.compile(
-    r"^(?:取消|算了|不用了?|不需要|暂时不需要|先不用|不了|停止|退出)"
-    r"(?:吧|。|！|!)?$",
-    re.IGNORECASE,
-)
-_ROUTE_CLARIFICATION_NEW_QUESTION_RE = re.compile(
-    r"[?？]|(?:换(?:个|一个)(?:问题|话题)|另一个问题|新问题|重新问|"
-    r"请问|帮我|告诉我|怎么|如何|为什么|为何|什么|哪些|哪个|哪里|"
-    r"是否|能否|可以吗|介绍|说明|分析)",
-    re.IGNORECASE,
-)
+def _route_scope_partitions(
+    choices: tuple[dict[str, Any], ...],
+) -> tuple[RouteScopePartition, ...]:
+    """Project server-owned clarification choices into typed scope values."""
+
+    partitions: list[RouteScopePartition] = []
+    for choice in choices:
+        dimensions: dict[str, str | None] = {}
+        for target, fields in (
+            ("product", ("products", "canonical_products")),
+            ("version", ("versions",)),
+            ("project", ("projects",)),
+        ):
+            values: list[str] = []
+            for field in fields:
+                raw_values = choice.get(field, [])
+                if not isinstance(raw_values, (list, tuple)):
+                    return ()
+                for raw in raw_values:
+                    value = str(raw or "").strip()
+                    if value and value not in values:
+                        values.append(value)
+                # ``products`` is the display value and ``canonical_products``
+                # is an internal identity projection; never treat both as
+                # two alternatives of one selected scope.
+                if values:
+                    break
+            if len(values) > 1:
+                return ()
+            dimensions[target] = values[0] if values else None
+        if not any(dimensions.values()):
+            return ()
+        partition = RouteScopePartition(**dimensions)
+        if partition not in partitions:
+            partitions.append(partition)
+    return tuple(partitions)
+
+
+def _trusted_applicability_scopes(
+    continuation: RouteClarificationContinuation | None,
+) -> tuple[ApplicabilityScope, ...]:
+    """Convert typed clarification partitions into hard task scopes.
+
+    Values originate from the already-authorized document catalog stored in
+    the clarification contract.  Synthetic trusted spans preserve that
+    provenance for project constraints; no user reply or rendered label is
+    parsed here.
+    """
+
+    if continuation is None:
+        return ()
+    scopes: list[ApplicabilityScope] = []
+    for partition in continuation.scope_partitions:
+        parts = [
+            ("product", partition.product),
+            ("version", partition.version),
+            ("project", partition.project),
+        ]
+        rendered = " ".join(value for _dimension, value in parts if value)
+        cursor = 0
+        sources: dict[str, ScopeSourceSpan] = {}
+        for dimension, value in parts:
+            if not value:
+                continue
+            start = rendered.find(value, cursor)
+            end = start + len(value)
+            sources[dimension] = ScopeSourceSpan(
+                dimension=dimension,
+                start=start,
+                end=end,
+                span=value,
+                origin="trusted_requirement",
+            )
+            cursor = end
+        scopes.append(ApplicabilityScope(
+            product=partition.product,
+            version=partition.version,
+            project=partition.project,
+            explicit_version=bool(partition.version),
+            explicit_project=bool(partition.project),
+            product_source=sources.get("product"),
+            version_source=sources.get("version"),
+            project_source=sources.get("project"),
+            matched_text=rendered,
+            extraction_reason="server_resolved_clarification_choice",
+        ))
+    return tuple(scopes)
+
+
+def _scope_partitioned_execution_baseline(
+    baseline: ExecutionBaseline,
+    continuation: RouteClarificationContinuation | None,
+) -> ExecutionBaseline:
+    """Bind resolved applicability to an immutable answer plan."""
+
+    scopes = _trusted_applicability_scopes(continuation)
+    if not scopes:
+        return baseline
+    plan = partition_plan_by_applicability_scopes(
+        baseline.plan,
+        scopes,
+        comparison=len(scopes) > 1,
+    )
+    assert continuation is not None
+    return build_execution_baseline(
+        plan=plan,
+        local_surface_plan=baseline.local_surface_plan,
+        contextual_plan=baseline.contextual_plan,
+        question=continuation.semantic_query,
+        standalone_query=continuation.canonical_retrieval_query,
+        route_context=baseline.route_context,
+        deterministic_is_followup=baseline.deterministic_is_followup,
+    )
 
 
 def _route_clarification_continuation(
@@ -275,10 +336,7 @@ def _route_clarification_continuation(
     analysis; only the contract owns their retrieval rendering.
     """
 
-    if (
-        not isinstance(pending_state, dict)
-        or pending_state.get("schema_version") != _ROUTE_PENDING_SCHEMA
-    ):
+    if not isinstance(pending_state, dict):
         return None
     original_query = str(pending_state.get("original_query") or "").strip()
     reply = str(question or "").strip()
@@ -287,37 +345,26 @@ def _route_clarification_continuation(
         or len(original_query) > 12000
         or not reply
         or len(reply) > 1200
-        or _ROUTE_CLARIFICATION_CANCEL_RE.fullmatch(reply)
-        or _ROUTE_CLARIFICATION_NEW_QUESTION_RE.search(reply)
     ):
         return None
-    choices = pending_state.get("choices", [])
-    if not isinstance(choices, list):
+    contract = contract_from_dict(pending_state.get("contract"))
+    if contract is None or contract.adapter != "semantic":
         return None
-    normalized_reply = _normalized_choice_text(reply)
-    mapped_reply = reply
-    for index, raw_choice in enumerate(choices, start=1):
-        if not isinstance(raw_choice, dict):
-            return None
-        key = str(raw_choice.get("key") or "").strip()
-        label = str(raw_choice.get("label") or "").strip()
-        value = str(raw_choice.get("value") or "").strip()
-        if not key or not label or not value:
-            return None
-        aliases = {
-            str(index),
-            _normalized_choice_text(key),
-            _normalized_choice_text(label),
-            _normalized_choice_text(label).replace("版本", ""),
-            _normalized_choice_text(value),
-        }
-        if normalized_reply in aliases:
-            # Persisted choices are display/value hints issued by the server,
-            # never KB/document authorization.  Rendering the full label gives
-            # the ordinary scope parser a source-authored product+version span.
-            mapped_reply = label
-            break
-    stored_answers = pending_state.get("clarification_answers", [])
+    resolution = resolve_clarification_reply(reply, pending_state)
+    if resolution.action not in {"single", "all", "refine"}:
+        return None
+    if resolution.action == "single" and resolution.choices:
+        mapped_reply = str(resolution.choices[0].get("label") or reply)
+    elif resolution.action == "all" and resolution.choices:
+        labels = "；".join(
+            str(choice.get("label") or "").strip()
+            for choice in resolution.choices
+            if str(choice.get("label") or "").strip()
+        )
+        mapped_reply = f"全部范围：{labels}" if labels else reply
+    else:
+        mapped_reply = resolution.answer or reply
+    stored_answers = pending_state.get("prior_answers", [])
     if not isinstance(stored_answers, list):
         return None
     answers: list[str] = []
@@ -331,28 +378,18 @@ def _route_clarification_continuation(
         original_query=original_query,
         current_answer=mapped_reply,
         prior_answers=tuple(answers[-5:]),
+        scope_partitions=_route_scope_partitions(resolution.choices),
     )
 
 
 def _clarification_answer_supplies_scope(
     continuation: RouteClarificationContinuation | None,
 ) -> bool:
-    """Whether a slot reply may be parsed as part of the semantic task.
-
-    Most clarification answers stay source-separated from the immutable task
-    root.  An explicit applicability scope is different: without parsing the
-    selected version (or an explicit request for all versions), the resolver
-    would ask the same question forever.  This projection is still bounded to
-    the server-owned continuation contract and grants no data access.
-    """
+    """Whether the server contract supplied typed applicability partitions."""
 
     if continuation is None:
         return False
-    answer = continuation.current_answer
-    return bool(
-        extract_query_constraints(answer).has_version_constraint
-        or query_requests_all_scopes(answer)
-    )
+    return bool(continuation.scope_partitions)
 
 
 def _semantic_entry(settings: object) -> Literal["legacy", "v3"]:
@@ -401,575 +438,29 @@ def _evidence_scope_reply_display_text(
     return "选择：都对比（" + "；".join(labels) + "）"
 
 
-def _future_expiry(value: object) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > datetime.now(timezone.utc) else None
-
-
-def _parsed_datetime(value: object) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
-        return None
-    return parsed
-
-
-def _strict_string_list(
-    value: object,
-    *,
-    max_items: int,
-    uuid_values: bool = False,
-    require_non_empty: bool = False,
-    max_chars: int = 500,
-) -> tuple[str, ...] | None:
-    if not isinstance(value, list) or len(value) > max_items:
-        return None
-    if require_non_empty and not value:
-        return None
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        if not isinstance(item, str):
-            return None
-        text = item.strip()
-        if not text or len(text) > max_chars:
-            return None
-        if uuid_values:
-            try:
-                text = str(uuid.UUID(text))
-            except (TypeError, ValueError, AttributeError):
-                return None
-        key = text.casefold()
-        if key in seen:
-            return None
-        seen.add(key)
-        normalized.append(text)
-    return tuple(normalized)
-
-
-def _validated_choice_scope_slices(value: object) -> tuple[dict, ...] | None:
-    """Validate exact section/chunk allow-lists carried by one choice.
-
-    ``None`` preserves rolling compatibility with document-level v2 states.
-    A present list is strict: every row binds one authorized KB/document pair
-    to an ingestion section key or exact chunk ids and declares whether that
-    slice proves the choice.  Missing selectors never fall back to a document.
-    """
-
-    if value is None or value == []:
-        return ()
-    if not isinstance(value, list) or not (1 <= len(value) <= 100):
-        return None
-    slices: list[dict] = []
-    seen: set[tuple[str, str, str, tuple[str, ...]]] = set()
-    for raw_slice in value:
-        if not isinstance(raw_slice, dict):
-            return None
-        try:
-            kb_id = str(uuid.UUID(str(raw_slice.get("kb_id") or "")))
-            doc_id = str(uuid.UUID(str(raw_slice.get("doc_id") or "")))
-        except (TypeError, ValueError, AttributeError):
-            return None
-        raw_section_key = raw_slice.get("section_key")
-        if raw_section_key is None:
-            section_key = None
-        elif (
-            not isinstance(raw_section_key, str)
-            or not raw_section_key.strip()
-            or len(raw_section_key.strip()) > 500
-        ):
-            return None
-        else:
-            section_key = raw_section_key.strip()
-        chunk_ids = _strict_string_list(
-            raw_slice.get("chunk_ids", []),
-            max_items=100,
-            uuid_values=True,
-        )
-        is_anchor = raw_slice.get("is_anchor")
-        if chunk_ids is None or not isinstance(is_anchor, bool):
-            return None
-        if section_key is None and not chunk_ids:
-            return None
-        identity = (kb_id, doc_id, section_key or "", tuple(chunk_ids))
-        if identity in seen:
-            return None
-        seen.add(identity)
-        slices.append({
-            "kb_id": kb_id,
-            "doc_id": doc_id,
-            "section_key": section_key,
-            "chunk_ids": list(chunk_ids),
-            "is_anchor": is_anchor,
-        })
-    return tuple(slices)
-
-
-def _scope_slice_identity_tokens(scope_slice: dict) -> set[tuple[str, ...]]:
-    """Return non-cartesian identities used for cross-choice exclusivity."""
-
-    kb_id = str(scope_slice.get("kb_id") or "")
-    doc_id = str(scope_slice.get("doc_id") or "")
-    section_key = str(scope_slice.get("section_key") or "").strip()
-    if section_key:
-        return {(kb_id, doc_id, "section", section_key)}
-    return {
-        (kb_id, doc_id, "chunk", str(chunk_id))
-        for chunk_id in scope_slice.get("chunk_ids", [])
-    }
-
-
-def _validated_evidence_choices(
-    value: object,
-    *,
-    selected_kb_ids: tuple[str, ...],
-) -> tuple[dict, ...] | None:
-    if not isinstance(value, list) or not (2 <= len(value) <= 6):
-        return None
-    prevalidated_doc_ids: list[tuple[str, ...]] = []
-    prevalidated_scope_slices: list[tuple[dict, ...]] = []
-    doc_occurrences: dict[str, int] = {}
-    for raw_choice in value:
-        if not isinstance(raw_choice, dict):
-            return None
-        doc_ids = _strict_string_list(
-            raw_choice.get("doc_ids"),
-            max_items=100,
-            uuid_values=True,
-            require_non_empty=True,
-        )
-        if doc_ids is None:
-            return None
-        scope_slices = _validated_choice_scope_slices(
-            raw_choice.get("scope_slices")
-        )
-        if scope_slices is None:
-            return None
-        prevalidated_doc_ids.append(doc_ids)
-        prevalidated_scope_slices.append(scope_slices)
-        for doc_id in doc_ids:
-            doc_occurrences[doc_id] = doc_occurrences.get(doc_id, 0) + 1
-    selected_kb_set = set(selected_kb_ids)
-    choices: list[dict] = []
-    seen_keys: set[str] = set()
-    all_doc_ids: set[str] = set()
-    for choice_index, raw_choice in enumerate(value):
-        key = raw_choice.get("key")
-        label = raw_choice.get("label")
-        if (
-            not isinstance(key, str)
-            or not re.fullmatch(r"c[1-9]\d*", key.strip(), re.IGNORECASE)
-            or len(key.strip()) > 40
-            or not isinstance(label, str)
-            or not label.strip()
-            or len(label.strip()) > 500
-        ):
-            return None
-        normalized_key = key.strip().casefold()
-        if normalized_key in seen_keys:
-            return None
-        seen_keys.add(normalized_key)
-
-        normalized: dict[str, object] = {
-            "key": normalized_key,
-            "label": label.strip(),
-        }
-        for field in _CHOICE_TEXT_FIELDS:
-            items = _strict_string_list(raw_choice.get(field), max_items=20)
-            if items is None:
-                return None
-            normalized[field] = list(items)
-        for field in _CHOICE_UUID_FIELDS:
-            items = (
-                prevalidated_doc_ids[choice_index]
-                if field == "doc_ids"
-                else _strict_string_list(
-                    raw_choice.get(field),
-                    max_items=100,
-                    uuid_values=True,
-                    require_non_empty=True,
-                )
-            )
-            if items is None:
-                return None
-            normalized[field] = list(items)
-        scope_slices = prevalidated_scope_slices[choice_index]
-        raw_anchor_doc_ids = raw_choice.get("anchor_doc_ids")
-        raw_companion_doc_ids = raw_choice.get("companion_doc_ids")
-        if raw_anchor_doc_ids is None and raw_companion_doc_ids is None:
-            # Rolling v2 compatibility: a document appearing in one choice is
-            # its exclusive anchor; a cross-choice document is a companion.
-            anchor_doc_ids = tuple(
-                doc_id
-                for doc_id in prevalidated_doc_ids[choice_index]
-                if doc_occurrences.get(doc_id) == 1
-            )
-            companion_doc_ids = tuple(
-                doc_id
-                for doc_id in prevalidated_doc_ids[choice_index]
-                if doc_occurrences.get(doc_id, 0) > 1
-            )
-        elif raw_anchor_doc_ids is None or raw_companion_doc_ids is None:
-            return None
-        else:
-            anchor_doc_ids = _strict_string_list(
-                raw_anchor_doc_ids,
-                max_items=100,
-                uuid_values=True,
-                require_non_empty=True,
-            )
-            companion_doc_ids = _strict_string_list(
-                raw_companion_doc_ids,
-                max_items=100,
-                uuid_values=True,
-            )
-            if anchor_doc_ids is None or companion_doc_ids is None:
-                return None
-        doc_id_set = set(prevalidated_doc_ids[choice_index])
-        anchor_set = set(anchor_doc_ids)
-        companion_set = set(companion_doc_ids)
-        if scope_slices:
-            slice_kb_ids = {str(item["kb_id"]) for item in scope_slices}
-            slice_doc_ids = {str(item["doc_id"]) for item in scope_slices}
-            slice_anchor_doc_ids = {
-                str(item["doc_id"])
-                for item in scope_slices
-                if item["is_anchor"] is True
-            }
-            if (
-                not slice_anchor_doc_ids
-                or not slice_kb_ids.issubset(set(normalized["kb_ids"]))
-                or slice_doc_ids != doc_id_set
-                or slice_anchor_doc_ids != anchor_set
-            ):
-                return None
-        if (
-            not anchor_set
-            or anchor_set & companion_set
-            or anchor_set | companion_set != doc_id_set
-            or (
-                not scope_slices
-                and any(doc_occurrences.get(doc_id) != 1 for doc_id in anchor_set)
-            )
-        ):
-            return None
-        normalized["anchor_doc_ids"] = list(anchor_doc_ids)
-        normalized["companion_doc_ids"] = list(companion_doc_ids)
-        if scope_slices:
-            normalized["scope_slices"] = [dict(item) for item in scope_slices]
-        if not set(normalized["kb_ids"]).issubset(selected_kb_set):
-            return None
-        all_doc_ids.update(normalized["doc_ids"])
-        if len(all_doc_ids) > 30:
-            return None
-        choices.append(normalized)
-    # A shared generic slice may accompany several choices, but a slice that
-    # proves one choice must be exclusive at section/chunk granularity.
-    choice_slice_tokens = [
-        {
-            token
-            for scope_slice in choice.get("scope_slices", [])
-            for token in _scope_slice_identity_tokens(scope_slice)
-        }
-        for choice in choices
-    ]
-    for choice_index, choice in enumerate(choices):
-        anchor_tokens = {
-            token
-            for scope_slice in choice.get("scope_slices", [])
-            if scope_slice.get("is_anchor") is True
-            for token in _scope_slice_identity_tokens(scope_slice)
-        }
-        other_tokens = {
-            token
-            for index, tokens in enumerate(choice_slice_tokens)
-            if index != choice_index
-            for token in tokens
-        }
-        if anchor_tokens & other_tokens:
-            return None
-    return tuple(choices)
-
-
-def _validated_evidence_pending_state(value: object) -> dict | None:
-    """Validate v2 state as data only; it never grants route or retrieval access."""
-
-    if not isinstance(value, dict):
-        return None
-    if (
-        value.get("schema_version") != _EVIDENCE_PENDING_SCHEMA
-        or value.get("kind") != _EVIDENCE_PENDING_KIND
-        or value.get("dispatch_authorized") is not False
-    ):
-        return None
-    try:
-        state_id = str(uuid.UUID(str(value.get("state_id") or "")))
-        base_user_message_id = str(
-            uuid.UUID(str(value.get("base_user_message_id") or ""))
-        )
-        clarification_message_id = str(
-            uuid.UUID(str(value.get("clarification_message_id") or ""))
-        )
-    except (TypeError, ValueError, AttributeError):
-        return None
-    original_query = value.get("original_query")
-    clarification_message = value.get("clarification_message")
-    dimension = value.get("dimension")
-    selection_mode = value.get("selection_mode")
-    if selection_mode is None and isinstance(value.get("choices"), list) and value["choices"]:
-        # Compatibility for bounded v2 states created before selection_mode
-        # was introduced. Broad states must always declare refine explicitly.
-        selection_mode = "choice"
-    created_at = _parsed_datetime(value.get("created_at"))
-    expires_at = _future_expiry(value.get("expires_at"))
-    if (
-        not isinstance(original_query, str)
-        or not original_query.strip()
-        or len(original_query.strip()) > 12000
-        or not isinstance(clarification_message, str)
-        or not clarification_message.strip()
-        or len(clarification_message.strip()) > 12000
-        or dimension not in _EVIDENCE_DIMENSIONS
-        or selection_mode not in _EVIDENCE_SELECTION_MODES
-        or created_at is None
-        or expires_at is None
-    ):
-        return None
-    now = datetime.now(timezone.utc)
-    if (
-        created_at > now + timedelta(minutes=5)
-        or expires_at <= created_at
-        or expires_at - created_at > timedelta(hours=24, minutes=5)
-    ):
-        return None
-    selected_kb_ids = _strict_string_list(
-        value.get("selected_kb_ids_snapshot"),
-        max_items=100,
-        uuid_values=True,
-        require_non_empty=True,
-    )
-    if selected_kb_ids is None:
-        return None
-    if selection_mode == "choice":
-        choices = _validated_evidence_choices(
-            value.get("choices"),
-            selected_kb_ids=selected_kb_ids,
-        )
-        if choices is None:
-            return None
-    else:
-        if value.get("choices") != []:
-            return None
-        choices = ()
-    return {
-        "schema_version": _EVIDENCE_PENDING_SCHEMA,
-        "kind": _EVIDENCE_PENDING_KIND,
-        "state_id": state_id,
-        "base_user_message_id": base_user_message_id,
-        "clarification_message_id": clarification_message_id,
-        "original_query": original_query.strip(),
-        "dimension": dimension,
-        "selection_mode": selection_mode,
-        "choices": [dict(choice) for choice in choices],
-        "clarification_message": clarification_message.strip(),
-        "selected_kb_ids_snapshot": list(selected_kb_ids),
-        "created_at": created_at.isoformat(),
-        "expires_at": expires_at.isoformat(),
-        "dispatch_authorized": False,
-    }
-
-
 def _active_pending_route_state(value: object) -> dict | None:
-    if not isinstance(value, dict):
-        return None
-    if value.get("schema_version") == _EVIDENCE_PENDING_SCHEMA:
-        return _validated_evidence_pending_state(value)
-    if value.get("schema_version") != _ROUTE_PENDING_SCHEMA:
-        return None
-    if not str(value.get("state_id") or "").strip():
-        return None
-    # A pending state is never an execution grant.  Missing or truthy values
-    # are treated as malformed rather than being interpreted permissively.
-    if value.get("dispatch_authorized") is not False:
-        return None
-    return value if _future_expiry(value.get("expires_at")) is not None else None
-
-
-def _normalized_choice_text(value: object) -> str:
-    return re.sub(
-        r"[\s\-—_·,，。!！?？:：;；、《》〈〉()（）\[\]【】'\"]+",
-        "",
-        str(value or ""),
-    ).casefold()
-
-
-def _evidence_choice_aliases(choice: dict) -> set[str]:
-    aliases = {
-        _normalized_choice_text(choice.get("key")),
-        _normalized_choice_text(choice.get("label")),
-    }
-    for field in _CHOICE_TEXT_FIELDS:
-        aliases.update(
-            _normalized_choice_text(item)
-            for item in choice.get(field, [])
-            if isinstance(item, str)
-        )
-    aliases.discard("")
-    return aliases
-
-
-def _is_pure_evidence_scope_selection(text: str, choice: dict) -> bool:
-    """Distinguish a short choice from a new question naming that choice."""
-
-    normalized = _normalized_choice_text(text)
-    aliases = _evidence_choice_aliases(choice)
-    if not normalized or not aliases:
-        return False
-    if normalized in aliases:
-        return True
-
-    residual = normalized
-    for alias in sorted(aliases, key=len, reverse=True):
-        residual = residual.replace(alias, "")
-    selection_fillers = re.compile(
-        r"(?:选择|查询|看看|使用|按照|确认|确定|想要|需要|"
-        r"我|请|想|要|选|就|查|看|用|按|这个|那个|该|这篇|那篇|"
-        r"版本|版|产品|项目|范围|的|吧|呀|啊|呢|哦|哈)",
-        re.IGNORECASE,
-    )
-    return not selection_fillers.sub("", residual)
+    # There is one persisted state protocol.  Adapter-specific execution data
+    # is validated by the adapter after this common boundary; it never changes
+    # the user-facing selection semantics or state lifecycle.
+    return validate_clarification_state(value)
 
 
 def _parse_evidence_scope_reply(
     question: str,
     pending_state: dict,
 ) -> _EvidenceScopeReply:
-    """Resolve a bounded reply without treating the pending JSON as authority."""
+    """Resolve every clarification through the shared reply resolver."""
 
-    text = str(question or "").strip()
-    choices = tuple(
-        dict(choice)
-        for choice in pending_state.get("choices", [])
-        if isinstance(choice, dict)
-    )
-    # Pending clarifications are often answered conversationally (for example
-    # ``2吧`` / ``c2。`` / ``第二个吧``). Strip only trailing particles and
-    # punctuation for bounded index recognition.
-    index_text = re.sub(r"(?:吧|呀|啊|呢|哦|哈|[。！!])+$", "", text).strip()
-    if _CANCEL_EVIDENCE_SCOPE_RE.fullmatch(text):
-        return _EvidenceScopeReply("cancel")
-    if pending_state.get("selection_mode") == "refine":
-        if (
-            _INVALID_EVIDENCE_SELECTION_RE.fullmatch(text)
-            or re.fullmatch(r"(?:c\s*)?\d+", index_text, re.IGNORECASE)
-            or re.fullmatch(
-                r"第\s*(?:[1-9]\d*|[一二三四五六七八九十])\s*(?:项|个|版本)?",
-                index_text,
-            )
-        ):
-            return _EvidenceScopeReply("repeat")
-        if _ALL_EVIDENCE_SCOPES_RE.fullmatch(text):
-            return _EvidenceScopeReply("refine")
-        if _SUBSTANTIVE_NEW_QUESTION_RE.search(text):
-            return _EvidenceScopeReply("new_question")
-        if (
-            _EXPLICIT_NEW_QUESTION_RE.search(text) or len(text) > 32
-        ) and not _EVIDENCE_REFINEMENT_HINT_RE.search(text):
-            return _EvidenceScopeReply("new_question")
-        return _EvidenceScopeReply("refine")
-    if _ALL_EVIDENCE_SCOPES_RE.fullmatch(text):
-        return _EvidenceScopeReply("compare_all", choices)
-
-    index_match = re.fullmatch(
-        r"(?:选(?:择)?\s*)?(?:c\s*)?([1-9]\d*)(?:\s*(?:项|个|版本))?",
-        index_text,
-        re.IGNORECASE,
-    ) or re.fullmatch(
-        r"第\s*([1-9]\d*)\s*(?:项|个|版本)?",
-        index_text,
-    )
-    chinese_index_match = re.fullmatch(
-        r"第\s*([一二三四五六七八九十])\s*(?:项|个|版本)?",
-        index_text,
-    )
-    selected_index: int | None = None
-    if index_match:
-        selected_index = int(index_match.group(1))
-    elif chinese_index_match:
-        selected_index = {
-            "一": 1,
-            "二": 2,
-            "三": 3,
-            "四": 4,
-            "五": 5,
-            "六": 6,
-            "七": 7,
-            "八": 8,
-            "九": 9,
-            "十": 10,
-        }[chinese_index_match.group(1)]
-    if selected_index is not None:
-        index = selected_index - 1
-        if 0 <= index < len(choices):
-            return _EvidenceScopeReply("single", (choices[index],))
-        return _EvidenceScopeReply("repeat")
-
-    normalized_reply = _normalized_choice_text(text)
-    matched: list[dict] = []
-    for choice in choices:
-        aliases = _evidence_choice_aliases(choice)
-        if any(
-            normalized_reply == alias
-            or (
-                len(alias) >= 3
-                and alias in normalized_reply
-                and (
-                    alias == _normalized_choice_text(choice.get("label"))
-                    or alias in {
-                        _normalized_choice_text(item)
-                        for item in choice.get("versions", [])
-                        if isinstance(item, str)
-                    }
-                )
-            )
-            for alias in aliases
-        ):
-            matched.append(choice)
-
-    if len(matched) == 1:
-        if _is_pure_evidence_scope_selection(text, matched[0]):
-            return _EvidenceScopeReply("single", (matched[0],))
-        # A substantive question that happens to name one candidate scope is a
-        # fresh request, not a lossy answer to the previous clarification.  It
-        # must be routed and retrieved from the complete authorized KB scope.
-        return _EvidenceScopeReply("new_question")
-    if len(matched) > 1 and re.search(r"对比|比较|区别|差异|分别", text):
-        # An explicit subset comparison is not the same as ``都对比``.  Keep
-        # only the uniquely named choices; otherwise an unmentioned third
-        # product/version/project would silently enter the document filter.
-        return _EvidenceScopeReply("compare_all", tuple(matched))
-    if len(matched) > 1:
-        return _EvidenceScopeReply("repeat")
-    if (
-        _INVALID_EVIDENCE_SELECTION_RE.fullmatch(text)
-        or re.fullmatch(r"(?:c\s*)?\d+", text, re.IGNORECASE)
-        or re.fullmatch(r"\d+(?:\.\d+){0,4}(?:\s*版本)?", text)
-    ):
-        return _EvidenceScopeReply("repeat")
-    if _EXPLICIT_NEW_QUESTION_RE.search(text) or len(text) > 32:
-        return _EvidenceScopeReply("new_question")
-    return _EvidenceScopeReply("new_question")
+    resolution = resolve_clarification_reply(question, pending_state)
+    mapped_action = {
+        "single": "single",
+        "all": "compare_all",
+        "refine": "refine",
+        "cancel": "cancel",
+        "new_question": "new_question",
+        "repeat": "repeat",
+    }[resolution.action]
+    return _EvidenceScopeReply(mapped_action, resolution.choices)
 
 
 def _evidence_scope_filter(
@@ -1044,7 +535,7 @@ def _refined_evidence_query(original_query: str, refinement: str) -> str:
     ).strip()
 
 
-def _evidence_event_pending_state(
+def _clarification_event_pending_state(
     payload: object,
     *,
     original_query: str,
@@ -1052,79 +543,80 @@ def _evidence_event_pending_state(
     base_user_message_id: uuid.UUID,
     clarification_message_id: uuid.UUID,
 ) -> dict | None:
-    """Convert a bounded-choice or broad-refinement event into pending data."""
+    """Persist one server-produced clarification contract as unified state."""
 
     if not isinstance(payload, dict):
         return None
-    if (
-        payload.get("schema_version") != _EVIDENCE_EVENT_SCHEMA
-        or payload.get("needs_clarification") is not True
-        or payload.get("dimension") not in _EVIDENCE_DIMENSIONS
-        or not isinstance(payload.get("question"), str)
-        or not payload["question"].strip()
-    ):
+    contract = contract_from_dict(payload)
+    if contract is None:
         return None
-    selected_snapshot = [str(value) for value in selected_kb_ids]
-    raw_choices = payload.get("choices")
-    if raw_choices == []:
-        selection_mode = "refine"
-        choices: tuple[dict, ...] = ()
-    else:
-        selection_mode = "choice"
-        validated_choices = _validated_evidence_choices(
-            raw_choices,
-            selected_kb_ids=tuple(selected_snapshot),
+    try:
+        return build_clarification_state(
+            contract=contract,
+            original_query=original_query,
+            selected_kb_ids=selected_kb_ids,
+            base_user_message_id=base_user_message_id,
+            clarification_message_id=clarification_message_id,
         )
-        if validated_choices is None:
-            return None
-        choices = validated_choices
-    if not selected_snapshot:
+    except ValueError:
         return None
-    created_at = now_utc()
-    state = {
-        "schema_version": _EVIDENCE_PENDING_SCHEMA,
-        "kind": _EVIDENCE_PENDING_KIND,
-        "state_id": str(uuid.uuid4()),
-        "base_user_message_id": str(base_user_message_id),
-        "clarification_message_id": str(clarification_message_id),
-        "original_query": original_query.strip(),
-        "dimension": payload["dimension"],
-        "selection_mode": selection_mode,
-        "choices": list(choices),
-        "clarification_message": payload["question"].strip(),
-        "selected_kb_ids_snapshot": selected_snapshot,
-        "created_at": created_at.isoformat(),
-        "expires_at": (created_at + timedelta(hours=24)).isoformat(),
-        "dispatch_authorized": False,
-    }
-    return _validated_evidence_pending_state(state)
 
 
-def _evidence_clarification_ack(
+async def _persist_clarification_presentation(
     *,
     conversation_id: uuid.UUID,
-    pending_state: dict,
-    route_state_revision: int,
-) -> dict:
-    """Acknowledge only a clarification state that is already durable."""
+    assistant_message_id: uuid.UUID,
+    turn_id: uuid.UUID | None,
+    content: str,
+    trace_id: str,
+) -> None:
+    """Persist exactly the text emitted by the answer-model presenter.
 
-    return {
-        "type": "evidence_clarification_ack",
-        "schema_version": _EVIDENCE_ACK_SCHEMA,
-        "persisted": True,
-        "pending_state_id": pending_state["state_id"],
-        "clarification_message_id": pending_state["clarification_message_id"],
-        "route_state_revision": route_state_revision,
-        "conversation_id": str(conversation_id),
-        # The choice belongs to the retrieval scope that created it.  The
-        # client reuses this snapshot for the selection request; the server
-        # still re-authorizes every KB/document before execution.  Do not make
-        # a click depend on whichever global KB filters happen to be selected
-        # later in the UI.
-        "selected_kb_ids_snapshot": list(
-            pending_state["selected_kb_ids_snapshot"]
-        ),
-    }
+    The structured state is committed before streaming so the picker is safe
+    to use even when presentation fails.  Text is written afterward from an
+    isolated session; no fixed business sentence is synthesized when the
+    model emits nothing.
+    """
+
+    rendered = str(content or "")
+    if not rendered:
+        return
+    try:
+        async with TaskReadSessionLocal() as session:
+            message = await session.get(Message, assistant_message_id)
+            if (
+                not isinstance(message, Message)
+                or message.conversation_id != conversation_id
+                or message.role != "assistant"
+            ):
+                raise RuntimeError("clarification assistant message is unavailable")
+            message.content = rendered
+            if turn_id is not None:
+                turn = await session.get(ChatTurn, turn_id)
+                if (
+                    not isinstance(turn, ChatTurn)
+                    or turn.conversation_id != conversation_id
+                    or turn.assistant_message_id != assistant_message_id
+                ):
+                    raise RuntimeError("clarification turn is unavailable")
+                turn.answer_content = rendered
+            await session.commit()
+    except Exception as exc:
+        log_exception_safely(
+            logger,
+            "[clarification/presentation persistence] trace=%s conv=%s",
+            trace_id,
+            conversation_id,
+            exc=exc,
+        )
+        trace_event(
+            "clarification.presentation_persistence_failed",
+            trace_id=trace_id,
+            conversation_id=conversation_id,
+            assistant_message_id=assistant_message_id,
+            turn_id=turn_id,
+            error=exc,
+        )
 
 
 def _closed_query_execution_task_contract(
@@ -1172,7 +664,6 @@ async def _route_clarification_response(
     conv: Conversation,
     user: User,
     question: str,
-    clarification_message: str,
     decision_reason: str,
     trace_id: str,
     selected_kb_ids: list[uuid.UUID],
@@ -1183,10 +674,11 @@ async def _route_clarification_response(
     existing_user_message: Message | None = None,
     parent_stream_logging: bool = False,
     original_query: str | None = None,
-    clarification_answers: tuple[str, ...] = (),
+    prior_clarification_answers: tuple[str, ...] = (),
     clarification_choices: tuple[dict, ...] = (),
+    clarification_contract: ClarificationContract | None = None,
 ) -> StreamingResponse:
-    """Persist a versioned, non-executable clarification and stream it.
+    """Persist one structured clarification state and stream its expression.
 
     ``existing_user_message`` is used only by the bounded V3 post-first-SSE
     barrier.  The user turn has already been durably accepted at that point,
@@ -1207,6 +699,37 @@ async def _route_clarification_response(
         if query_execution_gate is not None
         else None
     )
+
+    unresolved = (
+        task_contract.clarification.unresolved
+        if task_contract is not None
+        else ()
+    )
+    if clarification_contract is not None:
+        contract = clarification_contract
+    elif clarification_choices:
+        contract = ClarificationContract(
+            adapter="semantic",
+            dimension=(
+                "product_version"
+                if any("version" in str(item.get("label") or "").casefold() for item in clarification_choices)
+                else "query"
+            ),
+            reason_code="authorized_scope_ambiguous",
+            selection_mode="choice",
+            choices=tuple(clarification_choices),
+        )
+    else:
+        unresolved_role = str(unresolved[0].role if unresolved else "query").strip()
+        dimension = re.sub(r"[^a-z0-9_]+", "_", unresolved_role.casefold()).strip("_") or "query"
+        reason_code = re.sub(r"[^a-z0-9_]+", "_", str(decision_reason or "clarification").casefold()).strip("_") or "clarification"
+        contract = ClarificationContract(
+            adapter="semantic",
+            dimension=dimension[:64],
+            reason_code=reason_code[:64],
+            selection_mode="refine",
+            choices=(),
+        )
 
     input_route_state_revision = (
         _stored_pending_request_identity(turn)[0]
@@ -1241,7 +764,7 @@ async def _route_clarification_response(
             trace_id=trace_id,
             evidence_status="skipped",
             retrieval_executed=False,
-            answer_content=clarification_message,
+            answer_content="",
             answer_sources=[],
             search_snapshot={
                 "schema_version": "rag_search_snapshot.v1",
@@ -1268,65 +791,27 @@ async def _route_clarification_response(
         id=assistant_id,
         conversation_id=conv.id,
         role="assistant",
-        content=clarification_message,
+        content="",
         sources=[],
         **assistant_metadata,
     )
     if turn is not None:
         for key, value in assistant_metadata.items():
             setattr(user_msg, key, value)
-    created_at = now_utc()
-    unresolved = (
-        task_contract.clarification.unresolved if task_contract is not None else ()
-    )
     pending_original_query = str(original_query or question or "").strip()[:12000]
     pending_clarification_answers = [
         str(value).strip()[:1200]
-        for value in clarification_answers[-6:]
+        for value in prior_clarification_answers[-6:]
         if str(value).strip()
     ]
-    pending_clarification_choices: list[dict[str, str]] = []
-    for raw_choice in clarification_choices[:20]:
-        if not isinstance(raw_choice, dict):
-            raise ValueError("route clarification choice must be an object")
-        choice = {
-            "key": str(raw_choice.get("key") or "").strip()[:120],
-            "label": str(raw_choice.get("label") or "").strip()[:500],
-            "value": str(raw_choice.get("value") or "").strip()[:200],
-        }
-        if not all(choice.values()):
-            raise ValueError("route clarification choice is incomplete")
-        pending_clarification_choices.append(choice)
-    conv.pending_route_state = {
-        "schema_version": _ROUTE_PENDING_SCHEMA,
-        "state_id": str(uuid.uuid4()),
-        "base_user_message_id": str(user_msg.id),
-        "clarification_message_id": str(assistant_msg.id),
-        "intent_code": (task_contract.intent_code if task_contract is not None else "other"),
-        # A reply to this clarification is only a slot value.  Persist the
-        # immutable task root and bounded answers so every retry can recompile
-        # the full task instead of retrieving the reply text by itself.
-        "original_query": pending_original_query,
-        "clarification_answers": pending_clarification_answers,
-        # Choices are only input aliases for the next semantic turn.  Scope
-        # UUIDs and execution authorization are deliberately not persisted.
-        "choices": pending_clarification_choices,
-        "clarification_message": clarification_message.strip()[:12000],
-        "unresolved": [
-            {
-                "role": item.role,
-                "reason": item.reason,
-                "candidate_count": len(item.candidate_keys),
-            }
-            for item in unresolved
-        ],
-        "selected_kb_ids_snapshot": [str(value) for value in selected_kb_ids],
-        "created_at": created_at.isoformat(),
-        "expires_at": (created_at + timedelta(hours=24)).isoformat(),
-        # Execution authorization is deliberately not persisted.  A reply must
-        # re-enter the full semantic router and compiler.
-        "dispatch_authorized": False,
-    }
+    conv.pending_route_state = build_clarification_state(
+        contract=contract,
+        original_query=pending_original_query,
+        selected_kb_ids=selected_kb_ids,
+        base_user_message_id=user_msg.id,
+        clarification_message_id=assistant_msg.id,
+        prior_answers=pending_clarification_answers,
+    )
     conv.route_state_revision = int(getattr(conv, "route_state_revision", 0) or 0) + 1
     if existing_user_message is None:
         db.add_all([user_msg, assistant_msg])
@@ -1373,7 +858,7 @@ async def _route_clarification_response(
                 "id": assistant_msg.id,
                 "conversation_id": conv.id,
                 "role": "assistant",
-                "content": clarification_message,
+                "content": "",
                 "sources": [],
                 "tokens": None,
                 **assistant_metadata,
@@ -1404,7 +889,7 @@ async def _route_clarification_response(
 
     if emit_clarification_event:
         trace_event(
-            "intent.clarification_created",
+            "clarification.created",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
@@ -1414,7 +899,7 @@ async def _route_clarification_response(
             unresolved_count=len(unresolved),
             unresolved_roles=[item.role for item in unresolved],
             unresolved_reasons=[item.reason for item in unresolved],
-            **content_fields("clarification", clarification_message),
+            clarification_contract=contract.to_dict(public=False),
         )
     trace_event(
         "chat.response",
@@ -1431,7 +916,7 @@ async def _route_clarification_response(
         direct_evidence_count=0,
         related_reference_count=0,
         sources=[],
-        **content_fields("answer", clarification_message),
+        clarification_contract=contract.to_dict(public=False),
     )
 
     async def generate_clarification():
@@ -1448,6 +933,14 @@ async def _route_clarification_response(
         ]
         if turn is not None:
             events.append(_turn_state_event(turn))
+        events.append(
+            public_clarification_event(
+                final_pending_route_state,
+                route_state_revision=final_route_state_revision,
+                conversation_id=conv.id,
+                persisted=True,
+            )
+        )
         events.append(_search_process_event(
             "clarification",
             (("analyze", "问题分析"), ("generate", "生成")),
@@ -1501,13 +994,28 @@ async def _route_clarification_response(
                 "carryover_source_count": 0,
             },
             {"type": "search_step", "step": "generate", "status": "active"},
-            {"type": "text_delta", "content": clarification_message},
-            {"type": "search_step", "step": "generate", "status": "done"},
-            {"type": "done", "conversation_id": str(conv.id)},
             ]
         )
         for event in events:
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        presentation_parts: list[str] = []
+        async for delta in stream_clarification_text(
+            contract=contract,
+            original_query=pending_original_query,
+            trace_id=trace_id,
+        ):
+            presentation_parts.append(delta)
+            yield f"data: {json.dumps({'type': 'text_delta', 'content': delta}, ensure_ascii=False)}\n\n"
+        presentation_text = "".join(presentation_parts)
+        await _persist_clarification_presentation(
+            conversation_id=conv.id,
+            assistant_message_id=assistant_msg.id,
+            turn_id=turn.id if turn is not None else None,
+            content=presentation_text,
+            trace_id=trace_id,
+        )
+        yield f"data: {json.dumps({'type': 'search_step', 'step': 'generate', 'status': 'done'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conv.id)}, ensure_ascii=False)}\n\n"
 
     clarification_stream = generate_clarification()
     if not parent_stream_logging:
@@ -1523,7 +1031,7 @@ async def _route_clarification_response(
     )
 
 
-async def _evidence_pending_direct_response(
+async def _clarification_control_response(
     *,
     db: AsyncSession,
     conv: Conversation,
@@ -1535,7 +1043,12 @@ async def _evidence_pending_direct_response(
     repeat_reason: str | None = None,
     turn: ChatTurn | None = None,
 ) -> StreamingResponse:
-    """Repeat selectable evidence scopes or cancel them without model dispatch."""
+    """Resolve a clarification control action through the common presenter."""
+
+    pending_contract = contract_from_dict(pending_state.get("contract"))
+    if pending_contract is None:
+        raise ValueError("invalid unified clarification state")
+    presentation_contract = pending_contract
 
     input_route_state_revision = (
         _stored_pending_request_identity(turn)[0]
@@ -1544,27 +1057,26 @@ async def _evidence_pending_direct_response(
     )
 
     if action == "cancel":
-        answer = "已取消上一次资料范围选择。你可以继续提出新问题。"
+        presentation_contract = ClarificationContract(
+            adapter=pending_contract.adapter,
+            dimension=pending_contract.dimension,
+            reason_code="selection_cancelled",
+            selection_mode="refine",
+        )
+        answer = ""
         evidence_status = "skipped"
         decision_reason = "evidence_scope_selection_cancelled"
     else:
         if repeat_reason == "scope_unavailable":
-            # The old labels/filenames belong to the previous KB selection and
-            # must not be replayed after that request scope changes.
-            answer = (
-                "上一次候选资料与当前选择的知识库范围不一致。"
-                "请恢复原知识库范围后重新选择，或直接提出一个新问题。"
+            presentation_contract = ClarificationContract(
+                adapter=pending_contract.adapter,
+                dimension=pending_contract.dimension,
+                reason_code="scope_changed",
+                selection_mode="refine",
             )
         elif repeat_reason == "route_contract_unavailable":
-            answer = (
-                "已识别你补充的资料范围，但本次路由状态无法安全执行。"
-                "请重试刚才的选择；原范围选择已为你保留。"
-            )
-        else:
-            answer = (
-                "没有识别到有效选项，请按编号、版本或完整名称选择。\n"
-                + str(pending_state["clarification_message"])
-            )
+            pass
+        answer = ""
         evidence_status = "needs_clarification"
         decision_reason = "evidence_scope_selection_invalid"
 
@@ -1622,7 +1134,8 @@ async def _evidence_pending_direct_response(
     if turn is not None:
         for key, value in assistant_metadata.items():
             setattr(user_msg, key, value)
-    if action == "cancel":
+    should_clear_state = action == "cancel" or repeat_reason == "scope_unavailable"
+    if should_clear_state:
         current = getattr(conv, "pending_route_state", None)
         if isinstance(current, dict) and current.get("state_id") == pending_state.get("state_id"):
             conv.pending_route_state = None
@@ -1700,25 +1213,27 @@ async def _evidence_pending_direct_response(
     else:
         await commit_with_retry(db)
 
-    if action == "cancel":
+    if should_clear_state:
         trace_event(
-            "evidence.clarification_resolved",
+            "clarification.resolved",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
             pending_state_id=pending_state["state_id"],
-            resolution="cancelled",
+            resolution=(
+                "cancelled" if action == "cancel" else "scope_invalidated"
+            ),
             route_state_revision=conv.route_state_revision,
         )
     else:
         trace_event(
-            "evidence.clarification_repeated",
+            "clarification.repeated",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
             pending_state_id=pending_state["state_id"],
-            dimension=pending_state["dimension"],
-            choice_count=len(pending_state["choices"]),
+            dimension=pending_contract.dimension,
+            choice_count=len(pending_contract.choices),
             reason=repeat_reason or "invalid_selection",
             route_state_revision=conv.route_state_revision,
         )
@@ -1737,7 +1252,7 @@ async def _evidence_pending_direct_response(
         direct_evidence_count=0,
         related_reference_count=0,
         sources=[],
-        **content_fields("answer", answer),
+        clarification_contract=presentation_contract.to_dict(public=False),
     )
 
     async def generate_direct():
@@ -1782,39 +1297,40 @@ async def _evidence_pending_direct_response(
         )
         if action == "repeat" and repeat_reason != "scope_unavailable":
             events.append(
-                {
-                    "type": "evidence_clarification",
-                    "schema_version": _EVIDENCE_EVENT_SCHEMA,
-                    "needs_clarification": True,
-                    "dimension": pending_state["dimension"],
-                    "question": pending_state["clarification_message"],
-                    "reason": "selection_not_recognized",
-                    "choices": pending_state["choices"],
-                }
-            )
-            # This branch commits the repeated assistant message before the
-            # stream starts, and ``pending_state`` was validated as active by
-            # the caller.  The client may therefore enable the choices only
-            # after receiving this durable-state acknowledgement.
-            events.append(
-                _evidence_clarification_ack(
-                    conversation_id=conv.id,
-                    pending_state=pending_state,
+                public_clarification_event(
+                    pending_state,
                     route_state_revision=int(
                         getattr(conv, "route_state_revision", 0) or 0
                     ),
+                    conversation_id=conv.id,
+                    persisted=True,
                 )
             )
         events.extend(
             [
                 {"type": "search_step", "step": "generate", "status": "active"},
-                {"type": "text_delta", "content": answer},
-                {"type": "search_step", "step": "generate", "status": "done"},
-                {"type": "done", "conversation_id": str(conv.id)},
             ]
         )
         for event in events:
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        presentation_parts: list[str] = []
+        async for delta in stream_clarification_text(
+            contract=presentation_contract,
+            original_query=str(pending_state.get("original_query") or question),
+            trace_id=trace_id,
+        ):
+            presentation_parts.append(delta)
+            yield f"data: {json.dumps({'type': 'text_delta', 'content': delta}, ensure_ascii=False)}\n\n"
+        presentation_text = "".join(presentation_parts)
+        await _persist_clarification_presentation(
+            conversation_id=conv.id,
+            assistant_message_id=assistant_msg.id,
+            turn_id=turn.id if turn is not None else None,
+            content=presentation_text,
+            trace_id=trace_id,
+        )
+        yield f"data: {json.dumps({'type': 'search_step', 'step': 'generate', 'status': 'done'}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'conversation_id': str(conv.id)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         stream_in_conversation_log(generate_direct(), conversation_id=conv.id),
@@ -1879,6 +1395,7 @@ def _bounded_source_identity_snapshot(value: object) -> dict | None:
         "constraint_status",
         "constraint_reason",
         "evidence_role",
+        "source_verification",
         "rerank_status",
         "rerank_reason",
         "active_channels",
@@ -1928,6 +1445,13 @@ def _bounded_search_snapshot(payload: object) -> dict:
         "trace_id",
         "answer_provenance",
         "general_fallback_mode",
+        "grounding_policy",
+        "version_resolution_mode",
+        "evidence_execution_strategy",
+        "model_adjudication_state",
+        "unverified_generation",
+        "source_verification",
+        "unverified_reference_count",
     ):
         if key in data:
             value = data.get(key)
@@ -1942,6 +1466,47 @@ def _bounded_search_snapshot(payload: object) -> dict:
                     "no_hit",
                     "no_hit_or_insufficient",
                 }:
+                    continue
+            elif key == "grounding_policy":
+                value = str(value or "").strip().casefold()
+                if value not in {"required", "preferred", "none"}:
+                    continue
+            elif key == "version_resolution_mode":
+                value = str(value or "").strip().casefold()
+                if value not in {"exact", "partition", "compare", "all", "unknown"}:
+                    continue
+            elif key == "evidence_execution_strategy":
+                value = str(value or "").strip().casefold()
+                if value not in {
+                    "deterministic",
+                    "bounded_small_document",
+                    "joint_adjudication",
+                    "no_candidates",
+                }:
+                    continue
+            elif key == "model_adjudication_state":
+                value = str(value or "").strip().casefold()
+                if value not in {
+                    "not_requested",
+                    "skipped",
+                    "no_candidates",
+                    "succeeded",
+                    "failed",
+                }:
+                    continue
+            elif key == "unverified_generation":
+                if not isinstance(value, bool):
+                    continue
+            elif key == "source_verification":
+                value = str(value or "").strip().casefold()
+                if value not in {"verified", "unverified"}:
+                    continue
+            elif key == "unverified_reference_count":
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value < 0
+                ):
                     continue
             counters[key] = value
     return {
@@ -2075,6 +1640,7 @@ async def _validate_stream_answer_sources(
     raw_results: object,
     selected_kb_ids: list[uuid.UUID],
     read_session_factory: ReadSessionFactory | None = None,
+    allow_unverified: bool = False,
 ) -> tuple[list[dict], set[tuple[uuid.UUID, uuid.UUID]], str | None]:
     """Validate and refresh producer-provided answer evidence.
 
@@ -2135,12 +1701,27 @@ async def _validate_stream_answer_sources(
         if identity in seen_source_identities:
             return [], set(), "answer_source_duplicate"
         seen_source_identities.add(identity)
-        role = raw_source.get("evidence_role")
-        if role is not None and str(role).strip().casefold() not in {
+        role = str(raw_source.get("evidence_role") or "").strip().casefold()
+        if role and role not in {
             "direct",
             "related",
+            "unverified",
         }:
             return [], set(), "answer_source_role_invalid"
+        verification = str(
+            raw_source.get("source_verification") or "verified"
+        ).strip().casefold()
+        if verification not in {"verified", "unverified"}:
+            return [], set(), "answer_source_verification_invalid"
+        is_unverified = role == "unverified" or verification == "unverified"
+        if is_unverified and not (
+            role == "unverified"
+            and verification == "unverified"
+            and allow_unverified
+        ):
+            return [], set(), "unverified_answer_source_not_allowed"
+        if allow_unverified and not is_unverified:
+            return [], set(), "verified_source_in_unverified_generation"
         parsed_sources.append((dict(raw_source), identity))
 
     # A source claimed as generation context must also be present in the
@@ -2523,9 +2104,10 @@ def _read_evidence_status(value: object) -> str | None:
     return canonical_evidence_status(value) or "error"
 
 
-async def _historical_evidence_clarification(
+async def _historical_clarification(
     pending_route_state: object,
     *,
+    conversation_id: uuid.UUID | None,
     route_state_revision: object,
     assistant_message_ids: set[str],
     accessible_set: set[uuid.UUID] | None,
@@ -2542,9 +2124,12 @@ async def _historical_evidence_clarification(
     state = _active_pending_route_state(pending_route_state)
     if (
         state is None
-        or state.get("schema_version") != _EVIDENCE_PENDING_SCHEMA
+        or conversation_id is None
         or state.get("clarification_message_id") not in assistant_message_ids
     ):
+        return None
+    contract = contract_from_dict(state.get("contract"))
+    if contract is None:
         return None
     try:
         revision = int(route_state_revision or 0)
@@ -2558,7 +2143,7 @@ async def _historical_evidence_clarification(
     if accessible_set is not None and not selected_kb_ids.issubset(accessible_set):
         return None
 
-    choices = state["choices"]
+    choices = contract.choices
     referenced_doc_ids = {
         uuid.UUID(value)
         for choice in choices
@@ -2587,25 +2172,13 @@ async def _historical_evidence_clarification(
             ):
                 return None
 
-    public_choices = []
-    for choice in choices:
-        public_choice = {}
-        for field in _PUBLIC_CHOICE_FIELDS:
-            value = choice[field]
-            public_choice[field] = list(value) if isinstance(value, list) else value
-        public_choices.append(public_choice)
-    return {
-        "schema_version": _EVIDENCE_EVENT_SCHEMA,
-        "needs_clarification": True,
-        "dimension": state["dimension"],
-        "question": state["clarification_message"],
-        "choices": public_choices,
-        "acknowledged": True,
-        "persisted": True,
-        "pending_state_id": state["state_id"],
-        "clarification_message_id": state["clarification_message_id"],
-        "route_state_revision": revision,
-    }
+    event = public_clarification_event(
+        state,
+        route_state_revision=revision,
+        conversation_id=conversation_id,
+        persisted=True,
+    )
+    return event
 
 
 async def _messages_with_current_source_scope(
@@ -2625,8 +2198,9 @@ async def _messages_with_current_source_scope(
 
     accessible = await get_accessible_kb_ids(user, db)
     accessible_set = set(accessible) if accessible is not None else None
-    historical_clarification = await _historical_evidence_clarification(
+    historical_clarification = await _historical_clarification(
         pending_route_state,
+        conversation_id=(rows[0].conversation_id if rows else None),
         route_state_revision=route_state_revision,
         assistant_message_ids={
             str(row.id) for row in rows if row.role == "assistant"
@@ -2728,6 +2302,10 @@ async def _messages_with_current_source_scope(
                     "trace_id",
                     "answer_provenance",
                     "general_fallback_mode",
+                    "grounding_policy",
+                    "version_resolution_mode",
+                    "evidence_execution_strategy",
+                    "model_adjudication_state",
                 ):
                     value = counters.get(key)
                     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -2743,6 +2321,33 @@ async def _messages_with_current_source_scope(
                                 "off",
                                 "no_hit",
                                 "no_hit_or_insufficient",
+                            }:
+                                continue
+                        elif key == "grounding_policy":
+                            value = str(value or "").strip().casefold()
+                            if value not in {"required", "preferred", "none"}:
+                                continue
+                        elif key == "version_resolution_mode":
+                            value = str(value or "").strip().casefold()
+                            if value not in {"exact", "partition", "compare", "all", "unknown"}:
+                                continue
+                        elif key == "evidence_execution_strategy":
+                            value = str(value or "").strip().casefold()
+                            if value not in {
+                                "deterministic",
+                                "bounded_small_document",
+                                "joint_adjudication",
+                                "no_candidates",
+                            }:
+                                continue
+                        elif key == "model_adjudication_state":
+                            value = str(value or "").strip().casefold()
+                            if value not in {
+                                "not_requested",
+                                "skipped",
+                                "no_candidates",
+                                "succeeded",
+                                "failed",
                             }:
                                 continue
                         safe_counters[key] = value
@@ -3757,12 +3362,59 @@ async def send_message(
         conv.pending_route_state = None
         conv.route_state_revision = int(getattr(conv, "route_state_revision", 0) or 0) + 1
 
-    evidence_pending_state = (
-        pending_route_state
-        if pending_route_state
-        and pending_route_state.get("schema_version") == _EVIDENCE_PENDING_SCHEMA
+    pending_contract = (
+        contract_from_dict(pending_route_state.get("contract"))
+        if isinstance(pending_route_state, dict)
         else None
     )
+    evidence_pending_state = (
+        pending_route_state
+        if pending_contract is not None and pending_contract.adapter == "evidence"
+        else None
+    )
+    semantic_pending_state = (
+        pending_route_state
+        if pending_contract is not None and pending_contract.adapter == "semantic"
+        else None
+    )
+    if pending_route_state is not None and set(
+        pending_route_state.get("selected_kb_ids_snapshot", [])
+    ) != {str(value) for value in payload.knowledge_base_ids}:
+        return await _clarification_control_response(
+            db=db,
+            conv=conv,
+            user=user,
+            question=payload.question,
+            pending_state=pending_route_state,
+            trace_id=trace_id,
+            action="repeat",
+            repeat_reason="scope_unavailable",
+            turn=durable_turn,
+        )
+    semantic_reply = (
+        resolve_clarification_reply(payload.question, semantic_pending_state)
+        if semantic_pending_state is not None
+        else None
+    )
+    if semantic_reply is not None and semantic_reply.action in {"repeat", "cancel"}:
+        return await _clarification_control_response(
+            db=db,
+            conv=conv,
+            user=user,
+            question=payload.question,
+            pending_state=semantic_pending_state,
+            trace_id=trace_id,
+            action=semantic_reply.action,
+            turn=durable_turn,
+        )
+    if semantic_reply is not None and semantic_reply.action == "new_question":
+        conv.pending_route_state = None
+        conv.route_state_revision = int(
+            getattr(conv, "route_state_revision", 0) or 0
+        ) + 1
+        pending_route_state = None
+        semantic_pending_state = None
+        pending_contract = None
     evidence_reply = (
         _parse_evidence_scope_reply(payload.question, evidence_pending_state)
         if evidence_pending_state is not None
@@ -3778,20 +3430,6 @@ async def send_message(
         else None
     )
     evidence_repeat_reason = None
-    if evidence_pending_state is not None and evidence_reply is not None:
-        pending_kb_snapshot = set(
-            evidence_pending_state.get("selected_kb_ids_snapshot", [])
-        )
-        current_kb_snapshot = {str(value) for value in payload.knowledge_base_ids}
-        if (
-            pending_kb_snapshot != current_kb_snapshot
-            and evidence_reply.action
-            in {"single", "compare_all", "refine", "repeat"}
-        ):
-            if evidence_reply.action != "repeat":
-                evidence_reply = _EvidenceScopeReply("repeat")
-                evidence_filter = None
-            evidence_repeat_reason = "scope_unavailable"
     if (
         evidence_reply is not None
         and evidence_reply.action in {"single", "compare_all"}
@@ -3941,7 +3579,7 @@ async def send_message(
     )
     if expired_pending_state:
         trace_event(
-            "intent.clarification_expired",
+            "clarification.expired",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
@@ -3965,7 +3603,7 @@ async def send_message(
 
     if evidence_pending_state is not None and evidence_reply is not None:
         if evidence_reply.action == "cancel":
-            return await _evidence_pending_direct_response(
+            return await _clarification_control_response(
                 db=db,
                 conv=conv,
                 user=user,
@@ -3976,7 +3614,7 @@ async def send_message(
                 turn=durable_turn,
             )
         if evidence_reply.action == "repeat":
-            return await _evidence_pending_direct_response(
+            return await _clarification_control_response(
                 db=db,
                 conv=conv,
                 user=user,
@@ -4021,7 +3659,6 @@ async def send_message(
             conv=conv,
             user=user,
             question=payload.question,
-            clarification_message=UNRESOLVED_REFERENCE_MESSAGE,
             decision_reason="unresolved_reference",
             trace_id=trace_id,
             selected_kb_ids=payload.knowledge_base_ids,
@@ -4031,7 +3668,7 @@ async def send_message(
         )
         if cleared_evidence_state_id is not None:
             trace_event(
-                "evidence.clarification_resolved",
+                "clarification.resolved",
                 trace_id=trace_id,
                 conversation_id=conv.id,
                 user_id=user.id,
@@ -4107,7 +3744,7 @@ async def send_message(
                 conv.id,
                 exc=exc,
             )
-            return await _evidence_pending_direct_response(
+            return await _clarification_control_response(
                 db=db,
                 conv=conv,
                 user=user,
@@ -4267,27 +3904,22 @@ async def send_message(
             decision_reason=decision.decision_reason,
         )
         if not task_contract.dispatch_authorized:
-            clarification_message = (
-                route_task_contract.clarification.question.strip()
-                or UNRESOLVED_REFERENCE_MESSAGE
-            )
             response = await _route_clarification_response(
                 db=db,
                 conv=conv,
                 user=user,
                 question=payload.question,
-                clarification_message=clarification_message,
                 decision_reason=route_task_contract.decision_reason,
                 trace_id=trace_id,
                 selected_kb_ids=payload.knowledge_base_ids,
                 task_contract=route_task_contract,
                 turn=durable_turn,
                 original_query=(route_original_query or routing_question),
-                clarification_answers=route_clarification_answers,
+                prior_clarification_answers=route_clarification_answers,
             )
             if cleared_evidence_state_id is not None:
                 trace_event(
-                    "evidence.clarification_resolved",
+                    "clarification.resolved",
                     trace_id=trace_id,
                     conversation_id=conv.id,
                     user_id=user.id,
@@ -4444,14 +4076,14 @@ async def send_message(
             else payload.question
         )
     ).strip()
+    # The clarification contract keeps the immutable answer target separate
+    # from its retrieval rendering.  Scope selections are applied below as
+    # typed task partitions; the punctuation-bearing rendered query is never
+    # fed back into either semantic analyzer or local planner.
     semantic_task_query = (
-        route_continuation.canonical_retrieval_query
-        if _clarification_answer_supplies_scope(route_continuation)
-        else (
-            route_continuation.semantic_query
-            if route_continuation is not None
-            else effective_retrieval_query
-        )
+        route_continuation.semantic_query
+        if route_continuation is not None
+        else effective_retrieval_query
     ).strip()
     verified_followup_baseline = bool(
         conversation_context.active_task is None
@@ -4515,6 +4147,11 @@ async def send_message(
             route_context=analysis_route_context,
             deterministic_is_followup=conversation_context.is_followup,
         )
+        if _clarification_answer_supplies_scope(route_continuation):
+            execution_baseline = _scope_partitioned_execution_baseline(
+                execution_baseline,
+                route_continuation,
+            )
         execution_bundle = execution_baseline.execution_bundle
         query_execution_gate = evaluate_query_execution_gate(execution_baseline)
         v3_mode = (
@@ -4648,7 +4285,6 @@ async def send_message(
                 conv=conv,
                 user=user,
                 question=payload.question,
-                clarification_message=query_execution_gate.clarification_question,
                 decision_reason=query_execution_gate.decision_reason,
                 trace_id=trace_id,
                 selected_kb_ids=payload.knowledge_base_ids,
@@ -4656,11 +4292,11 @@ async def send_message(
                 query_execution_gate=query_execution_gate,
                 turn=durable_turn,
                 original_query=(route_original_query or execution_question),
-                clarification_answers=route_clarification_answers,
+                prior_clarification_answers=route_clarification_answers,
             )
             if cleared_evidence_state_id is not None:
                 trace_event(
-                    "evidence.clarification_resolved",
+                    "clarification.resolved",
                     trace_id=trace_id,
                     conversation_id=conv.id,
                     user_id=user.id,
@@ -4799,15 +4435,21 @@ async def send_message(
     if durable_turn is not None:
         durable_turn.user_message_id = user_msg.id
     current_pending = getattr(conv, "pending_route_state", None)
+    current_pending_contract = (
+        contract_from_dict(current_pending.get("contract"))
+        if isinstance(current_pending, dict)
+        else None
+    )
     if (
         isinstance(current_pending, dict)
-        and current_pending.get("schema_version") == _ROUTE_PENDING_SCHEMA
+        and current_pending_contract is not None
+        and current_pending_contract.adapter == "semantic"
     ):
         previous_state_id = current_pending.get("state_id")
         conv.pending_route_state = None
         conv.route_state_revision = int(getattr(conv, "route_state_revision", 0) or 0) + 1
         trace_event(
-            "intent.clarification_resolved",
+            "clarification.resolved",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
@@ -4824,7 +4466,7 @@ async def send_message(
     await db.commit()
     if cleared_evidence_state_id is not None:
         trace_event(
-            "evidence.clarification_resolved",
+            "clarification.resolved",
             trace_id=trace_id,
             conversation_id=conv.id,
             user_id=user.id,
@@ -4986,6 +4628,7 @@ async def send_message(
         knowledge_capability_authorized = False
         execution_clarification_role = QUERY_EXECUTION_UNRESOLVED_ROLE
         execution_clarification_choices: tuple[dict, ...] = ()
+        execution_clarification_contract: ClarificationContract | None = None
         full_response = []
         sources = []
         tokens = None
@@ -5010,8 +4653,8 @@ async def send_message(
         evidence_source_validation_locked = False
         evidence_source_validation_failure_emitted = False
         pending_done_chunk = None
-        evidence_clarification_payload = None
-        evidence_clarification_locked = False
+        clarification_payload = None
+        clarification_locked = False
         search_snapshot: dict | None = None
         # 会话和用户消息已提交。先告知前端会话 ID，用户在首条回答完成前停止时也能继续该会话。
         yield "data: " + json.dumps(
@@ -5314,8 +4957,18 @@ async def send_message(
                 ):
                     v3_adopted = v3_decision.applied
                     execution_baseline = v3_decision.selected_baseline
-                    execution_bundle = v3_decision.execution_bundle
-                    query_execution_gate = v3_decision.query_execution_gate
+                    if (
+                        v3_decision.applied
+                        and _clarification_answer_supplies_scope(route_continuation)
+                    ):
+                        execution_baseline = _scope_partitioned_execution_baseline(
+                            execution_baseline,
+                            route_continuation,
+                        )
+                    execution_bundle = execution_baseline.execution_bundle
+                    query_execution_gate = evaluate_query_execution_gate(
+                        execution_baseline
+                    )
                     if v3_decision.applied:
                         if v3_decision.compilation is None:
                             raise ValueError(
@@ -5557,10 +5210,13 @@ async def send_message(
                     error=exc,
                 )
             if scope_clarification is not None:
+                execution_clarification_contract = scope_clarification.to_contract()
                 execution_baseline = build_execution_clarification_baseline(
                     baseline=execution_baseline,
                     reason="authorized_scope_ambiguous",
-                    clarification_question=scope_clarification.question,
+                    clarification_question=(
+                        execution_clarification_contract.reason_code
+                    ),
                 )
                 execution_bundle = execution_baseline.execution_bundle
                 query_execution_gate = QueryExecutionGate(
@@ -5658,7 +5314,6 @@ async def send_message(
                 conv=conv,
                 user=user,
                 question=payload.question,
-                clarification_message=query_execution_gate.clarification_question,
                 decision_reason=query_execution_gate.decision_reason,
                 trace_id=trace_id,
                 selected_kb_ids=payload.knowledge_base_ids,
@@ -5668,8 +5323,9 @@ async def send_message(
                 existing_user_message=user_msg,
                 parent_stream_logging=True,
                 original_query=(route_original_query or effective_retrieval_query),
-                clarification_answers=route_clarification_answers,
+                prior_clarification_answers=route_clarification_answers,
                 clarification_choices=execution_clarification_choices,
+                clarification_contract=execution_clarification_contract,
             )
             async for clarification_chunk in clarification_response.body_iterator:
                 clarification_text = (
@@ -5823,21 +5479,24 @@ async def send_message(
                     pending_done_chunk = chunk
                     continue
                 if event_type == "text_delta":
-                    if (
-                        evidence_clarification_locked
-                        or evidence_source_validation_locked
-                    ):
-                        # Chat emits the trusted clarification question exactly
-                        # once when the gate event arrives.  A failed source
-                        # validation similarly emits one deterministic message.
-                        # Any later model/custom-producer delta is suppressed.
+                    if evidence_source_validation_locked:
+                        # A failed source validation emits one trusted technical
+                        # state; any later producer delta is suppressed.
                         continue
                     full_response.append(str(data.get("content") or ""))
-                elif event_type == "evidence_clarification":
-                    if evidence_clarification_payload is not None:
+                elif event_type == "clarification_state":
+                    if clarification_payload is not None:
                         continue
-                    evidence_clarification_payload = data
-                    evidence_clarification_locked = True
+                    clarification_contract = contract_from_dict(data)
+                    if (
+                        clarification_contract is None
+                        or data.get("status") != "proposed"
+                    ):
+                        raise ValueError("Pipeline 返回了无效的统一澄清合同")
+                    clarification_payload = clarification_contract.to_dict(
+                        public=False
+                    )
+                    clarification_locked = True
                     # The clarification event is the final generation gate.
                     # Fail closed even if a rolling/custom producer emitted a
                     # contradictory hit status or answer_sources beforehand.
@@ -5847,27 +5506,17 @@ async def send_message(
                     hit_count = 0
                     direct_evidence_count = 0
                     full_response.clear()
-                    # Forward the structured gate, then synthesize one exact
-                    # clarification delta. The Pipeline's following delta is
-                    # ignored by the locked text branch above.
-                    yield chunk
-                    clarification_question = str(data.get("question") or "").strip()
-                    if clarification_question:
-                        full_response.append(clarification_question)
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                {
-                                    "type": "text_delta",
-                                    "content": clarification_question,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n\n"
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            proposed_clarification_event(clarification_contract),
+                            ensure_ascii=False,
                         )
+                        + "\n\n"
+                    )
                     continue
                 elif event_type == "search_results":
-                    if evidence_clarification_locked:
+                    if clarification_locked:
                         previous_retrieval_executed = retrieval_executed
                         data = _clarification_locked_search_results(
                             data,
@@ -5977,6 +5626,13 @@ async def send_message(
                             raw_results=display_results,
                             selected_kb_ids=payload.knowledge_base_ids,
                             read_session_factory=TaskReadSessionLocal,
+                            allow_unverified=bool(
+                                normalized_evidence_status == "partial"
+                                and data.get("unverified_generation") is True
+                                and str(
+                                    data.get("source_verification") or ""
+                                ).strip().casefold() == "unverified"
+                            ),
                         )
                         if (
                             evidence_filter is not None
@@ -6088,7 +5744,7 @@ async def send_message(
                         or (answer_source_required and not answer_source_items)
                     )
                     if (
-                        not evidence_clarification_locked
+                        not clarification_locked
                         and (
                             source_validation_failed
                             or evidence_source_validation_locked
@@ -6455,9 +6111,9 @@ async def send_message(
                     save_db.add(ai_msg)
 
                 new_pending_state = None
-                if evidence_clarification_payload is not None:
-                    new_pending_state = _evidence_event_pending_state(
-                        evidence_clarification_payload,
+                if clarification_payload is not None:
+                    new_pending_state = _clarification_event_pending_state(
+                        clarification_payload,
                         original_query=(
                             effective_retrieval_query
                             or conversation_context.standalone_query
@@ -6466,9 +6122,8 @@ async def send_message(
                         base_user_message_id=user_msg.id,
                         clarification_message_id=ai_msg.id,
                     )
-                    raw_choices = evidence_clarification_payload.get("choices")
-                    if raw_choices and new_pending_state is None:
-                        raise ValueError("Pipeline 返回了无效的证据范围澄清选项")
+                    if new_pending_state is None:
+                        raise ValueError("Pipeline 返回了无效的统一澄清合同")
 
                 normalized_final_evidence_status = str(
                     evidence_status or ""
@@ -6612,7 +6267,7 @@ async def send_message(
                 )
             if resolved_pending_state_id is not None:
                 trace_event(
-                    "evidence.clarification_resolved",
+                    "clarification.resolved",
                     trace_id=trace_id,
                     conversation_id=conv.id,
                     user_id=user.id,
@@ -6636,13 +6291,19 @@ async def send_message(
                 )
             if created_pending_state is not None:
                 trace_event(
-                    "evidence.clarification_created",
+                    "clarification.created",
                     trace_id=trace_id,
                     conversation_id=conv.id,
                     user_id=user.id,
                     pending_state_id=created_pending_state["state_id"],
-                    dimension=created_pending_state["dimension"],
-                    choice_count=len(created_pending_state["choices"]),
+                    dimension=contract_from_dict(
+                        created_pending_state["contract"]
+                    ).dimension,
+                    choice_count=len(
+                        contract_from_dict(
+                            created_pending_state["contract"]
+                        ).choices
+                    ),
                     selected_kb_count=len(
                         created_pending_state["selected_kb_ids_snapshot"]
                     ),
@@ -6651,10 +6312,7 @@ async def send_message(
                         "original_query",
                         created_pending_state["original_query"],
                     ),
-                    **content_fields(
-                        "clarification",
-                        created_pending_state["clarification_message"],
-                    ),
+                    clarification_contract=created_pending_state["contract"],
                 )
             # 只有回答和路由统计真正提交成功后才把 Trace 标成 success，避免
             # “调用链成功但历史消息不存在”的竞态。
@@ -6784,16 +6442,16 @@ async def send_message(
                     error=stats_exc,
                 )
         if created_pending_state is not None:
-            # ``evidence_clarification`` is streamed as soon as the pipeline
-            # closes generation, but choices must remain disabled until the
-            # assistant message and pending state have committed together.
+            # The proposed state is streamed when ambiguity is discovered;
+            # choices become active only after message and state commit.
             yield (
                 "data: "
                 + json.dumps(
-                    _evidence_clarification_ack(
-                        conversation_id=conv.id,
-                        pending_state=created_pending_state,
+                    public_clarification_event(
+                        created_pending_state,
                         route_state_revision=persisted_route_state_revision,
+                        conversation_id=conv.id,
+                        persisted=True,
                     ),
                     ensure_ascii=False,
                 )

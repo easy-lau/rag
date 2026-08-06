@@ -17,13 +17,17 @@ from core.query_route_contract import parse_rag_route_decision
 from core.rag_v2.pipeline import (
     AnchorRetrievalSnapshot,
     _admit_and_bind_expansion_candidates,
+    _evidence_execution_decision,
     _should_use_general_model_fallback,
     _should_model_adjudicate_evidence,
     retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
 )
 from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
-from core.rag_v2.query_plan import plan_query_locally
+from core.rag_v2.query_plan import (
+    partition_plan_by_applicability_scopes,
+    plan_query_locally,
+)
 from core.rag_v2.task_graph import (
     compile_rag_execution_bundle,
     compile_retrieval_task_graph,
@@ -61,6 +65,7 @@ def _task_contract(
     requirements=None,
     relation: str = "new",
     query_mode: str | None = None,
+    evidence_scope: str = "enterprise_kb",
 ):
     mode = query_mode or ("contextualize" if relation != "new" else "current")
     contextual = mode == "contextualize"
@@ -70,7 +75,7 @@ def _task_contract(
             "readiness": "ready",
             "intent_code": "knowledge_qa",
             "relation": relation,
-            "evidence_scope": "enterprise_kb",
+            "evidence_scope": evidence_scope,
             "query_resolution": {
                 "mode": mode,
                 "context_turn_keys": ["t1"] if contextual else [],
@@ -396,6 +401,117 @@ class _HangingClient:
 
 
 class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
+    def test_execution_strategy_uses_evidence_topology_not_question_terms(self) -> None:
+        doc_id = str(uuid.uuid4())
+        candidates = [
+            {
+                "id": f"chunk-{index}",
+                "doc_id": doc_id,
+                "content": f"第{index + 1}段制度正文",
+                "full_document_chunk_count": 3,
+                "candidate_origins": (
+                    ["small_document_full", "initial_retrieval"]
+                    if index == 1
+                    else ["small_document_full"]
+                ),
+            }
+            for index in range(3)
+        ]
+
+        decision = _evidence_execution_decision(
+            deterministic_closed=False,
+            candidates=candidates,
+            full_document_candidates=candidates,
+        )
+
+        self.assertEqual(decision.strategy, "bounded_small_document")
+        self.assertEqual(decision.eligible_candidate_indexes, (1, 2, 3))
+        self.assertEqual(decision.anchor_candidate_indexes, (2,))
+
+    async def test_small_document_adjudication_failure_keeps_unverified_source_context(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        full_document = _full_document(
+            kb_id=kb_id,
+            doc_id=doc_id,
+            filename="内部制度.docx",
+            contents=[
+                "第一章 制度适用与基本原则。",
+                "特殊场景应结合审批记录，由责任部门复核后处理。",
+            ],
+        )
+        initial = dict(full_document[0])
+        initial.update(
+            vector_score=0.91,
+            vector_rank=1,
+            active_channels=["vector"],
+        )
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            rag_v2_model_evidence_adjudication_enabled=True,
+            rag_v2_model_evidence_adjudication_timeout_seconds=1,
+        )
+        failed = SimpleNamespace(
+            succeeded=False,
+            error="TimeoutError: evidence adjudication timed out",
+        )
+
+        with (
+            patch(
+                "core.rag_v2.pipeline.select_small_document_evidence_with_coverage",
+                new=AsyncMock(return_value=failed),
+            ) as small_adjudicator,
+            patch(
+                "core.rag_v2.pipeline.joint_rerank_with_coverage",
+                new=AsyncMock(),
+            ) as joint_adjudicator,
+        ):
+            payloads, client, *_ = await self._run(
+                question="遇到例外时应该怎么办",
+                kb_id=kb_id,
+                initial=[initial],
+                full_document=full_document,
+                settings_override=settings,
+            )
+
+        small_adjudicator.assert_awaited_once()
+        joint_adjudicator.assert_not_awaited()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_execution_strategy"], "bounded_small_document")
+        self.assertEqual(result["model_adjudication_state"], "failed")
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertTrue(result["unverified_generation"])
+        self.assertEqual(result["source_verification"], "unverified")
+        self.assertEqual(result["answer_source_count"], 2)
+        self.assertEqual(result["direct_evidence_count"], 0)
+        self.assertEqual(result["hit_count"], 0)
+        self.assertEqual(result["unverified_reference_count"], 2)
+        self.assertEqual(result["covered_requirement_ids"], [])
+        self.assertTrue(all(
+            source["source_verification"] == "unverified"
+            for source in result["answer_sources"]
+        ))
+        fallback_trace = next(
+            call.kwargs
+            for call in self._last_trace.call_args_list
+            if call.args and call.args[0] == "evidence.unverified_fallback"
+        )
+        self.assertTrue(fallback_trace["activated"])
+        self.assertEqual(fallback_trace["input_candidate_count"], 2)
+        self.assertEqual(fallback_trace["authorized_candidate_count"], 2)
+        self.assertEqual(fallback_trace["requirement_bound_candidate_count"], 2)
+        self.assertEqual(fallback_trace["converted_candidate_count"], 2)
+        self.assertEqual(fallback_trace["selected_candidate_count"], 2)
+        self.assertEqual(fallback_trace["exclusion_reason_counts"], {})
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("特殊场景应结合审批记录", prompt)
+        self.assertIn("语义支持关系尚未由重排模型验证", prompt)
+        self.assertIn("必须逐个范围独立回答", prompt)
+
     async def test_configuration_assignment_is_direct_evidence_without_ordered_steps(
         self,
     ) -> None:
@@ -577,6 +693,93 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertTrue(result.get("clarification"))
+
+    async def test_scope_metadata_cannot_close_a_shared_answer_target(self) -> None:
+        """Applicability matches are filters, not proof of the requested act."""
+
+        question = "在平台A中如何给自定义用户发送通知消息"
+        kb_id = uuid.uuid4()
+        base_requirement = AnswerRequirementV2(
+            id="r1",
+            description=question,
+            role="answer",
+            importance="required",
+            source="explicit",
+            coverage_mode="collection",
+            coverage_contract="ordered_steps",
+            depends_on_requirement_ids=(),
+            augmentation_requirement_ids=(),
+        )
+        base_plan = QueryPlanV2(
+            original_query=question,
+            answer_shape="process",
+            retrieval_queries=(question,),
+            requirements=(base_requirement,),
+            confidence=0.95,
+            source="model",
+        )
+        versions = ("6", "6.0.1", "7", "8.2.75")
+        scoped_plan = partition_plan_by_applicability_scopes(
+            base_plan,
+            tuple(
+                ApplicabilityScope(product="平台A", version=version)
+                for version in versions
+            ),
+            comparison=True,
+        )
+        candidates = []
+        for version in versions:
+            candidate = _candidate(
+                kb_id=kb_id,
+                doc_id=uuid.uuid4(),
+                chunk_index=0,
+                filename=f"平台A {version} 说明",
+                content=f"所属产品：平台A\n产品版本：{version}",
+            )
+            candidate["metadata"] = {"product": "平台A", "version": version}
+            candidates.append(candidate)
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            rag_v2_model_evidence_adjudication_enabled=True,
+            rag_v2_model_evidence_adjudication_timeout_seconds=1,
+        )
+        failed = SimpleNamespace(
+            succeeded=False,
+            error="simulated adjudication failure",
+        )
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=AsyncMock(return_value=failed),
+        ) as adjudicator:
+            payloads, *_ = await self._run(
+                question=question,
+                kb_id=kb_id,
+                initial=candidates,
+                full_document=candidates,
+                execution_bundle=compile_rag_execution_bundle(scoped_plan),
+                settings_override=settings,
+            )
+
+        adjudicator.assert_awaited_once()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_execution_strategy"], "joint_adjudication")
+        self.assertEqual(result["model_adjudication_state"], "failed")
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["coverage_status"], "partial")
+        self.assertTrue(result["unverified_generation"])
+        self.assertEqual(result["direct_evidence_count"], 0)
+        self.assertEqual(result["hit_count"], 0)
+        self.assertEqual(result["unverified_reference_count"], len(versions))
+        self.assertEqual(result["covered_requirement_ids"], [])
+        self.assertEqual(
+            {source["metadata"].get("version") for source in result["answer_sources"]},
+            set(versions),
+        )
+        self.assertTrue(all(
+            source["source_verification"] == "unverified"
+            for source in result["answer_sources"]
+        ))
 
     async def _run(
         self,
@@ -1043,9 +1246,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertFalse(result["retrieval_executed"])
         clarification = next(
-            item for item in payloads if item["type"] == "evidence_clarification"
+            item for item in payloads if item["type"] == "clarification_state"
         )
-        self.assertTrue(clarification["question"])
+        self.assertEqual(clarification["schema_version"], "rag_clarification_state.v1")
+        self.assertEqual(clarification["status"], "proposed")
         process = next(item for item in payloads if item["type"] == "search_process")
         self.assertEqual(
             [step["key"] for step in process["steps"]],
@@ -2379,9 +2583,9 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
         self.assertEqual(result["answer_sources"], [])
         self.assertFalse(any(
-            item["type"] == "evidence_clarification" for item in payloads
+            item["type"] == "clarification_state" for item in payloads
         ))
-        self.assertEqual(len(client.completions.calls), 0)
+        self.assertEqual(len(client.completions.calls), 1)
         # The identical anchor and literal answer query are physically
         # coalesced, but the ledger still retains both logical owners.
         self.assertEqual(len(executed_queries), 2)  # anchor/answer + bridge
@@ -2489,7 +2693,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         result = next(item for item in payloads if item["type"] == "search_results")
         clarification = next(
-            item for item in payloads if item["type"] == "evidence_clarification"
+            item for item in payloads if item["type"] == "clarification_state"
         )
         self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(len(clarification["choices"]), 2)
@@ -2619,7 +2823,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("CloudPivot 7", dynamic_queries[0])
         self.assertIn("1200元/天", prompt)
         self.assertFalse(any(
-            item["type"] == "evidence_clarification" for item in payloads
+            item["type"] == "clarification_state" for item in payloads
         ))
         completed = next(
             call.kwargs
@@ -3258,13 +3462,13 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         clarification = next(
             item
             for item in first_payloads
-            if item["type"] == "evidence_clarification"
+            if item["type"] == "clarification_state"
         )
         self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["answer_sources"], [])
         self.assertEqual(clarification["dimension"], "scope")
         self.assertEqual(clarification["choices"], [])
-        self.assertIn("请补充", clarification["question"])
+        self.assertEqual(clarification["selection_mode"], "refine")
         self.assertEqual(first_client.completions.calls, [])
 
     async def test_single_closed_route_with_product_and_rule_claims_does_not_refine(
@@ -3474,13 +3678,14 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["carryover_anchor_succeeded"])
         self.assertFalse(result["carryover_seed_used"])
         self.assertEqual(result["carryover_candidate_count"], 0)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         answer = "".join(
             item.get("content", "")
             for item in payloads
             if item.get("type") == "text_delta"
         )
-        self.assertIn("服务暂时不可用", answer)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("服务暂时不可用", system_prompt)
         self.assertNotIn("一线城市450元", answer)
         self.assertNotIn("未授权知识库", answer)
 
@@ -3700,7 +3905,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["carryover_anchor_succeeded"])
         self.assertEqual(result["answer_sources"], [])
         self.assertEqual(result["results"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         admission_trace = next(
             call.kwargs
             for call in self._last_trace.call_args_list
@@ -3723,7 +3928,8 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             for item in payloads
             if item.get("type") == "text_delta"
         )
-        self.assertIn("未找到", answer)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("知识库中未找到相关内容", system_prompt)
         self.assertNotIn("一线城市450元", answer)
 
     async def test_document_relevance_gate_excludes_lower_vector_noise(self) -> None:
@@ -3849,25 +4055,21 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         # than select a subset and let the model imply that it saw the full
         # policy.  Terminal traces intentionally have no hidden
         # ``all_context_sources`` field: ``context_sources`` is the sole
-        # model-visible source contract and is empty for a deterministic stop.
+        # model-visible source contract and stays empty while the answer model
+        # expresses the structured insufficient-evidence state.
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
         self.assertEqual(result["answer_sources"], [])
         self.assertEqual(result["answer_source_count"], 0)
         self.assertEqual(serialized_context, "")
         self.assertEqual(generation_context.kwargs["context_sources"], [])
-        self.assertTrue(generation_context.kwargs["deterministic"])
-        self.assertIsNone(generation_context.kwargs["model"])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(generation_context.kwargs["model"], "test-chat")
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertIn(
             "context_budget_limited",
             result["evidence_state"]["reasons"],
         )
-        answer_text = "".join(
-            item.get("content", "")
-            for item in payloads
-            if item.get("type") == "text_delta"
-        )
-        self.assertIn("无法形成可核验的完整答案链", answer_text)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("无法组成可核验的完整答案链", system_prompt)
 
     async def test_low_vector_nearest_neighbors_are_normal_no_hit(self) -> None:
         kb_id = uuid.uuid4()
@@ -3893,26 +4095,25 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "no_hit")
         self.assertEqual(result["answer_source_count"], 0)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertIn(
-            "知识库中未找到与“完全不同的主题”相关的内容",
-            "".join(
-                item.get("content", "")
-                for item in payloads
-                if item.get("type") == "text_delta"
-            ),
+            "知识库中未找到相关内容",
+            client.completions.calls[0]["messages"][0]["content"],
+        )
+        self.assertEqual(
+            client.completions.calls[0]["messages"][-1]["content"],
+            "完全不同的主题",
         )
         generation_context = next(
             call
             for call in self._last_trace.call_args_list
             if call.args and call.args[0] == "generation.context"
         )
-        self.assertTrue(generation_context.kwargs["deterministic"])
-        self.assertIsNone(generation_context.kwargs["model"])
+        self.assertEqual(generation_context.kwargs["model"], "test-chat")
         self.assertEqual(generation_context.kwargs["context"], "")
         fetch_full.assert_not_awaited()
 
-    async def test_unknown_policy_subject_with_generic_lexical_hits_is_no_hit(
+    async def test_unknown_policy_subject_keeps_recall_but_never_promotes_answer_sources(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -3953,19 +4154,21 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "no_hit")
-        self.assertEqual(result["results"], [])
-        self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
-        self.assertFalse(any(
-            item["type"] == "evidence_clarification" for item in payloads
+        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(len(result["results"]), 2)
+        self.assertTrue(all(
+            item["evidence_role"] == "related" for item in result["results"]
         ))
-        # The unknown owner is not a valid identity/classification qualifier,
-        # so the planner performs only the original retrieval instead of a
-        # meaningless synthetic bridge lookup.
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertFalse(any(
+            item["type"] == "clarification_state" for item in payloads
+        ))
+        # High-recall admission may inspect the admitted documents, but no
+        # candidate becomes an answer source without evidence closure.
         self.assertEqual(search.await_count, 1)
-        fetch_full.assert_not_awaited()
-        scoped.assert_not_awaited()
+        fetch_full.assert_awaited()
+        scoped.assert_awaited()
 
     async def test_no_hit_fallback_displays_raw_followup_not_standalone_query(
         self,
@@ -3991,14 +4194,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             full_document=[],
         )
 
-        answer = "".join(
-            item.get("content", "")
-            for item in payloads
-            if item.get("type") == "text_delta"
-        )
-        self.assertIn("那住宿呢", answer)
-        self.assertNotIn("普通员工的出差标准是什么", answer)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
+        user_prompt = client.completions.calls[0]["messages"][-1]["content"]
+        self.assertEqual(user_prompt, "那住宿呢")
+        self.assertNotIn("普通员工的出差标准是什么", user_prompt)
 
     async def test_explicit_year_scope_excludes_other_year_before_context(self) -> None:
         kb_id = uuid.uuid4()
@@ -4184,7 +4383,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "error")
         self.assertEqual(result["evidence_availability"], "unavailable")
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
 
     async def test_overview_loads_complete_small_document_in_source_order(self) -> None:
         kb_id = uuid.uuid4()
@@ -4284,7 +4483,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertIn(
             "collection_snapshot_unproven",
             result["evidence_state"]["reasons"],
@@ -4329,7 +4528,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertIn(
             "context_budget_limited",
             result["evidence_state"]["reasons"],
@@ -4542,7 +4741,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(case["answer_marker"], prompt)
                 self.assertNotIn("禁止纳入的未授权答案", prompt)
                 self.assertFalse(any(
-                    item["type"] == "evidence_clarification"
+                    item["type"] == "clarification_state"
                     for item in payloads
                 ))
 
@@ -4833,7 +5032,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed.kwargs["bridge_query_attempted_count"], 1)
         self.assertEqual(completed.kwargs["bridge_query_succeeded_count"], 0)
         self.assertEqual(completed.kwargs["bridge_query_candidate_count"], 0)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
 
     async def test_bridge_spec_materialization_failure_preserves_first_hop_diagnostic(
         self,
@@ -4884,7 +5083,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             }
             for call in search.await_args_list
         ))
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         bridge_error = next(
             call
             for call in self._last_trace.call_args_list
@@ -5052,7 +5251,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         result = next(item for item in payloads if item["type"] == "search_results")
         clarification = next(
-            item for item in payloads if item["type"] == "evidence_clarification"
+            item for item in payloads if item["type"] == "clarification_state"
         )
         self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(clarification["dimension"], "document")
@@ -5124,7 +5323,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             result["evidence_state"]["reasons"],
         )
         self.assertEqual(search.await_count, 2)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         answer_text = "".join(
             item.get("content", "")
             for item in payloads
@@ -5376,7 +5575,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertIn(
             "coverage_graph:required_answer_claim_missing",
             result["evidence_state"]["reasons"],
@@ -5516,20 +5715,15 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_availability"], "unavailable")
         self.assertEqual(result["results"], [])
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         answer = "".join(
             item.get("content", "")
             for item in payloads
             if item.get("type") == "text_delta"
         )
-        self.assertIn(
-            "服务暂时不可用",
-            answer,
-        )
-        self.assertNotIn(
-            "未找到相关内容",
-            answer,
-        )
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("服务暂时不可用", system_prompt)
+        self.assertNotIn("未找到相关内容", system_prompt)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
 
@@ -5614,7 +5808,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_status"], "error")
         self.assertEqual(result["evidence_availability"], "unavailable")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertEqual(search.await_count, 1)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
@@ -5757,13 +5951,14 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["carryover_seed_used"])
         self.assertEqual(result["carryover_anchor_succeeded"], False)
         self.assertEqual(result["carryover_candidate_count"], 0)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         answer = "".join(
             item.get("content", "")
             for item in payloads
             if item.get("type") == "text_delta"
         )
-        self.assertIn("服务暂时不可用", answer)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("服务暂时不可用", system_prompt)
         self.assertNotIn("450元", answer)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
@@ -5806,7 +6001,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_status"], "no_hit")
         self.assertEqual(result["results"], [])
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
         completed = next(
@@ -5899,14 +6094,15 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "scope_mismatch")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         answer = "".join(
             item.get("content", "")
             for item in payloads
             if item.get("type") == "text_delta"
         )
         self.assertNotIn("旧范围配置值为true", answer)
-        self.assertIn("指定产品、版本或适用范围", answer)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("产品、版本或适用范围冲突", system_prompt)
 
     async def test_retriever_output_outside_authorized_kb_is_rejected(self) -> None:
         authorized_kb_id = uuid.uuid4()
@@ -5928,7 +6124,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_status"], "no_hit")
         self.assertEqual(result["results"], [])
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
         answer = "".join(
             item.get("content", "")
             for item in payloads
@@ -5979,7 +6175,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         clarification_index = next(
             index
             for index, item in enumerate(payloads)
-            if item["type"] == "evidence_clarification"
+            if item["type"] == "clarification_state"
         )
         result = payloads[result_index]
         clarification = payloads[clarification_index]
@@ -5988,7 +6184,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["answer_sources"], [])
         self.assertTrue(clarification["needs_clarification"])
         self.assertEqual(len(clarification["choices"]), 2)
-        self.assertIn("都对比", clarification["question"])
+        self.assertEqual(clarification["selection_mode"], "choice")
         self.assertEqual(len(client.completions.calls), 0)
         self.assertEqual(payloads[-1]["type"], "done")
 
@@ -6028,7 +6224,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
         self.assertEqual(result["answer_sources"], [])
         self.assertFalse(any(
-            item["type"] == "evidence_clarification" for item in payloads
+            item["type"] == "clarification_state" for item in payloads
         ))
         displayed_doc_ids = {item["doc_id"] for item in result["results"]}
         # Related diagnostics remain bounded by the normal display budget;
@@ -6040,7 +6236,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             str(travel_doc),
         }))
         self.assertLessEqual(len(result["results"]), 5)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(len(client.completions.calls), 1)
 
     async def test_low_score_scope_competitor_does_not_force_clarification(
         self,
@@ -6096,7 +6292,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             {str(first_doc)},
         )
         self.assertFalse(any(
-            item["type"] == "evidence_clarification" for item in payloads
+            item["type"] == "clarification_state" for item in payloads
         ))
         self.assertEqual(len(client.completions.calls), 1)
 
@@ -6148,7 +6344,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             {str(calibrated_doc_id)},
         )
         self.assertFalse(any(
-            item["type"] == "evidence_clarification" for item in payloads
+            item["type"] == "clarification_state" for item in payloads
         ))
         self.assertEqual(len(client.completions.calls), 1)
         prompt = "\n".join(
@@ -6170,6 +6366,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             initial=[],
             full_document=[],
             settings_override=settings,
+            task_contract_override=_task_contract(
+                "如何设计一个通用的排班流程",
+                evidence_scope="mixed",
+            ),
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
@@ -6211,6 +6411,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             initial=[],
             full_document=[],
             settings_override=settings,
+            task_contract_override=_task_contract(
+                "如何设计一个通用的排班流程",
+                evidence_scope="mixed",
+            ),
         )
 
         self.assertEqual(len(client.completions.calls), 1)
@@ -6241,14 +6445,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             "source_bound_scope_requires_knowledge_evidence",
         )
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(client.completions.calls, [])
-        answer = "".join(
-            item.get("content", "")
-            for item in payloads
-            if item.get("type") == "text_delta"
-        )
-        self.assertIn("知识库中未找到", answer)
-        self.assertIn("暂时无法提供准确答案", answer)
+        self.assertEqual(len(client.completions.calls), 1)
+        system_prompt = client.completions.calls[0]["messages"][0]["content"]
+        self.assertIn("知识库中未找到相关内容", system_prompt)
+        self.assertIn("禁止使用自己的知识编造企业事实", system_prompt)
 
     async def test_insufficient_evidence_fallback_requires_broadest_mode(self) -> None:
         kb_id = uuid.uuid4()
@@ -6280,13 +6480,17 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             initial=candidates,
             full_document=[],
             settings_override=no_hit_only,
+            task_contract_override=_task_contract(
+                "员工标准是什么",
+                evidence_scope="mixed",
+            ),
         )
         strict_result = next(
             item for item in strict_payloads if item["type"] == "search_results"
         )
         self.assertEqual(strict_result["evidence_status"], "insufficient_evidence")
         self.assertEqual(strict_result["answer_provenance"], "knowledge_base")
-        self.assertEqual(strict_client.completions.calls, [])
+        self.assertEqual(len(strict_client.completions.calls), 1)
 
         broad = _settings()
         broad.rag_general_fallback_mode = "no_hit_or_insufficient"
@@ -6296,6 +6500,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             initial=candidates,
             full_document=[],
             settings_override=broad,
+            task_contract_override=_task_contract(
+                "员工标准是什么",
+                evidence_scope="mixed",
+            ),
         )
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_status"], "insufficient_evidence")
@@ -6317,6 +6525,123 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generation_context["context_sources"], [])
         self.assertEqual(generation_context["all_context_sources"], [])
 
+    async def test_adjudication_failure_keeps_general_fallback_closed(self) -> None:
+        kb_id = uuid.uuid4()
+        candidates = [
+            _candidate(
+                kb_id=kb_id,
+                doc_id=uuid.uuid4(),
+                chunk_index=0,
+                filename="员工制度摘要.docx",
+                content="员工制度包含差旅与费用管理章节。",
+            )
+        ]
+        settings = _settings()
+        settings.rag_v2_model_evidence_adjudication_enabled = True
+        settings.rag_general_fallback_mode = "no_hit_or_insufficient"
+        settings.rag_general_fallback_model = "fast-fallback-model"
+        failed_outcome = SimpleNamespace(
+            succeeded=False,
+            error="ValueError: invalid evidence response",
+        )
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=AsyncMock(return_value=failed_outcome),
+        ) as adjudicate:
+            payloads, client, *_ = await self._run(
+                question="普通员工的完整出差标准是什么",
+                kb_id=kb_id,
+                initial=candidates,
+                full_document=[],
+                settings_override=settings,
+            )
+
+        adjudicate.assert_awaited_once()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["model_adjudication_state"], "failed")
+        self.assertEqual(
+            result["model_adjudication_error"],
+            "ValueError: invalid evidence response",
+        )
+        self.assertIsNone(result["general_fallback_blocked_reason"])
+        self.assertEqual(result["answer_provenance"], "knowledge_base")
+        self.assertTrue(result["unverified_generation"])
+        self.assertEqual(result["source_verification"], "unverified")
+        self.assertEqual(result["direct_evidence_count"], 0)
+        self.assertEqual(result["hit_count"], 0)
+        self.assertEqual(result["unverified_reference_count"], 1)
+        self.assertEqual(len(result["answer_sources"]), 1)
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls[0]["model"], "test-chat")
+        prompt = "\n".join(
+            message["content"]
+            for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("语义支持关系尚未由重排模型验证", prompt)
+        self.assertIn("员工制度包含差旅与费用管理章节", prompt)
+        generation_context = next(
+            call.kwargs
+            for call in self._last_trace.call_args_list
+            if call.args and call.args[0] == "generation.context"
+        )
+        self.assertEqual(generation_context["model_adjudication_state"], "failed")
+        self.assertIn("员工制度包含差旅与费用管理章节", generation_context["context"])
+        self.assertEqual(len(generation_context["context_sources"]), 1)
+        self.assertEqual(len(generation_context["all_context_sources"]), 1)
+
+    async def test_successful_adjudication_with_insufficient_evidence_does_not_degrade(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        candidate = _candidate(
+            kb_id=kb_id,
+            doc_id=uuid.uuid4(),
+            chunk_index=0,
+            filename="员工制度目录.docx",
+            content="员工制度包含若干管理章节。",
+        )
+        settings = _settings()
+        settings.rag_v2_model_evidence_adjudication_enabled = True
+        outcome = SimpleNamespace(
+            succeeded=True,
+            error=None,
+            results=[{
+                **candidate,
+                "evidence_role": "related",
+                "contribution_role": "background",
+                "supports_requirement_ids": [],
+                "rerank_status": "verified",
+            }],
+            coverage_status="insufficient",
+            missing_requirement_ids=("r1",),
+        )
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=AsyncMock(return_value=outcome),
+        ) as adjudicate:
+            payloads, client, *_ = await self._run(
+                question="普通员工的完整出差标准是什么",
+                kb_id=kb_id,
+                initial=[candidate],
+                full_document=[],
+                settings_override=settings,
+            )
+
+        adjudicate.assert_awaited_once()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["model_adjudication_state"], "succeeded")
+        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertFalse(result["unverified_generation"])
+        self.assertEqual(result["answer_sources"], [])
+        prompt = "\n".join(
+            message["content"] for message in client.completions.calls[0]["messages"]
+        )
+        self.assertIn("无法组成可核验的完整答案链", prompt)
+        self.assertNotIn("员工制度包含若干管理章节", prompt)
+
     def test_general_fallback_never_opens_for_error_or_scope_mismatch(self) -> None:
         for status in ("error", "scope_mismatch", "needs_clarification", "hit"):
             with self.subTest(status=status):
@@ -6332,6 +6657,11 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_should_use_general_model_fallback(
             evidence_status="insufficient_evidence",
             configured_mode="no_hit_or_insufficient",
+        ))
+        self.assertFalse(_should_use_general_model_fallback(
+            evidence_status="insufficient_evidence",
+            configured_mode="no_hit_or_insufficient",
+            model_adjudication_succeeded=False,
         ))
 
 

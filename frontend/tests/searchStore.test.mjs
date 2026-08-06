@@ -5,7 +5,7 @@ import { createPinia, setActivePinia } from 'pinia'
 import { useSearchStore } from '../src/stores/search.js'
 import {
   applyClarificationLifecycleEvent,
-  lockMessageClarificationEvidence,
+  lockMessageClarification,
 } from '../src/utils/chatClarification.js'
 
 function freshStore() {
@@ -154,7 +154,15 @@ test('历史 scope_mismatch 快照恢复后仍会清空范围外候选', () => {
 test('needs_clarification 表示检索已执行但选择前没有回答依据', () => {
   const store = freshStore()
   const clarification = {
+    type: 'clarification_state',
+    schema_version: 'rag_clarification_state.v1',
+    status: 'proposed',
+    persisted: false,
+    needs_clarification: true,
+    adapter: 'evidence',
     dimension: 'version',
+    reason_code: 'multiple_versions',
+    selection_mode: 'choice',
     choices: [
       { id: 'c1', label: '云枢 6.0.1' },
       { id: 'c2', label: '云枢 8.2.75' },
@@ -239,15 +247,21 @@ test('clarification 锁定后乱序 hit search_results 仍保持 fail closed', (
     sources: [],
   }
   const clarification = applyClarificationLifecycleEvent(message, {
-    type: 'evidence_clarification',
-    schema_version: 'rag_evidence_clarification.v1',
+    type: 'clarification_state',
+    schema_version: 'rag_clarification_state.v1',
+    status: 'proposed',
+    persisted: false,
+    needs_clarification: true,
+    adapter: 'evidence',
     dimension: 'version',
+    reason_code: 'multiple_versions',
+    selection_mode: 'choice',
     choices: [
       { key: 'c1', label: '云枢 6' },
       { key: 'c2', label: '云枢 8.6' },
     ],
   })
-  lockMessageClarificationEvidence(message, clarification)
+  lockMessageClarification(message, clarification)
   store.setClarification(clarification)
 
   const contradictoryHit = {
@@ -265,7 +279,7 @@ test('clarification 锁定后乱序 hit search_results 仍保持 fail closed', (
   // This is the same final lock applied by the chat event path after it sees
   // an existing picker; even a contradictory answer_sources payload is gone.
   message.sources = contradictoryHit.answer_sources
-  lockMessageClarificationEvidence(message, message.clarification)
+  lockMessageClarification(message, message.clarification)
 
   assert.deepEqual(message.sources, [])
   assert.equal(message.evidence_status, 'needs_clarification')

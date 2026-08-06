@@ -23,11 +23,10 @@ const searchTestSource = readFileSync(
   'utf8',
 )
 
-test('chat store 同时消费结构化事件和 search_results 内嵌澄清', () => {
-  assert.ok(chatStoreSource.includes("data.type === 'evidence_clarification'"))
-  assert.ok(chatStoreSource.includes("data.type === 'evidence_clarification_ack'"))
+test('chat store 只消费统一 clarification_state 生命周期事件', () => {
+  assert.ok(chatStoreSource.includes("data.type === 'clarification_state'"))
   assert.ok(chatStoreSource.includes('clarificationFromSearchEvent('))
-  assert.ok(chatStoreSource.includes('attachEvidenceClarification(aiMsg'))
+  assert.ok(chatStoreSource.includes('attachClarification(aiMsg'))
   assert.ok(chatStoreSource.includes('applyClarificationLifecycleEvent(aiMsg, data)'))
   assert.ok(chatStoreSource.includes('aiMsg = reactive(aiMsg)'))
 })
@@ -39,7 +38,7 @@ test('澄清选项使用原生 button 并提供序号、aria 与都对比操作'
   )
   assert.ok(chatMessageSource.includes(':aria-label="`选择第 ${choice.index} 项：${choice.label}`"'))
   assert.ok(chatMessageSource.includes("selectClarification('都对比')"))
-  assert.ok(chatMessageSource.includes('当前候选范围较多，无法安全列成有限选项'))
+  assert.ok(chatMessageSource.includes('可直接在输入框补充条件'))
   assert.ok(chatMessageSource.includes(':disabled="!clarificationCanSubmit"'))
   assert.ok(chatMessageSource.includes('以下选项已失效。请重新提问'))
 })
@@ -56,13 +55,13 @@ test('组件选择事件经 ChatView 回到 store 的统一 sendMessage 链', ()
   assert.ok(chatStoreSource.includes('`选择：${selected.label}`'))
 })
 
-test('未 ack、错误、中止和无 ack done 都会保持 picker 失效', () => {
+test('未激活、错误、中止和无 active done 都会保持 picker 失效', () => {
   assert.match(
     chatStoreSource,
     /data\.type === 'error'[\s\S]*applyClarificationLifecycleEvent\(aiMsg, data\)/,
   )
-  assert.ok(chatStoreSource.includes("invalidateClarification(lastAssistantMessage, searchStore, 'stream_aborted')"))
-  assert.ok(chatStoreSource.includes("invalidateClarification(aiMsg, searchStore, 'missing_persistence_ack')"))
+  assert.ok(chatStoreSource.includes("invalidateClarificationState(lastAssistantMessage, searchStore, 'stream_aborted')"))
+  assert.ok(chatStoreSource.includes("invalidateClarificationState(aiMsg, searchStore, 'missing_active_state')"))
   assert.ok(chatStoreSource.includes("? 'stream_aborted'"))
   assert.ok(chatStoreSource.includes(": (e.failureReason || 'request_failed')"))
 })
@@ -70,7 +69,7 @@ test('未 ack、错误、中止和无 ack done 都会保持 picker 失效', () =
 test('clarification 锁定后乱序 search_results 不恢复消息来源或 hit 状态', () => {
   assert.ok(chatStoreSource.includes('aiMsg.sources = clarification ? [] : answerSourcesFromSearchEvent'))
   assert.ok(chatStoreSource.includes("? { ...data, evidence_status: 'needs_clarification', clarification }"))
-  assert.ok(chatStoreSource.includes('lockClarificationEvidence(aiMsg, searchStore, attached)'))
+  assert.ok(chatStoreSource.includes('lockClarificationState(aiMsg, searchStore, attached)'))
 })
 
 test('历史消息通过服务端持久化状态归一化后恢复 picker', () => {
@@ -130,16 +129,12 @@ test('空回答 spinner 仅由活跃 request 状态驱动，终态与失败态�
   assert.ok(chatStoreSource.includes("if (activeRequestId.value === requestId) activeRequestId.value = ''"))
 })
 
-test('回答依据仅使用 answer_support，不把召回排序伪装成匹配率', () => {
-  assert.match(
-    chatMessageSource,
-    /function sourceSupportScore\(source\) \{[\s\S]*return finiteScore\(source\.answer_support\)\n\}/,
-  )
-  assert.doesNotMatch(
-    chatMessageSource,
-    /return finiteScore\(source\.answer_support\) \?\? finiteScore\(source\.effective_score\)/,
-  )
-  assert.ok(chatMessageSource.includes("const level = score === null ? '已验证'"))
+test('回答依据按文章展示，不把任一片段分数伪装成文章匹配率', () => {
+  assert.ok(chatMessageSource.includes('function documentCountForSources(items)'))
+  assert.ok(chatMessageSource.includes('groupEvidenceByDocument(items).length'))
+  assert.ok(chatMessageSource.includes('document-only'))
+  assert.doesNotMatch(chatMessageSource, /function sourceSupportScore/)
+  assert.doesNotMatch(chatMessageSource, /const percent = score/)
 })
 
 test('通用模型回答显示独立警示且不伪装成知识库依据', () => {

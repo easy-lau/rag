@@ -249,6 +249,10 @@ _QUERY_STANDALONE_VERSION_RE = re.compile(
     rf"(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_QUERY_BARE_VERSION_RE = re.compile(
+    rf"(?<![A-Za-z0-9_.])(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
+    re.IGNORECASE,
+)
 _LEADING_QUERY_WORDS = (
     "请问",
     "帮我",
@@ -726,6 +730,43 @@ def _clean_product(value: str) -> str:
     return cleaned.strip()
 
 
+def _query_product_is_identity(text: str, match: re.Match[str]) -> bool:
+    """Return whether a parsed product token has source-level identity.
+
+    A bare Chinese word adjacent to a number is not enough to establish an
+    applicability boundary: verbs such as ``升级8.6`` and nouns such as
+    ``部署8.6`` are ordinary query language, not product names.  Product
+    aliases and ASCII identifiers remain valid; Chinese names require either
+    a registered alias or an explicit product label in the query.
+    """
+
+    raw = match.groupdict().get("product") or ""
+    product = _clean_product(raw)
+    if not product:
+        return False
+    normalized = _canonical_product(product)
+    registered = {
+        _canonical_product(alias)
+        for group in _PRODUCT_ALIAS_GROUPS
+        for alias in group
+    }
+    if normalized in registered:
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]{1,30}", product):
+        return True
+    # Explicit source grammar, e.g. ``产品名称：某平台 8.6`` or
+    # ``某平台产品版本 8.6``.  This is deliberately structural rather than a
+    # list of question-specific verbs.
+    start, end = match.span("product")
+    prefix = text[max(0, start - 12):start]
+    suffix = text[end:min(len(text), end + 12)]
+    return bool(
+        re.search(r"产品\s*(?:名称|名)?\s*[：:]?\s*$", prefix)
+        or re.search(r"产品\s*(?:版本|v)?", suffix, re.IGNORECASE)
+        or re.search(r"系统|平台|应用", suffix)
+    )
+
+
 def _valid_query_match(text: str, match: re.Match[str]) -> bool:
     """避免把“云枢 8 个节点”这类数量误识别为版本。"""
 
@@ -742,7 +783,8 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
     """提取相邻的产品名和显式版本号。
 
     优先识别“我是/使用/针对 + 产品 + 版本”这类强提示，再识别
-    ``云枢8.6``、``CloudPivot v8.6`` 等紧邻写法。孤立数字不会被当作版本。
+    ``云枢8.6``、``CloudPivot v8.6`` 等紧邻写法；孤立的带点版本号可形成
+    product-less 版本范围，普通动作词不会被当作产品。
     """
 
     text = str(query or "").strip()
@@ -773,11 +815,17 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
         _QUERY_STANDALONE_VERSION_RE,
         _QUERY_VERSION_LABEL_RE,
         _QUERY_ADJACENT_RE,
+        _QUERY_BARE_VERSION_RE,
     ):
         matches = [
             candidate
             for candidate in pattern.finditer(text)
             if _valid_query_match(text, candidate)
+            and (
+                "product" not in candidate.groupdict()
+                or not candidate.group("product")
+                or _query_product_is_identity(text, candidate)
+            )
             and not query_span_is_negated(
                 text,
                 candidate.start(),
@@ -999,6 +1047,7 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
         _QUERY_VERSION_LABEL_RE,
         _QUERY_ADJACENT_RE,
         _QUERY_STANDALONE_VERSION_RE,
+        _QUERY_BARE_VERSION_RE,
     )
     raw: list[tuple[re.Match[str], str | None, str]] = []
     seen_ranges: set[tuple[int, int, str | None, str]] = set()
@@ -1016,6 +1065,11 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
             if not version:
                 continue
             product = _clean_product(raw_product) if raw_product else None
+            if (
+                product
+                and not _query_product_is_identity(source, match)
+            ):
+                continue
             # ``版本8.6`` is a product-less edition constraint.  The generic
             # adjacent-product pattern can otherwise misread the literal
             # label ``版本`` as a product and prevent the following standalone
@@ -1029,10 +1083,12 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
             # A generic full sentence capture must not duplicate a stronger
             # registered product match occupying the same version token.
             if any(
-                existing_product is not None
-                and existing_version == version
-                and existing_start <= match.start() < existing_end
-                for (existing_start, existing_end, existing_product, existing_version)
+                existing_version == version
+                and (
+                    existing_start <= match.start() < existing_end
+                    or match.start() <= existing_start < match.end()
+                )
+                for (existing_start, existing_end, _existing_product, existing_version)
                 in seen_ranges
             ):
                 continue

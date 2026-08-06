@@ -6,6 +6,7 @@ from core.rag_v2.bridge_resolution import partition_bridge_facts, resolve_bridge
 from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
 from core.rag_v2.evidence import (
     assemble_evidence_bundle,
+    assemble_unverified_candidate_bundle_with_diagnostics,
     finalize_visible_evidence_bundle,
 )
 from core.rag_v2.task_execution import BridgeResolution, TaskExecutionLedger
@@ -205,6 +206,44 @@ def _ledgered_evidence_bundle(
 
 
 class VisibleEvidenceFinalizationTests(unittest.TestCase):
+    def test_related_evidence_admission_is_bounded_and_labeled(self) -> None:
+        result = assemble_unverified_candidate_bundle_with_diagnostics(
+            candidates=[
+                {
+                    **_candidate(
+                        "related-2",
+                        "升级步骤二：执行迁移。",
+                        chunk_index=1,
+                    ),
+                    "supports_requirement_ids": ["r1"],
+                    "evidence_role": "related",
+                },
+                {
+                    **_candidate(
+                        "related-1",
+                        "升级步骤一：先备份数据库。",
+                        chunk_index=0,
+                    ),
+                    "supports_requirement_ids": ["r1"],
+                    "evidence_role": "related",
+                },
+            ],
+            allowed_requirement_ids=("r1",),
+            admission_reason="related_evidence_admitted:semantic_coverage_incomplete",
+        )
+
+        self.assertIsNotNone(result.bundle)
+        assert result.bundle is not None
+        self.assertEqual(result.bundle.state.confidence, "retrieved")
+        self.assertEqual(
+            result.bundle.state.reasons,
+            ("related_evidence_admitted:semantic_coverage_incomplete",),
+        )
+        self.assertEqual(
+            result.bundle.answer_source_ids,
+            ("related-1", "related-2"),
+        )
+
     def test_bridge_only_evidence_never_reaches_the_generation_context(self) -> None:
         requirements = (
             AnswerRequirementV2(
