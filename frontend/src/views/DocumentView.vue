@@ -1059,6 +1059,11 @@ async function submitText() {
       doc = await updateTextDocument(selectedKbId.value, editingDocId.value, textTitle.value.trim(), textContent.value, url, editTags.value)
     } else {
       doc = await createTextDocument(selectedKbId.value, textTitle.value.trim(), textContent.value, url, editTags.value)
+      // 创建接口会先持久化 processing 文档，再异步执行解析/向量化。
+      // 先绑定返回的文档，失败后的下一次点击才能更新同一行，而不是再次新建一行。
+      editingDocId.value = doc.id
+      editingDocument.value = doc
+      editorMode.value = 'edit'
     }
     processingStatus.value = '正在分块处理...'
     await pollDocumentStatus(doc.id)

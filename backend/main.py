@@ -25,6 +25,7 @@ from api import (
 from config import get_settings
 from core.logging_config import configure_application_logging
 from core.settings_crypto import SettingsEncryptionError
+from core.runtime_settings import apply_stored_settings
 from core.login_security import login_log_cleanup_loop
 from core.log_retention import log_retention_cleanup_loop
 from core.document_jobs import run_document_worker
@@ -50,7 +51,7 @@ if _development_log_path is not None:
 async def lifespan(app: FastAPI):
     # 启动时加载数据库中保存的设置（API Key、Base URL、模型等）
     try:
-        await settings.apply_stored_settings()
+        await apply_stored_settings()
     except SettingsEncryptionError:
         # 密钥丢失或密文损坏时不能静默回退到环境变量，否则会以错误配置继续处理用户请求。
         logging.getLogger(__name__).critical("[startup] 无法解密数据库中的模型密钥，拒绝启动应用")

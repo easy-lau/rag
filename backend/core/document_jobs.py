@@ -29,6 +29,7 @@ from core.document_parser import (
 )
 from core.document_content import normalize_document_markdown
 from core.embeddings import embed_batch
+from core.runtime_settings import apply_stored_settings
 from core.vision import image_to_markdown
 from database import AsyncSessionLocal
 from models.db_models import (
@@ -399,6 +400,11 @@ async def process_one_document_job() -> bool:
     )
     terminal = False
     try:
+        # Production runs this worker in a process separate from FastAPI.  Its
+        # cached Settings instance must therefore load the encrypted database
+        # configuration itself.  Refresh once per claimed job so model changes
+        # made in the admin UI apply without restarting the container.
+        await apply_stored_settings()
         doc = await _load_current_document(job)
         if doc is None:
             terminal = await _complete_job(job, [], None)

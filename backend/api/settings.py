@@ -17,12 +17,14 @@ from core.deps import require_permission
 from core.openai_client import get_service_credentials
 from core.permissions import SETTINGS_READ, SETTINGS_WRITE
 from core.reranker import clear_rerank_circuit_breakers
+from core.runtime_settings import (
+    EDITABLE_SETTING_KEYS,
+    coerce_setting_value as _coerce_setting_value,
+)
 from core.settings_crypto import (
     SECRET_SETTING_KEYS,
     SettingsEncryptionError,
-    decrypt_setting_secret,
     encrypt_setting_secret,
-    is_encrypted_setting_value,
 )
 from core.structured_output import (
     clear_structured_output_capability_cache,
@@ -129,7 +131,8 @@ class SettingsUpdate(BaseModel):
     site_copyright: str | None = None
 
 
-EDITABLE_SETTING_KEYS = frozenset(SettingsUpdate.model_fields)
+if frozenset(SettingsUpdate.model_fields) != EDITABLE_SETTING_KEYS:
+    raise RuntimeError("SettingsUpdate 与数据库运行时设置字段不一致")
 
 
 class ModelConnectionTest(BaseModel):
@@ -188,30 +191,6 @@ class SiteSettingsOut(BaseModel):
     site_logo: str
     browser_title: str
     site_copyright: str
-
-
-def _coerce_setting_value(key: str, value: str, settings) -> object:
-    if key == "rag_general_fallback_mode":
-        normalized = value.strip().casefold()
-        if normalized not in {
-            "off",
-            "no_hit",
-            "no_hit_or_insufficient",
-        }:
-            raise ValueError("invalid general fallback mode")
-        return normalized
-    current = getattr(
-        settings,
-        key,
-        "auto" if key == "llm_structured_output_mode" else None,
-    )
-    if isinstance(current, bool):
-        return value.strip().lower() in ("true", "1", "yes")
-    if isinstance(current, int):
-        return int(value)
-    if isinstance(current, float):
-        return float(value)
-    return value
 
 
 def _is_secret_placeholder(value: str) -> bool:
@@ -399,53 +378,6 @@ def _value_from_database(db_map: dict[str, str | None], key: str, settings):
     except (TypeError, ValueError):
         logger.warning("[系统设置] 忽略无法解析的字段 key=%s", key)
         return default
-
-
-def _decrypt_secret_for_runtime(value: str, settings) -> str:
-    return decrypt_setting_secret(value, settings.config_encryption_key)
-
-
-async def apply_stored_settings() -> None:
-    """数据库优先加载运行时设置，并在有主密钥时自动迁移历史明文 API Key。"""
-    from database import AsyncSessionLocal
-
-    settings = get_settings()
-    migrated_keys: list[str] = []
-    async with AsyncSessionLocal() as db:
-        rows = (await db.execute(select(SystemSetting))).scalars().all()
-        for row in rows:
-            if row.value is None or row.key not in EDITABLE_SETTING_KEYS:
-                continue
-
-            value = row.value
-            if row.key in SECRET_SETTING_KEYS:
-                try:
-                    value = _decrypt_secret_for_runtime(value, settings)
-                except SettingsEncryptionError as exc:
-                    # 密文若无法解密，继续使用环境变量会掩盖密钥丢失、也会破坏
-                    # “数据库优先”的语义。由 lifespan 中止应用启动，避免带着错误配置提供服务。
-                    logger.error("[系统设置] 无法加载加密密钥 key=%s: %s", row.key, exc)
-                    raise
-
-                if value and not is_encrypted_setting_value(row.value):
-                    if settings.config_encryption_key:
-                        row.value = encrypt_setting_secret(value, settings.config_encryption_key)
-                        migrated_keys.append(row.key)
-                    else:
-                        raise SettingsEncryptionError(
-                            "检测到历史明文模型密钥；请设置 CONFIG_ENCRYPTION_KEY 后重新启动以完成加密迁移"
-                        )
-
-            try:
-                setattr(settings, row.key, _coerce_setting_value(row.key, value, settings))
-            except (TypeError, ValueError):
-                logger.warning("[系统设置] 忽略无法解析的字段 key=%s", row.key)
-
-        if migrated_keys:
-            await db.commit()
-
-    if migrated_keys:
-        logger.info("[系统设置] 已将历史明文模型密钥迁移为加密存储：%s", ", ".join(migrated_keys))
 
 
 async def _load(db: AsyncSession) -> dict:
@@ -954,7 +886,8 @@ async def update_settings(
         )
     await db.commit()
 
-    # 单进程运行时即时生效；重启后 apply_stored_settings 会再次从数据库恢复。
+    # 当前 API 进程即时生效；独立文档 worker 会在领取下一条任务时重新加载。
+    # 重启后两个进程也都会从数据库恢复配置。
     for key, value in updates.items():
         setattr(settings, key, value)
     if any(

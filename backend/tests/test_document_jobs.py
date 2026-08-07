@@ -107,15 +107,33 @@ class DocumentJobWorkerTests(unittest.IsolatedAsyncioTestCase):
             attempt_count=1,
         )
         chunks = [{"content": "正文", "embedding": [0.1], "metadata": {}}]
+        runtime_loaded = False
+
+        async def load_runtime_settings() -> None:
+            nonlocal runtime_loaded
+            runtime_loaded = True
+
+        async def materialize(_job, _doc):
+            self.assertTrue(runtime_loaded)
+            return chunks, None
+
         with (
             patch("core.document_jobs._claim_next_job", new=AsyncMock(return_value=job)),
+            patch(
+                "core.document_jobs.apply_stored_settings",
+                new=AsyncMock(side_effect=load_runtime_settings),
+            ) as load_settings,
             patch("core.document_jobs._load_current_document", new=AsyncMock(return_value=SimpleNamespace())),
-            patch("core.document_jobs._materialize_chunks", new=AsyncMock(return_value=(chunks, None))),
+            patch(
+                "core.document_jobs._materialize_chunks",
+                new=AsyncMock(side_effect=materialize),
+            ),
             patch("core.document_jobs._complete_job", new=AsyncMock(return_value=True)) as complete,
             patch("core.document_jobs._discard_source_file", new=AsyncMock()) as discard,
         ):
             self.assertTrue(await process_one_document_job())
 
+        load_settings.assert_awaited_once_with()
         complete.assert_awaited_once_with(job, chunks, None)
         discard.assert_awaited_once_with({"source_path": "uploads/input.pdf"})
 
@@ -132,6 +150,7 @@ class DocumentJobWorkerTests(unittest.IsolatedAsyncioTestCase):
         chunks = [{"content": "识别文本", "embedding": [0.1], "metadata": {}}]
         with (
             patch("core.document_jobs._claim_next_job", new=AsyncMock(return_value=job)),
+            patch("core.document_jobs.apply_stored_settings", new=AsyncMock()),
             patch("core.document_jobs._load_current_document", new=AsyncMock(return_value=SimpleNamespace())),
             patch("core.document_jobs._materialize_chunks", new=AsyncMock(return_value=(chunks, "识别文本"))),
             patch("core.document_jobs._complete_job", new=AsyncMock(return_value=True)),
@@ -154,6 +173,7 @@ class DocumentJobWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch("core.document_jobs._claim_next_job", new=AsyncMock(return_value=job)),
+            patch("core.document_jobs.apply_stored_settings", new=AsyncMock()),
             patch("core.document_jobs._load_current_document", new=AsyncMock(return_value=SimpleNamespace())),
             patch("core.document_jobs._prepare_draft_content", new=AsyncMock(return_value="# 审阅内容")) as prepare,
             patch("core.document_jobs._complete_prepare", new=AsyncMock(return_value=True)) as complete_prepare,

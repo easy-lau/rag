@@ -19,7 +19,6 @@ from api.settings import (
     _run_model_connection_test,
     _secret_status,
     _test_config,
-    apply_stored_settings,
     list_models,
     test_model_connection as _test_model_connection_endpoint,
     update_settings,
@@ -30,6 +29,7 @@ from core.settings_crypto import (
     decrypt_setting_secret,
     encrypt_setting_secret,
 )
+from core.runtime_settings import apply_stored_settings
 from config import Settings
 from core.openai_client import get_embedding_client
 from models.db_models import SystemSetting
@@ -233,13 +233,30 @@ class SettingsContractValidationTests(unittest.TestCase):
 
 
 class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_startup_loads_encrypted_embedding_key_for_worker_process(self) -> None:
+        row = SystemSetting(
+            key="embedding_api_key",
+            value=encrypt_setting_secret("embedding-secret", "test-master-key"),
+        )
+        session = _Session([row])
+        settings = _runtime_settings()
+
+        with (
+            patch("core.runtime_settings.get_settings", return_value=settings),
+            patch("database.AsyncSessionLocal", return_value=_SessionContext(session)),
+        ):
+            await apply_stored_settings()
+
+        self.assertEqual(settings.embedding_api_key, "embedding-secret")
+        self.assertEqual(session.commits, 0)
+
     async def test_startup_migrates_legacy_plaintext_key_and_loads_runtime_value(self) -> None:
         row = SystemSetting(key="llm_api_key", value="legacy-secret")
         session = _Session([row])
         settings = _runtime_settings()
 
         with (
-            patch("api.settings.get_settings", return_value=settings),
+            patch("core.runtime_settings.get_settings", return_value=settings),
             patch("database.AsyncSessionLocal", return_value=_SessionContext(session)),
         ):
             await apply_stored_settings()
@@ -257,7 +274,7 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
         settings = _runtime_settings(config_encryption_key="wrong-key")
 
         with (
-            patch("api.settings.get_settings", return_value=settings),
+            patch("core.runtime_settings.get_settings", return_value=settings),
             patch("database.AsyncSessionLocal", return_value=_SessionContext(session)),
             self.assertRaises(SettingsEncryptionError),
         ):
@@ -269,7 +286,7 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
         settings = _runtime_settings(config_encryption_key="")
 
         with (
-            patch("api.settings.get_settings", return_value=settings),
+            patch("core.runtime_settings.get_settings", return_value=settings),
             patch("database.AsyncSessionLocal", return_value=_SessionContext(session)),
             self.assertRaises(SettingsEncryptionError),
         ):
@@ -514,7 +531,7 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
         settings = _runtime_settings()
 
         with (
-            patch("api.settings.get_settings", return_value=settings),
+            patch("core.runtime_settings.get_settings", return_value=settings),
             patch("database.AsyncSessionLocal", return_value=_SessionContext(session)),
         ):
             await apply_stored_settings()
