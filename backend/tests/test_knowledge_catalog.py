@@ -64,11 +64,33 @@ class KnowledgeCatalogRunnerTests(unittest.IsolatedAsyncioTestCase):
             is_active=False,
             tags=["云枢7"],
         )
+        self.draft = Document(
+            id=uuid.uuid4(),
+            kb_id=self.kb_id,
+            filename="8.1升级8.6.20",
+            file_type="md",
+            status="draft",
+            is_active=True,
+            tags=["升级"],
+        )
 
-    async def test_count_uses_only_authorized_scope_and_metadata_evidence(self) -> None:
+    def _assert_excludes_drafts_and_inactive(self, statements) -> None:
+        compiled = [
+            (str(stmt.compile()), dict(stmt.compile().params))
+            for stmt in statements
+        ]
+        for sql, params in compiled:
+            self.assertIn("is_active is true", sql.casefold())
+            self.assertNotIn("is_active is false", sql.casefold())
+            self.assertTrue(
+                any(value == "draft" for value in params.values()),
+                f"expected a draft status bound parameter in: {params}",
+            )
+
+    async def test_default_catalog_hides_drafts_and_inactive_documents(self) -> None:
         db = _CatalogDB([
-            _Result(scalar=2),
-            _Result(rows=[(self.ready, self.kb), (self.inactive, self.kb)]),
+            _Result(scalar=1),
+            _Result(rows=[(self.ready, self.kb)]),
         ])
         request = KnowledgeRequestSemantics(
             resource="document_catalog",
@@ -90,15 +112,48 @@ class KnowledgeCatalogRunnerTests(unittest.IsolatedAsyncioTestCase):
         answer = "".join(
             item["content"] for item in events if item["type"] == "text_delta"
         )
-        self.assertEqual(search["total"], 2)
+        self.assertEqual(search["total"], 1)
         self.assertTrue(all(
             item["source_kind"] == "document_metadata"
             for item in search["answer_sources"]
         ))
-        self.assertIn("共有 2 篇文章", answer)
+        self.assertIn("共有 1 篇文章", answer)
         self.assertIn("《云枢6配置参数说明》", answer)
-        self.assertIn("《云枢7配置》", answer)
+        self.assertNotIn("《云枢7配置》", answer)
+        self.assertNotIn("8.1升级8.6.20", answer)
         self.assertNotIn("embedding", answer.casefold())
+        self._assert_excludes_drafts_and_inactive(db.statements)
+
+    async def test_explicit_inactive_filter_still_lists_disabled_documents(self) -> None:
+        db = _CatalogDB([
+            _Result(scalar=1),
+            _Result(rows=[(self.inactive, self.kb)]),
+        ])
+        request = KnowledgeRequestSemantics(
+            resource="document_catalog",
+            operation="list",
+            status_filter="inactive",
+        )
+
+        events = await _events(run_knowledge_catalog_stream(
+            question="列出当前停用的文档",
+            kb_ids=[self.kb_id],
+            search_config={},
+            conversation_id=str(uuid.uuid4()),
+            db=db,
+            knowledge_request=request,
+        ))
+
+        answer = "".join(
+            item["content"] for item in events if item["type"] == "text_delta"
+        )
+        self.assertIn("《云枢7配置》", answer)
+        self.assertNotIn("8.1升级8.6.20", answer)
+        for statement in db.statements:
+            self.assertIn("is_active is false", str(statement.compile()).casefold())
+            self.assertTrue(
+                any(value == "draft" for value in dict(statement.compile().params).values())
+            )
         process = next(item for item in events if item["type"] == "search_process")
         self.assertEqual(process["execution_path"], "catalog")
         self.assertEqual(
@@ -129,10 +184,10 @@ class KnowledgeCatalogRunnerTests(unittest.IsolatedAsyncioTestCase):
                     operation="list",
                 ),
                 [
-                    _Result(scalar=2),
-                    _Result(rows=[(self.ready, self.kb), (self.inactive, self.kb)]),
+                    _Result(scalar=1),
+                    _Result(rows=[(self.ready, self.kb)]),
                 ],
-                "共找到 2 篇文章",
+                "共找到 1 篇文章",
             ),
             (
                 KnowledgeRequestSemantics(
@@ -141,9 +196,9 @@ class KnowledgeCatalogRunnerTests(unittest.IsolatedAsyncioTestCase):
                     group_by="status",
                 ),
                 [
-                    _Result(scalar=2),
-                    _Result(rows=[(self.ready, self.kb), (self.inactive, self.kb)]),
-                    _Result(rows=[("ready", 1), ("inactive", 1)]),
+                    _Result(scalar=1),
+                    _Result(rows=[(self.ready, self.kb)]),
+                    _Result(rows=[("ready", 1)]),
                 ],
                 "按状态统计如下",
             ),
@@ -166,7 +221,7 @@ class KnowledgeCatalogRunnerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(expected, answer)
                 if request.operation == "group":
                     self.assertIn("已就绪：1 篇", answer)
-                    self.assertIn("已停用：1 篇", answer)
+                    self.assertNotIn("已停用", answer)
 
 
 if __name__ == "__main__":

@@ -75,14 +75,18 @@ def _catalog_filter_pattern(value: object) -> str:
 
 
 def _status_condition(request: KnowledgeRequestSemantics):
+    # 草稿是未发布内容：任何状态下都不进入问答/知识库检索，只通过文档管理页对创建者可见。
+    # 默认（any）只检索已发布且启用的内容，停用文档同样不可见；显式查询停用/处理中/失败
+    # 等状态时仍按用户明确要求过滤（但草稿依旧排除）。
+    not_draft = Document.status != "draft"
     if request.status_filter == "inactive":
-        return Document.is_active.is_(False)
+        return and_(Document.is_active.is_(False), not_draft)
     active = Document.is_active.is_(True)
     if request.status_filter == "any":
-        return None
+        return and_(active, not_draft)
     if request.status_filter == "not_ready":
-        return and_(active, Document.status != "ready")
-    return and_(active, Document.status == request.status_filter)
+        return and_(active, Document.status != "ready", not_draft)
+    return and_(active, Document.status == request.status_filter, not_draft)
 
 
 def _catalog_conditions(
