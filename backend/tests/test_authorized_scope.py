@@ -1,7 +1,10 @@
 import unittest
 import uuid
 
-from core.authorized_scope import resolve_authorized_scope_clarification
+from core.authorized_scope import (
+    auto_select_single_authorized_scope,
+    resolve_authorized_scope_clarification,
+)
 from core.query_constraints import ApplicabilityScope
 from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
 
@@ -63,6 +66,57 @@ def _plan(*, product="平台A", version=None, answer_shape="process"):
     )
 
 
+class AutoSelectSingleAuthorizedScopeTests(unittest.TestCase):
+    def test_single_document_across_versions_is_auto_selected(self) -> None:
+        doc_id = str(uuid.uuid4())
+        choices = {
+            ("平台a", "6"): {
+                "product": "平台A",
+                "version": "6",
+                "kb_ids": {"kb-1"},
+                "doc_ids": {doc_id},
+            },
+            ("平台a", "7"): {
+                "product": "平台A",
+                "version": "7",
+                "kb_ids": {"kb-1"},
+                "doc_ids": {doc_id},
+            },
+        }
+
+        self.assertTrue(auto_select_single_authorized_scope(choices))
+
+    def test_multiple_distinct_documents_remain_ambiguous(self) -> None:
+        choices = {
+            ("平台a", "6"): {
+                "product": "平台A",
+                "version": "6",
+                "kb_ids": {"kb-1"},
+                "doc_ids": {str(uuid.uuid4())},
+            },
+            ("平台a", "7"): {
+                "product": "平台A",
+                "version": "7",
+                "kb_ids": {"kb-1"},
+                "doc_ids": {str(uuid.uuid4())},
+            },
+        }
+
+        self.assertFalse(auto_select_single_authorized_scope(choices))
+
+    def test_single_version_single_document_is_auto_selected(self) -> None:
+        choices = {
+            ("平台a", "6"): {
+                "product": "平台A",
+                "version": "6",
+                "kb_ids": {"kb-1"},
+                "doc_ids": {str(uuid.uuid4())},
+            },
+        }
+
+        self.assertTrue(auto_select_single_authorized_scope(choices))
+
+
 class AuthorizedScopeClarificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_authorized_versions_require_clarification(self):
         kb_id = uuid.uuid4()
@@ -99,6 +153,44 @@ class AuthorizedScopeClarificationTests(unittest.IsolatedAsyncioTestCase):
             plan=_plan(),
             query="平台A的登录参数应该怎么修改",
             kb_ids=[selected_kb_id],
+        )
+
+        self.assertIsNone(result)
+
+    async def test_multiple_versions_on_one_document_do_not_clarify(self) -> None:
+        """All version choices resolving to the same authorized doc auto-select.
+
+        The server owns the only candidate: asking the user to pick a version
+        would offer no real document choice, so the version picker is skipped.
+        """
+
+        kb_id = uuid.uuid4()
+        shared_doc_id = uuid.uuid4()
+        rows = [
+            (
+                shared_doc_id,
+                kb_id,
+                f"平台A-6-配置.md",
+                [],
+                f"所属产品：平台A\n产品版本：6",
+                {"product": "平台A", "version": "6"},
+            ),
+            (
+                shared_doc_id,
+                kb_id,
+                f"平台A-7-配置.md",
+                [],
+                f"所属产品：平台A\n产品版本：7",
+                {"product": "平台A", "version": "7"},
+            ),
+        ]
+        db = _CatalogDB(rows)
+
+        result = await resolve_authorized_scope_clarification(
+            db,
+            plan=_plan(),
+            query="平台A的登录参数应该怎么修改",
+            kb_ids=[kb_id],
         )
 
         self.assertIsNone(result)

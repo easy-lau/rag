@@ -850,18 +850,18 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             _candidate(
                 chunk_id="v6-basic",
                 doc_id="doc-v6",
-                filename="钉钉",
-                content="所属产品：云枢6>> 产品版本：6.0.1>>",
+                filename="集成目标说明",
+                content="所属产品：ProductX>> 产品版本：6.0.1>>",
                 topic=0.7,
                 support=0.1,
             ),
             _candidate(
                 chunk_id="v8-basic",
                 doc_id="doc-v8",
-                filename="二开发送钉钉工作通知",
+                filename="二开发送集成通知",
                 content=(
-                    "所属产品：云枢8>> 产品版本：8.2.75>> "
-                    "所属项目：中青建安>"
+                    "所属产品：ProductX>> 产品版本：8.2.75>> "
+                    "所属项目：项目甲>"
                 ),
                 topic=0.9,
                 support=0.1,
@@ -869,8 +869,8 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             _candidate(
                 chunk_id="v8-solution",
                 doc_id="doc-v8",
-                filename="二开发送钉钉工作通知",
-                content="调用 DingTalkMessageServiceImpl 发送钉钉工作通知",
+                filename="二开发送集成通知",
+                content="调用 IntegrationMessageService 发送工作通知",
                 topic=1.0,
                 support=0.98,
                 role="direct",
@@ -878,8 +878,8 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             _candidate(
                 chunk_id="v7-config",
                 doc_id="doc-v7-config",
-                filename="云枢7配置",
-                content="所属产品：云枢>> 产品版本：云枢7全系>>",
+                filename="ProductX7配置",
+                content="所属产品：ProductX>> 产品版本：7全系>>",
                 topic=0.2,
                 support=0.0,
                 role="irrelevant",
@@ -887,9 +887,9 @@ class EvidenceAmbiguityTests(unittest.TestCase):
         ]
 
         decision = detect_evidence_scope_ambiguity(
-            query="云枢中想二开钉钉消息可以吗",
+            query="产品：ProductX，想二开集成消息可以吗",
             constraints=extract_query_constraints(
-                "云枢中想二开钉钉消息可以吗"
+                "产品：ProductX，想二开集成消息可以吗"
             ),
             candidates=candidates,
         )
@@ -902,8 +902,8 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             {("6.0.1",), ("8.2.75",)},
         )
         labels = " ".join(choice.label for choice in decision.choices)
-        self.assertIn("中青建安", labels)
-        self.assertNotIn("云枢7配置", labels)
+        self.assertIn("项目甲", labels)
+        self.assertNotIn("ProductX7配置", labels)
         self.assertEqual(decision.allowed_doc_ids, ())
         self.assertEqual(decision.to_dict()["allowed_doc_ids"], [])
 
@@ -1388,11 +1388,11 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             _candidate(
                 chunk_id="filename-v6",
                 doc_id="doc-filename-v6",
-                filename="云枢6配置参数说明",
+                filename="ProductX6配置参数说明",
                 content="登录用户名枚举配置说明",
                 metadata={
-                    "source": "云枢6配置参数说明",
-                    "heading": "云枢6配置参数说明 › 四、解决方案",
+                    "source": "ProductX6配置参数说明",
+                    "heading": "ProductX6配置参数说明 › 四、解决方案",
                 },
                 topic=0.9,
                 support=0.8,
@@ -1401,9 +1401,9 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             _candidate(
                 chunk_id="filename-v7",
                 doc_id="doc-filename-v7",
-                filename="云枢7配置",
+                filename="ProductX7配置",
                 content="登录用户名枚举配置说明",
-                metadata={"source": "云枢7配置"},
+                metadata={"source": "ProductX7配置"},
                 topic=0.9,
                 support=0.8,
                 role="direct",
@@ -1428,16 +1428,16 @@ class EvidenceAmbiguityTests(unittest.TestCase):
             _candidate(
                 chunk_id=f"filename-cmp-{version}",
                 doc_id=f"doc-filename-cmp-{version}",
-                filename=f"云枢{version}配置",
+                filename=f"ProductX{version}配置",
                 content="登录安全配置说明",
-                metadata={"source": f"云枢{version}配置"},
+                metadata={"source": f"ProductX{version}配置"},
                 topic=0.9,
                 support=0.8,
                 role="direct",
             )
             for version in ("6", "7", "8")
         ]
-        query = "比较云枢6和云枢7的登录安全配置"
+        query = "比较ProductX6和ProductX7的登录安全配置"
         plan = resolve_explicit_scope_comparison(
             query=query,
             constraints=extract_query_constraints(query),

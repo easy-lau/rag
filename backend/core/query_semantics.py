@@ -708,6 +708,7 @@ class ResolvedTurnSemantics:
     bridge_candidates: tuple[QueryAnalysisBridgeCandidate, ...]
     canonical_retrieval_queries: tuple[str, ...]
     canonical_retrieval_query: str
+    confidence: float = 0.0
     knowledge_request: KnowledgeRequestSemantics | None = None
 
     def __post_init__(self) -> None:
@@ -742,12 +743,19 @@ class ResolvedTurnSemantics:
         canonical = _normalised(self.canonical_retrieval_query)
         if not canonical:
             raise ValueError("resolved semantics requires a canonical retrieval query")
+        if (
+            isinstance(self.confidence, bool)
+            or not isinstance(self.confidence, (int, float))
+            or not 0 <= float(self.confidence) <= 1
+        ):
+            raise ValueError("resolved semantics confidence must be between 0 and 1")
         knowledge_request = self.knowledge_request or content_knowledge_request()
         if not isinstance(knowledge_request, KnowledgeRequestSemantics):
             raise ValueError("resolved semantics requires a knowledge request")
         object.__setattr__(self, "selected_context_turn_keys", selected)
         object.__setattr__(self, "canonical_retrieval_queries", queries)
         object.__setattr__(self, "canonical_retrieval_query", canonical)
+        object.__setattr__(self, "confidence", float(self.confidence))
         object.__setattr__(self, "knowledge_request", knowledge_request)
 
     @property
@@ -765,6 +773,7 @@ class ResolvedTurnSemantics:
             "bridge_candidates": [item.to_dict() for item in self.bridge_candidates],
             "canonical_retrieval_queries": list(self.canonical_retrieval_queries),
             "canonical_retrieval_query": self.canonical_retrieval_query,
+            "confidence": self.confidence,
             "knowledge_request": self.knowledge_request.to_dict(),
         }
 
@@ -778,6 +787,7 @@ class ResolvedTurnSemantics:
             "answer_unit_count": len(self.answer_units),
             "bridge_candidate_count": len(self.bridge_candidates),
             "canonical_query_count": len(self.canonical_retrieval_queries),
+            "confidence": self.confidence,
             "knowledge_request": self.knowledge_request.safe_summary(),
         }
 
@@ -823,6 +833,7 @@ def resolve_turn_semantics(
         bridge_candidates=analysis.bridge_candidates,
         canonical_retrieval_queries=queries,
         canonical_retrieval_query=canonical,
+        confidence=analysis.confidence,
     )
 
 

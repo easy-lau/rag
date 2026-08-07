@@ -604,6 +604,41 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_small_document_empty_content_is_inconclusive(self) -> None:
+        """The small-document selector also maps empty content to inconclusive."""
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=AsyncMock(return_value=SimpleNamespace(
+                        choices=[SimpleNamespace(
+                            message=SimpleNamespace(content="")
+                        )]
+                    ))
+                )
+            )
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await select_small_document_evidence_with_coverage(
+                "普通员工的出差标准是什么",
+                [
+                    {"id": "grade", "doc_id": "travel", "content": "普通员工属于D级。"},
+                    {"id": "train", "doc_id": "travel", "content": "D级乘高铁二等座。"},
+                ],
+                [_requirement("r1", "回答普通员工出差标准")],
+                bridge_requirement_ids=(),
+                eligible_candidate_indexes=(1, 2),
+                anchor_candidate_indexes=(1,),
+            )
+
+        self.assertFalse(outcome.succeeded)
+        self.assertEqual(outcome.failure_kind, "empty_content")
+        self.assertEqual(outcome.adjudication.status, "inconclusive")
+        self.assertEqual(outcome.adjudication.reason, "empty_content")
+
     async def test_complete_claim_without_required_bridge_fails_closed(self) -> None:
         payload = {
             "selected": [{
@@ -1635,7 +1670,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.results[0]["jointly_selected"])
 
     async def test_unknown_product_scope_cannot_enter_joint_set(self) -> None:
-        requirements = [_requirement("r1", "云枢登录配置")]
+        requirements = [_requirement("r1", "产品甲登录配置")]
         results = [
             {"id": "generic", "content": "设置统一登录失败提示", "score": 0.02}
         ]
@@ -1667,7 +1702,7 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         }
 
         outcome = await self._run(
-            "云枢登录怎么配置",
+            "产品：产品甲，登录怎么配置",
             results,
             requirements,
             payload,
@@ -1737,12 +1772,23 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(outcome.succeeded)
         self.assertIn("TimeoutError", outcome.error or "")
+        self.assertEqual(outcome.adjudication.status, "inconclusive")
+        self.assertEqual(outcome.adjudication.reason, "timeout")
         self.assertEqual(client.chat.completions.create.await_count, 2)
         self.assertFalse(outcome.results[0]["jointly_selected"])
         self.assertIsNone(outcome.results[0]["evidence_role"])
         self.assertEqual(outcome.results[0]["rerank_status"], "unverified")
 
-    async def test_contract_failures_open_role_scoped_circuit(self) -> None:
+    async def test_contract_failures_are_inconclusive_without_circuit(self) -> None:
+        """Contract validation rejections are model behavior, not an outage.
+
+        The adjudication contract separates ``inconclusive`` (empty content,
+        rejected contract, timeout) from ``failed`` (provider infrastructure).
+        A malformed model response keeps the deterministic candidate scope
+        eligible for auto-confirm and never opens the circuit breaker, so the
+        next request still reaches the provider.
+        """
+
         requirements = [_requirement("r1", "取得住宿标准")]
         results = [{"id": "hotel", "content": "D级住宿450元/天。", "score": 0.02}]
         client = _client_with_raw("{bad json")
@@ -1768,14 +1814,102 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
                 "住宿标准是什么", results, requirements, timeout_seconds=1.0
             )
 
+        for outcome in (first, second, third):
+            self.assertFalse(outcome.succeeded)
+            self.assertEqual(outcome.failure_kind, "contract_validation")
+            self.assertEqual(outcome.adjudication.status, "inconclusive")
+            self.assertEqual(outcome.adjudication.reason, "contract_validation")
+            self.assertEqual(outcome.circuit_state, "closed")
+        # The circuit never opened, so every request reached the provider:
+        # two attempts (initial + repair) for each of the three requests.
+        self.assertEqual(client.chat.completions.create.await_count, 6)
+
+    async def test_provider_infrastructure_failures_open_role_scoped_circuit(
+        self,
+    ) -> None:
+        """Protocol/connection failures are ``failed`` and trip the breaker."""
+
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{"id": "hotel", "content": "D级住宿450元/天。", "score": 0.02}]
+
+        class ProviderUnavailable(Exception):
+            status_code = 500
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=AsyncMock(side_effect=ProviderUnavailable("upstream 500"))
+                )
+            )
+        )
+        settings = SimpleNamespace(
+            **vars(_settings()),
+            llm_base_url="https://provider.example/v1",
+            rag_v2_model_evidence_circuit_breaker_enabled=True,
+            rag_v2_model_evidence_circuit_breaker_threshold=2,
+            rag_v2_model_evidence_circuit_breaker_cooldown_seconds=60,
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=settings),
+        ):
+            first = await joint_rerank_with_coverage(
+                "住宿标准是什么", results, requirements, timeout_seconds=1.0
+            )
+            second = await joint_rerank_with_coverage(
+                "住宿标准是什么", results, requirements, timeout_seconds=1.0
+            )
+            third = await joint_rerank_with_coverage(
+                "住宿标准是什么", results, requirements, timeout_seconds=1.0
+            )
+
         self.assertFalse(first.succeeded)
-        self.assertEqual(first.failure_kind, "contract_validation")
+        self.assertEqual(first.failure_kind, "provider_error")
+        self.assertEqual(first.adjudication.status, "failed")
         self.assertEqual(first.circuit_state, "closed")
         self.assertEqual(second.circuit_state, "opened")
         self.assertEqual(third.failure_kind, "circuit_open")
         self.assertEqual(third.circuit_state, "open")
+        self.assertEqual(third.adjudication.status, "failed")
         # The third request is rejected before any provider call.
-        self.assertEqual(client.chat.completions.create.await_count, 4)
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+
+    async def test_empty_content_is_inconclusive_not_failed(self) -> None:
+        """An empty model response is ``inconclusive``, not a provider outage.
+
+        Empty content keeps the deterministic candidate scope eligible for
+        server auto-confirm and never counts toward the circuit breaker, so
+        the next request still reaches the provider.
+        """
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=AsyncMock(return_value=SimpleNamespace(
+                        choices=[SimpleNamespace(
+                            message=SimpleNamespace(content="")
+                        )]
+                    ))
+                )
+            )
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "住宿标准是什么",
+                [{"id": "hotel", "content": "D级住宿450元/天。", "score": 0.02}],
+                [_requirement("r1", "取得住宿标准")],
+            )
+
+        self.assertFalse(outcome.succeeded)
+        self.assertEqual(outcome.error, "empty_content")
+        self.assertEqual(outcome.failure_kind, "empty_content")
+        self.assertEqual(outcome.adjudication.status, "inconclusive")
+        self.assertEqual(outcome.adjudication.reason, "empty_content")
+        self.assertEqual(outcome.coverage_status, "insufficient")
+        self.assertFalse(outcome.results[0]["jointly_selected"])
 
     async def test_malformed_joint_json_falls_back_without_promotion(self) -> None:
         with (

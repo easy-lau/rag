@@ -9,7 +9,8 @@ evidence authority; the backend recomputes the final coverage decision.
 
 from __future__ import annotations
 
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 
 CoverageStatus = Literal["complete", "partial", "insufficient"]
@@ -64,9 +65,43 @@ def coverage_status_protocol_text() -> str:
 
 
 __all__ = [
+    "AdjudicationOutcome",
+    "AdjudicationStatus",
+    "INCONCLUSIVE_FAILURE_KINDS",
     "COVERAGE_STATUS_ALIASES",
     "COVERAGE_STATUSES",
     "CoverageStatus",
     "coverage_status_protocol_text",
     "normalize_coverage_status",
 ]
+
+
+AdjudicationStatus = Literal["succeeded", "inconclusive", "failed"]
+
+# Failure kinds that mean "the model produced no usable conclusion" (empty
+# content, output rejected by the contract parser, or deadline timeout).
+# They are deliberately distinct from provider infrastructure failures: they
+# never open the circuit breaker and keep the deterministic candidate scope
+# eligible for server-side auto-selection.
+INCONCLUSIVE_FAILURE_KINDS = frozenset({
+    "empty_content",
+    "timeout",
+    "contract_validation",
+})
+
+
+@dataclass(frozen=True)
+class AdjudicationOutcome:
+    """裁决结果契约：区分模型无结论与供应商基础设施故障。
+
+    ``succeeded`` 携带重排后的候选/证据选择；``inconclusive`` 表示模型没有
+    给出可用结论（空内容、契约拒绝或超时），不是供应商故障；``failed`` 表示
+    协议/连接级基础设施失败，保持 fail-closed（熔断、保留候选供澄清）。
+    该契约只描述一次裁决调用，不决定证据角色——是否回答由确定性候选范围
+    auto-confirm 与回答策略共同决定。
+    """
+
+    status: AdjudicationStatus
+    reason: str | None = None
+    elapsed_ms: int = 0
+    payload: Any = None

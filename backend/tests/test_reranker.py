@@ -60,7 +60,7 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(constraints.product, "云枢")
         self.assertEqual(constraints.version, "8.6")
         self.assertTrue(constraints.explicit_version)
-        self.assertEqual(constraints.matched_text, "云枢8.6")
+        self.assertEqual(constraints.matched_text, "我是云枢8.6")
         self.assertIn("显式版本", constraints.extraction_reason)
 
     def test_obvious_old_versions_are_deterministic_mismatches(self) -> None:
@@ -79,7 +79,7 @@ class QueryConstraintTests(unittest.TestCase):
             self.assertEqual(evaluation.candidate_versions, (version,))
 
     def test_explicit_compatibility_is_not_misclassified_as_exact(self) -> None:
-        constraints = extract_query_constraints("云枢8.6登录安全配置")
+        constraints = extract_query_constraints("我是云枢8.6，查询登录安全配置")
         evaluation = evaluate_candidate_constraints(
             constraints,
             {
@@ -131,25 +131,25 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(evaluation.status, "mismatch")
         self.assertIn("6", evaluation.candidate_versions)
 
-    def test_product_aliases_are_explicit_but_arbitrary_substrings_are_not(self) -> None:
-        constraints = extract_query_constraints("云枢8.6登录安全")
-        alias = evaluate_candidate_constraints(
+    def test_exact_product_identity_does_not_use_implicit_aliases(self) -> None:
+        constraints = extract_query_constraints("我是云枢8.6，查询登录安全")
+        exact = evaluate_candidate_constraints(
             constraints,
-            {"filename": "CloudPivot 8.6 安全配置", "content": "配置说明"},
+            {"metadata": {"product": "云枢", "version": "8.6"}, "content": "配置说明"},
         )
         conflicting = evaluate_candidate_constraints(
             constraints,
             {"metadata": {"product": "非云枢", "version": "8.6"}, "content": "配置说明"},
         )
-        self.assertEqual(alias.status, "exact")
+        self.assertEqual(exact.status, "exact")
         self.assertEqual(conflicting.status, "mismatch")
 
-    def test_node_count_is_not_extracted_as_version_and_product_only_is_kept(self) -> None:
+    def test_node_count_does_not_create_product_or_version_scope(self) -> None:
         constraints = extract_query_constraints("使用云枢 8 个节点")
-        self.assertEqual(constraints.product, "云枢")
+        self.assertIsNone(constraints.product)
         self.assertIsNone(constraints.version)
         self.assertFalse(constraints.has_hard_constraint)
-        self.assertTrue(constraints.has_product_constraint)
+        self.assertFalse(constraints.has_product_constraint)
 
     def test_productless_explicit_version_labels_are_extracted(self) -> None:
         for query, version in (
@@ -211,7 +211,7 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(evaluation.candidate_versions, ("7",))
 
     def test_bare_component_compatibility_cannot_upgrade_old_product_document(self) -> None:
-        constraints = extract_query_constraints("云枢8.6登录安全")
+        constraints = extract_query_constraints("我是云枢8.6，查询登录安全")
         evaluation = evaluate_candidate_constraints(
             constraints,
             {
@@ -223,7 +223,7 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(evaluation.status, "mismatch")
 
     def test_version_metadata_without_product_identity_is_unknown(self) -> None:
-        constraints = extract_query_constraints("云枢8.6登录安全")
+        constraints = extract_query_constraints("我是云枢8.6，查询登录安全")
         evaluation = evaluate_candidate_constraints(
             constraints,
             {
@@ -236,7 +236,7 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(evaluation.status, "unknown")
 
     def test_conflicting_declared_versions_are_not_exact(self) -> None:
-        constraints = extract_query_constraints("云枢8.6登录安全")
+        constraints = extract_query_constraints("我是云枢8.6，查询登录安全")
         evaluation = evaluate_candidate_constraints(
             constraints,
             {
@@ -248,7 +248,7 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(evaluation.status, "mismatch")
 
     def test_single_number_tag_is_not_treated_as_product_version(self) -> None:
-        constraints = extract_query_constraints("云枢8.6登录安全")
+        constraints = extract_query_constraints("我是云枢8.6，查询登录安全")
         evaluation = evaluate_candidate_constraints(
             constraints,
             {
@@ -261,12 +261,12 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertEqual(evaluation.status, "unknown")
 
     def test_product_generation_suffix_and_flattened_markdown_fields_are_normalized(self) -> None:
-        product_only = extract_query_constraints("云枢中想二开钉钉消息可以吗")
+        product_only = extract_query_constraints("产品：云枢；想二开消息可以吗")
         candidate = {
             "filename": "二开发送钉钉工作通知",
             "content": (
                 "【一、基本信息】\n"
-                "> 所属产品：云枢8>> 产品版本：8.2.75>> 所属项目：中青建安>"
+                "> 所属产品：云枢>> 产品版本：8.2.75>> 所属项目：中青建安>"
             ),
         }
 
@@ -277,18 +277,18 @@ class QueryConstraintTests(unittest.TestCase):
         self.assertNotIn("所属项目", evaluation.candidate_products)
 
         explicit_version = evaluate_candidate_constraints(
-            extract_query_constraints("云枢8.6中如何发送钉钉消息"),
+            extract_query_constraints("我是云枢8.6，如何发送消息"),
             candidate,
         )
         self.assertEqual(explicit_version.status, "mismatch")
         self.assertIn("8.2.75", explicit_version.reason)
 
-    def test_registered_alias_with_generation_is_not_arbitrary_substring_match(self) -> None:
-        constraints = extract_query_constraints("云枢中如何配置消息")
+    def test_exact_product_label_is_not_arbitrary_substring_match(self) -> None:
+        constraints = extract_query_constraints("产品：云枢；如何配置消息")
         same_product = evaluate_candidate_constraints(
             constraints,
             {
-                "metadata": {"product": "云枢8", "version": "8.2.75"},
+                "metadata": {"product": "云枢", "version": "8.2.75"},
                 "content": "消息配置",
             },
         )
@@ -309,7 +309,7 @@ class QueryConstraintTests(unittest.TestCase):
                 "id": "basic",
                 "kb_id": "kb-a",
                 "doc_id": "doc-a",
-                "content": "所属产品：云枢8>> 产品版本：8.2.75>>",
+                "content": "所属产品：云枢>> 产品版本：8.2.75>>",
             },
             {
                 "id": "solution",
@@ -331,7 +331,7 @@ class QueryConstraintTests(unittest.TestCase):
             },
         ]
         enriched = inherit_document_constraint_metadata(candidates)
-        constraints = extract_query_constraints("云枢中想二开钉钉消息可以吗")
+        constraints = extract_query_constraints("产品：云枢；想二开消息可以吗")
         evaluations = {
             item["id"]: evaluate_candidate_constraints(constraints, item)
             for item in enriched
@@ -392,6 +392,86 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
             client.chat.completions.create.await_args.kwargs["model"],
             "fast-reranker",
         )
+
+    async def test_legacy_rerank_negotiates_response_format_downgrade(self) -> None:
+        """The legacy rerank path reuses the structured-output negotiation.
+
+        A provider that rejects ``response_format`` must degrade to plain JSON
+        instead of failing the whole rerank with a 400.
+        """
+
+        class ProviderContractError(Exception):
+            status_code = 400
+
+        payload = {"results": [_assessment(1, topic=0.9, support=0.9)]}
+
+        async def create(**kwargs):
+            if "response_format" in kwargs:
+                raise ProviderContractError(
+                    "Request failed: Bad Request, error: "
+                    "This response_format type is unavailable now"
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(
+                    message=SimpleNamespace(content=json.dumps(payload))
+                )]
+            )
+
+        create_mock = AsyncMock(side_effect=create)
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create_mock))
+        )
+        results = [{"id": "a", "content": "报销需先提交申请", "score": 0.02}]
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch(
+                "core.reranker.get_settings",
+                return_value=SimpleNamespace(
+                    chat_model="test-chat",
+                    llm_base_url="https://provider.example/v1",
+                ),
+            ),
+        ):
+            outcome = await rerank_with_status(
+                "公司的报销流程是什么",
+                results,
+                [AnswerRequirement("r1", "回答公司的报销流程")],
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.structured_output_mode, "plain_json")
+        self.assertEqual(
+            outcome.structured_output_attempted_modes,
+            ("json_schema", "json_object", "plain_json"),
+        )
+        self.assertNotIn("response_format", create_mock.await_args_list[-1].kwargs)
+
+    async def test_legacy_rerank_uses_adjudication_timeout_not_llm_timeout(
+        self,
+    ) -> None:
+        """Legacy rerank must not fall back to the global LLM timeout."""
+
+        results = [{"id": "a", "content": "A", "score": 0.02}]
+        client = _client_with_payload(
+            {"results": [_assessment(1, topic=0.9, support=0.9)]}
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch(
+                "core.reranker.get_settings",
+                return_value=SimpleNamespace(
+                    chat_model="test-chat",
+                    llm_request_timeout_seconds=60,
+                    rerank_timeout_seconds=15,
+                ),
+            ),
+        ):
+            outcome = await rerank_with_status("普通查询", results)
+
+        self.assertTrue(outcome.succeeded)
+        request_timeout = client.chat.completions.create.await_args.kwargs["timeout"]
+        self.assertGreater(request_timeout, 0.0)
+        self.assertLessEqual(request_timeout, 15.0)
 
     async def test_complete_valid_assessments_are_trusted_and_sorted(self) -> None:
         results = [
@@ -557,7 +637,7 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
                 "kb_id": "kb",
                 "doc_id": "doc",
                 "filename": "二开发送钉钉工作通知",
-                "content": "所属产品：云枢8>> 产品版本：8.2.75>>",
+                "content": "所属产品：云枢>> 产品版本：8.2.75>>",
                 "score": 0.03,
             },
             {
@@ -589,7 +669,7 @@ class RerankerTests(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             outcome = await rerank_with_status(
-                "云枢中想二开钉钉消息可以吗",
+                "产品：云枢；想二开消息可以吗",
                 results,
                 [AnswerRequirement("r1", "确认是否支持二开发送钉钉消息")],
             )

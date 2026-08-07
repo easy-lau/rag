@@ -63,8 +63,8 @@ def _step_event(step: str, status: str) -> str:
 def _catalog_filter_pattern(value: object) -> str:
     """Compile one exact source literal into a bounded ordered match.
 
-    Ordered-character matching allows metadata such as ``云枢6配置`` to match
-    the user literal ``云枢配置`` without inventing synonyms or consulting a
+    Ordered-character matching allows metadata such as ``产品甲6配置`` to match
+    the user literal ``产品甲配置`` without inventing synonyms or consulting a
     vector model.  The input is request-catalog text, not raw SQL.
     """
 

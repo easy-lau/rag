@@ -25,6 +25,14 @@ test('检索结果面板区分有限选项和需要自由补充的澄清', () =>
   assert.match(panelSource, /回复序号、版本或“都对比”/)
 })
 
+test('授权候选存在但证据不足时展示文档确认而不是无资料', () => {
+  assert.match(panelSource, /candidateConfirmation/)
+  assert.match(panelSource, /answerability_status/)
+  assert.match(panelSource, /已找到当前权限范围内的候选文章/)
+  assert.match(panelSource, /确认后系统只会在所选文章内/)
+  assert.match(panelSource, /确认前不会把候选资料当作已验证答案/)
+})
+
 test('右侧检索面板只按文章展示，不展开候选片段', () => {
   assert.match(panelSource, /document-only/)
   assert.match(panelSource, /\{\{ displayedDocumentCount \}\} 篇文章/)

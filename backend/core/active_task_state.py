@@ -19,10 +19,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.read_sessions import ReadSessionFactory, isolated_read_session
+from core.semantic_memory import (
+    ResolvedEntityMemory,
+    parse_resolved_entity_memory,
+)
 from models.db_models import Document, DocumentChunk
 
 
-ACTIVE_TASK_STATE_SCHEMA_VERSION = "rag_active_task.v1"
+ACTIVE_TASK_STATE_SCHEMA_VERSION = "rag_active_task.v2"
 ACTIVE_TASK_STATE_STATUS = "active"
 MAX_ACTIVE_TASK_QUERY_CHARS = 8000
 MAX_ACTIVE_TASK_SOURCES = 20
@@ -80,12 +84,22 @@ class ActiveTaskState:
     created_at: datetime
     status: str = ACTIVE_TASK_STATE_STATUS
     schema_version: str = ACTIVE_TASK_STATE_SCHEMA_VERSION
+    semantic_memory: ResolvedEntityMemory | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != ACTIVE_TASK_STATE_SCHEMA_VERSION:
+        if self.schema_version not in {
+            "rag_active_task.v1",
+            ACTIVE_TASK_STATE_SCHEMA_VERSION,
+        }:
             raise ValueError("unsupported active-task schema")
         if self.status != ACTIVE_TASK_STATE_STATUS:
             raise ValueError("active-task state is not active")
+        if (
+            self.schema_version == ACTIVE_TASK_STATE_SCHEMA_VERSION
+            and self.semantic_memory is not None
+            and not isinstance(self.semantic_memory, ResolvedEntityMemory)
+        ):
+            raise ValueError("active-task semantic_memory is invalid")
         if isinstance(self.revision, bool) or self.revision < 1:
             raise ValueError("active-task revision must be positive")
         root_query = _bounded_text(
@@ -140,6 +154,11 @@ class ActiveTaskState:
             "trace_id": self.trace_id,
             "created_at": self.created_at.isoformat(),
             "status": self.status,
+            "semantic_memory": (
+                self.semantic_memory.to_dict()
+                if self.semantic_memory is not None
+                else None
+            ),
         }
 
     def safe_summary(self) -> dict[str, Any]:
@@ -152,6 +171,11 @@ class ActiveTaskState:
             "document_count": len(self.selected_doc_ids),
             "source_count": len(self.selected_chunk_ids),
             "status": self.status,
+            "semantic_fact_count": (
+                len(self.semantic_memory.facts)
+                if self.semantic_memory is not None
+                else 0
+            ),
         }
 
 
@@ -159,6 +183,12 @@ def parse_active_task_state(value: object) -> ActiveTaskState | None:
     """Strictly parse persisted JSON; malformed/stale shapes fail closed."""
 
     if not isinstance(value, Mapping):
+        return None
+    schema_version = str(value.get("schema_version") or "")
+    if schema_version not in {
+        "rag_active_task.v1",
+        ACTIVE_TASK_STATE_SCHEMA_VERSION,
+    }:
         return None
     expected_fields = {
         "schema_version",
@@ -174,15 +204,24 @@ def parse_active_task_state(value: object) -> ActiveTaskState | None:
         "created_at",
         "status",
     }
+    if schema_version == ACTIVE_TASK_STATE_SCHEMA_VERSION:
+        expected_fields = {*expected_fields, "semantic_memory"}
     if set(value) != expected_fields:
         return None
+    semantic_memory: ResolvedEntityMemory | None = None
+    if schema_version == ACTIVE_TASK_STATE_SCHEMA_VERSION:
+        raw_memory = value.get("semantic_memory")
+        if raw_memory is not None:
+            semantic_memory = parse_resolved_entity_memory(raw_memory)
+            if semantic_memory is None:
+                return None
     try:
         revision = value["revision"]
         if isinstance(revision, bool):
             return None
         created_at = datetime.fromisoformat(str(value["created_at"]))
         return ActiveTaskState(
-            schema_version=str(value["schema_version"]),
+            schema_version=schema_version,
             state_id=uuid.UUID(str(value["state_id"])),
             revision=int(revision),
             root_query=str(value["root_query"]),
@@ -206,6 +245,7 @@ def parse_active_task_state(value: object) -> ActiveTaskState | None:
             trace_id=str(value["trace_id"]),
             created_at=created_at,
             status=str(value["status"]),
+            semantic_memory=semantic_memory,
         )
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
@@ -219,6 +259,7 @@ def build_active_task_state(
     source_turn_id: uuid.UUID,
     trace_id: str,
     previous_revision: int = 0,
+    semantic_memory: ResolvedEntityMemory | None = None,
 ) -> ActiveTaskState:
     """Create state only from already validated answer-source identities."""
 
@@ -260,6 +301,7 @@ def build_active_task_state(
         source_turn_id=source_turn_id,
         trace_id=trace_id,
         created_at=datetime.now(timezone.utc),
+        semantic_memory=semantic_memory,
     )
 
 

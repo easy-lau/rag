@@ -116,8 +116,15 @@ async def run_knowledge_result_stream(
     evidence_scope_filter: dict | None = None,
     knowledge_request: KnowledgeRequestSemantics | None = None,
     result_sources: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    acknowledgement: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Read or synthesize only the documents selected by server-issued handles."""
+    """Read or synthesize only the documents selected by server-issued handles.
+
+    ``acknowledgement`` is a server-produced lead-in for reference-correction
+    turns (for example ``第四个不是《钉钉》吗``).  It is prepended verbatim to
+    the deterministic read answer so the user sees the confirmation before the
+    document body; it never alters document selection or retrieval.
+    """
 
     del (
         search_config,
@@ -253,6 +260,7 @@ async def run_knowledge_result_stream(
         context_chars=len(document_text),
         context_truncated=truncated,
         elapsed_ms=retrieval_ms,
+        correction_acknowledged=bool(acknowledgement),
         **content_fields("question", user_question),
     )
     yield _step("retrieve", "done")
@@ -280,6 +288,8 @@ async def run_knowledge_result_stream(
     generation_started = time.perf_counter()
     if knowledge_request.operation == "read":
         answer = document_text
+        if acknowledgement:
+            answer = f"{acknowledgement}\n\n{answer}"
         if truncated:
             answer += "\n\n> 文档较长，当前展示了前 30000 个字符。"
         yield _sse({"type": "text_delta", "content": answer})

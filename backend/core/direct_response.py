@@ -82,7 +82,15 @@ def _bounded_history(
     return history
 
 
-def _system_prompt(response_mode: str) -> str:
+def _system_prompt(response_mode: str, *, decision_reason: str | None = None) -> str:
+    if decision_reason == "conversation_repair_rule":
+        return (
+            "你是企业 RAG 问答助手的对话修复模式。用户正在质疑系统刚才的澄清或选择"
+            "行为（例如“为什么要我选择”“你刚刚不是已经回答了吗”）。直接承认问题、"
+            "简短解释系统行为（证据确认流程过度触发，不应在只有一个候选时要求选择），"
+            "并根据历史回答把话题带回知识库问答。不得声称重新检索过资料，不得编造"
+            "文档内容；如果用户随后提出具体业务问题，提示其继续提问即可。"
+        )
     if response_mode == "writing":
         return (
             "你是专业的中文写作助手。只根据用户本轮明确提供的内容和目标完成润色、"
@@ -200,7 +208,10 @@ async def run_direct_response_stream(
         "pipeline_version": DIRECT_RUNNER_VERSION,
     })
 
-    system_prompt = _system_prompt(task_contract.response_mode)
+    system_prompt = _system_prompt(
+        task_contract.response_mode,
+        decision_reason=task_contract.decision_reason,
+    )
     messages = [{"role": "system", "content": system_prompt}, *history]
     messages.append({"role": "user", "content": user_question})
     trace_event(

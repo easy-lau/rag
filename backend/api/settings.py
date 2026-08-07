@@ -2,7 +2,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -66,6 +66,7 @@ class SettingsOut(BaseModel):
     llm_structured_output_mode: Literal[
         "auto", "json_schema", "json_object", "plain_json"
     ]
+    llm_disable_thinking: bool
     intent_model: str
     rerank_model: str
     temperature: float
@@ -100,6 +101,7 @@ class SettingsUpdate(BaseModel):
     llm_structured_output_mode: Literal[
         "auto", "json_schema", "json_object", "plain_json"
     ] | None = None
+    llm_disable_thinking: bool | None = None
     intent_model: str | None = Field(None, max_length=255)
     rerank_model: str | None = Field(None, max_length=255)
     temperature: float | None = None
@@ -270,6 +272,86 @@ def _validate_model_base_url_updates(updates: dict[str, object], settings) -> No
             )
 
 
+# Model IDs must be real provider identifiers.  Placeholder/template values
+# (e.g. an ORM ``objectId`` string or a server-side template variable) were
+# the root cause of the 8-05 ``model not found: objectId`` outage.  They are
+# rejected at the save boundary instead of failing at request time.
+_PLACEHOLDER_MODEL_MARKERS = (
+    "objectid",
+    "{{",
+    "}}",
+    "{%",
+    "%}",
+    "<model>",
+    "model_id",
+    "your_",
+    "todo",
+    "placeholder",
+    "demo-model",
+)
+_MODEL_FIELDS = (
+    "chat_model",
+    "intent_model",
+    "rerank_model",
+    "embedding_model",
+    "vision_model",
+    "rag_general_fallback_model",
+)
+# intent/rerank/fallback models may be empty to mean "reuse the chat model".
+_OPTIONAL_MODEL_FIELDS = frozenset({
+    "intent_model",
+    "rerank_model",
+    "rag_general_fallback_model",
+})
+_TIMEOUT_FIELDS = ("rerank_timeout_seconds",)
+_BOOL_FIELDS = ("llm_disable_thinking", "rerank_enabled", "show_sources")
+
+
+def _validate_settings_contract(
+    updates: dict[str, object],
+    settings: Any,
+) -> None:
+    """Reject invalid runtime settings at the save boundary (contract layer).
+
+    This is a whitelist contract, not a per-field ``if``: every model name is
+    checked for placeholders, every timeout stays in ``[1, 120]`` seconds and
+    every boolean field must be a real boolean.  A bad value must fail loudly
+    here instead of being silently stored and exploding at request time.
+    """
+
+    for field in _MODEL_FIELDS:
+        if field not in updates:
+            continue
+        raw = str(updates[field] or "").strip()
+        updates[field] = raw
+        if not raw:
+            if field in _OPTIONAL_MODEL_FIELDS:
+                continue
+            raise HTTPException(status_code=400, detail="模型名称不能为空")
+        lowered = raw.casefold()
+        for marker in _PLACEHOLDER_MODEL_MARKERS:
+            if marker in lowered:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{field} 不能包含占位符或模板变量",
+                )
+    for field in _TIMEOUT_FIELDS:
+        if field not in updates:
+            continue
+        value = updates[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise HTTPException(status_code=400, detail="超时配置必须为数字")
+        numeric = float(value)
+        if not 1.0 <= numeric <= 120.0:
+            raise HTTPException(
+                status_code=400,
+                detail="超时配置必须在 1~120 秒之间",
+            )
+    for field in _BOOL_FIELDS:
+        if field in updates and not isinstance(updates[field], bool):
+            raise HTTPException(status_code=400, detail="布尔配置必须为 true/false")
+
+
 async def _validate_embedding_update(updates: dict[str, object], settings) -> None:
     """Embedding 连接发生变化时，在保存前验证可用性及 2560 维约束。"""
     api_key_field, base_url_field, model_field = MODEL_SERVICE_FIELDS["embedding"]
@@ -377,6 +459,9 @@ async def _load(db: AsyncSession) -> dict:
         "chat_model": _value_from_database(db_map, "chat_model", settings),
         "llm_structured_output_mode": _value_from_database(
             db_map, "llm_structured_output_mode", settings
+        ),
+        "llm_disable_thinking": _value_from_database(
+            db_map, "llm_disable_thinking", settings
         ),
         "intent_model": _value_from_database(db_map, "intent_model", settings),
         "rerank_model": _value_from_database(db_map, "rerank_model", settings),
@@ -838,6 +923,7 @@ async def update_settings(
             # 空值表示复用对话模型；统一去除首尾空白，避免模型 ID 隐性失效。
             updates[optional_model_field] = str(updates[optional_model_field]).strip()
     _validate_model_base_url_updates(updates, settings)
+    _validate_settings_contract(updates, settings)
     if any(key in SECRET_SETTING_KEYS for key in updates) and not settings.config_encryption_key:
         raise HTTPException(
             status_code=503,
@@ -873,7 +959,12 @@ async def update_settings(
         setattr(settings, key, value)
     if any(
         key in updates
-        for key in ("llm_base_url", "chat_model", "llm_structured_output_mode")
+        for key in (
+            "llm_base_url",
+            "chat_model",
+            "llm_structured_output_mode",
+            "llm_disable_thinking",
+        )
     ):
         # 端点、模型或管理员选择变化后，旧能力结论不能污染新配置。
         clear_structured_output_capability_cache()
@@ -884,6 +975,7 @@ async def update_settings(
             "chat_model",
             "rerank_model",
             "llm_structured_output_mode",
+            "llm_disable_thinking",
             "rerank_timeout_seconds",
         )
     ):

@@ -32,6 +32,7 @@ from core.query_understanding_v3_contract import (
     parse_query_understanding,
 )
 from core.rag_trace import content_fields, exception_log_text, trace_event
+from core.result_reference import parse_result_reference_surface
 from core.structured_output import create_structured_completion
 
 
@@ -42,19 +43,6 @@ QUERY_UNDERSTANDING_V3_MAX_TOKENS = 1400
 QueryUnderstandingMode = Literal["off", "shadow", "active"]
 QueryUnderstandingOrigin = Literal["model", "deterministic"]
 
-_RESULT_ORDINAL_RE = re.compile(
-    r"第(?P<ordinal>[0-9一二三四五六七八九十两]+)(?:个|篇|份|条)?"
-    r"(?:文章|文档|资料|文件)?",
-    re.IGNORECASE,
-)
-_RESULT_LAST_RE = re.compile(
-    r"(?:最后|末尾)(?:一个|一篇|一份|一条)?(?:文章|文档|资料|文件)?",
-    re.IGNORECASE,
-)
-_RESULT_PREFIX_RE = re.compile(
-    r"前(?P<count>[0-9一二三四五六七八九十两]+)(?:个|篇|份|条)?",
-    re.IGNORECASE,
-)
 _RESULT_COMPARE_RE = re.compile(r"(?:比较|对比|区别|差异|异同)", re.IGNORECASE)
 _RESULT_SUMMARIZE_RE = re.compile(r"(?:总结|概括|摘要|归纳)", re.IGNORECASE)
 _RESULT_READ_RE = re.compile(
@@ -115,24 +103,6 @@ def _normalised_mode(value: object) -> QueryUnderstandingMode:
     return mode  # type: ignore[return-value]
 
 
-def _small_ordinal(value: str) -> int | None:
-    text = str(value or "").strip()
-    if text.isdigit():
-        number = int(text)
-        return number if 1 <= number <= 20 else None
-    digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-              "六": 6, "七": 7, "八": 8, "九": 9}
-    if text == "十":
-        return 10
-    if "十" in text:
-        left, right = text.split("十", 1)
-        tens = digits.get(left, 1) if left else 1
-        units = digits.get(right, 0) if right else 0
-        number = tens * 10 + units
-        return number if 1 <= number <= 20 else None
-    return digits.get(text)
-
-
 def _deterministic_result_reference_analysis(
     *,
     question: str,
@@ -152,23 +122,22 @@ def _deterministic_result_reference_analysis(
 
     selected = []
     operation = "read"
-    prefix = _RESULT_PREFIX_RE.search(question)
-    ordinal = _RESULT_ORDINAL_RE.search(question)
-    if prefix is not None:
-        count = _small_ordinal(prefix.group("count"))
+    reference = parse_result_reference_surface(question)
+    if reference is None:
+        return None
+    if reference.kind == "prefix":
+        count = reference.value
         if count is None or count < 2 or count > len(results):
             return None
         selected = results[:count]
         operation = "compare"
-    elif _RESULT_LAST_RE.search(question):
+    elif reference.kind == "last":
         selected = [results[-1]]
-    elif ordinal is not None:
-        index = _small_ordinal(ordinal.group("ordinal"))
+    else:
+        index = reference.value
         if index is None or index > len(results):
             return None
         selected = [results[index - 1]]
-    else:
-        return None
 
     if len(selected) == 1 and _RESULT_SUMMARIZE_RE.search(question):
         operation = "summarize"

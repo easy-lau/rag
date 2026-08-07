@@ -2309,8 +2309,19 @@ class EvidenceBundle:
             # Requirement bindings on an unverified fallback source partition
             # candidates by answer target; they are not proof that the target
             # is covered.  Coverage remains empty until normal adjudication and
-            # graph closure succeed.
-            if str(item.metadata.get("source_verification") or "").casefold() == "unverified":
+            # graph closure succeed.  The one exception is a server-side
+            # dominant-document auto-selection: that scope decision is
+            # deterministic, so the binding counts as coverage even though the
+            # reranker status stays unverified.
+            verification = str(
+                item.metadata.get("source_verification") or ""
+            ).strip().casefold()
+            verification_basis = str(
+                item.metadata.get("verification_basis") or ""
+            ).strip().casefold()
+            if verification == "unverified" and verification_basis != (
+                "deterministic_candidate_scope_confirmed"
+            ):
                 continue
             for requirement_id in item.supports_requirement_ids:
                 if requirement_id in seen:

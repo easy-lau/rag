@@ -314,20 +314,26 @@ _NORMALIZED_COMPATIBLE_VERSION_KEYS = {
     for item in _COMPATIBLE_VERSION_KEYS
 }
 
-# 企业产品别名集中维护在这里，供查询硬约束和意图路由共同使用。新增产品时
-# 只扩展一个别名组，不在路由层继续堆叠产品关键词。英文别名使用 ASCII 边界
-# 匹配，避免把 ``wecom`` 误命中为更长单词的一部分。
-_PRODUCT_ALIAS_GROUPS = (
-    frozenset({
-        "云枢",
-        "cloudpivot",
-        "cloudpivotplatform",
-        "cloudpivot platform",
-        "cloudpivot平台",
-    }),
-    frozenset({"钉钉", "dingtalk"}),
-    frozenset({"企业微信", "企微", "wecom", "workwechat", "wechatwork"}),
-    frozenset({"泛微OA", "泛微", "weaveroa", "weaver oa"}),
+# Product aliases are business data, not language grammar.  They belong to the
+# scoped terminology registry or source-authored document metadata and must
+# never be embedded in this request parser.  The parser below recognizes only
+# explicit labels and generic ASCII identifier/version syntax.
+_QUERY_ASCII_PRODUCT_VERSION_RE = re.compile(
+    rf"(?P<product>[A-Za-z][A-Za-z0-9_\-]{{1,30}})"
+    rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
+    re.IGNORECASE,
+)
+_QUERY_PRODUCT_LABEL_ONLY_RE = re.compile(
+    r"产品\s*(?:名称|名)?\s*[：:]\s*"
+    r"(?P<product>[A-Za-z\u3400-\u9fff][A-Za-z0-9_.\-\u3400-\u9fff]{1,30})",
+    re.IGNORECASE,
+)
+_QUERY_PRODUCT_AND_VERSION_LABEL_RE = re.compile(
+    rf"产品\s*(?:名称|名)?\s*[：:]\s*"
+    rf"(?P<product>[A-Za-z\u3400-\u9fff][A-Za-z0-9_.\-\u3400-\u9fff]{{1,30}}?)"
+    rf"\s*[,，;；]\s*(?:产品)?版本\s*[：:]\s*"
+    rf"(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
+    re.IGNORECASE,
 )
 _VERSION_UNIT_WORDS = re.compile(
     r"^\s*(?:个|台|套|节点|实例|用户|条|项|次|分钟|小时|天|人|页|条记录)"
@@ -396,8 +402,8 @@ _DECLARED_VERSION_LIST_SEPARATOR_RE = re.compile(
     re.IGNORECASE,
 )
 # These are sentence/grammar words, not product identities.  The parser only
-# permits a product prefix to preserve common forms like ``云枢6全系`` and
-# ``CloudPivot 8.2.75``; rejecting these markers prevents a malformed prose
+# permits a product prefix to preserve common forms like ``产品甲6全系`` and
+# ``ProductX 8.2.75``; rejecting these markers prevents a malformed prose
 # value such as ``当前版本为 6`` from gaining scope authority.
 _NON_IDENTITY_VERSION_PREFIX_MARKERS = (
     "当前",
@@ -421,11 +427,10 @@ _NON_IDENTITY_VERSION_PREFIX_MARKERS = (
     "含",
 )
 # File names and ingestion headings are often the only source-anchored
-# applicability signal available for a chunk (for example ``云枢7配置`` or
-# ``差旅制度2025版``).  They are useful for scope grouping, but only when a
-# registered product alias is adjacent to a version, or when a number is
-# explicitly marked as a version/edition.  Do not treat arbitrary numbers in
-# paths, dates, or document names as versions.
+# applicability signal available for a chunk. They are useful for scope
+# grouping only when an ASCII identifier is adjacent to a version or a number
+# is explicitly marked as a version/edition. Arbitrary path/date numbers are
+# never versions.
 _SOURCE_IDENTITY_METADATA_KEYS = {
     "source",
     "heading",
@@ -495,34 +500,6 @@ def _alias_search_pattern(alias: str) -> re.Pattern[str]:
             re.IGNORECASE,
         )
     return re.compile(escaped, re.IGNORECASE)
-
-
-def _known_enterprise_product_match(
-    query: str,
-) -> tuple[str, re.Match[str]] | None:
-    text = str(query or "")
-    aliases = sorted(
-        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
-        key=len,
-        reverse=True,
-    )
-    matches: list[tuple[int, int, str, re.Match[str]]] = []
-    for alias in aliases:
-        for match in _alias_search_pattern(alias).finditer(text):
-            if query_span_is_negated(text, match.start(), match.end()):
-                continue
-            matches.append((match.start(), -len(match.group(0)), alias, match))
-    if not matches:
-        return None
-    _, _, alias, match = min(matches, key=lambda item: (item[0], item[1]))
-    return alias, match
-
-
-def match_known_enterprise_product(query: str) -> str | None:
-    """Return the explicit registered enterprise-product text in a query."""
-
-    matched = _known_enterprise_product_match(query)
-    return matched[1].group(0) if matched is not None else None
 
 
 @dataclass(frozen=True)
@@ -692,29 +669,10 @@ def _canonical_product(value: str) -> str:
         if normalized.endswith(suffix) and len(normalized) > len(suffix):
             normalized = normalized[: -len(suffix)]
             break
-    for aliases in _PRODUCT_ALIAS_GROUPS:
-        normalized_aliases = {_normalize_product(alias) for alias in aliases}
-        # 知识文档常把产品代际写进“所属产品”，例如“云枢8”或
-        # “CloudPivot 8”。这里的尾部数字是产品版本，不是一个名为
-        # “云枢8”的新产品；仅对注册过的产品别名和纯版本尾缀做该归一化，
-        # 不允许任意 substring 命中。
-        for alias in sorted(normalized_aliases, key=len, reverse=True):
-            if not normalized.startswith(alias):
-                continue
-            suffix = normalized[len(alias):]
-            if suffix and re.fullmatch(r"\d{1,12}(?:全系)?", suffix):
-                return min(normalized_aliases, key=len)
-        if normalized in normalized_aliases:
-            return min(normalized_aliases, key=len)
     return normalized
 
 
 def _product_aliases(value: str) -> tuple[str, ...]:
-    normalized = _canonical_product(value)
-    for aliases in _PRODUCT_ALIAS_GROUPS:
-        normalized_aliases = {_canonical_product(alias) for alias in aliases}
-        if normalized in normalized_aliases:
-            return tuple(sorted(aliases, key=len, reverse=True))
     return (value,)
 
 
@@ -736,22 +694,14 @@ def _query_product_is_identity(text: str, match: re.Match[str]) -> bool:
     A bare Chinese word adjacent to a number is not enough to establish an
     applicability boundary: verbs such as ``升级8.6`` and nouns such as
     ``部署8.6`` are ordinary query language, not product names.  Product
-    aliases and ASCII identifiers remain valid; Chinese names require either
-    a registered alias or an explicit product label in the query.
+    ASCII identifiers remain valid; Chinese names require an explicit product
+    label or a source-derived terminology binding outside this parser.
     """
 
     raw = match.groupdict().get("product") or ""
     product = _clean_product(raw)
     if not product:
         return False
-    normalized = _canonical_product(product)
-    registered = {
-        _canonical_product(alias)
-        for group in _PRODUCT_ALIAS_GROUPS
-        for alias in group
-    }
-    if normalized in registered:
-        return True
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.\-]{1,30}", product):
         return True
     # Explicit source grammar, e.g. ``产品名称：某平台 8.6`` or
@@ -762,13 +712,18 @@ def _query_product_is_identity(text: str, match: re.Match[str]) -> bool:
     suffix = text[end:min(len(text), end + 12)]
     return bool(
         re.search(r"产品\s*(?:名称|名)?\s*[：:]?\s*$", prefix)
+        or re.search(
+            r"(?:我是|我使用的是|我用的是|当前使用|正在使用|"
+            r"使用的是|用的是|使用|针对|关于|适用于|基于)\s*$",
+            prefix,
+        )
         or re.search(r"产品\s*(?:版本|v)?", suffix, re.IGNORECASE)
         or re.search(r"系统|平台|应用", suffix)
     )
 
 
 def _valid_query_match(text: str, match: re.Match[str]) -> bool:
-    """避免把“云枢 8 个节点”这类数量误识别为版本。"""
+    """避免把“产品甲 8 个节点”这类数量误识别为版本。"""
 
     groups = match.groupdict()
     version = groups.get("version") or groups.get("suffix_version") or ""
@@ -783,7 +738,7 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
     """提取相邻的产品名和显式版本号。
 
     优先识别“我是/使用/针对 + 产品 + 版本”这类强提示，再识别
-    ``云枢8.6``、``CloudPivot v8.6`` 等紧邻写法；孤立的带点版本号可形成
+    ``产品甲8.6``、``ProductX v8.6`` 等紧邻写法；孤立的带点版本号可形成
     product-less 版本范围，普通动作词不会被当作产品。
     """
 
@@ -792,25 +747,14 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
         return ApplicabilityScope()
 
     match: re.Match[str] | None = None
-    # 先处理系统已知别名，避免通用中文分组把“登录用户名枚举云枢8.6”整段
-    # 当成产品名。别名词典是确定性边界，后续可由产品配置扩展。
-    known_aliases = sorted(
-        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
-        key=len,
-        reverse=True,
-    )
-    known_pattern = re.compile(
-        rf"(?P<product>{'|'.join(re.escape(alias) for alias in known_aliases)})"
-        rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
-        re.IGNORECASE,
-    )
     # Collect every positive match at the strongest available syntax tier.
     # A comparison/mixed query containing several distinct positive scopes has
     # no safe *global* constraint; requirement-level planning will preserve
     # each scope independently.  An explicit ``只看/仅查`` clause may narrow a
     # previously negated comparison to one final scope.
     for pattern in (
-        known_pattern,
+        _QUERY_PRODUCT_AND_VERSION_LABEL_RE,
+        _QUERY_ASCII_PRODUCT_VERSION_RE,
         _QUERY_CUE_RE,
         _QUERY_STANDALONE_VERSION_RE,
         _QUERY_VERSION_LABEL_RE,
@@ -821,6 +765,13 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
             candidate
             for candidate in pattern.finditer(text)
             if _valid_query_match(text, candidate)
+            and not (
+                pattern is _QUERY_ASCII_PRODUCT_VERSION_RE
+                and re.fullmatch(
+                    rf"[vV]\s*{_VERSION_PATTERN}",
+                    candidate.group(0),
+                )
+            )
             and (
                 "product" not in candidate.groupdict()
                 or not candidate.group("product")
@@ -865,17 +816,35 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
         match = matches[0]
         if match is not None:
             break
-    # 产品-only 约束只对明确的产品别名启用，避免把“系统 6 个节点”之类普通词
-    # 当成产品。版本查询仍优先走上面的相邻规则。
+    # Product-only identity cannot be inferred without scoped terminology or
+    # an explicit product label.  Keep the query unbound and let authorized
+    # catalog resolution propose candidates instead of guessing a product.
     if match is None:
-        known_product = _known_enterprise_product_match(text)
-        if known_product is not None:
-            _, product_match = known_product
-            matched_text = product_match.group(0)
+        product_label = next(
+            (
+                candidate
+                for candidate in _QUERY_PRODUCT_LABEL_ONLY_RE.finditer(text)
+                if not query_span_is_negated(
+                    text,
+                    candidate.start(),
+                    candidate.end(),
+                )
+            ),
+            None,
+        )
+        if product_label is not None:
+            matched_text = product_label.group(0)
+            product = _clean_product(product_label.group("product"))
             return ApplicabilityScope(
-                product=matched_text,
+                product=product,
+                product_source=_scope_source(
+                    dimension="product",
+                    query=text,
+                    start=product_label.start("product"),
+                    end=product_label.end("product"),
+                ),
                 matched_text=matched_text,
-                extraction_reason=f"由查询片段“{matched_text}”识别出产品约束，未指定显式版本",
+                extraction_reason="由查询中的显式产品标签识别产品约束",
             )
         return ApplicabilityScope()
 
@@ -915,8 +884,10 @@ def _extract_product_version_constraint_legacy(query: str) -> ApplicabilityScope
 
 # Project detection is intentionally narrow.  A plain proper noun is not a
 # project merely because a model says so; it must appear in an explicit source
-# construction such as ``中青建安项目`` / ``项目：中青建安`` or an immediately
-# preceding named scope before a registered product (``中青建安的云枢8.2``).
+# construction such as ``中青建安项目中`` / ``项目：中青建安``.  A possessive
+# prefix such as ``某某的产品`` is only a semantic qualifier candidate; it is
+# not authoritative project scope until authorized document metadata confirms
+# it later in the evidence path.
 _PROJECT_LABEL_PREFIX_RE = re.compile(
     r"(?:项目名称|所属项目|项目)\s*[：:]\s*"
     r"(?P<project>[A-Za-z0-9_\-\u3400-\u9fff]{2,48})",
@@ -924,13 +895,9 @@ _PROJECT_LABEL_PREFIX_RE = re.compile(
 )
 _PROJECT_LABEL_SUFFIX_RE = re.compile(
     r"(?P<project>[A-Za-z0-9_\-\u3400-\u9fff]{2,48}?)"
-    # A bare ``项目`` is not enough: in ``项目等级`` / ``项目经理`` it is an
-    # ordinary noun inside the asked fact, not a named applicability scope.
-    # Require either an explicit scope suffix or a punctuation/whitespace/end
-    # boundary after 项目/工程.  This keeps project detection source-owned and
-    # prevents the greedy text before ``项目`` from becoming a fabricated
-    # tenant constraint.
-    r"(?:项目|工程)(?:(?:的|中|内|下|里|范围内)|(?=$|[\s，,。；;：:！!？?]))",
+    # A bare terminal ``项目`` is an ordinary noun (for example ``有哪些项目``),
+    # not an applicability declaration.  Require a structural scope suffix.
+    r"(?:项目|工程)(?:的|中|内|下|里|范围内)",
     re.IGNORECASE,
 )
 _PROJECT_GENERIC_VALUES = frozenset({
@@ -967,9 +934,8 @@ def _project_source_spans(query: str) -> tuple[ScopeSourceSpan, ...]:
     def add(match: re.Match[str]) -> None:
         start, end = match.span("project")
         value = source[start:end].strip()
-        # The possessive-prefix fallback can greedily include the literal
-        # ``项目`` in ``中青建安项目的云枢8.2``.  Preserve the actual project
-        # name span rather than silently changing its value after the fact.
+        # The suffix grammar captures the name before ``项目/工程``.  Preserve
+        # the literal source span; do not repair values with phrase blacklists.
         for suffix in ("项目", "工程"):
             if value.endswith(suffix) and len(value) > len(suffix):
                 end -= len(suffix)
@@ -978,7 +944,6 @@ def _project_source_spans(query: str) -> tuple[ScopeSourceSpan, ...]:
         if (
             not value
             or value.casefold() in _PROJECT_GENERIC_VALUES
-            or any(marker in value for marker in ("什么", "哪些", "如何", "怎么"))
             or (start, end) in seen
             or query_span_is_negated(source, start, end)
         ):
@@ -997,24 +962,6 @@ def _project_source_spans(query: str) -> tuple[ScopeSourceSpan, ...]:
         for match in pattern.finditer(source):
             add(match)
 
-    # ``中青建安的云枢8.2`` is a source-authored named applicability prefix.
-    # Limit it to registered products so a generic possessive phrase cannot
-    # silently become a project dimension.
-    aliases = sorted(
-        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
-        key=len,
-        reverse=True,
-    )
-    if aliases:
-        product_pattern = "|".join(re.escape(alias) for alias in aliases)
-        prefix_pattern = re.compile(
-            rf"(?P<project>[\u3400-\u9fffA-Za-z0-9_\-]{{2,48}}?)的"
-            rf"(?:{product_pattern})\s*(?:版本\s*|[vV]\s*)?"
-            rf"{_VERSION_PATTERN}{_VERSION_BOUNDARY}",
-            re.IGNORECASE,
-        )
-        for match in prefix_pattern.finditer(source):
-            add(match)
     return tuple(values)
 
 
@@ -1029,20 +976,11 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
     source = str(query or "")
     if not source.strip():
         return ()
-    aliases = sorted(
-        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
-        key=len,
-        reverse=True,
-    )
-    known_pattern = re.compile(
-        rf"(?P<product>{'|'.join(re.escape(alias) for alias in aliases)})"
-        rf"\s*(?:版本\s*|[vV]\s*)?(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
-        re.IGNORECASE,
-    )
-    # Prefer registered-product pairs.  Generic patterns remain a conservative
-    # fallback for product-less policies/years and never overwrite a pair.
+    # Generic ASCII identifiers and explicit labels are language structure;
+    # product aliases are resolved by scoped terminology outside this parser.
     patterns = (
-        known_pattern,
+        _QUERY_PRODUCT_AND_VERSION_LABEL_RE,
+        _QUERY_ASCII_PRODUCT_VERSION_RE,
         _QUERY_CUE_RE,
         _QUERY_VERSION_LABEL_RE,
         _QUERY_ADJACENT_RE,
@@ -1055,6 +993,13 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
         for match in pattern.finditer(source):
             if (
                 not _valid_query_match(source, match)
+                or (
+                    pattern is _QUERY_ASCII_PRODUCT_VERSION_RE
+                    and re.fullmatch(
+                        rf"[vV]\s*{_VERSION_PATTERN}",
+                        match.group(0),
+                    )
+                )
                 or query_span_is_negated(source, match.start(), match.end())
             ):
                 continue
@@ -1081,7 +1026,7 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
             if key in seen_ranges:
                 continue
             # A generic full sentence capture must not duplicate a stronger
-            # registered product match occupying the same version token.
+            # structural match occupying the same version token.
             if any(
                 existing_version == version
                 and (
@@ -1094,12 +1039,6 @@ def _positive_product_version_scopes(query: str) -> tuple[ApplicabilityScope, ..
                 continue
             seen_ranges.add(key)
             raw.append((match, product, version))
-        if raw:
-            # Registered product pairs are enough to enumerate a comparison;
-            # later weaker regexes must not turn their surrounding question
-            # shell into a second pseudo-product.
-            if pattern is known_pattern:
-                break
 
     projects = _project_source_spans(source)
     scopes: list[ApplicabilityScope] = []
@@ -1262,8 +1201,8 @@ def _is_declared_version_product_prefix(prefix: str) -> bool:
     """Return whether a field-local prefix can safely name a product.
 
     ``产品版本`` is authoritative only when the version token is directly
-    declared.  A known product alias (``云枢6``), or an identifier containing
-    an ASCII product token (``产品A1.0``), is safe enough.  A free-form Chinese
+    declared. An identifier containing an ASCII product token (``产品A1.0``)
+    is safe enough. A free-form Chinese
     phrase is intentionally *not* promoted to product identity: otherwise
     ``住宿标准1200`` after a comma can masquerade as another version-list item.
     This conservative choice may leave an unusual, unregistered all-Chinese
@@ -1279,13 +1218,6 @@ def _is_declared_version_product_prefix(prefix: str) -> bool:
         return False
     if any(marker in compact for marker in _NON_IDENTITY_VERSION_PREFIX_MARKERS):
         return False
-    known_aliases = {
-        _normalize_product(alias)
-        for group in _PRODUCT_ALIAS_GROUPS
-        for alias in group
-    }
-    if normalized in known_aliases:
-        return True
     # Unregistered identifiers are allowed only when their token grammar is
     # explicit enough to be an identity (for example ``产品A``/``PlatformX``),
     # rather than ordinary Chinese prose following a list separator.
@@ -1379,39 +1311,24 @@ def _source_identity_facts(
 ) -> tuple[set[str], set[str]]:
     """Extract conservative product/version facts from source labels.
 
-    A registered product alias followed by a version is a strong identity
-    signal.  Product-less policies may use an explicit ``版``/``版本``/``年度``
+    An ASCII product identifier followed by a version is a strong identity
+    signal. Product-less policies may use an explicit ``版``/``版本``/``年度``
     marker, while bare numbers remain ignored.  The latter is important for
     filenames containing dates, ticket numbers, or section counters.
     """
 
     products: set[str] = set()
     versions: set[str] = set()
-    known_aliases = sorted(
-        (alias for group in _PRODUCT_ALIAS_GROUPS for alias in group),
-        key=len,
-        reverse=True,
-    )
-    product_version_pattern = re.compile(
-        rf"(?P<product>{'|'.join(re.escape(alias) for alias in known_aliases)})"
-        rf"\s*(?:版本\s*|[vV]\s*)?"
-        rf"(?P<version>{_VERSION_PATTERN}){_VERSION_BOUNDARY}",
-        re.IGNORECASE,
-    )
+    product_version_pattern = _QUERY_ASCII_PRODUCT_VERSION_RE
 
     for text in texts:
         source = str(text or "")
-        for alias in known_aliases:
-            match = _alias_search_pattern(alias).search(source)
-            if match is not None:
-                products.add(match.group(0).strip())
-
         for match in product_version_pattern.finditer(source):
             version = match.group("version") or ""
             if "." not in version and _VERSION_UNIT_WORDS.match(
                 source[match.end():]
             ):
-                # ``云枢 8 个节点`` is a quantity, not a product version.
+                # ``产品甲 8 个节点`` is a quantity, not a product version.
                 continue
             products.add(match.group("product").strip())
             versions.add(_normalize_version(version))
@@ -1477,7 +1394,7 @@ def _declared_document_identity(
     )
     products.update(source_products)
     versions.update(source_versions)
-    # A filename often carries only the product generation (``云枢6配置``),
+    # A filename often carries only the product generation (``产品甲6配置``),
     # while structured metadata carries the full release (``6.0.1``).  Treat
     # the shorter numeric prefix as a display alias of the detailed identity;
     # retaining both would manufacture a second mutually-exclusive scope for
@@ -1871,8 +1788,8 @@ def _inherit_document_constraint_metadata_rows(
                         )
                     ):
                         # A filename may name an integration target (for example
-                        # DingTalk) while an explicit ``所属产品`` header declares
-                        # the document's actual applicability (CloudPivot).  Keep
+                        # ProductY) while an explicit ``所属产品`` header declares
+                        # the document's actual applicability (ProductX).  Keep
                         # the title signal for recall, but also inherit the one
                         # authoritative document product so constraint checking
                         # does not misclassify the answer chunk.
@@ -1927,7 +1844,7 @@ def _collect_compatibility_versions(
     """返回正向兼容版本、明确不支持版本和语句中绑定的产品。
 
     正文兼容声明必须同时出现产品别名和版本。“组件支持8.6”这种
-    裸版本语句不能将《云枢7配置》升级为云枢8.6的可用证据。
+    裸版本语句不能将《产品甲7配置》升级为产品甲8.6的可用证据。
     """
 
     compatible: set[str] = set()
@@ -1949,7 +1866,7 @@ def _collect_compatibility_versions(
     )
     patterns = (
         re.compile(rf"{cue}\s*{product_version}", re.IGNORECASE),
-        # 同时覆盖“云枢8.6不再兼容”这类产品版本在前的自然表达。
+        # 同时覆盖“产品甲8.6不再兼容”这类产品版本在前的自然表达。
         re.compile(
             rf"{product_version}\s*[，,：:;；的]*\s*{cue}",
             re.IGNORECASE,
@@ -2018,7 +1935,7 @@ def _evaluate_product_version_constraints(
             compatible_versions.update(_versions_from_value(value))
 
     # 文件名、原始 source/heading 标签和标签字段通常是文档身份的强信号；
-    # 正文只在明确字段/兼容语句中参与强判定，避免“本文比较云枢8.6与云枢6”
+    # 正文只在明确字段/兼容语句中参与强判定，避免“本文比较产品甲8.6与产品甲6”
     # 把旧版本文档误判 exact。
     source_identity_texts = _source_identity_texts(candidate)
     source_products, source_versions = _source_identity_facts(
@@ -2065,7 +1982,7 @@ def _evaluate_product_version_constraints(
         if value:
             candidate_products.add(value)
     declared_versions.update(_declared_versions_from_document_fields(searchable))
-    # 兼容“版本：云枢6”，但裸的“Java版本：8.6”/“数据库版本：8.6”
+    # 兼容“版本：产品甲6”，但裸的“运行时版本：8.6”/“数据库版本：8.6”
     # 不能被当成目标产品版本。
     for match in _GENERIC_DOCUMENT_VERSION_FIELD_RE.finditer(searchable):
         versions_after_label, end = _declared_versions_after_field_label(
@@ -2187,7 +2104,7 @@ def _evaluate_product_version_constraints(
         )
 
     # 版本数字必须绑定到目标产品身份。只有 metadata.version=8.6
-    # 或正文出现某个组件的8.6，不能证明这是云枢8.6文档。
+    # 或正文出现某个组件的8.6，不能证明这是产品甲8.6文档。
     if not product_matches:
         return ConstraintEvaluation(
             status="unknown",
@@ -2361,7 +2278,7 @@ def _product_version_mismatch_dimensions(
     ):
         dimensions.append("version")
 
-    # Explicit incompatibility such as “不支持云枢8.6” can be a mismatch even
+    # Explicit incompatibility such as “不支持产品甲8.6” can be a mismatch even
     # when the source identity lists the requested version.  It is still a
     # version dimension; do not expose the source sentence in diagnostics.
     if evaluation.status == "mismatch" and not dimensions:

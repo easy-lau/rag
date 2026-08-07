@@ -198,7 +198,7 @@ class DocumentRelevanceAdmissionTests(unittest.TestCase):
                     metadata={"产品名称": "云枢", "产品版本": "6"},
                 ),
             ],
-            query="云枢登录强制修改密码应该怎么办",
+            query="产品：云枢，登录强制修改密码应该怎么办",
         )
         self.assertEqual(
             decision.admitted_doc_ids,

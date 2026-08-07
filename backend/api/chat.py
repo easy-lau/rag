@@ -45,6 +45,7 @@ from core.active_task_state import (
     parse_active_task_state,
     resolve_active_task_state,
 )
+from core.semantic_memory import extract_resolved_entity_memory
 from models.schemas import (
     ChatRequest,
     ConversationBatchDeleteRequest,
@@ -61,6 +62,7 @@ from core.knowledge_result import run_knowledge_result_stream
 from core.query_semantics import (
     ROUTE_CLARIFICATION_CONTINUATION_SCHEMA_VERSION,
     RouteClarificationContinuation,
+    KnowledgeRequestSemantics,
     RouteScopePartition,
     content_knowledge_request,
     document_catalog_request_for_question,
@@ -116,6 +118,7 @@ from core.conversation_context import (
     ConversationContext,
     apply_active_task_context,
     apply_resolved_turn_semantics,
+    apply_result_reference_memory_context,
     apply_v3_catalog_context_selection,
     build_active_task_v2_execution_context,
     build_current_turn_v2_execution_context,
@@ -128,6 +131,11 @@ from core.conversation_context import (
     resolve_routed_conversation_context,
     resolve_result_reference_sources,
     route_context_payloads,
+)
+from core.result_reference_memory import (
+    build_result_reference_memory,
+    parse_result_reference_memory,
+    resolve_result_reference_memory,
 )
 from core.query_route_compiler import (
     RagSemanticEntryGate,
@@ -1452,6 +1460,10 @@ def _bounded_search_snapshot(payload: object) -> dict:
         "unverified_generation",
         "source_verification",
         "unverified_reference_count",
+        "retrieval_status",
+        "answerability_status",
+        "intent_status",
+        "semantic_confidence",
     ):
         if key in data:
             value = data.get(key)
@@ -1508,13 +1520,93 @@ def _bounded_search_snapshot(payload: object) -> dict:
                     or value < 0
                 ):
                     continue
+            elif key == "retrieval_status":
+                value = str(value or "").strip().casefold()
+                if value not in {
+                    "no_match",
+                    "authorized_candidates_found",
+                    "unauthorized_only",
+                }:
+                    continue
+            elif key == "answerability_status":
+                value = str(value or "").strip().casefold()
+                if value not in {
+                    "answerable",
+                    "scope_unresolved",
+                    "evidence_incomplete",
+                    "provider_failed",
+                    "refused",
+                    "unavailable",
+                }:
+                    continue
+            elif key == "intent_status":
+                value = str(value or "").strip().casefold()
+                if value not in {
+                    "unknown",
+                    "lookup",
+                    "explain",
+                    "compare",
+                    "modify_guide",
+                    "troubleshoot",
+                }:
+                    continue
+            elif key == "semantic_confidence":
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not 0 <= float(value) <= 1
+                ):
+                    continue
             counters[key] = value
+    evidence_quality = _bounded_evidence_quality(data.get("evidence_quality"))
+    if evidence_quality is not None:
+        counters["evidence_quality"] = evidence_quality
     return {
         "schema_version": "rag_search_snapshot.v1",
         "candidates": candidates,
         "answer_sources": answer_sources,
         "counters": counters,
     }
+
+
+def _bounded_evidence_quality(value: object) -> dict[str, object] | None:
+    """Validate the small quality vector persisted with a search snapshot."""
+
+    if not isinstance(value, dict):
+        return None
+    levels = {"high", "medium", "low", "unknown"}
+    result: dict[str, object] = {}
+    for key in ("coverage", "reliability", "freshness", "consistency"):
+        level = str(value.get(key) or "").strip().casefold()
+        if level not in levels:
+            return None
+        result[key] = level
+    completeness = str(value.get("completeness") or "").strip().casefold()
+    if completeness not in {"complete", "partial", "unknown"}:
+        return None
+    result["completeness"] = completeness
+    ratio = value.get("coverage_ratio")
+    if ratio is not None:
+        if (
+            isinstance(ratio, bool)
+            or not isinstance(ratio, (int, float))
+            or not 0 <= float(ratio) <= 1
+        ):
+            return None
+        ratio = round(float(ratio), 4)
+    result["coverage_ratio"] = ratio
+    raw_missing = value.get("missing_requirement_ids")
+    if not isinstance(raw_missing, list) or len(raw_missing) > 8:
+        return None
+    missing: list[str] = []
+    for raw in raw_missing:
+        item = str(raw or "").strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", item):
+            return None
+        if item not in missing:
+            missing.append(item)
+    result["missing_requirement_ids"] = missing
+    return result
 
 
 def _clarification_locked_search_results(payload: dict, *, trace_id: str) -> dict:
@@ -1713,12 +1805,30 @@ async def _validate_stream_answer_sources(
         ).strip().casefold()
         if verification not in {"verified", "unverified"}:
             return [], set(), "answer_source_verification_invalid"
+        verification_basis = str(
+            raw_source.get("verification_basis") or ""
+        ).strip().casefold()
+        deterministic_scope = (
+            verification_basis == "deterministic_candidate_scope_confirmed"
+        )
         is_unverified = role == "unverified" or verification == "unverified"
-        if is_unverified and not (
-            role == "unverified"
-            and verification == "unverified"
-            and allow_unverified
-        ):
+        # Unverified generation admits legacy unverified sources and the
+        # deterministic dominant-document auto-selection.  The latter keeps an
+        # honest ``source_verification=unverified`` (the reranker never
+        # confirmed it) while its server-side scope decision is expressed by
+        # ``verification_basis``; anything else fails closed.
+        unverified_admission = allow_unverified and (
+            (
+                role == "unverified"
+                and verification == "unverified"
+            )
+            or (
+                role == "direct"
+                and verification == "unverified"
+                and deterministic_scope
+            )
+        )
+        if is_unverified and not unverified_admission:
             return [], set(), "unverified_answer_source_not_allowed"
         if allow_unverified and not is_unverified:
             return [], set(), "verified_source_in_unverified_generation"
@@ -2306,6 +2416,10 @@ async def _messages_with_current_source_scope(
                     "version_resolution_mode",
                     "evidence_execution_strategy",
                     "model_adjudication_state",
+                    "retrieval_status",
+                    "answerability_status",
+                    "intent_status",
+                    "semantic_confidence",
                 ):
                     value = counters.get(key)
                     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -2347,10 +2461,53 @@ async def _messages_with_current_source_scope(
                                 "skipped",
                                 "no_candidates",
                                 "succeeded",
+                                "inconclusive",
                                 "failed",
                             }:
                                 continue
+                        elif key == "retrieval_status":
+                            value = str(value or "").strip().casefold()
+                            if value not in {
+                                "no_match",
+                                "authorized_candidates_found",
+                                "unauthorized_only",
+                            }:
+                                continue
+                        elif key == "answerability_status":
+                            value = str(value or "").strip().casefold()
+                            if value not in {
+                                "answerable",
+                                "scope_unresolved",
+                                "evidence_incomplete",
+                                "provider_failed",
+                                "refused",
+                                "unavailable",
+                            }:
+                                continue
+                        elif key == "intent_status":
+                            value = str(value or "").strip().casefold()
+                            if value not in {
+                                "unknown",
+                                "lookup",
+                                "explain",
+                                "compare",
+                                "modify_guide",
+                                "troubleshoot",
+                            }:
+                                continue
+                        elif key == "semantic_confidence":
+                            if (
+                                isinstance(value, bool)
+                                or not isinstance(value, (int, float))
+                                or not 0 <= float(value) <= 1
+                            ):
+                                continue
                         safe_counters[key] = value
+                evidence_quality = _bounded_evidence_quality(
+                    counters.get("evidence_quality")
+                )
+                if evidence_quality is not None:
+                    safe_counters["evidence_quality"] = evidence_quality
 
             def refreshed_snapshot_items(key: str) -> list[dict]:
                 refreshed_items: list[dict] = []
@@ -3536,6 +3693,33 @@ async def send_message(
                     conversation_context.standalone_query,
                 ),
             )
+        # Result-list memory: ``我想看第四个`` / ``第四个不是《钉钉》吗`` resolve
+        # directly against the numbered list the user last saw.  The ordinal is
+        # language structure; the document identity is re-authorized below and
+        # the execution floor reads it without re-running retrieval/V3.
+        resolved_result_reference = await resolve_result_reference_memory(
+            db,
+            value=getattr(conv, "result_reference_memory", None),
+            question=payload.question,
+            selected_kb_ids=payload.knowledge_base_ids,
+            read_session_factory=TaskReadSessionLocal,
+        )
+        if resolved_result_reference is not None:
+            conversation_context = apply_result_reference_memory_context(
+                context=conversation_context,
+                question=payload.question,
+                resolved_reference=resolved_result_reference,
+            )
+            trace_event(
+                "conversation.result_reference_memory_resolved",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                resolution="applied",
+                reference=resolved_result_reference.safe_summary(),
+            )
+    else:
+        resolved_result_reference = None
     if pipeline_base_query is not None or route_continuation_query is not None:
         conversation_context = replace(
             conversation_context,
@@ -4095,11 +4279,15 @@ async def send_message(
             and not evidence_pending_execution
             and conversation_context.active_task is None
             and not verified_followup_baseline
+            and conversation_context.query_resolution_mode
+            != "result_reference_memory"
         ):
             # Strip every heuristic/route-selected projection before V3 sees
             # the request.  Route candidates remain available as a bounded
             # source catalog, but V2 starts from the literal user question
             # until a catalog-bound selection has been validated and reloaded.
+            # A server-resolved result-list reference is not a heuristic: its
+            # document identity is already re-authorized and must survive.
             conversation_context = build_v3_catalog_candidate_context(
                 context=conversation_context,
                 current_question=semantic_task_query,
@@ -4167,6 +4355,7 @@ async def send_message(
             conversation_context.active_task is None
             and not verified_followup_baseline
             and not evidence_pending_execution
+            and resolved_result_reference is None
             and v3_mode in {"shadow", "active"}
         ):
             v3_baseline = build_query_understanding_v3_baseline(
@@ -4214,6 +4403,19 @@ async def send_message(
                 )
             else:
                 v3_shadow_pending = True
+        if (
+            resolved_result_reference is not None
+            and v3_mode in {"shadow", "active"}
+            and not evidence_pending_execution
+        ):
+            trace_event(
+                "query.understanding.v3.skipped",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                reason="result_reference_memory_resolved",
+                reference=resolved_result_reference.safe_summary(),
+            )
         # `intent` is the client-visible routing envelope.  Keep the final V2
         # execution decision next to the task contract so a client can tell a
         # planning result from a closed execution gate without parsing trace
@@ -4481,6 +4683,9 @@ async def send_message(
     expected_active_task_revision = int(
         getattr(conv, "active_task_revision", 0) or 0
     )
+    expected_result_reference_revision = int(
+        getattr(conv, "result_reference_revision", 0) or 0
+    )
     if v3_active_pending and v3_baseline is not None:
         try:
             fence_identity = build_query_understanding_v3_fence_identity(
@@ -4635,6 +4840,7 @@ async def send_message(
         retrieval_executed = None
         evidence_status = None
         coverage_status = None
+        unverified_generation_flag = False
         displayed_result_count = None
         context_evidence_count = None
         hit_count = None
@@ -5029,6 +5235,26 @@ async def send_message(
                             "semantic_compilation_mode": "v3_fallback",
                             "semantic_compilation_decision": adoption_reason,
                         }
+                    if (
+                        getattr(v3_decision, "decision", None) == "fallback"
+                        and query_execution_gate is not None
+                    ):
+                        # 观测门：V3 模型失败必须落到本地基线继续执行，知识
+                        # 问答不允许因 V3 失败而整轮 skipped。该事件只表达
+                        # “已回退本地执行”，不改变执行决策本身。
+                        trace_event(
+                            "query.understanding.v3.fallback",
+                            trace_id=trace_id,
+                            conversation_id=conv.id,
+                            user_id=user.id,
+                            reason="baseline_local",
+                            model_failure_reason=v3_decision.reason,
+                            baseline_runnable=bool(
+                                query_execution_gate.baseline.is_runnable
+                            ),
+                            decision_reason=query_execution_gate.decision_reason,
+                            adoption_reason=adoption_reason,
+                        )
                     trace_event(
                         "query.understanding.v3.fence_rejected",
                         trace_id=trace_id,
@@ -5178,6 +5404,41 @@ async def send_message(
                     capability=knowledge_request.safe_summary(),
                     selected_kb_count=len(set(payload.knowledge_base_ids)),
                 )
+
+        # Result-list memory floor: an ordinal reference such as ``我想看第四个``
+        # or ``第四个不是《钉钉》吗`` has already been resolved by the conversation
+        # layer against the persisted numbered list the user saw.  It reads that
+        # exact document directly and must never degrade into vector retrieval of
+        # the words ``第四个``, even when the intent model timed out or V3
+        # returned an unusable contract.
+        if (
+            pipeline_version == "v2"
+            and isinstance(task_contract, RagTaskContract)
+            and task_contract.dispatch_authorized
+            and resolved_result_reference is not None
+            and resolved_result_reference.source
+        ):
+            memory_source = resolved_result_reference.source
+            knowledge_request = KnowledgeRequestSemantics(
+                resource="document_result",
+                operation="read",
+                result_handles=("r_mem_001",),
+                result_labels=(
+                    str(memory_source.get("filename") or "")[:255],
+                ),
+                answer_form="overview",
+            )
+            knowledge_capability_authorized = True
+            trace_event(
+                "knowledge.capability.floor_selected",
+                trace_id=trace_id,
+                conversation_id=conv.id,
+                user_id=user.id,
+                reason="result_reference_memory",
+                capability=knowledge_request.safe_summary(),
+                reference=resolved_result_reference.safe_summary(),
+                selected_kb_count=len(set(payload.knowledge_base_ids)),
+            )
 
         # Resolve applicability ambiguity from the caller's current authorized
         # document catalog before retrieval.  Ranking models may score evidence
@@ -5357,11 +5618,36 @@ async def send_message(
                         "direct knowledge execution requires an authorized capability"
                     )
                 if result_execution:
-                    result_sources = resolve_result_reference_sources(
-                        context=conversation_context,
-                        handles=knowledge_request.result_handles,
-                        kb_ids=payload.knowledge_base_ids,
-                    )
+                    if (
+                        conversation_context.query_resolution_mode
+                        == "result_reference_memory"
+                        and conversation_context.result_reference_memory_sources
+                    ):
+                        # The memory floor owns the binding: the handle is a
+                        # synthetic memory marker and the resolved document was
+                        # re-authorized by the conversation layer, so the route
+                        # candidate catalog is never consulted.
+                        result_sources = (
+                            conversation_context.result_reference_memory_sources
+                        )
+                        trace_event(
+                            "knowledge.result_reference.memory_bound",
+                            trace_id=trace_id,
+                            conversation_id=conv.id,
+                            user_id=user.id,
+                            source_count=len(result_sources),
+                            reference=(
+                                resolved_result_reference.safe_summary()
+                                if resolved_result_reference is not None
+                                else None
+                            ),
+                        )
+                    else:
+                        result_sources = resolve_result_reference_sources(
+                            context=conversation_context,
+                            handles=knowledge_request.result_handles,
+                            kb_ids=payload.knowledge_base_ids,
+                        )
                     rag_stream_runner = run_knowledge_result_stream
                 else:
                     rag_stream_runner = run_knowledge_catalog_stream
@@ -5444,6 +5730,12 @@ async def send_message(
                 rag_stream_kwargs["knowledge_request"] = knowledge_request
                 if result_execution:
                     rag_stream_kwargs["result_sources"] = result_sources
+                    if (
+                        conversation_context.result_reference_memory_acknowledgement
+                    ):
+                        rag_stream_kwargs["acknowledgement"] = (
+                            conversation_context.result_reference_memory_acknowledgement
+                        )
             elif pipeline_version == "v2" and execution_bundle is not None:
                 # This single immutable handoff makes the compiled DAG the
                 # production execution authority.  V1/direct callers retain
@@ -5559,6 +5851,9 @@ async def send_message(
                         if normalized_evidence_status is not None
                         else str(raw_evidence_status or "").strip().casefold()
                     )
+                    raw_unverified_generation = data.get("unverified_generation")
+                    if isinstance(raw_unverified_generation, bool):
+                        unverified_generation_flag = raw_unverified_generation
                     direct_evidence_count = data.get("direct_evidence_count")
                     if (
                         isinstance(direct_evidence_count, bool)
@@ -6148,11 +6443,26 @@ async def send_message(
                 should_update_route_state = bool(
                     new_pending_state is not None or selected_scope_completed
                 )
+                # A fully closed hit is always memorable.  An unverified
+                # auto-answer (the 50%-80% tier, single-document selection) is
+                # also memorable: the sources are real, re-authorized
+                # evidence, and the entity memory derived from them is exactly
+                # what the next standalone-but-related turn needs.  Without
+                # this, the earlier turn would answer, then the next turn
+                # would forget it and re-enter the confirmation loop.
+                active_task_eligible = bool(
+                    normalized_final_evidence_status in {"hit", "partial"}
+                    and (
+                        normalized_final_evidence_status == "hit"
+                        or unverified_generation_flag
+                    )
+                )
                 should_update_active_task = bool(
                     durable_turn is not None
-                    and normalized_final_evidence_status == "hit"
+                    and active_task_eligible
                     and (
                         coverage_status == "complete"
+                        or normalized_final_evidence_status == "partial"
                         or not any(
                             requirement.role == "answer"
                             and requirement.requires_collection_closure
@@ -6168,8 +6478,26 @@ async def send_message(
                     and sources
                     and execution_bundle is not None
                 )
+                # A numbered document catalog answer is the result list the
+                # user sees.  It is persisted separately from the active task:
+                # ``我想看第四个`` must resolve against this exact ordered list,
+                # not against whatever the newest turn happened to read.
+                should_update_result_reference_memory = bool(
+                    durable_turn is not None
+                    and knowledge_request is not None
+                    and knowledge_request.is_catalog_operation
+                    and knowledge_request.operation in {"list", "count"}
+                    and normalized_final_evidence_status == "hit"
+                    and evidence_source_validation_ok is True
+                    and not evidence_source_validation_locked
+                    and sources
+                )
                 persisted_conv = None
-                if should_update_route_state or should_update_active_task:
+                if (
+                    should_update_route_state
+                    or should_update_active_task
+                    or should_update_result_reference_memory
+                ):
                     persisted_conv = await save_db.get(Conversation, conv.id)
                     if persisted_conv is None:
                         raise RuntimeError("会话不存在，无法保存会话执行状态")
@@ -6223,6 +6551,16 @@ async def send_message(
                             else effective_retrieval_query
                         )
                     )
+                    semantic_memory = extract_resolved_entity_memory(
+                        sources=sources,
+                        question=(
+                            user_message_content
+                            or payload.question
+                            or task_root_query
+                        ),
+                        source_turn_id=durable_turn.id,
+                        trace_id=trace_id,
+                    )
                     active_state = build_active_task_state(
                         root_query=task_root_query,
                         answer_shape=execution_bundle.plan.answer_shape,
@@ -6234,12 +6572,66 @@ async def send_message(
                             if previous_active is not None
                             else persisted_active_revision
                         ),
+                        semantic_memory=semantic_memory,
                     )
                     persisted_conv.active_task_state = active_state.to_dict()
                     persisted_conv.active_task_revision = (
                         persisted_active_revision + 1
                     )
                     persisted_active_state = active_state
+
+                if (
+                    should_update_result_reference_memory
+                    and persisted_conv is not None
+                ):
+                    persisted_result_revision = int(
+                        getattr(
+                            persisted_conv,
+                            "result_reference_revision",
+                            0,
+                        )
+                        or 0
+                    )
+                    if (
+                        persisted_result_revision
+                        != expected_result_reference_revision
+                    ):
+                        raise RuntimeError("会话结果列表状态已被其他请求更新")
+                    previous_memory = parse_result_reference_memory(
+                        getattr(
+                            persisted_conv,
+                            "result_reference_memory",
+                            None,
+                        )
+                    )
+                    result_reference_root_query = str(
+                        effective_retrieval_query or ""
+                    ).strip() or payload.question
+                    result_memory = build_result_reference_memory(
+                        root_query=result_reference_root_query,
+                        list_label="知识库文档目录",
+                        items=sources[:20],
+                        source_turn_id=durable_turn.id,
+                        trace_id=trace_id,
+                        previous_revision=(
+                            previous_memory.revision
+                            if previous_memory is not None
+                            else persisted_result_revision
+                        ),
+                    )
+                    persisted_conv.result_reference_memory = (
+                        result_memory.to_dict()
+                    )
+                    persisted_conv.result_reference_revision = (
+                        persisted_result_revision + 1
+                    )
+                    trace_event(
+                        "conversation.result_reference_memory_persisted",
+                        trace_id=trace_id,
+                        conversation_id=conv.id,
+                        user_id=user.id,
+                        memory=result_memory.safe_summary(),
+                    )
 
                 if (
                     durable_turn is None

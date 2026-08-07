@@ -206,6 +206,14 @@
                   </template>
                   <n-select v-model:value="form.llm_structured_output_mode" :options="structuredOutputModeOptions" />
                 </n-form-item>
+                <n-form-item label="关闭模型思考模式">
+                  <div class="flex w-full items-center justify-between gap-4">
+                    <span class="text-xs leading-5 text-[var(--ui-text-secondary)]">
+                      仅当当前兼容接口明确支持 thinking 控制时开启；不再根据模型名称自动判断。
+                    </span>
+                    <n-switch v-model:value="form.llm_disable_thinking" />
+                  </div>
+                </n-form-item>
               </div>
             </n-form>
 
@@ -223,7 +231,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { NAutoComplete, NButton, NForm, NFormItem, NIcon, NInput, NInputNumber, NSelect, NSpin, NTag, NTooltip, useMessage } from 'naive-ui'
+import { NAutoComplete, NButton, NForm, NFormItem, NIcon, NInput, NInputNumber, NSelect, NSpin, NSwitch, NTag, NTooltip, useMessage } from 'naive-ui'
 import { HelpCircleOutline, LockClosedOutline, RefreshOutline } from '@vicons/ionicons5'
 import { getAvailableModels, testModelConnection } from '@/api/settings'
 import { normalizeOptionalModel, resolveOptionalLlmModel } from '@/utils/modelSettings'
@@ -441,6 +449,7 @@ async function handleSave() {
     const payload = {
       chat_model: form.value.chat_model,
       llm_structured_output_mode: form.value.llm_structured_output_mode,
+      llm_disable_thinking: Boolean(form.value.llm_disable_thinking),
       intent_model: normalizeOptionalModel(form.value.intent_model),
       rerank_model: normalizeOptionalModel(form.value.rerank_model),
       temperature: form.value.temperature,

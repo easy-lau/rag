@@ -669,15 +669,15 @@ class RagTaskCompilerContractTests(unittest.TestCase):
     def test_task_contract_derives_source_and_version_policy(self) -> None:
         exact = _compile(
             _route(evidence_scope="enterprise_kb"),
-            question="云枢8.6如何修改登录参数",
+            question="产品：云枢，版本：8.6，如何修改登录参数",
         )
         partition = _compile(
             _route(evidence_scope="mixed"),
-            question="云枢如何修改登录参数",
+            question="产品：云枢，如何修改登录参数",
         )
         all_versions = _compile(
             _route(evidence_scope="mixed"),
-            question="对比云枢所有版本的登录参数",
+            question="对比产品：云枢的所有版本登录参数",
         )
 
         self.assertEqual(exact.grounding_policy, "required")

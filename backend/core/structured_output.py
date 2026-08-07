@@ -65,6 +65,17 @@ def _configured_initial_mode(*, provider_identity: object, model: object) -> Str
     return None
 
 
+def _configured_disable_thinking() -> bool:
+    """Read the administrator-declared transport capability."""
+
+    try:
+        from config import get_settings
+
+        return bool(getattr(get_settings(), "llm_disable_thinking", False))
+    except Exception:
+        return False
+
+
 def clear_structured_output_capability_cache() -> None:
     """Clear process-local capability observations (primarily for tests)."""
 
@@ -142,13 +153,8 @@ def response_format_is_unsupported(
     )
 
 
-def _is_deepseek_v4_model(model: object) -> bool:
-    normalized = str(model or "").strip().casefold()
-    return bool(re.search(r"(?:^|[/._:-])deepseek-v4(?:$|[-._:])", normalized))
-
-
 def _thinking_control_is_unsupported(exc: BaseException) -> bool:
-    """Detect an explicit gateway rejection of DeepSeek's thinking control."""
+    """Detect an explicit gateway rejection of a declared thinking control."""
 
     if _status_code(exc) not in {400, 422}:
         return False
@@ -178,7 +184,7 @@ def _thinking_control_is_unsupported(exc: BaseException) -> bool:
 
 
 def _with_disabled_thinking(request: Mapping[str, Any]) -> dict[str, Any]:
-    """Merge DeepSeek's non-reasoning control without dropping caller extras."""
+    """Merge a declared non-reasoning control without dropping caller extras."""
 
     updated = dict(request)
     raw_extra_body = request.get("extra_body")
@@ -214,18 +220,19 @@ async def create_stream_completion(
     request: Mapping[str, Any],
     provider_identity: object,
     model: object,
+    disable_thinking: bool | None = None,
 ) -> tuple[Any, bool]:
-    """Open a streaming completion with DeepSeek thinking negotiation.
+    """Open a streaming completion with declared thinking negotiation.
 
-    The optional ``thinking.type=disabled`` control is sent only to DeepSeek
-    V4 models.  If the gateway rejects that optional parameter, retry the same
-    request once without it before any text can be emitted, then cache the
-    endpoint/model capability for subsequent requests.
+    ``thinking.type=disabled`` is sent only when the caller/configuration has
+    declared that capability.  No model name enables transport behaviour.  If
+    the gateway rejects the optional parameter, retry once without it before
+    any text can be emitted, then cache the observed endpoint/model capability.
     """
 
     key = _cache_key(provider_identity=provider_identity, model=model)
-    thinking_enabled = (
-        _is_deepseek_v4_model(model)
+    thinking_enabled = bool(
+        (_configured_disable_thinking() if disable_thinking is None else disable_thinking)
         and _THINKING_CONTROL_CACHE.get(key, True)
     )
     call_request = (
@@ -282,6 +289,7 @@ async def create_structured_completion(
     timeout_seconds: float,
     provider_identity: object,
     model: object,
+    disable_thinking: bool | None = None,
 ) -> StructuredOutputResult:
     """Create one completion using the strongest supported JSON transport.
 
@@ -300,8 +308,8 @@ async def create_structured_completion(
     initial_index = _MODE_ORDER.index(initial_mode)
     attempted: list[StructuredOutputMode] = []
     base_request = dict(request)
-    thinking_control_enabled = (
-        _is_deepseek_v4_model(model)
+    thinking_control_enabled = bool(
+        (_configured_disable_thinking() if disable_thinking is None else disable_thinking)
         and _THINKING_CONTROL_CACHE.get(key, True)
     )
 
@@ -354,7 +362,7 @@ async def create_structured_completion(
                     thinking_control_enabled
                     and _thinking_control_is_unsupported(exc)
                 ):
-                    # The current proxy/model cannot forward DeepSeek's
+                    # The current proxy/model cannot forward the declared
                     # optional control. Retry the same response-format mode
                     # without it and remember the capability for this process.
                     thinking_control_enabled = False

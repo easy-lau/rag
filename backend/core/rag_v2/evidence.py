@@ -427,7 +427,7 @@ def _task_scope_disambiguated_answer_ids(
 
     Multi-answer mapping normally distinguishes siblings from their visible
     target terms.  That is insufficient for a version/project comparison:
-    ``CloudPivot 6 安全配置`` and ``CloudPivot 7 安全配置`` intentionally have
+    ``ProductX 6 安全配置`` and ``ProductX 7 安全配置`` intentionally have
     the same target wording, while single-character versions are not general
     lexical evidence.  The immutable requirement scope can distinguish those
     siblings, but it remains an *admission identity*, not an answer claim.
@@ -682,6 +682,7 @@ def assemble_unverified_candidate_bundle_with_diagnostics(
     max_context_chunks: int = DEFAULT_CONTEXT_MAX_CHUNKS,
     max_context_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
     admission_reason: str = RELATED_EVIDENCE_REASON,
+    role_mode: Literal["unverified", "direct"] = "unverified",
 ) -> UnverifiedCandidateBundleResult:
     """Build a bounded, scope-safe snapshot for related-evidence generation.
 
@@ -748,17 +749,32 @@ def assemble_unverified_candidate_bundle_with_diagnostics(
             exclusion_counts["requirement_binding_excluded"] += 1
             continue
         seen_chunk_ids.add(item.chunk_id)
+        direct_mode = role_mode == "direct"
         converted.append(replace(
             item,
             confidence="retrieved",
-            role="complement",
+            role="direct" if direct_mode else "complement",
             contribution_kind=None,
             supports_requirement_ids=support_ids,
             metadata={
                 **dict(item.metadata),
                 "supports_requirement_ids": list(support_ids),
-                "evidence_role_v2": "complement",
+                "evidence_role_v2": "direct" if direct_mode else "complement",
+                "evidence_role": "direct" if direct_mode else "unverified",
+                # A server-side dominant-document auto-selection is a
+                # deterministic scope decision, not a model verification.  Two
+                # axes stay separate: the role axis keeps the answer evidence
+                # direct (evidence counts, coverage and the answer policy agree),
+                # while the verification axis stays unverified because the
+                # reranker never confirmed it.  The deterministic basis is what
+                # lets coverage/policy consumers treat the binding as positive
+                # evidence without ever claiming model verification.
                 "source_verification": "unverified",
+                "verification_basis": (
+                    "deterministic_candidate_scope_confirmed"
+                    if direct_mode
+                    else None
+                ),
                 "rerank_status": "unverified",
                 "unverified_generation_fallback": True,
             },
@@ -838,6 +854,29 @@ def assemble_unverified_candidate_bundle_with_diagnostics(
 
     selected = list(order_evidence_context_items(selected))
     item_ids = tuple(item.chunk_id for item in selected)
+    direct_mode = role_mode == "direct"
+    if direct_mode:
+        # The auto-confirmed dominant document was deterministically bound to
+        # the requested answer targets.  Report those bindings as covered so
+        # coverage counts and the answer policy agree; the reranker status
+        # stays unverified and the state keeps completeness=unknown, so the
+        # answer remains an honest labelled partial instead of a closed hit.
+        covered: list[str] = []
+        seen_covered: set[str] = set()
+        for item in selected:
+            for requirement_id in item.supports_requirement_ids:
+                if requirement_id in seen_covered:
+                    continue
+                seen_covered.add(requirement_id)
+                covered.append(requirement_id)
+        missing_ids = tuple(
+            requirement_id
+            for requirement_id in allowed_ids
+            if requirement_id not in seen_covered
+        )
+    else:
+        covered = []
+        missing_ids = allowed_ids
     bundle = EvidenceBundle(
         state=EvidenceState(
             availability="degraded",
@@ -848,7 +887,10 @@ def assemble_unverified_candidate_bundle_with_diagnostics(
         items=tuple(selected),
         context_item_ids=item_ids,
         answer_source_ids=item_ids,
-        missing_requirement_ids=allowed_ids,
+        # ``covered_requirement_ids`` is a derived property: it reads the
+        # items' roles and source verification, so the direct-mode metadata
+        # above is what makes coverage visible to the policy layer.
+        missing_requirement_ids=missing_ids,
     )
     context = build_evidence_context(
         bundle,

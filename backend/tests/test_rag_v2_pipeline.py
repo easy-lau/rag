@@ -23,6 +23,7 @@ from core.rag_v2.pipeline import (
     retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
 )
+from core.evidence_contract import AdjudicationOutcome
 from core.rag_v2.contracts import AnswerRequirementV2, QueryPlanV2
 from core.rag_v2.query_plan import (
     partition_plan_by_applicability_scopes,
@@ -428,7 +429,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.eligible_candidate_indexes, (1, 2, 3))
         self.assertEqual(decision.anchor_candidate_indexes, (2,))
 
-    async def test_small_document_adjudication_failure_keeps_unverified_source_context(
+    async def test_small_document_adjudication_failure_auto_answers_single_authoritative_document(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -481,17 +482,37 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_execution_strategy"], "bounded_small_document")
         self.assertEqual(result["model_adjudication_state"], "failed")
+        # A single authoritative authorized document has no meaningful choice
+        # to offer: the server auto-selects it and answers from the bounded
+        # document, labelled as unverified generation instead of asking the
+        # user to confirm the only option.
         self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["retrieval_status"], "authorized_candidates_found")
+        self.assertEqual(result["answerability_status"], "answerable")
         self.assertTrue(result["unverified_generation"])
-        self.assertEqual(result["source_verification"], "unverified")
-        self.assertEqual(result["answer_source_count"], 2)
-        self.assertEqual(result["direct_evidence_count"], 0)
-        self.assertEqual(result["hit_count"], 0)
-        self.assertEqual(result["unverified_reference_count"], 2)
-        self.assertEqual(result["covered_requirement_ids"], [])
+        self.assertGreater(result["answer_source_count"], 0)
+        self.assertEqual(
+            result["answer_policy"]["reason_code"],
+            "coverage_sufficient_answer",
+        )
+        self.assertEqual(
+            {source["doc_id"] for source in result["answer_sources"]},
+            {str(doc_id)},
+        )
+        # The reranker failing must not downgrade the bounded small-document
+        # answer evidence: the auto-confirmed scope keeps its direct role.
+        self.assertGreater(result["direct_evidence_count"], 0)
+        self.assertEqual(
+            result["covered_requirement_ids"],
+            ["r1"],
+        )
+        self.assertFalse(result["missing_requirement_ids"])
         self.assertTrue(all(
-            source["source_verification"] == "unverified"
+            source["evidence_role"] == "direct"
             for source in result["answer_sources"]
+        ))
+        self.assertFalse(any(
+            item["type"] == "clarification_state" for item in payloads
         ))
         fallback_trace = next(
             call.kwargs
@@ -499,18 +520,8 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             if call.args and call.args[0] == "evidence.unverified_fallback"
         )
         self.assertTrue(fallback_trace["activated"])
-        self.assertEqual(fallback_trace["input_candidate_count"], 2)
-        self.assertEqual(fallback_trace["authorized_candidate_count"], 2)
-        self.assertEqual(fallback_trace["requirement_bound_candidate_count"], 2)
-        self.assertEqual(fallback_trace["converted_candidate_count"], 2)
-        self.assertEqual(fallback_trace["selected_candidate_count"], 2)
-        self.assertEqual(fallback_trace["exclusion_reason_counts"], {})
-        prompt = "\n".join(
-            message["content"] for message in client.completions.calls[0]["messages"]
-        )
-        self.assertIn("特殊场景应结合审批记录", prompt)
-        self.assertIn("语义支持关系尚未由重排模型验证", prompt)
-        self.assertIn("必须逐个范围独立回答", prompt)
+        self.assertFalse(fallback_trace["requires_candidate_confirmation"])
+        self.assertEqual(len(client.completions.calls), 1)
 
     async def test_configuration_assignment_is_direct_evidence_without_ordered_steps(
         self,
@@ -765,20 +776,15 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["evidence_execution_strategy"], "joint_adjudication")
         self.assertEqual(result["model_adjudication_state"], "failed")
-        self.assertEqual(result["evidence_status"], "partial")
-        self.assertEqual(result["coverage_status"], "partial")
-        self.assertTrue(result["unverified_generation"])
+        self.assertEqual(result["evidence_status"], "needs_clarification")
+        self.assertEqual(result["answerability_status"], "provider_failed")
+        self.assertFalse(result["unverified_generation"])
         self.assertEqual(result["direct_evidence_count"], 0)
         self.assertEqual(result["hit_count"], 0)
-        self.assertEqual(result["unverified_reference_count"], len(versions))
+        self.assertEqual(result["answer_sources"], [])
         self.assertEqual(result["covered_requirement_ids"], [])
-        self.assertEqual(
-            {source["metadata"].get("version") for source in result["answer_sources"]},
-            set(versions),
-        )
-        self.assertTrue(all(
-            source["source_verification"] == "unverified"
-            for source in result["answer_sources"]
+        self.assertTrue(any(
+            item["type"] == "clarification_state" for item in payloads
         ))
 
     async def _run(
@@ -3139,6 +3145,104 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             {str(selected_doc_id)},
         )
 
+    async def test_candidate_confirmation_releases_only_selected_partial_context(
+        self,
+    ) -> None:
+        kb_id = uuid.uuid4()
+        selected_doc_id = uuid.uuid4()
+        other_doc_id = uuid.uuid4()
+        selected = _candidate(
+            kb_id=kb_id,
+            doc_id=selected_doc_id,
+            chunk_index=0,
+            filename="目标配置.md",
+            content="配置文档片段：feature.enabled=true。",
+        )
+        other = _candidate(
+            kb_id=kb_id,
+            doc_id=other_doc_id,
+            chunk_index=0,
+            filename="其他配置.md",
+            content="其他范围的配置值为false。",
+        )
+        question = "目标配置的完整内容是什么"
+
+        # A balanced two-document pool is genuinely ambiguous: neither
+        # document dominates, so the server asks the user which one to use
+        # instead of guessing.  A single authoritative document would be
+        # auto-selected and answered directly (see the adjudication-failure
+        # test above).
+        first_payloads, first_client, *_ = await self._run(
+            question=question,
+            kb_id=kb_id,
+            initial=[selected, other],
+            full_document=[],
+        )
+        first_result = next(
+            item for item in first_payloads if item["type"] == "search_results"
+        )
+        clarification = next(
+            item
+            for item in first_payloads
+            if item["type"] == "clarification_state"
+        )
+        self.assertEqual(first_result["evidence_status"], "needs_clarification")
+        self.assertEqual(first_result["retrieval_status"], "authorized_candidates_found")
+        self.assertEqual(first_result["answerability_status"], "evidence_incomplete")
+        self.assertEqual(first_result["answer_sources"], [])
+        self.assertEqual(first_client.completions.calls, [])
+        self.assertEqual(clarification["dimension"], "candidate_document")
+        self.assertEqual(len(clarification["choices"]), 2)
+
+        selected_choice = next(
+            choice
+            for choice in clarification["choices"]
+            if choice["doc_ids"] == [str(selected_doc_id)]
+        )
+        scope_filter = {
+            "mode": "single",
+            "kb_ids": selected_choice["kb_ids"],
+            "doc_ids": selected_choice["doc_ids"],
+            "choices": [selected_choice],
+        }
+        second_payloads, second_client, search, _fetch, scoped_search = (
+            await self._run(
+                question=question,
+                kb_id=kb_id,
+                initial=[],
+                full_document=[],
+                # A faulty scoped adapter may return another document.  The
+                # confirmed server-side allow-list must still remove it.
+                scoped=[selected, other],
+                evidence_scope_filter=scope_filter,
+            )
+        )
+        second_result = next(
+            item for item in second_payloads if item["type"] == "search_results"
+        )
+        self.assertEqual(second_result["evidence_status"], "partial")
+        self.assertEqual(second_result["answerability_status"], "answerable")
+        self.assertTrue(second_result["unverified_generation"])
+        self.assertEqual(
+            second_result["answer_policy"]["reason_code"],
+            "confirmed_candidate_partial_answer",
+        )
+        self.assertEqual(
+            {source["doc_id"] for source in second_result["answer_sources"]},
+            {str(selected_doc_id)},
+        )
+        self.assertFalse(any(
+            item["type"] == "clarification_state" for item in second_payloads
+        ))
+        prompt = "\n".join(
+            message["content"]
+            for message in second_client.completions.calls[0]["messages"]
+        )
+        self.assertIn("feature.enabled=true", prompt)
+        self.assertNotIn("其他范围的配置值", prompt)
+        search.assert_not_awaited()
+        self.assertGreaterEqual(scoped_search.await_count, 1)
+
     def test_model_evidence_adjudication_requires_opt_in(self) -> None:
         enabled = SimpleNamespace(rag_v2_model_evidence_adjudication_enabled=True)
 
@@ -4043,12 +4147,6 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        generation_context = next(
-            call
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "generation.context"
-        )
-        serialized_context = generation_context.kwargs["context"]
         # These 16 opaque fragments cannot prove a request for the *complete*
         # policy.  When their serialised size exceeds the context budget, the
         # final visible-evidence pass must reject the incomplete route rather
@@ -4057,19 +4155,17 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         # ``all_context_sources`` field: ``context_sources`` is the sole
         # model-visible source contract and stays empty while the answer model
         # expresses the structured insufficient-evidence state.
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["answer_sources"], [])
         self.assertEqual(result["answer_source_count"], 0)
-        self.assertEqual(serialized_context, "")
-        self.assertEqual(generation_context.kwargs["context_sources"], [])
-        self.assertEqual(generation_context.kwargs["model"], "test-chat")
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertTrue(any(
+            item["type"] == "clarification_state" for item in payloads
+        ))
+        self.assertEqual(client.completions.calls, [])
         self.assertIn(
             "context_budget_limited",
             result["evidence_state"]["reasons"],
         )
-        system_prompt = client.completions.calls[0]["messages"][0]["content"]
-        self.assertIn("无法组成可核验的完整答案链", system_prompt)
 
     async def test_low_vector_nearest_neighbors_are_normal_no_hit(self) -> None:
         kb_id = uuid.uuid4()
@@ -4113,7 +4209,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generation_context.kwargs["context"], "")
         fetch_full.assert_not_awaited()
 
-    async def test_unknown_policy_subject_keeps_recall_but_never_promotes_answer_sources(
+    async def test_unknown_policy_subject_keeps_recall_and_requests_confirmation(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -4154,14 +4250,14 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(len(result["results"]), 2)
         self.assertTrue(all(
             item["evidence_role"] == "related" for item in result["results"]
         ))
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(len(client.completions.calls), 1)
-        self.assertFalse(any(
+        self.assertEqual(client.completions.calls, [])
+        self.assertTrue(any(
             item["type"] == "clarification_state" for item in payloads
         ))
         # High-recall admission may inspect the admitted documents, but no
@@ -4481,9 +4577,9 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls, [])
         self.assertIn(
             "collection_snapshot_unproven",
             result["evidence_state"]["reasons"],
@@ -4526,9 +4622,9 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls, [])
         self.assertIn(
             "context_budget_limited",
             result["evidence_state"]["reasons"],
@@ -4843,7 +4939,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1200元/天", prompt)
         self.assertNotIn("9999元/天", prompt)
 
-    async def test_bridge_second_hop_inherits_product_version_and_project_scope(
+    async def test_bridge_second_hop_inherits_product_and_version_scope(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -4939,7 +5035,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("900元/天", prompt)
         displayed_doc_ids = {item["doc_id"] for item in result["results"]}
         self.assertNotIn(str(wrong_version["doc_id"]), displayed_doc_ids)
-        self.assertNotIn(str(wrong_project["doc_id"]), displayed_doc_ids)
+        # A bare possessive prefix is not project authority.  The competing
+        # project may remain a visible related candidate, but cannot enter the
+        # prompt or answer sources without an explicit project scope.
+        self.assertIn(str(wrong_project["doc_id"]), displayed_doc_ids)
 
     async def test_single_hop_does_not_trigger_dynamic_bridge_search(self) -> None:
         kb_id = uuid.uuid4()
@@ -5303,7 +5402,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         # subject belongs to D grade.  A timed-out bridge query may degrade
         # availability, but it must never expose the unjoined amount as an
         # answer source or invoke generation with it.
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["evidence_availability"], "degraded")
         self.assertEqual(result["answer_sources"], [])
         # Retrieval no longer executes a positional global query plan.  The
@@ -5323,7 +5422,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             result["evidence_state"]["reasons"],
         )
         self.assertEqual(search.await_count, 2)
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls, [])
         answer_text = "".join(
             item.get("content", "")
             for item in payloads
@@ -5553,8 +5652,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             client.completions.calls[0]["messages"][0]["content"],
         )
 
-    async def test_expansion_failure_keeps_related_but_unclosed_candidate_non_answer(self) -> None:
-        """A related source without a target/value claim must stay insufficient."""
+    async def test_expansion_failure_requests_candidate_confirmation(
+        self,
+    ) -> None:
+        """A related source stays non-answer evidence until user confirmation."""
 
         kb_id = uuid.uuid4()
         initial = [_candidate(
@@ -5573,9 +5674,9 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls, [])
         self.assertIn(
             "coverage_graph:required_answer_claim_missing",
             result["evidence_state"]["reasons"],
@@ -5723,6 +5824,8 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         system_prompt = client.completions.calls[0]["messages"][0]["content"]
         self.assertIn("服务暂时不可用", system_prompt)
+        self.assertIn("排查编号", system_prompt)
+        self.assertIn("失败阶段为检索阶段", system_prompt)
         self.assertNotIn("未找到相关内容", system_prompt)
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
@@ -6188,10 +6291,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.completions.calls), 0)
         self.assertEqual(payloads[-1]["type"], "done")
 
-    async def test_broad_document_topic_does_not_clarify_from_raw_candidates(
+    async def test_broad_document_topic_clarifies_from_authorized_candidates(
         self,
     ) -> None:
-        """Related document titles are diagnostic-only until answer closure."""
+        """Authorized retrieval candidates remain visible before answer closure."""
         kb_id = uuid.uuid4()
         leave_doc = uuid.uuid4()
         travel_doc = uuid.uuid4()
@@ -6221,22 +6324,21 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["answer_sources"], [])
-        self.assertFalse(any(
+        self.assertTrue(any(
             item["type"] == "clarification_state" for item in payloads
         ))
         displayed_doc_ids = {item["doc_id"] for item in result["results"]}
-        # Related diagnostics remain bounded by the normal display budget;
-        # unlike a clarification they are not required to enumerate every
-        # raw candidate/document.
+        # Display remains bounded even though clarification keeps one choice
+        # for every authorized candidate document.
         self.assertTrue(displayed_doc_ids)
         self.assertTrue(displayed_doc_ids.issubset({
             str(leave_doc),
             str(travel_doc),
         }))
         self.assertLessEqual(len(result["results"]), 5)
-        self.assertEqual(len(client.completions.calls), 1)
+        self.assertEqual(client.completions.calls, [])
 
     async def test_low_score_scope_competitor_does_not_force_clarification(
         self,
@@ -6397,13 +6499,14 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("未获得知识库证据支持", answer)
         self.assertIn("已根据资料回答", answer)
 
-    async def test_deepseek_v4_general_fallback_disables_thinking(self) -> None:
+    async def test_configured_general_fallback_disables_thinking(self) -> None:
         clear_structured_output_capability_cache()
         kb_id = uuid.uuid4()
         settings = _settings()
         settings.rag_general_fallback_mode = "no_hit"
-        settings.rag_general_fallback_model = "deepseek-v4-pro"
+        settings.rag_general_fallback_model = "generic-fallback-model"
         settings.llm_base_url = "https://llm.example/v1"
+        settings.llm_disable_thinking = True
 
         _payloads_result, client, *_ = await self._run(
             question="如何设计一个通用的排班流程",
@@ -6488,9 +6591,9 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         strict_result = next(
             item for item in strict_payloads if item["type"] == "search_results"
         )
-        self.assertEqual(strict_result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(strict_result["evidence_status"], "needs_clarification")
         self.assertEqual(strict_result["answer_provenance"], "knowledge_base")
-        self.assertEqual(len(strict_client.completions.calls), 1)
+        self.assertEqual(strict_client.completions.calls, [])
 
         broad = _settings()
         broad.rag_general_fallback_mode = "no_hit_or_insufficient"
@@ -6506,24 +6609,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
-        self.assertEqual(result["answer_provenance"], "general_model")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
+        self.assertEqual(result["answer_provenance"], "knowledge_base")
         self.assertEqual(result["answer_sources"], [])
-        self.assertEqual(len(client.completions.calls), 1)
-        prompt = "\n".join(
-            message["content"]
-            for message in client.completions.calls[0]["messages"]
-        )
-        self.assertNotIn("员工请假制度第1部分", prompt)
-        self.assertNotIn("员工出差交通、住宿和餐饮补贴标准", prompt)
-        generation_context = next(
-            call.kwargs
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "generation.context"
-        )
-        self.assertEqual(generation_context["context"], "")
-        self.assertEqual(generation_context["context_sources"], [])
-        self.assertEqual(generation_context["all_context_sources"], [])
+        self.assertEqual(client.completions.calls, [])
 
     async def test_adjudication_failure_keeps_general_fallback_closed(self) -> None:
         kb_id = uuid.uuid4()
@@ -6559,7 +6648,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
 
         adjudicate.assert_awaited_once()
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertEqual(result["model_adjudication_state"], "failed")
         self.assertEqual(
             result["model_adjudication_error"],
@@ -6567,31 +6656,224 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(result["general_fallback_blocked_reason"])
         self.assertEqual(result["answer_provenance"], "knowledge_base")
-        self.assertTrue(result["unverified_generation"])
-        self.assertEqual(result["source_verification"], "unverified")
+        self.assertFalse(result["unverified_generation"])
         self.assertEqual(result["direct_evidence_count"], 0)
         self.assertEqual(result["hit_count"], 0)
-        self.assertEqual(result["unverified_reference_count"], 1)
-        self.assertEqual(len(result["answer_sources"]), 1)
+        self.assertEqual(result["answer_sources"], [])
+        self.assertEqual(client.completions.calls, [])
+
+    async def test_single_rules_table_document_auto_answers_without_confirmation(
+        self,
+    ) -> None:
+        """A single authoritative rules-table document answers directly.
+
+        Reproduces the production trace: the question about D-level travel
+        rules retrieves only 《公司出差管理标准.docx》.  There is exactly one
+        authorized document, so the server auto-selects it and generates from
+        the bounded document instead of asking the user to confirm the only
+        option.
+        """
+
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunks = [
+            _candidate(
+                kb_id=kb_id,
+                doc_id=doc_id,
+                chunk_index=index,
+                filename="公司出差管理标准.docx",
+                content=content,
+            )
+            for index, content in enumerate([
+                "【公司出差管理标准.docx】\n公司出差管理标准",
+                "【公司出差管理标准.docx › 二、职级分类】\n| 职级 | 适用人员 |\n| D级 | 普通员工、专员 |",
+                "【公司出差管理标准.docx › 三、交通费用标准 › 3.1 飞机】\n| 职级 | 国内航班 | 国际航班 |\n| D级 | 经济舱 | 经济舱 |",
+                "【公司出差管理标准.docx › 三、交通费用标准 › 3.2 火车】\n| 职级 | 标准 |\n| D级 | 高铁/动车二等座、火车硬卧 |",
+                "【公司出差管理标准.docx › 三、交通费用标准 › 3.3 市内交通】\n| 职级 | 标准 |\n| D级 | 公共交通为主，特殊情况可乘出租车 |",
+            ])
+        ]
+
+        payloads, client, *_ = await self._run(
+            question="普通员工出差时可以乘坐的交通工具有哪些",
+            kb_id=kb_id,
+            initial=chunks,
+            full_document=[],
+            top_k=6,
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["retrieval_status"], "authorized_candidates_found")
+        self.assertEqual(result["answerability_status"], "answerable")
+        self.assertTrue(result["unverified_generation"])
+        self.assertEqual(
+            result["answer_policy"]["reason_code"],
+            "coverage_sufficient_answer",
+        )
+        self.assertFalse(result["answer_policy"]["partial_answer"])
+        self.assertEqual(
+            result["evidence_quality"]["retrieval_coverage_ratio"],
+            1.0,
+        )
+        self.assertGreater(result["answer_source_count"], 0)
+        self.assertEqual(
+            {source["doc_id"] for source in result["answer_sources"]},
+            {str(doc_id)},
+        )
+        self.assertEqual(
+            {source["evidence_type"] for source in result["answer_sources"]},
+            {"answer"},
+        )
+        self.assertTrue(all(
+            source["supports_question"] for source in result["answer_sources"]
+        ))
+        # The deterministic candidate scope is answer evidence, not background:
+        # reranker/model failure must not downgrade the table contents that the
+        # question directly asks about.
+        self.assertGreater(result["direct_evidence_count"], 0)
+        self.assertEqual(
+            result["covered_requirement_ids"],
+            ["r1"],
+        )
+        self.assertFalse(result["missing_requirement_ids"])
+        self.assertTrue(all(
+            source["evidence_role"] == "direct"
+            for source in result["answer_sources"]
+        ))
+        self.assertTrue(all(
+            source["evidence_contribution_role"] == "direct"
+            for source in result["answer_sources"]
+        ))
+        self.assertFalse(any(
+            item["type"] == "clarification_state" for item in payloads
+        ))
         self.assertEqual(len(client.completions.calls), 1)
-        self.assertEqual(client.completions.calls[0]["model"], "test-chat")
         prompt = "\n".join(
             message["content"]
             for message in client.completions.calls[0]["messages"]
         )
-        self.assertIn("语义支持关系尚未由重排模型验证", prompt)
-        self.assertIn("员工制度包含差旅与费用管理章节", prompt)
-        generation_context = next(
-            call.kwargs
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "generation.context"
-        )
-        self.assertEqual(generation_context["model_adjudication_state"], "failed")
-        self.assertIn("员工制度包含差旅与费用管理章节", generation_context["context"])
-        self.assertEqual(len(generation_context["context_sources"]), 1)
-        self.assertEqual(len(generation_context["all_context_sources"]), 1)
+        self.assertIn("经济舱", prompt)
+        self.assertIn("高铁/动车二等座", prompt)
 
-    async def test_successful_adjudication_with_insufficient_evidence_does_not_degrade(
+    async def test_inconclusive_adjudication_keeps_deterministic_direct_answer(
+        self,
+    ) -> None:
+        """Model-inconclusive adjudication never downgrades answer evidence.
+
+        Reproduces the production trace where the reranker returned empty
+        content: the evidence must be classified as ``inconclusive`` (the
+        model gave no verdict), keep the deterministic candidate scope
+        auto-confirmed, and still answer with direct evidence instead of
+        demanding document confirmation or skipping generation.
+        """
+
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunks = [
+            _candidate(
+                kb_id=kb_id,
+                doc_id=doc_id,
+                chunk_index=index,
+                filename="公司出差管理标准.docx",
+                content=content,
+            )
+            for index, content in enumerate([
+                "【公司出差管理标准.docx】\n公司出差管理标准",
+                "【公司出差管理标准.docx › 二、职级分类】\n| 职级 | 适用人员 |\n| D级 | 普通员工、专员 |",
+                "【公司出差管理标准.docx › 三、交通费用标准 › 3.1 飞机】\n| 职级 | 国内航班 | 国际航班 |\n| D级 | 经济舱 | 经济舱 |",
+            ])
+        ]
+        settings = _settings()
+        settings.rag_v2_model_evidence_adjudication_enabled = True
+        inconclusive = SimpleNamespace(
+            succeeded=False,
+            error="empty_content",
+            failure_kind="empty_content",
+            adjudication=AdjudicationOutcome(
+                status="inconclusive",
+                reason="empty_content",
+                elapsed_ms=12,
+            ),
+        )
+
+        with patch(
+            "core.rag_v2.pipeline.joint_rerank_with_coverage",
+            new=AsyncMock(return_value=inconclusive),
+        ) as adjudicate:
+            payloads, client, *_ = await self._run(
+                question="普通员工出差时可以乘坐的交通工具有哪些",
+                kb_id=kb_id,
+                initial=chunks,
+                full_document=[],
+                top_k=6,
+                settings_override=settings,
+            )
+
+        adjudicate.assert_awaited_once()
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["model_adjudication_state"], "inconclusive")
+        self.assertEqual(
+            result["model_adjudication_error"],
+            "empty_content",
+        )
+        self.assertEqual(result["evidence_status"], "partial")
+        self.assertEqual(result["answerability_status"], "answerable")
+        self.assertEqual(
+            result["answer_policy"]["reason_code"],
+            "coverage_sufficient_answer",
+        )
+        self.assertGreater(result["direct_evidence_count"], 0)
+        self.assertEqual(result["covered_requirement_ids"], ["r1"])
+        self.assertGreater(result["answer_source_count"], 0)
+        self.assertTrue(all(
+            source["evidence_role"] == "direct"
+            for source in result["answer_sources"]
+        ))
+        self.assertFalse(any(
+            item["type"] == "clarification_state" for item in payloads
+        ))
+        # The answer model ran exactly once; inconclusive adjudication did not
+        # skip generation.
+        self.assertEqual(len(client.completions.calls), 1)
+
+    async def test_balanced_two_document_pool_still_clarifies(self) -> None:
+        """Genuinely ambiguous pools keep the confirmation flow."""
+
+        kb_id = uuid.uuid4()
+        first_doc = uuid.uuid4()
+        second_doc = uuid.uuid4()
+        first = _candidate(
+            kb_id=kb_id,
+            doc_id=first_doc,
+            chunk_index=0,
+            filename="员工请假管理办法.docx",
+            content="员工请假制度第1部分：审批、休假和销假要求。",
+        )
+        second = _candidate(
+            kb_id=kb_id,
+            doc_id=second_doc,
+            chunk_index=0,
+            filename="公司出差管理标准.docx",
+            content="员工出差交通、住宿和餐饮补贴标准。",
+        )
+
+        payloads, client, *_ = await self._run(
+            question="员工标准是什么",
+            kb_id=kb_id,
+            initial=[first, second],
+            full_document=[],
+        )
+
+        result = next(item for item in payloads if item["type"] == "search_results")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
+        self.assertEqual(result["answer_sources"], [])
+        clarification = next(
+            item for item in payloads if item["type"] == "clarification_state"
+        )
+        self.assertEqual(len(clarification["choices"]), 2)
+        self.assertEqual(client.completions.calls, [])
+
+    async def test_successful_adjudication_with_insufficient_evidence_clarifies(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -6633,14 +6915,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         adjudicate.assert_awaited_once()
         result = next(item for item in payloads if item["type"] == "search_results")
         self.assertEqual(result["model_adjudication_state"], "succeeded")
-        self.assertEqual(result["evidence_status"], "insufficient_evidence")
+        self.assertEqual(result["evidence_status"], "needs_clarification")
         self.assertFalse(result["unverified_generation"])
         self.assertEqual(result["answer_sources"], [])
-        prompt = "\n".join(
-            message["content"] for message in client.completions.calls[0]["messages"]
-        )
-        self.assertIn("无法组成可核验的完整答案链", prompt)
-        self.assertNotIn("员工制度包含若干管理章节", prompt)
+        self.assertEqual(client.completions.calls, [])
 
     def test_general_fallback_never_opens_for_error_or_scope_mismatch(self) -> None:
         for status in ("error", "scope_mismatch", "needs_clarification", "hit"):

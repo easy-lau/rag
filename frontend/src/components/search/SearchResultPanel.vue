@@ -203,6 +203,10 @@ const clarificationRequiresRefinement = computed(() => Boolean(
   evidenceStatus.value === 'needs_clarification'
   && clarification.value?.requires_refinement,
 ))
+const candidateConfirmation = computed(() => Boolean(
+  evidenceStatus.value === 'needs_clarification'
+  && ['evidence_incomplete', 'provider_failed'].includes(searchStore.searchMeta.answerability_status),
+))
 const documentGroups = computed(() => groupEvidenceByDocument(searchStore.results))
 const resultBatchKey = computed(() => searchStore.searchMeta.trace_id || 'legacy-result')
 const displayedDocumentCount = computed(() => documentGroups.value.length)
@@ -290,6 +294,11 @@ const retrievalState = computed(() => ({
 
 const evidenceNotice = computed(() => {
   if (evidenceStatus.value === 'needs_clarification') {
+    if (candidateConfirmation.value) {
+      return searchStore.searchMeta.answerability_status === 'provider_failed'
+        ? '已找到当前权限范围内的候选文章，但证据裁决暂时失败。请确认要使用的文章；确认后系统只会在所选文章内给出带不确定性说明的回答。'
+        : '已找到当前权限范围内的候选文章，但现有证据还不能完整闭合答案。请确认要使用的文章；确认后系统会先回答原文能支持的部分，并说明缺失信息。'
+    }
     return clarificationRequiresRefinement.value
       ? '已找到多个可能范围，但无法安全列成有限选项。请在输入框补充具体产品、版本、项目或制度名称；补充前这些资料不能作为回答依据。'
       : '已找到多个适用范围的候选资料，请先在对话中选择所需范围；选择前这些资料不能作为回答依据。'
@@ -356,6 +365,8 @@ const decisionReasonLabel = computed(() => ({
   retrieval_skipped: '检索策略明确跳过知识库检索',
   optional_auto_detection: '可选检索由轻量判断决定',
   evidence_scope_ambiguous: '检索结果存在多个互斥适用范围，等待用户选择',
+  authorized_candidates_need_confirmation: '已找到授权候选资料，但证据尚不完整，等待用户确认文档范围',
+  provider_adjudication_failed_with_candidates: '已保留授权候选资料，证据裁决暂时失败，等待用户确认',
 })[decisionReason.value] || decisionReason.value)
 
 const retrievalExecutionLabel = computed(() => {
@@ -382,7 +393,7 @@ const emptyResultText = computed(() => {
     scope_mismatch: '未找到符合明确适用范围的回答依据',
     needs_clarification: clarificationRequiresRefinement.value
       ? '已找到多个可能范围，等待补充'
-      : '已找到多个适用范围，等待选择',
+      : (candidateConfirmation.value ? '已找到候选文章，等待确认' : '已找到多个适用范围，等待选择'),
     no_hit: '已完成检索，但没有找到相关内容',
     insufficient_evidence: '已找到相关资料，但证据不足以回答',
     unverified: '检索状态暂未确认',
@@ -399,7 +410,9 @@ const emptyResultHint = computed(() => ({
   scope_mismatch: '请确认问题中的产品、版本或项目名称，并录入与该范围一致的资料。',
   needs_clarification: clarificationRequiresRefinement.value
     ? '请在输入框补充具体产品、版本、项目或制度名称；补充前不会生成知识库答案。'
-    : '请在对话中回复序号、版本或“都对比”；选择前不会生成知识库答案。',
+    : (candidateConfirmation.value
+        ? '请在对话中选择候选文章；确认前不会把候选资料当作已验证答案。'
+        : '请在对话中回复序号、版本或“都对比”；选择前不会生成知识库答案。'),
   no_hit: '可以调整问法、检索标签，或确认知识库中已录入相关文档。',
   insufficient_evidence: '请补充适用对象、范围或制度名称；当前相近资料不能证明完整结论。',
   unverified: '服务端未返回完整证据状态，结果可能来自旧版本接口或请求已中断。',

@@ -159,6 +159,30 @@ def _candidate_from_catalog_row(row: Any) -> dict[str, object]:
     }
 
 
+def auto_select_single_authorized_scope(
+    choices_by_version: dict[
+        tuple[str, str],
+        dict[str, object],
+    ],
+) -> bool:
+    """Return True when every version choice resolves to one authorized document.
+
+    A clarification that offers only one meaningful authorized document adds
+    no information: the user has nothing to choose.  This is the same
+    philosophy as the evidence-side ``candidate_auto_confirmed``: a single
+    server-owned candidate is selected deterministically instead of entering
+    the version picker, even when the catalog attaches several version tags to
+    that one document.
+    """
+
+    distinct_doc_ids = {
+        str(doc_id)
+        for entry in choices_by_version.values()
+        for doc_id in (entry.get("doc_ids") or set())
+    }
+    return len(distinct_doc_ids) == 1
+
+
 async def resolve_authorized_scope_clarification(
     db: AsyncSession,
     *,
@@ -278,7 +302,11 @@ async def resolve_authorized_scope_clarification(
                 entry["kb_ids"].add(str(candidate["kb_id"]))
                 entry["doc_ids"].add(str(candidate["doc_id"]))
 
-    if len(choices_by_version) < 2:
+    if len(choices_by_version) < 2 or auto_select_single_authorized_scope(
+        choices_by_version
+    ):
+        # 单版本或全部候选版本都指向同一份已授权文档时没有可选择的歧义：
+        # 服务端直接选中该文档，不进入语义澄清。
         return None
     entries = sorted(
         choices_by_version.values(),
@@ -311,6 +339,7 @@ async def resolve_authorized_scope_clarification(
 
 __all__ = [
     "AuthorizedScopeChoice",
+    "auto_select_single_authorized_scope",
     "AuthorizedScopeClarification",
     "resolve_authorized_scope_clarification",
 ]

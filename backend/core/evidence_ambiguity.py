@@ -62,7 +62,7 @@ _TRAILING_PRODUCT_GENERATION_RE = re.compile(
 )
 _PROJECT_PLACEHOLDER_RE = re.compile(
     r"(?:非必填|选填|请填写|请填入|待填写|未填写|暂未填写|"
-    r"出现问题的项目|项目名称占位|project\s*name)",
+    r"项目名称占位|project\s*name)",
     re.IGNORECASE,
 )
 _PROJECT_PLACEHOLDER_EXACT_RE = re.compile(
@@ -1007,7 +1007,7 @@ def _query_anchored_document_keys(
 
     Scope metadata answers *where* a rule applies, not *what* the user asked.
     In the degraded rerank path every candidate is intentionally retained for
-    safe recovery, so a DingTalk version header may otherwise manufacture a
+    safe recovery, so an integration-target version header may otherwise manufacture a
     version choice for an unrelated question such as an employee meal
     allowance.  This lexical guard is used only to decide whether an inferred
     product/version/project may create a clarification choice.  It never

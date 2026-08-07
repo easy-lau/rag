@@ -19,15 +19,18 @@ from core.intent_router import (
     build_verified_evidence_scope_result,
     classify_intent_result,
     _classify_with_llm,
+    _conversation_repair_match,
     _default_config,
     _fallback_decision,
     _make_decision,
     _is_normative_query,
     _parse_llm_decision_result,
     _response_format_is_unsupported,
+    _reference_correction_match,
     _requires_knowledge_retrieval,
     _rule_match,
 )
+from core.result_reference import is_result_list_reference
 from core.structured_output import clear_structured_output_capability_cache
 from models.db_models import IntentCategory
 
@@ -422,7 +425,6 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
         for question in (
             "公司的报销流程是什么？",
             "普通员工的出差标准是什么？",
-            "云枢中想二开钉钉消息可以吗？",
         ):
             with self.subTest(question=question):
                 with (
@@ -1111,15 +1113,6 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
     def test_enterprise_or_external_operation_guard_corrects_chat_misclassification(self) -> None:
         questions = (
             "这个产品支持哪些部署方式？",
-            "云枢中如何配置登录用户名枚举？",
-            "CloudPivot 中如何配置登录用户名枚举？",
-            "钉钉中如何配置免登？",
-            "DingTalk 如何接入企业应用？",
-            "企业微信中如何配置通讯录同步？",
-            "企微如何配置回调接口？",
-            "WeCom 如何部署自建应用？",
-            "泛微OA中如何配置单点登录？",
-            "Weaver OA 如何配置接口认证？",
             "公司的报销流程是什么？",
             "普通员工的出差标准是什么？",
             "请根据员工手册回答请假制度",
@@ -1143,6 +1136,17 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(decision.retrieval_policy, "required")
                 self.assertEqual(decision.response_mode, "grounded_qa")
                 self.assertEqual(decision.decision_reason, "knowledge_scope_guard")
+
+    def test_product_operation_names_are_not_global_routing_rules(self) -> None:
+        # 产品身份由知识库内的受控术语或语义路由识别；在全局规则中新增任何
+        # 产品名称都会重新形成按业务对象打补丁的分类器。
+        for question in (
+            "甲系统中如何配置免登？",
+            "ProductX 如何接入企业应用？",
+            "乙平台如何部署自建应用？",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(_requires_knowledge_retrieval(question))
 
     def test_generic_operations_are_not_forced_into_enterprise_retrieval(self) -> None:
         questions = (
@@ -1317,6 +1321,287 @@ class IntentRoutingPolicyTests(unittest.IsolatedAsyncioTestCase):
                 "decision_reason",
             },
         )
+
+
+class ConversationRepairRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.config = _default_config()
+        clear_structured_output_capability_cache()
+
+    def test_repair_complaint_rule_skips_kb_retrieval(self) -> None:
+        question = "为什么要我选择，你刚刚不是已经回答了吗"
+        classified = _rule_match(question, _categories())
+        self.assertIsNotNone(classified)
+        self.assertEqual(classified.intent_code, "conversation_repair")
+        self.assertEqual(classified.action, "chat")
+        self.assertFalse(classified.need_retrieval)
+
+        decision = _apply_routing_policy(
+            question,
+            classified,
+            self.config,
+            selected_kb_count=2,
+        )
+        self.assertEqual(decision.response_mode, "general_chat")
+        self.assertEqual(decision.retrieval_policy, "skip")
+        self.assertFalse(decision.need_retrieval)
+        self.assertEqual(decision.decision_reason, "conversation_repair_rule")
+
+    def test_repair_rule_covers_bare_and_elliptical_complaints(self) -> None:
+        for question in (
+            "为什么要我选择",
+            "你刚刚不是已经回答了吗",
+            "不是已经回答过了吗，怎么又问我",
+            "别让我再确认了",
+            "你怎么总让我选择文档",
+            "系统为什么要我确认",
+        ):
+            with self.subTest(question=question):
+                classified = _rule_match(question, _categories())
+                self.assertIsNotNone(classified)
+                self.assertEqual(classified.intent_code, "conversation_repair")
+                self.assertFalse(classified.need_retrieval)
+
+    def test_business_questions_are_not_captured_by_repair_rule(self) -> None:
+        for question in (
+            "普通员工可以乘坐头等舱吗",
+            "普通员工出差时可以乘坐的交通工具有哪些",
+            "为什么我要确认这个审批单",
+            "为什么我不能乘坐头等舱",
+            "你怎么看待这件事",
+            "怎么确认这个方案可行",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(_conversation_repair_match(question))
+
+    async def test_repair_complaint_routes_to_chat_without_retrieval(self) -> None:
+        question = "为什么要我选择，你刚刚不是已经回答了吗"
+        create = AsyncMock(side_effect=AssertionError("对话修复不应调用路由模型"))
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_count_override=2,
+                route_context=(),
+                record_log=False,
+            )
+
+        self.assertEqual(result.route_decision.intent_code, "conversation_repair")
+        self.assertEqual(result.route_decision.evidence_scope, "general_world")
+        self.assertEqual(result.task_contract.response_mode, "general_chat")
+        self.assertEqual(result.task_contract.retrieval_policy, "skip")
+        self.assertEqual(result.task_contract.decision_reason, "conversation_repair_rule")
+        self.assertFalse(result.decision.need_retrieval)
+        self.assertEqual(
+            result.diagnostics["deterministic_preflight"],
+            "conversation_repair",
+        )
+        create.assert_not_awaited()
+
+    async def test_business_followup_first_class_question_still_retrieves(self) -> None:
+        question = "普通员工可以乘坐头等舱吗"
+        route_payload = {
+            "schema_version": "rag_route_decision.v1",
+            "readiness": "ready",
+            "intent_code": "knowledge_qa",
+            "relation": "new",
+            "evidence_scope": "enterprise_kb",
+            "query_resolution": {"mode": "current", "context_turn_keys": []},
+            "requirements": [{
+                "role": "answer",
+                "origin": "user_text",
+                "description": question,
+            }],
+            "clarification": {"question": "", "unresolved": []},
+            "confidence": 0.93,
+            "rationale": "企业差旅交通规则追问",
+        }
+        create = AsyncMock(return_value=_model_response(json.dumps(route_payload)))
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                question,
+                selected_kb_count_override=1,
+                route_context=(),
+                record_log=False,
+            )
+
+        self.assertEqual(result.route_decision.intent_code, "knowledge_qa")
+        self.assertEqual(result.task_contract.response_mode, "grounded_qa")
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        self.assertTrue(result.task_contract.dispatch_authorized)
+        self.assertFalse(_conversation_repair_match(question))
+        create.assert_awaited_once()
+
+
+class ResultReferenceRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.config = _default_config()
+        clear_structured_output_capability_cache()
+
+    def test_ordinal_result_reference_rule_routes_to_knowledge_qa(self) -> None:
+        for question in (
+            "我想看第四个",
+            "我想看第五个",
+            "帮我打开第三篇",
+            "最后一个是什么",
+        ):
+            with self.subTest(question=question):
+                classified = _rule_match(question, _categories())
+                self.assertIsNotNone(classified)
+                self.assertEqual(classified.intent_code, "knowledge_qa")
+                self.assertEqual(classified.action, "retrieve")
+                self.assertTrue(classified.need_retrieval)
+                self.assertEqual(classified.response_mode, "grounded_qa")
+
+    def test_regulation_clause_is_not_captured_by_result_reference_rule(self) -> None:
+        for question in (
+            "《员工手册》第3条说了什么",
+            "第3章讲了什么",
+            "第5节讲了什么",
+            "第3款如何执行",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(is_result_list_reference(question))
+                self.assertFalse(_reference_correction_match(question))
+                classified = _rule_match(question, _categories())
+                if classified is not None:
+                    self.assertNotEqual(classified.intent_code, "reference_correction")
+                    self.assertNotIn(
+                        "result_reference",
+                        classified.intent_code,
+                    )
+
+    def test_regulation_clause_with_explicit_read_verb_stays_a_knowledge_reference(
+        self,
+    ) -> None:
+        """条文 + 明确阅读动词仍是知识库问答，但不会误判为纠正。"""
+        classified = _rule_match("第3章的内容是什么", _categories())
+        self.assertIsNotNone(classified)
+        self.assertEqual(classified.intent_code, "knowledge_qa")
+        self.assertTrue(classified.need_retrieval)
+        self.assertFalse(_reference_correction_match("第3章的内容是什么"))
+
+    def test_reference_correction_rule_routes_without_rereading(self) -> None:
+        for question in (
+            "第四个不是《钉钉》吗",
+            "你刚才说错了，应该是第五个",
+            "第五个才对吧",
+            "你返回错了吧，我想看第四个",
+        ):
+            with self.subTest(question=question):
+                classified = _rule_match(question, _categories())
+                self.assertIsNotNone(classified)
+                self.assertEqual(classified.intent_code, "reference_correction")
+                self.assertEqual(classified.action, "retrieve")
+                self.assertTrue(classified.need_retrieval)
+                self.assertEqual(classified.response_mode, "grounded_qa")
+
+    async def test_ordinal_reference_preflight_skips_intent_model(self) -> None:
+        create = AsyncMock(
+            side_effect=AssertionError("结果序号引用不应调用路由模型")
+        )
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                "我想看第四个",
+                selected_kb_count_override=1,
+                route_context=(),
+                record_log=False,
+            )
+
+        self.assertEqual(result.route_decision.intent_code, "knowledge_qa")
+        self.assertEqual(result.task_contract.response_mode, "grounded_qa")
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        self.assertEqual(
+            result.diagnostics["deterministic_preflight"],
+            "result_reference",
+        )
+        create.assert_not_awaited()
+
+    async def test_reference_correction_preflight_skips_intent_model(self) -> None:
+        create = AsyncMock(
+            side_effect=AssertionError("结果纠正不应调用路由模型")
+        )
+        with (
+            patch(
+                "core.intent_router.get_intent_router_config",
+                new=AsyncMock(return_value=_default_config()),
+            ),
+            patch(
+                "core.intent_router.list_intent_categories",
+                new=AsyncMock(return_value=_categories()),
+            ),
+            patch(
+                "core.intent_router.get_client",
+                return_value=_model_client(create),
+            ),
+            patch("core.intent_router.get_settings", return_value=_model_settings()),
+            patch("core.intent_router.trace_event"),
+        ):
+            result = await classify_intent_result(
+                object(),
+                "第四个不是《钉钉》吗",
+                selected_kb_count_override=1,
+                route_context=(),
+                record_log=False,
+            )
+
+        self.assertEqual(
+            result.route_decision.intent_code,
+            "reference_correction",
+        )
+        self.assertEqual(
+            result.diagnostics["deterministic_preflight"],
+            "result_reference",
+        )
+        self.assertEqual(result.task_contract.retrieval_policy, "required")
+        create.assert_not_awaited()
 
 
 class IntentRoutingModelTests(unittest.IsolatedAsyncioTestCase):

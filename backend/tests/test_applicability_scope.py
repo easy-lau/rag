@@ -11,9 +11,15 @@ from core.query_constraints import (
 )
 
 
-def _candidate(*, project=None, version="8.2.75", global_scope=False):
+def _candidate(
+    *,
+    product="云枢",
+    project=None,
+    version="8.2.75",
+    global_scope=False,
+):
     metadata = {
-        "product": "云枢",
+        "product": product,
         "version": version,
     }
     if project is not None:
@@ -35,7 +41,7 @@ class ApplicabilityScopeTests(unittest.TestCase):
 
         scope = extract_applicability_scope(question)
 
-        self.assertEqual(scope.product, "云枢")
+        self.assertIsNone(scope.product)
         self.assertEqual(scope.version, "8.2.75")
         self.assertEqual(scope.project, "中青建安")
         self.assertIsNotNone(scope.project_source)
@@ -46,14 +52,13 @@ class ApplicabilityScopeTests(unittest.TestCase):
         )
         self.assertEqual(scope.project_source.span, "中青建安")
 
-    def test_prefix_project_scope_is_source_anchored_without_model_inference(self):
+    def test_possessive_prefix_is_not_promoted_to_project_scope(self):
         question = "中青建安的云枢8.2.75普通员工餐补标准是多少"
 
         scope = extract_applicability_scope(question)
 
-        self.assertEqual(scope.project, "中青建安")
-        self.assertIsNotNone(scope.project_source)
-        self.assertEqual(scope.project_source.span, "中青建安")
+        self.assertIsNone(scope.project)
+        self.assertIsNone(scope.project_source)
 
     def test_comparison_returns_independent_source_scopes(self):
         question = "比较 CloudPivot 6 和 CloudPivot 7 的安全配置"
@@ -145,8 +150,8 @@ class ApplicabilityScopeTests(unittest.TestCase):
         scopes = extract_applicability_scopes(
             "比较 CloudPivot 6 和 CloudPivot 7 的安全配置"
         )
-        candidate_6 = _candidate(version="6")
-        candidate_8 = _candidate(version="8")
+        candidate_6 = _candidate(product="CloudPivot", version="6")
+        candidate_8 = _candidate(product="CloudPivot", version="8")
 
         admission = admit_candidates_for_scopes([candidate_6, candidate_8], scopes)
 

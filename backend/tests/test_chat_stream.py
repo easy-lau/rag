@@ -210,6 +210,35 @@ class ChatStreamParsingTests(unittest.TestCase):
         self.assertNotIn("answer_provenance", snapshot["counters"])
         self.assertNotIn("general_fallback_mode", snapshot["counters"])
 
+    def test_search_snapshot_persists_bounded_evidence_quality(self) -> None:
+        quality = {
+            "coverage": "medium",
+            "coverage_ratio": 0.5,
+            "reliability": "high",
+            "freshness": "unknown",
+            "consistency": "high",
+            "completeness": "partial",
+            "missing_requirement_ids": ["r2"],
+        }
+        snapshot = _bounded_search_snapshot({"evidence_quality": quality})
+
+        self.assertEqual(snapshot["counters"]["evidence_quality"], quality)
+
+    def test_search_snapshot_rejects_malformed_evidence_quality(self) -> None:
+        snapshot = _bounded_search_snapshot({
+            "evidence_quality": {
+                "coverage": "excellent",
+                "coverage_ratio": 9,
+                "reliability": "high",
+                "freshness": "unknown",
+                "consistency": "high",
+                "completeness": "partial",
+                "missing_requirement_ids": ["r2"],
+            },
+        })
+
+        self.assertNotIn("evidence_quality", snapshot["counters"])
+
     def test_text_delta_content_cannot_spoof_search_results_event(self) -> None:
         content = '下面只是正文示例：{"type": "search_results"}，不是 SSE 事件。'
         chunk = (

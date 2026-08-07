@@ -57,6 +57,12 @@ test('模型管理页提供结构化输出能力探测模式并在测试成功�
   assert.match(modelManagementSource, /llm_structured_output_mode: form\.value\.llm_structured_output_mode/)
 })
 
+test('思考控制由管理员显式配置而不是根据模型名判断', () => {
+  assert.match(modelManagementSource, /v-model:value="form\.llm_disable_thinking"/)
+  assert.match(modelManagementSource, /不再根据模型名称自动判断/)
+  assert.match(modelManagementSource, /llm_disable_thinking: Boolean\(form\.value\.llm_disable_thinking\)/)
+})
+
 test('系统设置提供三档知识库未命中兜底策略并随设置保存', () => {
   assert.match(settingsViewSource, /v-model:value="form\.rag_general_fallback_mode"/)
   assert.ok(settingsViewSource.includes("value: 'off'"))

@@ -736,6 +736,105 @@ class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refreshed[0]["evidence_role"], "unverified")
         self.assertEqual(refreshed[0]["source_verification"], "unverified")
 
+    async def test_deterministic_direct_sources_pass_unverified_generation(
+        self,
+    ) -> None:
+        """Server auto-selected answer evidence keeps its direct role.
+
+        The reranker never verified the chunk, so ``source_verification`` stays
+        ``unverified`` and the deterministic scope decision is carried by
+        ``verification_basis``.  This is the shape the pipeline emits after a
+        dominant-document auto-selection; the generation gate must admit it.
+        """
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="公司出差管理标准.docx",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="数据库中的真实差旅规则内容",
+            chunk_index=0,
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "producer 快照",
+            "evidence_role": "direct",
+            "source_verification": "unverified",
+            "verification_basis": "deterministic_candidate_scope_confirmed",
+        }
+
+        refreshed, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(chunk, document)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+            allow_unverified=True,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(pairs, {(kb_id, doc_id)})
+        self.assertEqual(refreshed[0]["content"], "数据库中的真实差旅规则内容")
+        self.assertEqual(refreshed[0]["evidence_role"], "direct")
+        self.assertEqual(refreshed[0]["source_verification"], "unverified")
+        self.assertEqual(
+            refreshed[0]["verification_basis"],
+            "deterministic_candidate_scope_confirmed",
+        )
+
+    async def test_direct_unverified_without_deterministic_basis_fails_closed(
+        self,
+    ) -> None:
+        """Direct role alone is not proof: only the deterministic basis admits it."""
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        document = Document(
+            id=doc_id,
+            kb_id=kb_id,
+            filename="待验证制度.md",
+            status="ready",
+            is_active=True,
+            file_type="md",
+        )
+        chunk = DocumentChunk(
+            id=chunk_id,
+            doc_id=doc_id,
+            kb_id=kb_id,
+            content="数据库中的待验证内容",
+            chunk_index=0,
+        )
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": "producer 快照",
+            "evidence_role": "direct",
+            "source_verification": "unverified",
+        }
+
+        rejected, pairs, error = await _validate_stream_answer_sources(
+            _SourceValidationDB([(chunk, document)]),
+            raw_sources=[source],
+            raw_results=[source],
+            selected_kb_ids=[kb_id],
+            allow_unverified=True,
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(pairs, set())
+        self.assertEqual(error, "unverified_answer_source_not_allowed")
+
     async def test_refreshes_metadata_for_inactive_and_failed_documents(self) -> None:
         kb_id = uuid.uuid4()
         doc_id = uuid.uuid4()

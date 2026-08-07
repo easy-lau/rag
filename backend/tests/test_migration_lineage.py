@@ -263,7 +263,7 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertFalse(revision.nullable)
         self.assertEqual(str(revision.server_default.arg), "0")
 
-    def test_alembic_has_single_0035_head(self) -> None:
+    def test_alembic_has_single_0038_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -271,10 +271,13 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0035"])
+        self.assertEqual(scripts.get_heads(), ["0038"])
         self.assertEqual(scripts.get_revision("0032").down_revision, "0031")
         self.assertEqual(scripts.get_revision("0034").down_revision, "0033")
         self.assertEqual(scripts.get_revision("0035").down_revision, "0034")
+        self.assertEqual(scripts.get_revision("0036").down_revision, "0035")
+        self.assertEqual(scripts.get_revision("0037").down_revision, "0036")
+        self.assertEqual(scripts.get_revision("0038").down_revision, "0037")
 
     def test_message_duration_migration_is_additive(self) -> None:
         migration_31 = _load_migration("0031_add_message_answer_duration.py")
@@ -416,6 +419,82 @@ class MigrationLineageTests(unittest.TestCase):
             "FOREIGN KEY(concept_id, kb_id) REFERENCES terminology_concepts (id, kb_id)",
             "CREATE UNIQUE INDEX uq_terminology_scope_bindings_identity",
             "COALESCE(document_id, '00000000-0000-0000-0000-000000000000'::uuid)",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, sql)
+
+    def test_conversation_repair_migration_compiles_as_postgresql_ddl(self) -> None:
+        """0036 must compile offline; its JSON examples column cannot pass a raw Python list."""
+
+        migration = _load_migration("0036_add_conversation_repair_intent.py")
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={
+                "as_sql": True,
+                "output_buffer": output,
+                "literal_binds": True,
+            },
+        )
+        operations = Operations(context)
+        with patch.object(migration, "op", operations):
+            migration.upgrade()
+        sql = output.getvalue()
+        for fragment in (
+            "INSERT INTO intent_categories",
+            "'conversation_repair'",
+            "为什么要我选择",
+            "'chat'",
+            "90",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, sql)
+
+    def test_result_reference_memory_migration_compiles_as_postgresql_ddl(self) -> None:
+        """0037 must compile offline and stay additive on conversations."""
+
+        migration = _load_migration("0037_add_conversation_result_reference_memory.py")
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        operations = Operations(context)
+        with patch.object(migration, "op", operations):
+            migration.upgrade()
+        sql = output.getvalue()
+        for fragment in (
+            "ALTER TABLE conversations ADD COLUMN result_reference_memory JSONB",
+            "result_reference_revision INTEGER",
+            "DEFAULT 0",
+            "NOT NULL",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, sql)
+
+    def test_reference_correction_migration_compiles_as_postgresql_ddl(self) -> None:
+        """0038 must compile offline; its JSON examples column needs op.inline_literal."""
+
+        migration = _load_migration("0038_add_reference_correction_intent.py")
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={
+                "as_sql": True,
+                "output_buffer": output,
+                "literal_binds": True,
+            },
+        )
+        operations = Operations(context)
+        with patch.object(migration, "op", operations):
+            migration.upgrade()
+        sql = output.getvalue()
+        for fragment in (
+            "INSERT INTO intent_categories",
+            "'reference_correction'",
+            "第四个不是《钉钉》吗",
+            "'retrieve'",
+            "95",
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, sql)

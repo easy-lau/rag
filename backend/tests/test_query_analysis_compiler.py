@@ -150,7 +150,7 @@ class QueryAnalysisV2CompilerTests(unittest.TestCase):
         self.assertEqual(validation.reason, "candidate_current_turn_coverage_incomplete")
 
     def test_explicit_scope_is_copied_from_the_trusted_baseline_not_model_fields(self):
-        question = "云枢8.6普通员工的住宿标准和餐补分别是多少"
+        question = "我使用的是产品甲8.6，普通员工的住宿标准和餐补分别是多少"
         baseline = _generic_baseline(question)
         analysis = _analysis(
             question,
@@ -173,7 +173,7 @@ class QueryAnalysisV2CompilerTests(unittest.TestCase):
         for requirement in compiled.plan.requirements:
             self.assertEqual(
                 (requirement.scope_product, requirement.scope_version),
-                ("云枢", "8.6"),
+                ("产品甲", "8.6"),
             )
             self.assertTrue(requirement.scope_explicit_version)
         self.assertEqual(compiled.task_graph.task_by_id["anchor_root"].query, question)

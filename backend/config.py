@@ -155,6 +155,12 @@ class Settings(BaseSettings):
         "auto",
         validation_alias="__DATABASE_SETTINGS_ONLY_LLM_STRUCTURED_OUTPUT_MODE",
     )
+    # Optional OpenAI-compatible transport capability.  It is administrator
+    # declared and never inferred from a provider or model name.
+    llm_disable_thinking: bool = Field(
+        False,
+        validation_alias="__DATABASE_SETTINGS_ONLY_LLM_DISABLE_THINKING",
+    )
     # 意图识别与对话共用 LLM 服务凭据；留空时运行时自动复用 chat_model。
     intent_model: str = Field(
         "", validation_alias="__DATABASE_SETTINGS_ONLY_INTENT_MODEL"

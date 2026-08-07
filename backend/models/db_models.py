@@ -431,6 +431,13 @@ class Conversation(Base):
     active_task_revision: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # The numbered result list the user last saw (for example a document
+    # catalog answer).  Ordinal references such as ``我想看第四个`` resolve
+    # against this list; every item is re-authorized per request.
+    result_reference_memory: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    result_reference_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation", cascade="all, delete-orphan")

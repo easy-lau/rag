@@ -82,6 +82,7 @@ _LOCAL_DIRECT_DECISION_REASONS = frozenset(
         "exact_greeting",
         "explicit_platform_help",
         "inline_writing_content",
+        "conversation_repair_rule",
     }
 )
 
@@ -461,6 +462,14 @@ def _compile_base_plan(
                 response_mode="grounded_qa",
                 retrieval_policy="required",
                 decision_reason="knowledge_scope_guard",
+            )
+        if category.code == "conversation_repair":
+            # 确定性对话修复规则：用户质疑系统行为，不进入知识库检索，并让
+            # direct runner 使用专用修复提示词，而不是通用闲聊提示词。
+            return _ExecutionPlan(
+                response_mode="general_chat",
+                retrieval_policy="skip",
+                decision_reason="conversation_repair_rule",
             )
         return _ExecutionPlan(
             response_mode="general_chat",

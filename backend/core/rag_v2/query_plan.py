@@ -466,7 +466,7 @@ def _clean_implicit_subject(value: str) -> str:
     subject = re.sub(r"^(?:请问|请|查询|确认|了解|帮我看一下|帮我查一下)\s*", "", subject)
     # Product/version/project applicability is an independent hard scope, not
     # part of the entity whose classification must be resolved.  Keeping a
-    # leading scope such as ``云枢8.6`` inside ``云枢8.6普通员工`` makes the
+    # leading scope such as ``产品甲8.6`` inside ``产品甲8.6普通员工`` makes the
     # evidence layer search for a nonexistent mapping subject and used to
     # discard the valid ``普通员工 -> D级`` bridge.  Remove only a source-text
     # constraint that is explicitly recognized at the beginning; unknown
@@ -482,7 +482,7 @@ def _suffix_after_explicit_scope(value: str) -> str | None:
     """Return only a self-contained suffix after an explicit version scope.
 
     A project or tenant label can precede the product/version applicability
-    scope (for example ``中青建安的云枢8.2.75普通员工餐补标准``).  The planner
+    scope (for example ``项目甲的产品甲8.2.75普通员工餐补标准``).  The planner
     cannot safely guess whether that unknown prefix is a project or the
     business subject.  It therefore never deletes the prefix directly: it
     exposes only the text after the source-recognized scope, and the caller may

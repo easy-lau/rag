@@ -696,7 +696,7 @@ def extract_bridge_subject(description: Any) -> str | None:
         return None
     subject = match.group("subject").strip(" ：:，,。；;（）()[]【】")
     # Product/version text is an applicability scope, not part of the entity
-    # being classified.  ``云枢8.6普通员工`` must therefore resolve the
+    # being classified.  ``产品甲8.6普通员工`` must therefore resolve the
     # same bridge subject as the source clause ``普通员工对应D级``.  Only
     # remove a recognized explicit scope when a non-empty business subject
     # remains; a product that is itself the queried entity stays intact.
@@ -1380,7 +1380,7 @@ def detect_bridge_scope_ambiguities(
     The result is deliberately based only on explicit source applicability
     identities.  Different KBs or unscoped duplicates alone are not treated as
     alternatives; neither proves a semantic conflict.  Conversely, equal
-    bridge values across CloudPivot 6 and 7 still form an ambiguity because the
+    bridge values across ProductX 6 and 7 still form an ambiguity because the
     value does not prove that their downstream policy clauses are equivalent.
     """
 

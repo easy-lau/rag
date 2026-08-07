@@ -4,7 +4,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from core.direct_response import run_direct_response_stream
+from core.direct_response import _system_prompt, run_direct_response_stream
 from core.query_route_compiler import CompiledAnswerRequirement, RagTaskContract
 from core.query_route_compiler import TaskContractDispatchError
 from core.query_route_contract import RouteClarification
@@ -113,6 +113,22 @@ def _payloads(chunks: list[str]) -> list[dict]:
 
 
 class DirectResponseRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_conversation_repair_decision_uses_dedicated_prompt(self) -> None:
+        prompt = _system_prompt(
+            "general_chat",
+            decision_reason="conversation_repair_rule",
+        )
+        self.assertIn("对话修复模式", prompt)
+        self.assertIn("证据确认流程过度触发", prompt)
+        self.assertNotIn("写作助手", prompt)
+
+    def test_general_chat_decision_keeps_general_prompt(self) -> None:
+        prompt = _system_prompt(
+            "general_chat",
+            decision_reason="classified_general_chat",
+        )
+        self.assertNotIn("对话修复模式", prompt)
+
     async def _run(
         self,
         response_mode: str,

@@ -148,19 +148,19 @@ class StructuredOutputTests(unittest.TestCase):
             client = _Client()
             first = await create_structured_completion(
                 client,
-                request={"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "json"}]},
+                request={"model": "model-a", "messages": [{"role": "user", "content": "json"}]},
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-flash",
+                model="model-a",
             )
             second = await create_structured_completion(
                 client,
-                request={"model": "deepseek-v4-flash", "messages": [{"role": "user", "content": "json"}]},
+                request={"model": "model-a", "messages": [{"role": "user", "content": "json"}]},
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-flash",
+                model="model-a",
             )
             return first, second, client.chat.completions.calls
 
@@ -177,13 +177,13 @@ class StructuredOutputTests(unittest.TestCase):
             result = await create_structured_completion(
                 client,
                 request={
-                    "model": "deepseek-v4-pro",
+                    "model": "model-a",
                     "messages": [{"role": "system", "content": "Return the contract."}],
                 },
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-a",
             )
             return result, client.chat.completions.calls
 
@@ -207,13 +207,13 @@ class StructuredOutputTests(unittest.TestCase):
             result = await create_structured_completion(
                 client,
                 request={
-                    "model": "deepseek-v4-pro",
+                    "model": "model-a",
                     "messages": [{"role": "system", "content": "Return JSON."}],
                 },
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-a",
             )
             return result, client.chat.completions.calls
 
@@ -228,13 +228,13 @@ class StructuredOutputTests(unittest.TestCase):
             result = await create_structured_completion(
                 client,
                 request={
-                    "model": "deepseek-v4-pro",
+                    "model": "model-a",
                     "messages": [{"role": "system", "content": "Return JSON."}],
                 },
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=0.1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-a",
             )
             return result, client.chat.completions.calls
 
@@ -243,20 +243,21 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(result.attempted_modes, ("json_schema", "json_object"))
         self.assertEqual(calls[-1]["response_format"], {"type": "json_object"})
 
-    def test_deepseek_v4_disables_thinking_for_structured_request(self):
+    def test_declared_capability_disables_thinking_for_structured_request(self):
         async def run():
             client = _SuccessfulClient()
             result = await create_structured_completion(
                 client,
                 request={
-                    "model": "deepseek-v4-pro",
+                    "model": "model-with-thinking-control",
                     "messages": [{"role": "system", "content": "Return JSON."}],
                     "extra_body": {"trace": {"enabled": True}},
                 },
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-with-thinking-control",
+                disable_thinking=True,
             )
             return result, client.chat.completions.calls
 
@@ -270,7 +271,7 @@ class StructuredOutputTests(unittest.TestCase):
             },
         )
 
-    def test_non_deepseek_model_does_not_receive_thinking_control(self):
+    def test_undeclared_capability_does_not_receive_thinking_control(self):
         async def run():
             client = _SuccessfulClient()
             result = await create_structured_completion(
@@ -294,7 +295,7 @@ class StructuredOutputTests(unittest.TestCase):
         async def run():
             client = _ThinkingUnsupportedClient()
             request = {
-                "model": "deepseek-v4-pro",
+                "model": "model-with-thinking-control",
                 "messages": [{"role": "system", "content": "Return JSON."}],
             }
             first = await create_structured_completion(
@@ -303,7 +304,8 @@ class StructuredOutputTests(unittest.TestCase):
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-with-thinking-control",
+                disable_thinking=True,
             )
             second = await create_structured_completion(
                 client,
@@ -311,7 +313,8 @@ class StructuredOutputTests(unittest.TestCase):
                 strict_response_format={"type": "json_schema", "json_schema": {"name": "x"}},
                 timeout_seconds=1,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-with-thinking-control",
+                disable_thinking=True,
             )
             return first, second, client.chat.completions.calls
 
@@ -329,20 +332,21 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertEqual(second.mode, "json_schema")
         self.assertFalse(second.thinking_disabled)
 
-    def test_stream_completion_disables_thinking_only_for_deepseek_v4(self):
+    def test_stream_completion_uses_only_declared_thinking_capability(self):
         async def run():
-            deepseek_client = _SuccessfulClient()
+            declared_client = _SuccessfulClient()
             other_client = _SuccessfulClient()
-            deepseek_stream, deepseek_disabled = await create_stream_completion(
-                deepseek_client,
+            declared_stream, declared_disabled = await create_stream_completion(
+                declared_client,
                 request={
-                    "model": "deepseek-v4-pro",
+                    "model": "model-with-thinking-control",
                     "messages": [{"role": "user", "content": "你好"}],
                     "stream": True,
                     "extra_body": {"trace": {"enabled": True}},
                 },
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-with-thinking-control",
+                disable_thinking=True,
             )
             other_stream, other_disabled = await create_stream_completion(
                 other_client,
@@ -355,19 +359,19 @@ class StructuredOutputTests(unittest.TestCase):
                 model="gpt-5.6-luna",
             )
             return (
-                deepseek_stream,
-                deepseek_disabled,
-                deepseek_client.chat.completions.calls,
+                declared_stream,
+                declared_disabled,
+                declared_client.chat.completions.calls,
                 other_stream,
                 other_disabled,
                 other_client.chat.completions.calls,
             )
 
-        deepseek_stream, deepseek_disabled, deepseek_calls, other_stream, other_disabled, other_calls = asyncio.run(run())
-        self.assertTrue(deepseek_stream.ok)
-        self.assertTrue(deepseek_disabled)
+        declared_stream, declared_disabled, declared_calls, other_stream, other_disabled, other_calls = asyncio.run(run())
+        self.assertTrue(declared_stream.ok)
+        self.assertTrue(declared_disabled)
         self.assertEqual(
-            deepseek_calls[0]["extra_body"],
+            declared_calls[0]["extra_body"],
             {
                 "trace": {"enabled": True},
                 "thinking": {"type": "disabled"},
@@ -381,7 +385,7 @@ class StructuredOutputTests(unittest.TestCase):
         async def run():
             client = _ThinkingUnsupportedClient()
             request = {
-                "model": "deepseek-v4-pro",
+                "model": "model-with-thinking-control",
                 "messages": [{"role": "user", "content": "你好"}],
                 "stream": True,
             }
@@ -389,13 +393,15 @@ class StructuredOutputTests(unittest.TestCase):
                 client,
                 request=request,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-with-thinking-control",
+                disable_thinking=True,
             )
             second_stream, second_disabled = await create_stream_completion(
                 client,
                 request=request,
                 provider_identity="https://llm.example/v1",
-                model="deepseek-v4-pro",
+                model="model-with-thinking-control",
+                disable_thinking=True,
             )
             return (
                 first_stream,

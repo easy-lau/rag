@@ -164,6 +164,74 @@ def _runtime_settings(**overrides):
     return SimpleNamespace(**values)
 
 
+class SettingsContractValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from api.settings import _validate_settings_contract
+
+        self.validate = _validate_settings_contract
+
+    def test_placeholder_model_id_is_rejected_at_save_boundary(self) -> None:
+        settings = _runtime_settings()
+
+        with self.assertRaises(HTTPException) as raised:
+            self.validate({"intent_model": "objectId"}, settings)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("占位符", raised.exception.detail)
+
+    def test_template_variable_model_id_is_rejected(self) -> None:
+        settings = _runtime_settings()
+
+        with self.assertRaises(HTTPException):
+            self.validate({"chat_model": "{{model_name}}"}, settings)
+
+    def test_empty_required_model_is_rejected(self) -> None:
+        settings = _runtime_settings()
+
+        with self.assertRaises(HTTPException) as raised:
+            self.validate({"chat_model": "   "}, settings)
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_optional_model_may_be_empty_to_reuse_chat_model(self) -> None:
+        settings = _runtime_settings()
+
+        updates = {"intent_model": ""}
+        self.validate(updates, settings)
+
+        self.assertEqual(updates["intent_model"], "")
+
+    def test_out_of_range_timeout_is_rejected(self) -> None:
+        settings = _runtime_settings()
+
+        with self.assertRaises(HTTPException) as raised:
+            self.validate({"rerank_timeout_seconds": 300}, settings)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("1~120", raised.exception.detail)
+
+    def test_boolean_fields_require_boolean_type(self) -> None:
+        settings = _runtime_settings()
+
+        with self.assertRaises(HTTPException) as raised:
+            self.validate({"rerank_enabled": "true"}, settings)
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_legitimate_model_and_timeout_values_pass(self) -> None:
+        settings = _runtime_settings()
+
+        updates = {
+            "chat_model": "gpt-5.6-luna",
+            "intent_model": "deepseek-v4-pro",
+            "rerank_timeout_seconds": 15,
+            "rerank_enabled": False,
+        }
+        self.validate(updates, settings)
+
+        self.assertEqual(updates["chat_model"], "gpt-5.6-luna")
+
+
 class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_startup_migrates_legacy_plaintext_key_and_loads_runtime_value(self) -> None:
         row = SystemSetting(key="llm_api_key", value="legacy-secret")

@@ -19,6 +19,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.active_task_state import ResolvedActiveTask
+from core.result_reference_memory import ResolvedResultReference
+from core.semantic_memory import has_entity_reuse
 from core.query_constraints import (
     canonical_product_name,
     extract_document_constraint_identity,
@@ -30,6 +32,7 @@ from core.query_surface_structure import (
 )
 from core.query_semantics import ResolvedTurnSemantics
 from core.read_sessions import ReadSessionFactory, isolated_read_session
+from core.result_reference import same_result_reference_selection
 from models.db_models import Document, DocumentChunk, Message
 
 
@@ -77,11 +80,12 @@ _UNRESOLVED_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _ELLIPTICAL_ENTITY_FOLLOWUP_RE = re.compile(
-    # 裸“如果”通常会引出完整条件问题；只有“如果是 Redis 呢”这类
+    # 裸“如果”通常会引出完整条件问题；只有“如果是某系统呢”这类
     # 明确省略被比较对象的表达才继承上一轮。
     r"^\s*(?:"
     r"(?:那(?:么)?|如果是|改成|换成)\s*(?=\S).{1,48}?|"
-    r"(?:云\s*枢|cloudpivot(?:\s*platform)?)\s*"
+    r"(?:[A-Za-z][A-Za-z0-9_.+\-]{1,30}|"
+    r"[\u3400-\u9fff]{1,12}(?:系统|平台|产品|服务)?)\s*"
     r"\d{1,3}(?:\.\d{1,3}){0,3}"
     r")\s*(?:呢|怎么样|如何|可以吗)[？?。.!！\s]*$",
     re.IGNORECASE,
@@ -101,24 +105,23 @@ _ANSWER_REFINEMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _MISSING_ACTION_OBJECT_RE = re.compile(
-    # “云枢中如何配置 / 那在云枢里怎么设置 / 那要怎么处理”给出了
+    # “某系统中如何配置 / 那在某平台里怎么设置 / 那要怎么处理”给出了
     # 操作方式，却省略了配置或处理的对象。只有整句在动作处结束才命中；
-    # “云枢中如何配置登录用户名枚举”因动作后存在宾语，不会继承旧主题。
+    # “某系统中如何配置登录用户名枚举”因动作后存在宾语，不会继承旧主题。
     r"^\s*(?:那(?:么)?|然后|所以)?\s*"
     r"(?:"
     r"(?:在|用)\s*(?P<prep_scope>[A-Za-z0-9_.+\-\u3400-\u9fff]"
     r"(?:[A-Za-z0-9_.+\-\u3400-\u9fff \t]{0,38}?[A-Za-z0-9_.+\-\u3400-\u9fff])?)"
     r"\s*(?:里面|中|里|内|上)\s*|"
-    # 无介词分支禁止把“对象在产品中”整段吞成 scope；否则“登录用户名枚举在云枢中如何配置”
+    # 无介词分支禁止把“对象在产品中”整段吞成 scope；否则“登录用户名枚举在产品甲中如何配置”
     # 会被错误地当成缺少宾语的追问。
     r"(?![^中里内上]{0,40}在)(?P<located_scope>[A-Za-z0-9_.+\-\u3400-\u9fff]"
     r"(?:[A-Za-z0-9_.+\-\u3400-\u9fff \t]{0,38}?[A-Za-z0-9_.+\-\u3400-\u9fff])?)"
     r"\s*(?:里面|中|里|内|上)\s*|"
     # 无“中/里/内/上”的写法只接受一个明确的系统名。这里不能使用任意文本，
-    # 否则“云枢默认密码怎么配置”会把“云枢默认密码”整体吞成 scope，误判为
+    # 否则“某产品默认密码怎么配置”会把完整宾语吞成 scope，误判为
     # 缺少配置对象。带宾语的完整问题必须继续作为 standalone question。
     r"(?P<bare_scope>(?![^\n]{0,40}在)(?:"
-    r"(?:云\s*枢|cloudpivot(?:\s*platform)?)(?:\s*\d+(?:\.\d+)*)?|"
     r"[A-Za-z][A-Za-z0-9_.+\-]{1,30}|"
     r"[\u3400-\u9fff]{1,12}(?:系统|平台|产品|服务)"
     r"))"
@@ -152,11 +155,6 @@ _CJK_SCOPE_ENTITY_RE = re.compile(
 _COMMON_LATIN_WORDS = {
     "how", "what", "why", "where", "when", "which", "can", "could",
     "should", "please", "help", "the", "this", "that",
-}
-_KNOWN_LATIN_SCOPE_KEYS = {
-    "cloudpivot", "cloudpivotplatform", "redis", "python", "postgresql",
-    "postgres", "mysql", "oracle", "sqlserver", "mongodb", "elasticsearch",
-    "kafka", "nginx", "docker", "kubernetes", "k8s", "spring", "java",
 }
 _REFERENCE_WITH_POSTFIX_RE = re.compile(
     r"(?:这个|该|上述|上面(?:的)?|前面(?:的)?)(?:配置|参数|功能|方案|问题|"
@@ -214,18 +212,11 @@ _TOPIC_TRAILING_QUESTION_RE = re.compile(
 
 
 def _scope_key(value: str) -> str:
-    normalized = re.sub(
+    return re.sub(
         r"[^a-z0-9\u3400-\u9fff]+",
         "",
         str(value or "").casefold(),
     )
-    if re.fullmatch(r"(?:云枢|cloudpivot(?:platform)?)(?:\d+(?:\.\d+)*)?", normalized):
-        return "cloudpivot"
-    return normalized
-
-
-def _is_known_product_scope(value: str) -> bool:
-    return _scope_key(value) == "cloudpivot"
 
 
 def _previous_scope_keys(question: str | None) -> set[str]:
@@ -240,7 +231,7 @@ def _previous_scope_keys(question: str | None) -> set[str]:
         keys.add(_scope_key(constraints.product))
     for entity in _PLAIN_LATIN_ENTITY_RE.findall(text):
         key = _scope_key(entity)
-        if key in _KNOWN_LATIN_SCOPE_KEYS:
+        if key and key not in _COMMON_LATIN_WORDS:
             keys.add(key)
     keys.update(
         key
@@ -274,9 +265,9 @@ def _is_explicit_scope_change(
     previous_scopes = _previous_scope_keys(previous_user_question)
     if previous_scopes:
         return _scope_key(current_scope) not in previous_scopes
-    # 当前产品词典能明确识别“云枢”时，允许它补齐上一轮的通用主题；
-    # Redis/Python 等未知新实体没有上一轮同实体依据，保守视为新话题。
-    return not _is_known_product_scope(current_scope)
+    # 没有上一轮同一来源实体可验证时，保守视为新话题；不为任何产品或技术
+    # 维护例外名单。
+    return True
 
 
 def _has_explicit_postfix_object(question: str) -> bool:
@@ -295,7 +286,7 @@ def _has_explicit_postfix_object(question: str) -> bool:
 def _previous_topic_supports_action_followup(question: str | None) -> bool:
     """Require a plausible configurable object before filling an omitted one.
 
-    Product-scoped phrases such as ``云枢中如何配置`` are ambiguous even when
+    Product-scoped phrases such as ``产品甲中如何配置`` are ambiguous even when
     a conversation exists.  They may inherit ``登录用户名枚举`` or ``默认密码``,
     but must not turn an unrelated greeting, weather question or general
     science topic into a retrieval query merely because it was the last turn.
@@ -387,8 +378,13 @@ class ConversationContext:
     active_task: ResolvedActiveTask | None = None
     # ``document`` reuses the previously closed source scope.  ``topic_only``
     # keeps the task objective as context but requires a fresh authorized
-    # retrieval (for example CloudPivot 7 -> CloudPivot 6).
+    # retrieval (for example ProductX 7 -> ProductX 6).
     active_task_scope_mode: Literal["document", "topic_only"] = "document"
+    # Server-resolved ordinal reference into the persisted result list the
+    # user last saw.  Only re-authorized document identities are copied here;
+    # persisted JSON never crosses into the pipeline directly.
+    result_reference_memory_sources: tuple[dict[str, Any], ...] = ()
+    result_reference_memory_acknowledgement: str | None = None
 
 
 V2ExecutionContextMode = Literal[
@@ -1078,19 +1074,13 @@ def _merge_missing_action_object(action_question: str, object_text: str) -> str:
     topic = _previous_topic_object(object_text)
     current_scope = _missing_action_scope(action)
     if current_scope:
-        # “云枢中如何配置” + “云枢登录用户名枚举是什么” should not
-        # become “云枢中如何配置云枢登录用户名枚举”.
-        if _is_known_product_scope(current_scope):
-            scope_pattern = (
-                r"(?:云\s*枢|cloudpivot(?:\s*platform)?)"
-                r"(?:\s*\d+(?:\.\d+)*)?"
-            )
-        else:
-            scope_pattern = r"\s*".join(
-                re.escape(part)
-                for part in re.split(r"\s+", current_scope)
-                if part
-            )
+        # Avoid duplicating an explicitly repeated scope without maintaining
+        # product aliases or technology allow-lists in the conversation layer.
+        scope_pattern = r"\s*".join(
+            re.escape(part)
+            for part in re.split(r"\s+", current_scope)
+            if part
+        )
         topic = re.sub(
             rf"^\s*(?:在|用)?\s*{scope_pattern}\s*(?:中|里|内|上|的)?\s*",
             "",
@@ -1138,7 +1128,7 @@ def build_standalone_query(
     if not previous:
         return question.strip()
     current_text = question.strip()[:8000]
-    # “那8.6呢 / 那云枢7呢”继承上一轮主题，但必须把旧版本替换掉；同时不把
+    # “那8.6呢 / 那某产品7呢”继承上一轮主题，但必须把旧版本替换掉；同时不把
     # “原始追问”这类调试字段送进召回。
     version_only = _VERSION_ONLY_FOLLOWUP_RE.fullmatch(question.strip())
     previous_constraints = extract_query_constraints(previous)
@@ -1166,6 +1156,25 @@ def build_standalone_query(
             )
         previous_topic = previous_topic.strip(" \t\r\n，。！？；：,.!?;:")
         return f"{target_product}{target_version} {previous_topic}".strip()[:8000]
+    if (
+        _ELLIPTICAL_ENTITY_FOLLOWUP_RE.fullmatch(question.strip())
+        and current_constraints.explicit_version
+    ):
+        # Replacing an explicitly written version is language structure and
+        # does not require knowing which business product owns it. Preserve
+        # the previous topic text, remove only its source-anchored version,
+        # and let authorized catalog/terminology resolution bind the product.
+        previous_topic = previous
+        if previous_constraints.matched_text:
+            previous_topic = re.sub(
+                re.escape(previous_constraints.matched_text),
+                "",
+                previous_topic,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        previous_topic = previous_topic.strip(" \t\r\n，。！？；：,.!?;:")
+        return f"{current_text} {previous_topic}".strip()[:8000]
     if followup_reason == "missing_action_object":
         # 检索问题中不能出现“需要继承的上一轮主题”这类调试元话语；它会
         # 稀释向量并让全文检索产生无意义的 AND 条件。上下文原因只写 Trace。
@@ -1419,6 +1428,34 @@ def apply_active_task_context(
         has_previous_turn=True,
         previous_user_question=resolved_task.state.root_query,
     )
+    if (
+        not is_followup
+        and reason == "standalone_question"
+        and same_result_reference_selection(
+            current,
+            resolved_task.state.root_query,
+        )
+    ):
+        # The selected ordinal is language structure, while the active task
+        # owns its already re-authorized document identity.  Matching the same
+        # single ordinal across adjacent task turns therefore continues that
+        # exact task without resolving the number against an older result list
+        # again. Multiple/different ordinals remain new semantic work.
+        is_followup = True
+        reason = "active_result_reference"
+    if not is_followup and reason == "standalone_question":
+        # Reference follow-up detection covers anaphora and ellipsis, not
+        # *entity* reuse.  ``普通员工可以乘坐头等舱吗`` is a correctly
+        # self-contained question that nevertheless re-mentions an entity
+        # (``普通员工``) resolved by the previous grounded turn.  Bind the
+        # re-authorized sources back to that mention so the answer can reuse
+        # the already-grounded rules instead of re-running an unanchored
+        # retrieval.  The question itself stays the immutable anchor; only the
+        # evidence set is carried over.
+        memory = resolved_task.state.semantic_memory
+        if memory is not None and has_entity_reuse(current, memory):
+            is_followup = True
+            reason = "semantic_entity_reuse"
     if not is_followup:
         return context
     scope_mode: Literal["document", "topic_only"] = "document"
@@ -1441,13 +1478,20 @@ def apply_active_task_context(
         requested_version = str(current_constraints.version or "").casefold()
         if requested_version and requested_version not in current_versions:
             scope_mode = "topic_only"
-    standalone_query = build_standalone_query(
-        current,
-        previous_user_question=resolved_task.state.root_query,
-        previous_assistant_answer=latest.assistant_answer,
-        carryover_sources=resolved_task.sources if scope_mode == "document" else (),
-        followup_reason=reason,
-    )
+    if reason == "semantic_entity_reuse":
+        # Entity reuse means the same entity reappears in a complete question.
+        # Concatenating the historical question would turn a bounded evidence
+        # reuse into a fabricated new fact; keep the literal current question
+        # as the retrieval anchor, exactly like the V3 catalog boundary does.
+        standalone_query = current
+    else:
+        standalone_query = build_standalone_query(
+            current,
+            previous_user_question=resolved_task.state.root_query,
+            previous_assistant_answer=latest.assistant_answer,
+            carryover_sources=resolved_task.sources if scope_mode == "document" else (),
+            followup_reason=reason,
+        )
     return replace(
         context,
         is_followup=True,
@@ -1467,6 +1511,49 @@ def apply_active_task_context(
         # must rediscover authorized documents for the requested version.
         active_task=(resolved_task if scope_mode == "document" else None),
         active_task_scope_mode=scope_mode,
+    )
+
+
+def apply_result_reference_memory_context(
+    *,
+    context: ConversationContext,
+    question: str,
+    resolved_reference: ResolvedResultReference | None,
+) -> ConversationContext:
+    """Bind a persisted result-list ordinal to its re-authorized document.
+
+    The ordinal itself is language structure; the document identity comes
+    from ``result_reference_memory`` and is re-authorized before this function
+    is called.  The follow-up therefore never re-runs retrieval or re-interprets
+    the number through a model: the resolved document is read directly.
+    """
+
+    if resolved_reference is None:
+        return context
+    if not isinstance(context, ConversationContext):
+        raise ValueError("context must be a ConversationContext")
+    current = str(question or "").strip()
+    if not current:
+        return context
+    reason = (
+        "reference_correction"
+        if resolved_reference.correction
+        else "ordinal_result_reference"
+    )
+    return replace(
+        context,
+        is_followup=True,
+        followup_reason=f"result_reference_memory:{reason}",
+        standalone_query=current,
+        carryover_sources=(resolved_reference.source,),
+        previous_user_question=resolved_reference.memory.root_query,
+        unresolved_reference=False,
+        relation="followup",
+        query_resolution_mode="result_reference_memory",
+        context_turn_keys=(),
+        active_task=None,
+        result_reference_memory_sources=(resolved_reference.source,),
+        result_reference_memory_acknowledgement=resolved_reference.acknowledgement,
     )
 
 

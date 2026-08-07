@@ -171,11 +171,31 @@ def _candidate_ranges_are_well_formed(analysis: QueryAnalysis) -> bool:
 def _scope_ranges(question: str) -> tuple[tuple[int, int], ...]:
     """Return source-authored route scope ranges without trusting the model."""
 
+    scopes = extract_applicability_scopes(question)
     ranges = {
         (source.start, source.end)
-        for scope in extract_applicability_scopes(question)
+        for scope in scopes
         for source in scope.source_spans
     }
+    # The deterministic scope parser may retain a structural cue or field
+    # label around the typed values (for example ``我使用的是 + 产品 + 版本``).
+    # Candidate coverage must ignore that complete parser-owned span as
+    # grammatical scope scaffolding; otherwise a valid multi-target analysis
+    # is rejected merely because it did not pretend the cue was an answer
+    # target.  Only an exact occurrence enclosing every typed source span is
+    # trusted, so this cannot enlarge scope from model text or document data.
+    for scope in scopes:
+        matched_text = str(scope.matched_text or "")
+        sources = tuple(scope.source_spans)
+        if not matched_text or not sources:
+            continue
+        start = question.find(matched_text)
+        while start >= 0:
+            end = start + len(matched_text)
+            if all(start <= source.start < source.end <= end for source in sources):
+                ranges.add((start, end))
+                break
+            start = question.find(matched_text, start + 1)
     if ranges:
         return tuple(sorted(ranges))
     # Product-only legacy constraints do not appear in the multi-scope
@@ -274,7 +294,7 @@ def _bridge_policy_is_safe(
         return True, False, None
     # Validate against the same shared grammatical entity classifier used by
     # the frame.  A leading explicit product/version can make the conservative
-    # whole-sentence frame retain ``云枢8.6普通员工`` as one qualifier, while
+    # whole-sentence frame retain ``产品甲8.6普通员工`` as one qualifier, while
     # the source-anchored candidate correctly points at the literal subspan
     # ``普通员工``.  Requiring textual equality with that whole frame would
     # reject a safe scope-preserving case; the parser-owned classifier keeps

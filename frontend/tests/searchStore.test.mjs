@@ -170,6 +170,17 @@ test('needs_clarification 表示检索已执行但选择前没有回答依据', 
   }
   store.setResults({
     evidence_status: 'needs_clarification',
+    retrieval_status: 'authorized_candidates_found',
+    answerability_status: 'evidence_incomplete',
+    intent_status: 'lookup',
+    semantic_confidence: 0.82,
+    evidence_quality: {
+      coverage: 'medium',
+      reliability: 'medium',
+      freshness: 'unknown',
+      consistency: 'high',
+      completeness: 'partial',
+    },
     displayed_result_count: 2,
     hit_count: 2,
     direct_evidence_count: 2,
@@ -184,6 +195,11 @@ test('needs_clarification 表示检索已执行但选择前没有回答依据', 
   })
 
   assert.equal(store.searchMeta.evidence_status, 'needs_clarification')
+  assert.equal(store.searchMeta.retrieval_status, 'authorized_candidates_found')
+  assert.equal(store.searchMeta.answerability_status, 'evidence_incomplete')
+  assert.equal(store.searchMeta.intent_status, 'lookup')
+  assert.equal(store.searchMeta.semantic_confidence, 0.82)
+  assert.equal(store.searchMeta.evidence_quality.completeness, 'partial')
   assert.equal(store.searchMeta.retrieval_executed, true)
   assert.equal(store.searchMeta.displayed_candidate_count, 2)
   assert.equal(store.searchMeta.hit_count, 0)

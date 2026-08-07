@@ -22,7 +22,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import get_settings
 from core.openai_client import get_client
-from core.query_constraints import match_known_enterprise_product
 from core.query_route_compiler import (
     CompiledAnswerRequirement,
     RagTaskContract,
@@ -44,6 +43,7 @@ from core.query_route_contract import (
     parse_rag_route_decision,
 )
 from core.query_surface_structure import parse_query_surface_frame
+from core.result_reference import is_result_list_reference
 from core.rag_trace import content_fields, exception_log_text, trace_event
 from core.structured_output import create_structured_completion
 from core.rag_v2.query_plan import infer_implicit_bridge
@@ -77,6 +77,24 @@ DEFAULT_INTENT_CATEGORIES: tuple[dict, ...] = (
         "action": "retrieve",
         "enabled": True,
         "priority": 100,
+    },
+    {
+        "code": "conversation_repair",
+        "name": "对话修复",
+        "description": "用户质疑、纠正或抱怨系统刚才的回答、澄清或选择行为（例如“为什么要我选择”“你刚刚不是已经回答了吗”）。直接说明系统行为并修复对话，不再触发知识库检索；真正的业务追问仍按知识库问答处理。",
+        "examples": ["为什么要我选择，你刚刚不是已经回答了吗", "你刚才为什么一直问我要哪个文档", "不是已经回答过了吗，怎么又问我"],
+        "action": "chat",
+        "enabled": True,
+        "priority": 90,
+    },
+    {
+        "code": "reference_correction",
+        "name": "结果引用纠正",
+        "description": "用户纠正或质疑前面列出的结果序号（例如“第四个不是《钉钉》吗”“你刚才说错了，应该是第五个”）。按已展示的结果列表重新解析序号，直接读取正确文档，不再重新检索或要求用户选择。",
+        "examples": ["第四个不是《钉钉》吗", "你刚才说错了，应该是第五个", "第五个才对吧", "你返回错了吧，我想看第四个"],
+        "action": "retrieve",
+        "enabled": True,
+        "priority": 95,
     },
     {
         "code": "general_chat",
@@ -226,6 +244,69 @@ _HIGH_CONFIDENCE_CREATIVE_WRITING_RE = re.compile(
     r"[!！。,.，?？~～\s]*$",
     re.IGNORECASE,
 )
+_CONVERSATION_REPAIR_RE = re.compile(
+    r"(?:"
+    r"(?:为什么|为何|怎么|干嘛|干吗)(?:要|非得|非要)?(?:你|您|系统|助手|这个系统|它)"
+    r"[^。！？!?]{0,24}(?:选择|确认|澄清|追问|提问|问我|问|回答|提示|检索)"
+    r"|(?:为什么|为何|怎么|干嘛|干吗)(?:要|非得|非要)?(?:让|要|叫)我"
+    r"[^。！？!?]{0,24}(?:选择|确认|澄清|追问|提问|回答|提示)"
+    r"|(?:你|您|系统|这个系统)(?:为什么|为何|怎么|干嘛|干吗)"
+    r"(?:总|老是|一直|又)?(?:让|要|叫)(?:我|我们)"
+    r"[^。！？!?]{0,16}(?:选择|选|确认|澄清|追问|提问|回答|提示)"
+    r"|(?:不是已经|明明已经|不是说了|你已经|你刚刚|你刚才)"
+    r"[^。！？!?]{0,16}(?:回答|说过|选择|确认|澄清|提示|问了)"
+    r"|(?:不要|别再|别)(?:再)?(?:问我|问|让我(?:再)?(?:选择|确认|澄清))"
+    r")",
+    re.IGNORECASE,
+)
+
+
+_REFERENCE_CORRECTION_RE = re.compile(
+    r"(?:"
+    r"(?:第[0-9一二三四五六七八九十两]+(?:个|篇|份|条)?)[^。！？!?]{0,24}?"
+    r"(?:不是|难道不是)|"
+    r"不是[^。！？!?]{0,20}(?:第[0-9一二三四五六七八九十两]+)(?:个|篇|份|条)?|"
+    r"(?:你|您|系统)(?:刚才|刚刚)?(?:说|答|看|返回|给|发|标)"
+    r"(?:错|错了|反了|成别的)|"
+    r"(?:你|您|系统)?(?:搞错|弄错|记错|看错)|"
+    r"应该是|才是|才对|纠正|更正|修正"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _reference_correction_match(text: str) -> bool:
+    """Detect corrections to a previously displayed result list.
+
+    This is a language-structure rule, not business knowledge: it fires only
+    when the user challenges a numbered result (``第四个不是《钉钉》吗``) or the
+    assistant's own list handling (``你刚才说错了，应该是第五个``).  The rule
+    itself never picks a document; execution resolves the ordinal against the
+    persisted result list.
+    """
+
+    normalized = re.sub(r"\s+", "", text or "").casefold()
+    if not normalized:
+        return False
+    return bool(_REFERENCE_CORRECTION_RE.search(normalized))
+
+
+def _conversation_repair_match(text: str) -> bool:
+    """Detect meta-conversation complaints about the system's own behaviour.
+
+    This is a language-structure rule, not business knowledge: it only fires
+    when the user references the assistant/system and the system's own
+    interaction verbs (选择/确认/澄清/追问/回答/提示).  A complaint must not
+    re-enter the knowledge-base retrieval loop, otherwise the system would
+    search the KB for "为什么要我选择" and answer with unrelated candidates.
+    """
+
+    normalized = re.sub(r"\s+", "", text or "").casefold()
+    if not normalized:
+        return False
+    return bool(_CONVERSATION_REPAIR_RE.search(normalized))
+
+
 _GENERIC_SYSTEM_HELP_RE = re.compile(
     r"^(?:帮助|系统帮助|怎么使用(?:这个)?系统|如何使用(?:这个)?系统|系统如何检索)"
     r"[!！。,.，?？\s]*$",
@@ -539,14 +620,10 @@ def _requires_knowledge_retrieval(question: str) -> bool:
         or _is_normative_query(text)
     ):
         return True
-    # 只有命中集中维护的企业产品词典且确实询问产品操作时，才用策略层纠正
-    # general_chat。查询约束提取还能识别 Python3.11 等任意产品版本表达，不能
-    # 直接拿 constraints.product 当企业领域信号，否则通用技术问题也会被查库。
-    enterprise_product = match_known_enterprise_product(text)
-    return bool(
-        enterprise_product
-        and _KNOWLEDGE_OPERATION_RE.search(text)
-    )
+    # 产品名称和别名属于知识库作用域内的业务数据，不能由全局规则表裁决。
+    # 未命中上述通用语言结构时交给语义路由；路由失败仍由 ``other`` 的安全
+    # 兜底执行检索，因此删除产品词典不会把不确定问题降级成无检索闲聊。
+    return False
 
 
 def _default_config() -> IntentRouterConfig:
@@ -700,6 +777,18 @@ def _rule_match(
         return None
     category_by_code = {item.code: item for item in categories if item.enabled}
 
+    if _reference_correction_match(text):
+        item = category_by_code.get("reference_correction")
+        if item:
+            return _make_decision(item, 0.97, "rule")
+    if is_result_list_reference(text):
+        item = category_by_code.get("knowledge_qa")
+        if item:
+            return _make_decision(item, 0.97, "rule")
+    if _conversation_repair_match(text):
+        item = category_by_code.get("conversation_repair")
+        if item:
+            return _make_decision(item, 0.98, "rule")
     if _GREETING_RE.fullmatch(text):
         item = category_by_code.get("general_chat")
         if item:
@@ -1683,12 +1772,32 @@ def _rule_route_requirements(question: str) -> tuple[RouteRequirement, ...]:
     return tuple(requirements)
 
 
+def _conversation_repair_route_decision(
+    question: str,
+    categories: Iterable[IntentCategory],
+) -> tuple[RagRouteDecision, IntentDecision] | None:
+    """Compile a deterministic conversation-repair route when the rule fires.
+
+    Returns ``None`` when the pattern does not match or the category is not
+    available, so callers keep their existing fallback ordering.
+    """
+
+    if not _conversation_repair_match(question):
+        return None
+    category = _find_category(categories, "conversation_repair")
+    if category is None or not category.enabled or category.action != "chat":
+        return None
+    decision = _make_decision(category, 0.98, "rule")
+    return _rule_route_decision(question, decision), decision
+
+
 def _rule_route_decision(
     question: str,
     decision: IntentDecision,
 ) -> RagRouteDecision:
     scope = {
         "general_chat": "general_world",
+        "conversation_repair": "general_world",
         "system_help": "platform_self",
         "writing": "current_input",
     }.get(decision.intent_code, "enterprise_kb")
@@ -1892,6 +2001,17 @@ def _apply_routing_policy(
             decision_reason="explicit_general_chat",
         )
 
+    if _conversation_repair_match(question):
+        # 对话修复是确定性本地规则：用户质疑系统行为时不得再进入知识库检索，
+        # 并让 direct runner 使用专用修复提示词。
+        return _with_execution_policy(
+            decision,
+            response_mode="general_chat",
+            retrieval_policy="skip",
+            need_retrieval=False,
+            decision_reason="conversation_repair_rule",
+        )
+
     # 同时附带原文并不代表不需要知识库。例如“根据员工手册润色以下申请”
     # 的主要动作是写作，但外部手册仍是事实约束；知识依赖必须优先于 inline。
     if _is_knowledge_dependent_writing_request(question):
@@ -2058,7 +2178,57 @@ async def _classify_route_contract_result(
         and not _HIGH_CONFIDENCE_GENERAL_CHAT_RE.fullmatch(question.strip())
         and not _HIGH_CONFIDENCE_CREATIVE_WRITING_RE.fullmatch(question.strip())
     )
-    if preflight_enterprise_followup or preflight_enterprise_new:
+    reference_result_preflight = (
+        selected_kb_count > 0
+        and not has_pending_clarification
+        and not fallback_unresolved
+        and (
+            _reference_correction_match(question)
+            or is_result_list_reference(question)
+        )
+    )
+    repair_route = _conversation_repair_route_decision(question, categories)
+    if repair_route is not None:
+        # Conversation repair outranks the enterprise preflight: a complaint
+        # about the system's own behaviour must not be re-run through the
+        # knowledge-base retrieval loop.
+        route, _repair_decision = repair_route
+        if available_turn_keys and normalized_context:
+            route = replace(
+                route,
+                query_resolution=RouteQueryResolution(
+                    mode="contextualize",
+                    context_turn_keys=(available_turn_keys[0],),
+                ),
+                rationale="对话修复：直接回应系统行为，不进入知识库检索",
+            )
+        route_source = "rule"
+        diagnostics.update(
+            schema_valid=True,
+            deterministic_preflight="conversation_repair",
+        )
+    elif reference_result_preflight:
+        # 序号引用/纠正不依赖企业词典：用户是在挑选或纠正前面列出的结果。
+        # 确定性路由避免模型超时后落入 ``other`` 再重新检索“第几个”这类词。
+        preferred_code = (
+            "reference_correction"
+            if _reference_correction_match(question)
+            else "knowledge_qa"
+        )
+        preferred = _find_category(categories, preferred_code)
+        if (
+            preferred is not None
+            and preferred.enabled
+            and preferred.action in VALID_ACTIONS
+        ):
+            fallback_decision = _make_decision(preferred, 0.97, "rule")
+            route = _rule_route_decision(question, fallback_decision)
+            route_source = "rule"
+            diagnostics.update(
+                schema_valid=True,
+                deterministic_preflight="result_reference",
+            )
+    elif preflight_enterprise_followup or preflight_enterprise_new:
         fallback_decision = _fallback_decision(config, categories, source="rule")
         preferred = _find_category(categories, "knowledge_qa")
         if preferred is not None and preferred.enabled and preferred.action == "retrieve":

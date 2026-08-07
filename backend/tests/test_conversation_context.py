@@ -501,7 +501,6 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
             "那在云枢里怎么设置",
             "那要怎么配置",
             "如何处理",
-            "云枢怎么配置",
         )
         for question in followups:
             with self.subTest(question=question):
@@ -530,6 +529,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
             "CloudPivot defaultPwd 怎么配置",
             "Redis的持久化怎么配置",
             "PostgreSQL高可用怎么配置",
+            "云枢怎么配置",
         )
         for question in complete_questions:
             with self.subTest(question=question):
@@ -608,7 +608,10 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
                 has_previous_turn=True,
                 previous_user_question="登录用户名枚举是什么",
             ),
-            (True, "missing_action_object"),
+            (
+                False,
+                "unresolved_reference:missing_action_object:explicit_new_scope",
+            ),
         )
         self.assertEqual(
             detect_followup(
@@ -664,7 +667,10 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
                         has_previous_turn=True,
                         previous_user_question=previous,
                     ),
-                    (True, "missing_action_object"),
+                    (
+                        False,
+                        "unresolved_reference:missing_action_object:explicit_new_scope",
+                    ),
                 )
         self.assertEqual(
             detect_followup(
@@ -686,8 +692,11 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
                     has_previous_turn=True,
                     previous_user_question=previous,
                 )
-                self.assertTrue(is_followup)
-                self.assertEqual(reason, "missing_action_object")
+                self.assertFalse(is_followup)
+                self.assertEqual(
+                    reason,
+                    "unresolved_reference:missing_action_object:explicit_new_scope",
+                )
 
     def test_reference_with_concrete_postfix_object_is_standalone(self) -> None:
         complete_questions = (
@@ -740,7 +749,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
 
         constraints = extract_query_constraints(rewritten)
 
-        self.assertEqual(constraints.product, "云枢")
+        self.assertIsNone(constraints.product)
         self.assertEqual(constraints.version, "7")
         self.assertTrue(constraints.explicit_version)
         self.assertNotIn("8.6", rewritten)
@@ -853,7 +862,7 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
 
         constraints = extract_query_constraints(rewritten)
 
-        self.assertEqual(constraints.product, "云枢")
+        self.assertIsNone(constraints.product)
         self.assertEqual(constraints.version, "8.6")
         self.assertNotIn("云枢7", rewritten)
         self.assertNotIn("原始追问", rewritten)
@@ -956,13 +965,14 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
             kb_ids=[kb_id],
         )
 
-        self.assertTrue(context.is_followup)
-        self.assertEqual(context.followup_reason, "missing_action_object")
-        self.assertFalse(context.unresolved_reference)
-        self.assertIn("登录用户名枚举", context.standalone_query)
-        self.assertIn("云枢中如何配置", context.standalone_query)
-        self.assertEqual(len(context.carryover_sources), 1)
-        self.assertEqual(context.carryover_sources[0]["id"], chunk_id)
+        self.assertFalse(context.is_followup)
+        self.assertEqual(
+            context.followup_reason,
+            "unresolved_reference:missing_action_object:explicit_new_scope",
+        )
+        self.assertTrue(context.unresolved_reference)
+        self.assertEqual(context.standalone_query, "云枢中如何配置")
+        self.assertEqual(context.carryover_sources, ())
 
     async def test_prepare_context_without_history_marks_missing_object_unresolved(self) -> None:
         db = _FakeDB([], [])
@@ -1157,16 +1167,16 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
             kb_ids=[uuid.uuid4()],
         )
 
-        self.assertTrue(context.is_followup)
-        self.assertEqual(context.followup_reason, "missing_action_object")
+        self.assertFalse(context.is_followup)
+        self.assertEqual(
+            context.followup_reason,
+            "unresolved_reference:missing_action_object:explicit_new_scope",
+        )
         self.assertEqual(
             context.previous_user_question,
             "登录用户名枚举是什么",
         )
-        self.assertEqual(
-            context.standalone_query,
-            "云枢中如何配置登录用户名枚举",
-        )
+        self.assertEqual(context.standalone_query, "云枢中如何配置")
         self.assertEqual(context.carryover_sources, ())
         self.assertEqual(db.execute_count, 1)
 

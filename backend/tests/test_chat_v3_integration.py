@@ -16,6 +16,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from api.chat import _v3_active_timeout_seconds, send_message
+from core.active_task_state import ResolvedActiveTask, build_active_task_state
+from core.active_task_state import parse_active_task_state
+from core.semantic_memory import extract_resolved_entity_memory
 from core.clarification import ClarificationContract, build_clarification_state
 from core.conversation_context import ConversationContext, RouteTurnCandidate
 from core.query_analysis_execution import (
@@ -87,6 +90,29 @@ class _SaveDB:
 
     async def commit(self) -> None:
         self.commit_count += 1
+
+
+class _PersistingSaveDB:
+    """Save session whose ``get`` returns the mutable conversation object."""
+
+    def __init__(self, conversation: SimpleNamespace) -> None:
+        self.conversation = conversation
+        self.added: list[object] = []
+
+    async def __aenter__(self) -> "_PersistingSaveDB":
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> bool:
+        return False
+
+    async def get(self, _model: object, _identity: object) -> SimpleNamespace:
+        return self.conversation
+
+    def add(self, value: object) -> None:
+        self.added.append(value)
+
+    async def commit(self) -> None:
+        return None
 
 
 def _routing_result(
@@ -673,6 +699,452 @@ class ChatV3IntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(v2_calls[0]["conversation_history"], [])
         self.assertEqual(v2_calls[0]["carryover_sources"], [source])
+        self.assertTrue(v2_calls[0]["is_followup"])
+
+    async def test_same_active_result_reference_stays_on_selected_document(self) -> None:
+        question = "第四个里面这么点东西吗"
+        root_query = "我要看第四个"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        source_turn_id = uuid.uuid4()
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "filename": "已选择的文档.md",
+            "content": "该文档的已授权正文",
+            "evidence_role": "direct",
+            "candidate_origin": "active_task_state",
+        }
+        state = build_active_task_state(
+            root_query=root_query,
+            answer_shape="overview",
+            sources=[source],
+            source_turn_id=source_turn_id,
+            trace_id=uuid.uuid4().hex,
+        )
+        resolved_task = ResolvedActiveTask(
+            state=state,
+            sources=(source,),
+            kb_ids=(kb_id,),
+            doc_ids=(doc_id,),
+        )
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+            route_turn_candidates=(RouteTurnCandidate(
+                candidate_key="t1",
+                user_question=root_query,
+                assistant_answer="已打开第 4 篇文档。",
+                raw_sources=(source,),
+                assistant_turn_id=source_turn_id,
+            ),),
+        )
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=state.to_dict(),
+            active_task_revision=state.revision,
+        )
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        v2_calls: list[dict] = []
+
+        async def v2_stream(**kwargs):
+            v2_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        v3_service = SimpleNamespace(
+            run_active=AsyncMock(
+                side_effect=AssertionError(
+                    "an authorized active result reference must skip V3"
+                )
+            )
+        )
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.resolve_active_task_state",
+                new=AsyncMock(return_value=resolved_task),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=_routing_result(selected_kb_count=1)),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=_v3_settings(anchor_prefetch_enabled=False),
+            ),
+            patch(
+                "api.chat.get_query_understanding_v3_execution_service",
+                return_value=v3_service,
+            ),
+            patch("api.chat.run_rag_v2_stream", new=v2_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        v3_service.run_active.assert_not_awaited()
+        self.assertEqual(len(v2_calls), 1)
+        self.assertIs(v2_calls[0]["active_task_scope"], resolved_task)
+        self.assertEqual(v2_calls[0]["active_task_scope"].doc_ids, (doc_id,))
+        self.assertEqual(v2_calls[0]["carryover_sources"], [source])
+        self.assertEqual(
+            v2_calls[0]["followup_reason"],
+            "active_task_state:active_result_reference",
+        )
+        self.assertIn(root_query, v2_calls[0]["standalone_query"])
+
+    async def test_partial_unverified_answer_persists_entity_memory(self) -> None:
+        # 上一轮是 unverified 自动回答（coverage_sufficient_answer）也必须写入
+        # active_task_state + semantic_memory；否则下一轮实体复用无记忆可用，
+        # 又回到“检索不到就澄清”的旧循环。
+        question = "普通员工出差时可以乘坐的交通工具有哪些"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+        )
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=None,
+            active_task_revision=0,
+        )
+        request_db = _RequestDB(conversation)
+        save_db = _PersistingSaveDB(conversation)
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        source_item = {
+            "source_kind": "document_chunk",
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "content": (
+                "| 职级 | 适用人员 |\n"
+                "| --- | --- |\n"
+                "| D级 | 普通员工、专员 |"
+            ),
+            "chunk_index": 2,
+            "metadata": {},
+            "filename": "公司出差管理标准.docx",
+            "file_type": "docx",
+            "evidence_role": "unverified",
+            "source_verification": "unverified",
+        }
+
+        class V3Service:
+            async def run_active(self, **kwargs):
+                return _compiled_v3_result(
+                    baseline=kwargs["baseline"],
+                    target_texts=("普通员工出差",),
+                )
+
+        async def v2_stream(**kwargs):
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [{**source_item}],
+                "answer_sources": [{**source_item}],
+                "retrieval_executed": True,
+                "evidence_status": "partial",
+                "coverage_status": "insufficient",
+                "unverified_generation": True,
+                "source_verification": "unverified",
+                "displayed_result_count": 1,
+                "direct_evidence_count": 0,
+                "related_reference_count": 1,
+            }, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "text_delta",
+                "content": "D级适用普通员工、专员。",
+            }, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        from datetime import datetime, timezone as _tz
+
+        fake_turn = SimpleNamespace(
+            id=uuid.uuid4(),
+            conversation_id=conversation_id,
+            user_id=user_id,
+            request_id="req-entity-memory",
+            trace_id="trace-entity-memory",
+            status="accepted",
+            evidence_status=None,
+            retrieval_executed=None,
+            error_code=None,
+            answer_content=None,
+            answer_sources=None,
+            search_snapshot=None,
+            tokens=None,
+            user_message_id=None,
+            assistant_message_id=None,
+            execution_attempts=1,
+            lease_owner=None,
+            lease_expires_at=None,
+            created_at=datetime.now(_tz.utc),
+            updated_at=datetime.now(_tz.utc),
+            generated_at=None,
+            completed_at=None,
+        )
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.resolve_active_task_state",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=_routing_result(selected_kb_count=1)),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=_v3_settings(anchor_prefetch_enabled=False),
+            ),
+            patch(
+                "api.chat.get_query_understanding_v3_execution_service",
+                return_value=V3Service(),
+            ),
+            patch(
+                "api.chat._validate_stream_answer_sources",
+                new=AsyncMock(return_value=(
+                    [dict(source_item)],
+                    {(doc_id, chunk_id)},
+                    None,
+                )),
+            ),
+            patch("api.chat.run_rag_v2_stream", new=v2_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat._durable_turn_supported", return_value=True),
+            patch(
+                "api.chat.reserve_turn",
+                new=AsyncMock(return_value=(fake_turn, True)),
+            ),
+            patch("api.chat.find_turn_for_user", new=AsyncMock(return_value=None)),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        persisted = conversation.active_task_state
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        parsed = parse_active_task_state(persisted)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None and parsed.semantic_memory is not None
+        self.assertEqual(
+            [(f.mention, f.attribute, f.value) for f in parsed.semantic_memory.facts],
+            [("普通员工", "职级", "D级")],
+        )
+        self.assertEqual(parsed.root_query, question)
+        self.assertEqual(parsed.selected_chunk_ids, (chunk_id,))
+
+    async def test_standalone_question_reusing_resolved_entity_skips_v3(self) -> None:
+        # 上一轮已确认 普通员工=D级（来源：公司出差管理标准.docx）。
+        # 下一轮“普通员工可以乘坐头等舱吗”是独立问题，但复用该实体：锚定来源、
+        # 保持当前问题为检索锚点，并且不再进入 V3/澄清循环。
+        question = "普通员工可以乘坐头等舱吗"
+        root_query = "普通员工出差时可以乘坐的交通工具有哪些"
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        doc_id = uuid.uuid4()
+        chunk_id = uuid.uuid4()
+        source_turn_id = uuid.uuid4()
+        source = {
+            "id": str(chunk_id),
+            "chunk_id": str(chunk_id),
+            "doc_id": str(doc_id),
+            "kb_id": str(kb_id),
+            "filename": "公司出差管理标准.docx",
+            "content": (
+                "【公司出差管理标准.docx › 二、职级分类】\n"
+                "| 职级 | 适用人员 |\n"
+                "| --- | --- |\n"
+                "| D级 | 普通员工、专员 |"
+            ),
+            "evidence_role": "direct",
+            "candidate_origin": "active_task_state",
+        }
+        memory = extract_resolved_entity_memory(
+            sources=[source],
+            question=root_query,
+            source_turn_id=source_turn_id,
+            trace_id=uuid.uuid4().hex,
+        )
+        self.assertIsNotNone(memory)
+        state = build_active_task_state(
+            root_query=root_query,
+            answer_shape="fact",
+            sources=[source],
+            source_turn_id=source_turn_id,
+            trace_id=uuid.uuid4().hex,
+            semantic_memory=memory,
+        )
+        resolved_task = ResolvedActiveTask(
+            state=state,
+            sources=(source,),
+            kb_ids=(kb_id,),
+            doc_ids=(doc_id,),
+        )
+        context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query=question,
+            history_messages=(),
+            carryover_sources=(),
+            route_turn_candidates=(RouteTurnCandidate(
+                candidate_key="t1",
+                user_question=root_query,
+                assistant_answer="普通员工属于D级，国内外航班均为经济舱。",
+                raw_sources=(source,),
+                assistant_turn_id=source_turn_id,
+            ),),
+        )
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=state.to_dict(),
+            active_task_revision=state.revision,
+        )
+        request_db = _RequestDB(conversation)
+        save_db = _SaveDB()
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        v2_calls: list[dict] = []
+
+        async def v2_stream(**kwargs):
+            v2_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        v3_service = SimpleNamespace(
+            run_active=AsyncMock(
+                side_effect=AssertionError(
+                    "entity reuse binds to the active task and must skip V3"
+                )
+            )
+        )
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=context),
+            ),
+            patch(
+                "api.chat.resolve_active_task_state",
+                new=AsyncMock(return_value=resolved_task),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=_routing_result(selected_kb_count=1)),
+            ),
+            patch(
+                "api.chat.get_settings",
+                return_value=_v3_settings(anchor_prefetch_enabled=False),
+            ),
+            patch(
+                "api.chat.get_query_understanding_v3_execution_service",
+                return_value=v3_service,
+            ),
+            patch("api.chat.run_rag_v2_stream", new=v2_stream),
+            patch("database.AsyncSessionLocal", return_value=save_db),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question=question,
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=request_db,
+                user=user,
+            )
+            await _sse_events(response)
+
+        v3_service.run_active.assert_not_awaited()
+        self.assertEqual(len(v2_calls), 1)
+        self.assertIs(v2_calls[0]["active_task_scope"], resolved_task)
+        self.assertEqual(v2_calls[0]["carryover_sources"], [source])
+        self.assertEqual(
+            v2_calls[0]["followup_reason"],
+            "active_task_state:semantic_entity_reuse",
+        )
+        self.assertEqual(v2_calls[0]["standalone_query"], question)
         self.assertTrue(v2_calls[0]["is_followup"])
 
     async def test_pending_route_reply_keeps_original_task_when_v3_falls_back(self) -> None:

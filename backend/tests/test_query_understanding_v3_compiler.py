@@ -305,7 +305,7 @@ class QueryUnderstandingV3CompilerTests(unittest.TestCase):
         ))
 
     def test_sequential_version_targets_do_not_expand_to_a_cross_product(self):
-        question = "云枢6.0的安装要求和云枢7.0的升级要求分别是什么"
+        question = "ProductX6.0的安装要求和ProductX7.0的升级要求分别是什么"
         catalog = SourceSpanCatalog.build(current_question=question)
         understanding = _candidate(
             catalog,
