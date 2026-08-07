@@ -13,6 +13,7 @@ from api import document as document_api
 from config import Settings
 from core.document_jobs import (
     ClaimedDocumentJob,
+    _prepare_draft_content,
     _source_path,
     enqueue_document_processing_job,
     process_one_document_job,
@@ -139,6 +140,59 @@ class DocumentJobWorkerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await process_one_document_job())
 
         discard.assert_not_awaited()
+
+
+    async def test_prepare_completion_keeps_draft_and_keeps_source_file(self) -> None:
+        job = ClaimedDocumentJob(
+            id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            document_revision=1,
+            job_type="prepare",
+            payload={"source_path": "uploads/input.docx"},
+            attempt_count=1,
+        )
+        with (
+            patch("core.document_jobs._claim_next_job", new=AsyncMock(return_value=job)),
+            patch("core.document_jobs._load_current_document", new=AsyncMock(return_value=SimpleNamespace())),
+            patch("core.document_jobs._prepare_draft_content", new=AsyncMock(return_value="# 审阅内容")) as prepare,
+            patch("core.document_jobs._complete_prepare", new=AsyncMock(return_value=True)) as complete_prepare,
+            patch("core.document_jobs._materialize_chunks", new=AsyncMock()) as materialize,
+            patch("core.document_jobs._complete_job", new=AsyncMock()) as complete,
+            patch("core.document_jobs._discard_source_file", new=AsyncMock()) as discard,
+        ):
+            self.assertTrue(await process_one_document_job())
+
+        prepare.assert_awaited_once()
+        complete_prepare.assert_awaited_once_with(job, "# 审阅内容")
+        materialize.assert_not_awaited()
+        complete.assert_not_awaited()
+        discard.assert_not_awaited()
+
+    async def test_prepare_draft_content_joins_chunks_for_plain_files(self) -> None:
+        job = ClaimedDocumentJob(
+            id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            kb_id=uuid.uuid4(),
+            document_revision=1,
+            job_type="prepare",
+            payload={"source_path": "uploads/plain.md", "original_name": "plain.md"},
+            attempt_count=1,
+        )
+        with tempfile.TemporaryDirectory() as upload_dir:
+            source = Path(upload_dir) / "plain.md"
+            source.write_text("source", encoding="utf-8")
+            with (
+                patch("core.document_jobs._source_path", return_value=source),
+                patch(
+                    "core.document_jobs.parse_file",
+                    return_value=[{"content": "第一节"}, {"content": "第二节"}],
+                ),
+            ):
+                result = await _prepare_draft_content(job, SimpleNamespace(filename="plain.md"))
+
+        self.assertIn("第一节", result)
+        self.assertIn("第二节", result)
 
 
 class DocumentRouteBoundaryTests(unittest.TestCase):

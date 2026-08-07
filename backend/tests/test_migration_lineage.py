@@ -263,7 +263,7 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertFalse(revision.nullable)
         self.assertEqual(str(revision.server_default.arg), "0")
 
-    def test_alembic_has_single_0038_head(self) -> None:
+    def test_alembic_has_single_0040_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -271,13 +271,45 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0038"])
+        self.assertEqual(scripts.get_heads(), ["0040"])
         self.assertEqual(scripts.get_revision("0032").down_revision, "0031")
         self.assertEqual(scripts.get_revision("0034").down_revision, "0033")
         self.assertEqual(scripts.get_revision("0035").down_revision, "0034")
         self.assertEqual(scripts.get_revision("0036").down_revision, "0035")
         self.assertEqual(scripts.get_revision("0037").down_revision, "0036")
         self.assertEqual(scripts.get_revision("0038").down_revision, "0037")
+        self.assertEqual(scripts.get_revision("0039").down_revision, "0038")
+        self.assertEqual(scripts.get_revision("0040").down_revision, "0039")
+
+    def test_prepare_job_type_migration_rewrites_job_constraint(self) -> None:
+        migration = _load_migration("0040_add_prepare_job_type.py")
+        recorder = _MigrationRecorder()
+
+        with patch.object(migration, "op", recorder):
+            migration.upgrade()
+
+        sql = "\n".join(recorder.executed)
+        self.assertIn("DROP CONSTRAINT ck_document_processing_jobs_type", sql)
+        self.assertIn(
+            "CHECK (job_type IN ('file', 'text', 'image', 'prepare'))",
+            sql.replace("\n", " "),
+        )
+
+    def test_document_staged_path_migration_is_additive(self) -> None:
+        migration = _load_migration("0039_add_document_staged_path.py")
+        recorder = _MigrationRecorder()
+
+        with patch.object(migration, "op", recorder):
+            migration.upgrade()
+
+        added = {
+            column.name: column
+            for table_name, column in recorder.added_columns
+            if table_name == "documents"
+        }
+        self.assertIn("staged_path", added)
+        self.assertIsInstance(added["staged_path"].type, String)
+        self.assertTrue(added["staged_path"].nullable)
 
     def test_message_duration_migration_is_additive(self) -> None:
         migration_31 = _load_migration("0031_add_message_answer_duration.py")

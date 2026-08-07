@@ -36,9 +36,16 @@
     </SurfaceCard>
 
     <template v-else>
-      <div v-if="canDeleteDocument && checkedRowKeys.length" class="flex items-center gap-3 mb-3">
+      <div v-if="checkedRowKeys.length" class="flex items-center gap-3 mb-3">
         <span class="text-sm text-gray-500 dark:text-gray-400">已选 {{ checkedRowKeys.length }} 项</span>
-        <n-button size="small" type="error" @click="openBatchDelete">
+        <n-button
+          v-if="checkedDraftCount && checkedDraftCount === checkedRowKeys.length"
+          size="small" type="primary" :loading="batchIngesting" @click="submitBatchIngest"
+        >
+          <template #icon><n-icon><CloudDoneOutline /></n-icon></template>
+          保存入库（{{ checkedDraftCount }}）
+        </n-button>
+        <n-button v-if="canDeleteDocument" size="small" type="error" @click="openBatchDelete">
           <template #icon><n-icon><TrashOutline /></n-icon></template>
           批量删除
         </n-button>
@@ -76,6 +83,7 @@
               <n-icon :size="36" class="text-blue-400 mb-2"><CloudUploadOutline /></n-icon>
               <p class="text-sm text-gray-600 dark:text-gray-400">点击或拖拽文件到此处</p>
               <p class="text-xs text-gray-400 mt-1">支持 PDF、Word、PPT、Excel、TXT、Markdown</p>
+              <p class="text-xs text-amber-500/90 dark:text-amber-400/90 mt-2">上传后自动打开编辑页审阅，可直接修改内容；点击「保存入库」才正式进入知识库，取消则保持草稿。</p>
             </div>
           </n-upload-dragger>
         </n-upload>
@@ -124,8 +132,8 @@
         </n-upload>
         <p class="text-xs text-gray-400 mt-3 leading-relaxed">
           {{ canUpdateDocument
-            ? '图片将通过「设置 → 多模态模型」配置的视觉模型转写成文本，上传后可在编辑器中对照原图校对。'
-            : '图片将通过「设置 → 多模态模型」配置的视觉模型转写成文本并直接入库。' }}
+            ? '上传后由视觉模型转写并自动打开编辑页，可对照原图修改识别文本；点击「保存入库」才正式入库。'
+            : '上传后由视觉模型转写并暂存为草稿；点击「保存入库」才正式入库。' }}
         </p>
         <div class="mt-3">
           <div class="text-xs text-gray-500 mb-1.5">标签（可选，用于检索软加权）</div>
@@ -160,6 +168,7 @@
           <div class="flex min-w-0 items-center gap-2">
             <span class="truncate text-base font-semibold text-gray-800 dark:text-gray-100">{{ documentEditorTitle }}</span>
             <n-tag v-if="isViewingDocument" size="small" :bordered="false" round>仅查看</n-tag>
+            <n-tag v-if="isDraftEditor" size="small" type="warning" :bordered="false" round>待入库</n-tag>
           </div>
           <n-button text aria-label="关闭文档编辑器" :disabled="submittingText" @click="showTextEditor = false">
             <template #icon><n-icon :size="20"><CloseOutline /></n-icon></template>
@@ -303,7 +312,7 @@
         <!-- Footer -->
         <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between px-4 sm:px-6 py-3 border-t border-gray-200 dark:border-gray-700 shrink-0">
           <span class="text-xs text-gray-400">
-            {{ textContent.length }} 字符 · {{ isViewingDocument ? '当前仅查看' : '按标题自动分块入库' }}
+            {{ textContent.length }} 字符 · {{ editorFooterHint }}
           </span>
           <div class="flex justify-end gap-2">
             <n-button :disabled="submittingText" @click="showTextEditor = false">{{ isViewingDocument ? '关闭' : '取消' }}</n-button>
@@ -361,12 +370,12 @@
 import { ref, reactive, computed, onMounted, onUnmounted, watch, h } from 'vue'
 import { useRoute } from 'vue-router'
 import { NButton, NIcon, NSelect, NDataTable, NModal, NUpload, NUploadDragger, NTag, NInput, NSpin, NSwitch, NImage, useMessage } from 'naive-ui'
-import { CloudUploadOutline, TrashOutline, CreateOutline, CloseOutline, PencilOutline, LibraryOutline, ArrowBackOutline, ImageOutline, PricetagsOutline, EyeOutline } from '@vicons/ionicons5'
+import { CloudUploadOutline, CloudDoneOutline, TrashOutline, CreateOutline, CloseOutline, PencilOutline, LibraryOutline, ArrowBackOutline, ImageOutline, PricetagsOutline, EyeOutline } from '@vicons/ionicons5'
 import { renderDocMarkdown } from '@/utils/markdown'
 import { canReadDocumentRow, canUpdateDocumentRow, canDeleteDocumentRow } from '@/utils/documentPermissions'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useAuthStore } from '@/stores/auth'
-import { getAllDocuments, uploadDocument, uploadImageDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, getDocumentImage, updateTextDocument, updateDocumentTags } from '@/api/document'
+import { getAllDocuments, uploadDocument, uploadImageDocument, ingestDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, getDocumentImage, updateTextDocument, updateDocumentTags } from '@/api/document'
 import { getDocumentTags } from '@/api/knowledge'
 import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
@@ -390,6 +399,8 @@ const rowKey = (row) => row.id
 const showDeleteConfirm = ref(false)
 const deleteTarget = ref(null)
 const deleting = ref(false)
+const ingestingId = ref(null)
+const batchIngesting = ref(false)
 const deleteConfirmTitle = computed(() => deleteTarget.value?.kind === 'batch' ? '删除选中文档？' : '删除文档？')
 const deleteConfirmSubject = computed(() => {
   if (!deleteTarget.value) return ''
@@ -400,6 +411,11 @@ const deleteConfirmDescription = computed(() => deleteTarget.value?.kind === 'ba
   ? '删除后，所选文档及其已生成的检索内容都无法恢复。'
   : '删除后，该文档及其已生成的检索内容都无法恢复。'
 )
+// 勾选行里可以由当前用户“保存入库”的草稿数
+const checkedDraftCount = computed(() => checkedRowKeys.value.filter(id => {
+  const row = docs.value.find(d => d.id === id)
+  return row?.status === 'draft' && canUpdateDocumentRow(row)
+}).length)
 const pagination = reactive({
   page: 1,
   pageSize: 10,                      // 默认每页 10 条
@@ -461,11 +477,19 @@ const editingDocument = ref(null)
 
 const renderedMarkdown = computed(() => renderDocMarkdown(textContent.value || ''))
 const isViewingDocument = computed(() => editorMode.value === 'view')
+const isDraftEditor = computed(() => editorMode.value === 'draft')
 const documentEditorTitle = computed(() => ({
   create: '手动输入文档',
   edit: '编辑文档',
   view: '查看文档',
+  draft: '审阅文档 · 待入库',
 })[editorMode.value] || '文档内容')
+const editorFooterHint = computed(() => {
+  if (isViewingDocument.value) return '当前仅查看'
+  if (isDraftEditor.value) return '草稿内容 · 编辑后保存入库'
+  return '按标题自动分块入库'
+})
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'])
 
 const previewMode = ref('markdown')
 const mobileEditorPane = ref('editor')
@@ -541,7 +565,7 @@ const simulatedChunks = computed(() => {
 const kbOptions = computed(() => kbStore.list.map(kb => ({ label: kb.name, value: kb.id })))
 
 const statusTag = (s) => {
-  const map = { ready: ['success', '就绪'], processing: ['warning', '处理中'], failed: ['error', '失败'] }
+  const map = { ready: ['success', '就绪'], processing: ['warning', '处理中'], draft: ['default', '草稿'], failed: ['error', '失败'] }
   const [type, text] = map[s] || ['default', s]
   return h(NTag, { type, size: 'small' }, () => text)
 }
@@ -567,13 +591,13 @@ const columns = computed(() => [
   },
   { title: '类型', key: 'file_type', width: 82, align: 'center', titleAlign: 'center' },
   { title: '分块数', key: 'chunk_count', width: 82, align: 'center', titleAlign: 'center' },
-  { title: '状态', key: 'status', width: 96, align: 'center', titleAlign: 'center', render: row => row.is_active ? statusTag(row.status) : h(NTag, { type: 'default', size: 'small' }, () => '停用') },
+  { title: '状态', key: 'status', width: 96, align: 'center', titleAlign: 'center', render: row => row.status === 'draft' ? statusTag('draft') : (row.is_active ? statusTag(row.status) : h(NTag, { type: 'default', size: 'small' }, () => '停用')) },
   ...(canUpdateDocument.value ? [{
     title: '启用', key: 'is_active', width: 80, align: 'center', titleAlign: 'center',
     render: row => h(NSwitch, {
       value: row.is_active,
       size: 'small',
-      disabled: !canUpdateDocumentRow(row),
+      disabled: row.status === 'draft' || !canUpdateDocumentRow(row),
       title: canUpdateDocumentRow(row) ? '切换文档启用状态' : '仅文档创建者或超级管理员可以修改',
       onUpdateValue: () => handleToggle(row),
     })
@@ -588,15 +612,25 @@ const columns = computed(() => [
     title: '操作', key: 'actions', width: 132, fixed: 'right', align: 'center', titleAlign: 'center',
     render: row => h(RowActions, { label: `文档 ${row.filename} 操作` }, {
       default: () => [
-        canReadDocumentRow(row)
+        row.status === 'draft' && canReadDocumentRow(row)
+          ? h(NButton, { text: true, size: 'small', 'aria-label': '审阅草稿', title: '审阅草稿', onClick: () => openDraftEditor(row) },
+              { icon: () => h(NIcon, null, () => h(EyeOutline)) })
+          : null,
+        row.status === 'draft'
+          ? (canUpdateDocumentRow(row)
+              ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '保存入库', title: '保存入库', loading: ingestingId.value === row.id, onClick: () => submitIngest(row) },
+                  { icon: () => h(NIcon, null, () => h(CloudDoneOutline)) })
+              : null)
+          : null,
+        row.status !== 'draft' && canReadDocumentRow(row)
           ? h(NButton, { text: true, size: 'small', 'aria-label': '查看文档', title: '查看文档', onClick: () => openViewEditor(row) },
               { icon: () => h(NIcon, null, () => h(EyeOutline)) })
           : null,
-        canUpdateDocumentRow(row)
+        row.status !== 'draft' && canUpdateDocumentRow(row)
           ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑标签', title: '编辑标签', onClick: () => openTagEditor(row) },
               { icon: () => h(NIcon, null, () => h(PricetagsOutline)) })
           : null,
-        canUpdateDocumentRow(row)
+        row.status !== 'draft' && canUpdateDocumentRow(row)
           ? h(NButton, { text: true, type: 'primary', size: 'small', 'aria-label': '编辑内容', title: '编辑内容', onClick: () => openEditEditor(row) },
               { icon: () => h(NIcon, null, () => h(PencilOutline)) })
           : null,
@@ -716,23 +750,23 @@ async function submitUpload() {
       const doc = await uploadDocument(selectedKbId.value, fileList.value[i].file, null, uploadTags.value)
       uploaded.push(doc)
     }
-    uploadStatus.value = '正在处理文档...'
-    const results = await Promise.allSettled(uploaded.map(doc => pollDocumentStatus(doc.id)))
+    // 上传只暂存为草稿并准备审阅内容；分块/向量化由「保存入库」显式触发。
+    uploadStatus.value = '正在准备内容...'
+    const results = await Promise.allSettled(uploaded.map(doc => pollDocumentPrepared(doc.id)))
     const failed = results.filter(r => r.status === 'rejected').length
+    const prepared = uploaded.filter((_, i) => results[i].status === 'fulfilled')
     showUpload.value = false
     fileList.value = []
     uploadTags.value = []
     docs.value = await getAllDocuments(selectedKbId.value)
     await loadKbTags()
     if (failed > 0) {
-      msg.warning(`${uploaded.length - failed} 个成功，${failed} 个处理失败`)
-    } else if (uploaded.length === 1 && canUpdateDocumentRow(uploaded[0])) {
-      // 单文件：自动打开审阅编辑器
-      await openEditEditor(uploaded[0])
+      msg.warning(`${uploaded.length - failed} 个已暂存为草稿，${failed} 个内容准备失败（可在列表中删除）`)
+    } else if (uploaded.length === 1 && prepared[0] && canUpdateDocumentRow(prepared[0])) {
+      // 单文件：自动打开审阅编辑器；确认「保存入库」才正式入库，取消则保持草稿
+      await openDraftEditor(prepared[0])
     } else {
-      msg.success(canUpdateDocumentRow(uploaded[0])
-        ? `${uploaded.length} 个文档处理完成，可点击编辑操作审阅内容`
-        : `${uploaded.length} 个文档创建成功`)
+      msg.success(`${uploaded.length} 个文档已暂存为草稿，可打开审阅后点击「保存入库」`)
     }
   } catch {
     msg.error('上传失败，请重试')
@@ -771,6 +805,10 @@ function openEditEditor(row) {
 }
 
 async function openDocumentEditor(row, mode) {
+  if (row.status === 'draft' && mode !== 'draft') {
+    msg.warning('该文档尚未入库，请先点击「保存入库」')
+    return
+  }
   if (!canReadDocument.value || !canReadDocumentRow(row)) {
     msg.warning('当前角色没有查看文档的权限')
     return
@@ -787,7 +825,7 @@ async function openDocumentEditor(row, mode) {
     }
     editingDocId.value = row.id
     editingDocument.value = doc
-    editorMode.value = mode === 'edit' ? 'edit' : 'view'
+    editorMode.value = mode === 'edit' ? 'edit' : mode === 'draft' ? 'draft' : 'view'
     mobileEditorPane.value = 'editor'
     clearEditingImageUrl()
     if (doc.image_url) {
@@ -806,9 +844,16 @@ async function openDocumentEditor(row, mode) {
     sourceUrlEnabled.value = !!doc.source_url
     editTags.value = [...(doc.tags || [])]
     showTextEditor.value = true
+    if (mode === 'draft' && !(doc.raw_content || '').trim()) {
+      msg.warning('内容仍在准备中或解析失败，可稍后重试或删除该草稿')
+    }
   } catch {
     msg.error('加载文档内容失败')
   }
+}
+
+function openDraftEditor(row) {
+  return openDocumentEditor(row, 'draft')
 }
 
 function openTagEditor(row) {
@@ -857,23 +902,23 @@ async function submitImageUpload() {
       const doc = await uploadImageDocument(selectedKbId.value, imageFileList.value[i].file, imageUploadTags.value)
       uploaded.push(doc)
     }
-    imageUploadStatus.value = '多模态模型正在识别图片内容...'
-    const results = await Promise.allSettled(uploaded.map(doc => pollDocumentStatus(doc.id)))
+    // 上传只暂存为草稿并视觉转写（prepare）；分块/向量化由「保存入库」显式触发。
+    imageUploadStatus.value = '视觉模型正在识别图片内容...'
+    const results = await Promise.allSettled(uploaded.map(doc => pollDocumentPrepared(doc.id)))
     const failed = results.filter(r => r.status === 'rejected').length
+    const prepared = uploaded.filter((_, i) => results[i].status === 'fulfilled')
     showImageUpload.value = false
     imageFileList.value = []
     imageUploadTags.value = []
     docs.value = await getAllDocuments(selectedKbId.value)
     await loadKbTags()
     if (failed > 0) {
-      msg.warning(`${uploaded.length - failed} 张识别成功，${failed} 张失败（请检查「设置 → 多模态模型」配置）`)
-    } else if (uploaded.length === 1 && canUpdateDocumentRow(uploaded[0])) {
-      // 单张：自动打开审阅编辑器，对照原图校对识别结果
-      await openEditEditor(uploaded[0])
+      msg.warning(`${uploaded.length - failed} 张已暂存为草稿，${failed} 张识别失败（可在列表中删除，或检查「设置 → 多模态模型」配置）`)
+    } else if (uploaded.length === 1 && prepared[0] && canUpdateDocumentRow(prepared[0])) {
+      // 单张：自动打开审阅编辑器，对照原图校对识别结果；确认入库或取消保持草稿
+      await openDraftEditor(prepared[0])
     } else {
-      msg.success(canUpdateDocumentRow(uploaded[0])
-        ? `${uploaded.length} 张图片识别完成，可点击编辑操作审阅识别内容`
-        : `${uploaded.length} 张图片文档创建成功`)
+      msg.success(`${uploaded.length} 张图片已暂存为草稿，可打开审阅后点击「保存入库」`)
     }
   } catch {
     msg.error('图片上传失败，请重试')
@@ -896,8 +941,107 @@ function pollDocumentStatus(docId) {
   })
 }
 
+// 草稿的内容准备（prepare 任务）完成后 raw_content 才有值，供编辑页审阅
+function pollDocumentPrepared(docId) {
+  return new Promise((resolve, reject) => {
+    const timer = setInterval(async () => {
+      try {
+        const doc = await getDocument(selectedKbId.value, docId)
+        if (doc.status === 'failed') { clearInterval(timer); reject(new Error('内容准备失败')) }
+        else if (doc.status !== 'draft' || (doc.raw_content || '').trim()) { clearInterval(timer); resolve(doc) }
+      } catch (e) { clearInterval(timer); reject(e) }
+    }, 2000)
+    setTimeout(() => { clearInterval(timer); reject(new Error('处理超时')) }, 120000)
+  })
+}
+
+async function submitIngest(row) {
+  if (!selectedKbId.value || !canUpdateDocumentRow(row)) {
+    msg.warning('只有文档创建者或超级管理员可以保存入库')
+    return
+  }
+  if (row.status !== 'draft') return
+  if (IMAGE_EXTS.has((row.file_type || '').toLowerCase()) && !(row.raw_content || '').trim()) {
+    msg.warning('图片内容仍在准备中，请稍候再试')
+    return
+  }
+  ingestingId.value = row.id
+  try {
+    const doc = await ingestDocument(selectedKbId.value, row.id)
+    const ready = await pollDocumentStatus(doc.id)
+    const idx = docs.value.findIndex(d => d.id === row.id)
+    if (idx !== -1) docs.value[idx] = { ...docs.value[idx], ...ready }
+    msg.success('文档已保存入库')
+    // 单文档入库后自动打开审阅编辑器，保留“解析后校对”体验
+    if (canUpdateDocumentRow(ready)) await openEditEditor(ready)
+  } catch (e) {
+    msg.error(e.message === '处理失败' ? '文档入库失败，请检查文件内容后重试' : '保存入库失败，请重试')
+  } finally {
+    ingestingId.value = null
+  }
+}
+
+async function submitBatchIngest() {
+  if (!selectedKbId.value) return
+  const targets = checkedRowKeys.value
+    .map(id => docs.value.find(d => d.id === id))
+    .filter(row => row?.status === 'draft' && canUpdateDocumentRow(row))
+  const unprepared = targets.filter(row =>
+    IMAGE_EXTS.has((row.file_type || '').toLowerCase()) && !(row.raw_content || '').trim()
+  )
+  const ready = targets.filter(row => !unprepared.includes(row))
+  if (unprepared.length) msg.warning(`${unprepared.length} 张图片内容仍在准备中，已跳过`)
+  if (!ready.length) return
+  batchIngesting.value = true
+  try {
+    const results = await Promise.allSettled(ready.map(async row => {
+      const doc = await ingestDocument(selectedKbId.value, row.id)
+      return pollDocumentStatus(doc.id)
+    }))
+    const ok = results.filter(r => r.status === 'fulfilled').length
+    const failed = ready.length - ok
+    docs.value = await getAllDocuments(selectedKbId.value)
+    checkedRowKeys.value = []
+    if (failed) msg.warning(`${ok} 个已入库，${failed} 个入库失败`)
+    else msg.success(`${ok} 个文档已保存入库`)
+  } catch {
+    msg.error('保存入库失败，请重试')
+  } finally {
+    batchIngesting.value = false
+  }
+}
+
 async function submitText() {
   if (!textTitle.value.trim() || !textContent.value.trim()) return
+  // 草稿编辑页：点击「保存入库」即正式入库（解析/分块/向量化），取消则保持草稿
+  if (editorMode.value === 'draft') {
+    if (!editingDocId.value || !canUpdateDocumentRow(editingDocument.value)) {
+      msg.warning('只有文档创建者或超级管理员可以保存入库')
+      return
+    }
+    submittingText.value = true
+    processingStatus.value = '正在保存入库...'
+    try {
+      const url = (sourceUrlEnabled.value && sourceUrl.value.trim()) ? sourceUrl.value.trim() : null
+      const doc = await ingestDocument(selectedKbId.value, editingDocId.value, {
+        title: textTitle.value.trim(),
+        content: textContent.value,
+        source_url: url,
+        tags: editTags.value,
+      })
+      await pollDocumentStatus(doc.id)
+      msg.success('文档已保存入库')
+      showTextEditor.value = false
+      docs.value = await getAllDocuments(selectedKbId.value)
+      await loadKbTags()
+    } catch (e) {
+      msg.error(e.message === '处理失败' ? '文档入库失败，请检查文件内容后重试' : '保存入库失败，请重试')
+    } finally {
+      submittingText.value = false
+      processingStatus.value = ''
+    }
+    return
+  }
   const isUpdate = editorMode.value === 'edit' && !!editingDocId.value
   if (isViewingDocument.value) {
     msg.warning('当前为只读查看模式')

@@ -63,6 +63,7 @@ class CrudRouteAuthorizationTests(unittest.TestCase):
             ("POST", "/knowledge/{kb_id}/documents"): DOC_CREATE,
             ("POST", "/knowledge/{kb_id}/documents/image"): DOC_CREATE,
             ("POST", "/knowledge/{kb_id}/documents/text"): DOC_CREATE,
+            ("POST", "/knowledge/{kb_id}/documents/{doc_id}/ingest"): DOC_UPDATE,
             ("PUT", "/knowledge/{kb_id}/documents/{doc_id}"): DOC_UPDATE,
             ("PATCH", "/knowledge/{kb_id}/documents/{doc_id}/tags"): DOC_UPDATE,
             ("PATCH", "/knowledge/{kb_id}/documents/{doc_id}/toggle"): DOC_UPDATE,
@@ -88,6 +89,7 @@ class CrudRouteAuthorizationTests(unittest.TestCase):
 
     def test_every_document_mutation_enforces_object_action(self) -> None:
         expected = {
+            ("POST", "/knowledge/{kb_id}/documents/{doc_id}/ingest"): "update",
             ("PUT", "/knowledge/{kb_id}/documents/{doc_id}"): "update",
             ("PATCH", "/knowledge/{kb_id}/documents/{doc_id}/tags"): "update",
             ("PATCH", "/knowledge/{kb_id}/documents/{doc_id}/toggle"): "update",

@@ -35,6 +35,10 @@ export const createTextDocument = (kbId, title, content, sourceUrl = null, tags 
 
 export const getDocument = (kbId, docId) => http.get(`/knowledge/${kbId}/documents/${docId}`)
 
+// 保存入库：把草稿交给解析/分块/向量化管线，正式进入知识库检索。
+// body 为编辑页审阅结果（标题/内容/来源/标签）；内容未改动时普通文件仍按原文件入库。
+export const ingestDocument = (kbId, docId, body) => http.post(`/knowledge/${kbId}/documents/${docId}/ingest`, body)
+
 // 文档原图是受保护的知识库资源，必须通过带 Bearer token 的请求读取，
 // 再由页面使用临时 blob URL 展示；不能直接交给 <img src> 匿名访问。
 export const getDocumentImage = (url) => {

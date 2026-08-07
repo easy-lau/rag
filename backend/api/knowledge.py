@@ -2,6 +2,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, text, bindparam
+from sqlalchemy import or_
 from sqlalchemy import UUID as SA_UUID
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import selectinload
@@ -61,9 +62,14 @@ async def list_knowledge_bases(
     rows = (await db.execute(stmt)).scalars().all()
     # doc_count 历史上是手工维护的冗余计数，易与真实行数漂移（上传 +1、并发删除丢更新）。
     # 这里直接按 documents 表的真实行数返回，确保展示永远准确，与文档管理列表一致。
-    counts = dict((await db.execute(
-        select(Document.kb_id, func.count()).group_by(Document.kb_id)
-    )).all())
+    # 草稿只计入创建者本人（超管不受限），避免非本人看到未发布内容的存在性。
+    count_stmt = select(Document.kb_id, func.count()).group_by(Document.kb_id)
+    if accessible is not None:
+        count_stmt = count_stmt.where(or_(
+            Document.status != "draft",
+            Document.created_by == user.id,
+        ))
+    counts = dict((await db.execute(count_stmt)).all())
     for kb in rows:
         kb.created_by_name = _name(kb.creator)
         kb.doc_count = counts.get(kb.id, 0)

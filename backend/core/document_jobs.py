@@ -40,8 +40,8 @@ from models.db_models import (
 
 
 logger = logging.getLogger(__name__)
-DocumentJobType = Literal["file", "text", "image"]
-_JOB_TYPES = frozenset({"file", "text", "image"})
+DocumentJobType = Literal["file", "text", "image", "prepare"]
+_JOB_TYPES = frozenset({"file", "text", "image", "prepare"})
 
 
 @dataclass(frozen=True)
@@ -234,6 +234,55 @@ async def _materialize_chunks(job: ClaimedDocumentJob, doc: Document) -> tuple[l
     ], raw_content
 
 
+async def _prepare_draft_content(job: ClaimedDocumentJob, doc: Document) -> str:
+    """抽取草稿审阅内容（raw_content），不产生分块/向量，也不删除源文件。
+
+    上传接口只入队 prepare 任务：解析完成后文档仍是 draft，供编辑页审阅；
+    「保存入库」才触发真正的分块与向量化（file/text 任务）。
+    """
+
+    if job.job_type == "image":
+        markdown = await image_to_markdown(str(_source_path(job.payload)))
+    else:
+        path = _source_path(job.payload)
+        extension = path.suffix.lower()
+        source_name = str(job.payload.get("original_name") or doc.filename)
+        if extension in {".xlsx", ".xls"}:
+            markdown = await asyncio.to_thread(excel_to_markdown, str(path))
+        elif extension == ".docx":
+            markdown = await asyncio.to_thread(docx_to_markdown, str(path))
+        else:
+            chunks = await asyncio.to_thread(parse_file, str(path), source_name=source_name)
+            markdown = "\n\n".join(str(item["content"]) for item in chunks)
+    if not markdown.strip():
+        raise ValueError("文档内容为空")
+    return normalize_document_markdown(markdown)
+
+
+async def _complete_prepare(job: ClaimedDocumentJob, raw_content: str) -> bool:
+    """prepare 的终态：写入审阅内容但保持 draft，不产生任何检索分块。"""
+
+    async with AsyncSessionLocal() as db:
+        persisted = await db.get(DocumentProcessingJob, job.id, with_for_update=True)
+        doc = await db.get(Document, job.document_id, with_for_update=True)
+        if persisted is None or doc is None:
+            return True
+        if doc.processing_revision != job.document_revision:
+            persisted.status = "superseded"
+            persisted.lease_expires_at = None
+            await db.commit()
+            return True
+        if persisted.status != "running" or persisted.attempt_count != job.attempt_count:
+            return False
+        doc.raw_content = raw_content
+        persisted.status = "completed"
+        persisted.completed_at = now_utc()
+        persisted.lease_expires_at = None
+        persisted.last_error = None
+        await db.commit()
+        return True
+
+
 async def _complete_job(
     job: ClaimedDocumentJob,
     chunks_data: list[dict],
@@ -354,10 +403,25 @@ async def process_one_document_job() -> bool:
         if doc is None:
             terminal = await _complete_job(job, [], None)
             return True
-        chunks, raw_content = await _materialize_chunks(job, doc)
-        terminal = await _complete_job(job, chunks, raw_content)
-        if terminal:
-            logger.info("[文档任务] 完成 job=%s doc=%s chunks=%s", job.id, job.document_id, len(chunks))
+        if job.job_type == "prepare":
+            raw_content = await _prepare_draft_content(job, doc)
+            terminal = await _complete_prepare(job, raw_content)
+            if terminal:
+                logger.info(
+                    "[文档任务] 草稿内容准备完成 job=%s doc=%s",
+                    job.id,
+                    job.document_id,
+                )
+        else:
+            chunks, raw_content = await _materialize_chunks(job, doc)
+            terminal = await _complete_job(job, chunks, raw_content)
+            if terminal:
+                logger.info(
+                    "[文档任务] 完成 job=%s doc=%s chunks=%s",
+                    job.id,
+                    job.document_id,
+                    len(chunks),
+                )
     except Exception as exc:
         terminal = await _fail_job(job, exc)
     finally:

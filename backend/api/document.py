@@ -1,9 +1,10 @@
 import os
 import json
 import uuid
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 from pydantic import BaseModel
 from database import get_db
@@ -162,11 +163,19 @@ async def list_documents(
     user: User = Depends(require_kb_access(DOC_READ)),
 ):
     offset = (page - 1) * page_size
-    rows = (await db.execute(
+    stmt = (
         select(Document)
         .options(selectinload(Document.creator), selectinload(Document.updater))
         .where(Document.kb_id == kb_id)
-        .order_by(Document.created_at.desc())
+    )
+    if not user.is_superadmin:
+        # 草稿仅创建者可见，其他人查询知识库时不出现
+        stmt = stmt.where(or_(
+            Document.status != "draft",
+            Document.created_by == user.id,
+        ))
+    rows = (await db.execute(
+        stmt.order_by(Document.created_at.desc())
         .offset(offset).limit(page_size)
     )).scalars().all()
     return [_document_out(document, user) for document in rows]
@@ -195,14 +204,16 @@ async def upload_document(
     with open(saved_path, "wb") as f_out:
         f_out.write(contents)
 
-    doc = Document(kb_id=kb_id, filename=file.filename, file_type=ext, status="processing",
+    # 上传只暂存草稿并抽取审阅内容（prepare 任务）；分块/向量化推迟到「保存入库」。
+    doc = Document(kb_id=kb_id, filename=file.filename, file_type=ext, status="draft",
+                   staged_path=saved_path, is_active=False,
                    tags=_parse_tags(tags), created_by=user.id)
     db.add(doc)
     await db.flush()
     enqueue_document_processing_job(
         db,
         document=doc,
-        job_type="file",
+        job_type="prepare",
         source_path=saved_path,
         original_name=file.filename,
     )
@@ -242,9 +253,11 @@ async def upload_image_document(
     with open(saved_path, "wb") as f_out:
         f_out.write(contents)
 
+    # 上传只暂存草稿并抽取审阅内容（prepare 任务：视觉转写）；分块/向量化推迟到「保存入库」。
     doc = Document(
         kb_id=kb_id, filename=file.filename, file_type=ext,
-        image_url=f"/api/uploads/images/{saved_name}", status="processing",
+        image_url=f"/api/uploads/images/{saved_name}", status="draft",
+        staged_path=saved_path, is_active=False,
         tags=_parse_tags(tags), created_by=user.id,
     )
     db.add(doc)
@@ -252,7 +265,7 @@ async def upload_image_document(
     enqueue_document_processing_job(
         db,
         document=doc,
-        job_type="image",
+        job_type="prepare",
         source_path=saved_path,
         original_name=file.filename,
     )
@@ -270,8 +283,99 @@ class TextDocumentIn(BaseModel):
     tags: list[str] = []
 
 
+class IngestDocumentIn(BaseModel):
+    """编辑页「保存入库」提交的草稿审阅结果（标题/内容/来源/标签）。"""
+
+    title: str | None = None
+    content: str | None = None
+    source_url: str | None = None
+    tags: list[str] | None = None
+
+
 class TagsIn(BaseModel):
     tags: list[str] = []
+
+
+@router.post("/{kb_id}/documents/{doc_id}/ingest", response_model=DocumentOut)
+async def ingest_document(
+    kb_id: uuid.UUID,
+    doc_id: uuid.UUID,
+    body: IngestDocumentIn | None = None,
+    db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
+    user: User = Depends(require_kb_access(DOC_UPDATE)),
+):
+    """「保存入库」：把草稿交给处理管线解析、分块、向量化。
+
+    上传接口只建草稿行（status=draft + staged_path）并准备审阅内容，
+    不产生任何检索内容；只有这里才入队处理任务，文档经历 processing → ready。
+    编辑页可提交审阅结果：内容未改动时普通文件仍从暂存源文件解析（分块与
+    既有 file 任务一致）；内容被编辑过则按编辑后的内容以 text 任务入库。
+    """
+    doc = await _load_document(db, kb_id, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    await _require_document_action(user, doc, "update", audit)
+    if doc.status != "draft":
+        raise HTTPException(status_code=409, detail="仅草稿状态的文档可以保存入库")
+
+    is_image = (doc.file_type or "").lower() in IMAGE_EXTS
+    content_changed = False
+    if body is not None:
+        if body.title is not None and body.title.strip():
+            doc.filename = body.title.strip()
+        if body.content is not None:
+            incoming = normalize_document_markdown(body.content)
+            content_changed = incoming != (doc.raw_content or "")
+            doc.raw_content = incoming
+        if body.source_url is not None:
+            doc.source_url = body.source_url.strip() or None
+        if body.tags is not None:
+            doc.tags = _normalize_tags(body.tags)
+
+    # 图片：prepare 阶段已完成视觉转写，直接对 raw_content 分块/向量化，避免二次调用视觉模型。
+    # 普通文件：内容未编辑时从暂存源文件解析（分块一致）；编辑过则以文本任务按新内容入库。
+    if is_image:
+        if not (doc.raw_content or "").strip():
+            raise HTTPException(status_code=409, detail="图片内容仍在准备中，请稍后重试")
+        job_type = "text"
+        source_path = None
+    elif content_changed:
+        job_type = "text"
+        source_path = None
+    else:
+        if not doc.staged_path:
+            raise HTTPException(status_code=409, detail="草稿缺少暂存源文件，无法入库")
+        job_type = "file"
+        source_path = doc.staged_path
+
+    staged_file = doc.staged_path
+    doc.status = "processing"
+    doc.is_active = True  # 草稿默认未启用，正式入库后启用
+    doc.chunk_count = 0
+    doc.processing_revision += 1
+    doc.staged_path = None
+    doc.updated_by = user.id
+    doc.updated_at = now_utc()
+    enqueue_document_processing_job(
+        db,
+        document=doc,
+        job_type=job_type,
+        source_path=source_path,
+        original_name=doc.filename,
+    )
+    # 文件草稿内容被编辑后以文本入库，原暂存文件不再是入库来源；图片的暂存文件
+    # 即展示原图，必须保留。
+    if job_type == "text" and staged_file and not is_image:
+        try:
+            Path(staged_file).unlink(missing_ok=True)
+        except OSError:
+            pass
+    audit.log(db, "doc.ingest", target_type="document", target_id=doc.id, target_name=doc.filename,
+              detail=_document_audit_detail(doc, user, job_type=job_type, content_edited=content_changed))
+    await db.commit()
+    await db.refresh(doc)
+    return _document_out(doc, user)
 
 
 @router.post("/{kb_id}/documents/text", response_model=DocumentOut)
@@ -305,11 +409,13 @@ async def get_document(
     kb_id: uuid.UUID,
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    audit: AuditLogger = Depends(get_audit),
     user: User = Depends(require_kb_access(DOC_READ)),
 ):
     doc = await _load_document(db, kb_id, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
+    await _require_document_action(user, doc, "read", audit)
     if not doc.raw_content:
         chunks = (await db.execute(
             select(DocumentChunk.content)
@@ -333,6 +439,8 @@ async def update_text_document(
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
     await _require_document_action(user, doc, "update", audit)
+    if doc.status == "draft":
+        raise HTTPException(status_code=409, detail="草稿尚未入库，请先点击「保存入库」")
 
     # 新任务拥有新的 revision。旧分块只有在新 revision 完整解析、向量化并
     # 原子写入后才会被替换；失败任务不会留下“先清空、后失败”的半成品状态。
@@ -425,8 +533,15 @@ async def delete_document(
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
     await _require_document_action(user, doc, "delete", audit)
+    staged_path = doc.staged_path
     audit.log(db, "doc.delete", target_type="document", target_id=doc.id, target_name=doc.filename,
               detail=_document_audit_detail(doc, user))
     await db.delete(doc)
     await db.commit()
+    # 草稿被删除时同步清理其暂存源文件；正式入库后文件归处理任务托管。
+    if staged_path:
+        try:
+            Path(staged_path).unlink(missing_ok=True)
+        except OSError:
+            pass
     return {"message": "删除成功"}

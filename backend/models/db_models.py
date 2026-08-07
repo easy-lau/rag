@@ -58,6 +58,9 @@ class Document(Base):
     raw_content: Mapped[str | None] = mapped_column(Text)
     source_url: Mapped[str | None] = mapped_column(Text)
     image_url: Mapped[str | None] = mapped_column(Text)
+    # 上传接口只暂存草稿：源文件路径在正式「保存入库」前由草稿行持有。
+    # 入库后交由处理任务托管（处理完成即清理），草稿被删除时同步清理磁盘文件。
+    staged_path: Mapped[str | None] = mapped_column(Text)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="processing")
     # Every enqueue captures this revision.  A worker may spend minutes

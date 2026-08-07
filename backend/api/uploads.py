@@ -61,6 +61,13 @@ async def get_document_image(
         raise HTTPException(status_code=404, detail="图片不存在")
 
     await ensure_kb_access(user, document.kb_id, db)
+    # 草稿（含识别原图）仅创建者或超管可见
+    if (
+        str(document.status or "").strip().casefold() == "draft"
+        and not user.is_superadmin
+        and document.created_by != user.id
+    ):
+        raise HTTPException(status_code=404, detail="图片不存在")
     return FileResponse(
         image_path,
         filename=filename,

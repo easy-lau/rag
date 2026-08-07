@@ -51,8 +51,11 @@ def evaluate_document_permissions(user: User, document: Document) -> DocumentPer
         return DocumentPermissions(read=True, update=True, delete=True)
 
     is_owner = is_document_owner(user, document)
+    # 草稿只对创建者（及超管）可见：非本人既不能查看，也不能出现在列表/统计中；
+    # 正式入库（status=ready）后才恢复为普通文档的可读规则。
+    is_draft = str(getattr(document, "status", "") or "").strip().casefold() == "draft"
     return DocumentPermissions(
-        read=_has_permission(user, DOC_READ),
+        read=_has_permission(user, DOC_READ) and (is_owner or not is_draft),
         update=is_owner and _has_permission(user, DOC_UPDATE),
         delete=is_owner and _has_permission(user, DOC_DELETE),
     )

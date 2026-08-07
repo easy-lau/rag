@@ -42,8 +42,8 @@ class UploadSecurityTests(unittest.IsolatedAsyncioTestCase):
             image_dir = Path(upload_dir) / "images"
             image_dir.mkdir()
             (image_dir / filename).write_bytes(b"image")
-            document = SimpleNamespace(kb_id=uuid.uuid4())
-            user = SimpleNamespace(id=uuid.uuid4())
+            document = SimpleNamespace(kb_id=uuid.uuid4(), status="ready", created_by=None)
+            user = SimpleNamespace(id=uuid.uuid4(), is_superadmin=False)
             db = _FakeDb(document)
             access_check = AsyncMock()
 
@@ -54,4 +54,48 @@ class UploadSecurityTests(unittest.IsolatedAsyncioTestCase):
                 response = await get_document_image(filename, db, user)
 
             access_check.assert_awaited_once_with(user, document.kb_id, db)
+            self.assertEqual(Path(response.path), (image_dir / filename).resolve())
+
+    async def test_draft_image_rejected_for_non_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as upload_dir:
+            filename = f"{uuid.uuid4()}.png"
+            image_dir = Path(upload_dir) / "images"
+            image_dir.mkdir()
+            (image_dir / filename).write_bytes(b"image")
+            document = SimpleNamespace(
+                kb_id=uuid.uuid4(),
+                status="draft",
+                created_by=uuid.uuid4(),  # 非当前用户
+            )
+            user = SimpleNamespace(id=uuid.uuid4(), is_superadmin=False)
+            db = _FakeDb(document)
+
+            with (
+                patch("api.uploads.get_settings", return_value=SimpleNamespace(upload_dir=upload_dir)),
+                patch("api.uploads.ensure_kb_access", new=AsyncMock()),
+            ):
+                with self.assertRaisesRegex(HTTPException, "图片不存在"):
+                    await get_document_image(filename, db, user)
+
+    async def test_draft_image_allowed_for_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as upload_dir:
+            filename = f"{uuid.uuid4()}.png"
+            image_dir = Path(upload_dir) / "images"
+            image_dir.mkdir()
+            (image_dir / filename).write_bytes(b"image")
+            owner_id = uuid.uuid4()
+            document = SimpleNamespace(
+                kb_id=uuid.uuid4(),
+                status="draft",
+                created_by=owner_id,
+            )
+            user = SimpleNamespace(id=owner_id, is_superadmin=False)
+            db = _FakeDb(document)
+
+            with (
+                patch("api.uploads.get_settings", return_value=SimpleNamespace(upload_dir=upload_dir)),
+                patch("api.uploads.ensure_kb_access", new=AsyncMock()),
+            ):
+                response = await get_document_image(filename, db, user)
+
             self.assertEqual(Path(response.path), (image_dir / filename).resolve())

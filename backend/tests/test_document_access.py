@@ -20,8 +20,8 @@ def _user(*permissions: str, is_superadmin: bool = False):
     )
 
 
-def _document(owner_id):
-    return SimpleNamespace(created_by=owner_id)
+def _document(owner_id, *, status: str = "ready"):
+    return SimpleNamespace(created_by=owner_id, status=status)
 
 
 class DocumentAccessTests(unittest.TestCase):
@@ -62,6 +62,37 @@ class DocumentAccessTests(unittest.TestCase):
                 )
                 require_document_action(user, _document(owner_id), "update")
                 require_document_action(user, _document(owner_id), "delete")
+
+    def test_draft_is_readable_only_by_its_owner(self) -> None:
+        owner = _user(DOC_READ)
+        other = _user(DOC_READ, DOC_UPDATE, DOC_DELETE)
+        draft = _document(owner.id, status="draft")
+
+        owner_permissions = evaluate_document_permissions(owner, draft)
+        self.assertTrue(owner_permissions.read)
+
+        other_permissions = evaluate_document_permissions(other, draft)
+        self.assertEqual(
+            other_permissions.as_dict(),
+            {"read": False, "update": False, "delete": False},
+        )
+        with self.assertRaises(DocumentAccessDenied):
+            require_document_action(other, draft, "read")
+
+    def test_superadmin_can_read_any_draft(self) -> None:
+        user = _user(is_superadmin=True)
+        draft = _document(uuid.uuid4(), status="draft")
+
+        permissions = evaluate_document_permissions(user, draft)
+        self.assertTrue(permissions.read)
+        require_document_action(user, draft, "read")
+
+    def test_ready_document_remains_readable_to_scoped_users(self) -> None:
+        user = _user(DOC_READ)
+        ready = _document(uuid.uuid4(), status="ready")
+
+        self.assertTrue(evaluate_document_permissions(user, ready).read)
+
 
     def test_ownerless_document_is_not_writable_by_ordinary_user(self) -> None:
         user = _user(DOC_READ, DOC_UPDATE, DOC_DELETE)
