@@ -1,16 +1,17 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-6xl mx-auto space-y-5">
-      <PageHeader title="用户管理" description="维护账号、角色归属与启用状态；高风险删除需二次确认。">
-        <template #actions>
+    <div class="space-y-5">
+      <SurfaceCard padding="none" class="overflow-hidden">
+        <div class="admin-card-toolbar">
+          <div class="admin-card-toolbar__copy">
+            <strong>用户列表</strong>
+            <span>共 {{ users.length }} 个账号</span>
+          </div>
           <n-button type="primary" @click="openCreate">
             <template #icon><n-icon><AddOutline /></n-icon></template>
             新建用户
           </n-button>
-        </template>
-      </PageHeader>
-
-      <SurfaceCard padding="none" class="overflow-hidden">
+        </div>
         <n-data-table
           :columns="columns" :data="users" :loading="loading"
           :pagination="pagination" :scroll-x="ui.isCompact ? 760 : undefined"
@@ -81,7 +82,6 @@ import { getUsers, createUser, updateUser, deleteUser } from '@/api/users'
 import { getAssignableRoles } from '@/api/roles'
 import { useUiStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import RowActions from '@/components/ui/RowActions.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'

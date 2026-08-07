@@ -301,7 +301,7 @@ async function handleLogin() {
   min-width: 0;
   place-items: center;
   padding: 48px;
-  border-left: 1px solid var(--ui-border-strong);
+  border-left: 1px solid color-mix(in srgb, var(--ui-divider) 58%, transparent);
   background: transparent;
 }
 
@@ -435,7 +435,7 @@ async function handleLogin() {
     min-height: 520px;
     align-items: start;
     padding: 42px 24px 64px;
-    border-top: 1px solid var(--ui-border-strong);
+    border-top: 1px solid color-mix(in srgb, var(--ui-divider) 58%, transparent);
     border-left: 0;
   }
 }

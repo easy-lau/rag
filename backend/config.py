@@ -294,6 +294,10 @@ class Settings(BaseSettings):
     login_throttle_retention_hours: int = Field(48, ge=24, le=720)
     login_log_aggregate_seconds: int = Field(60, ge=10, le=3600)
     login_log_retention_days: int = Field(90, ge=7, le=3650)
+    # 操作审计与智能路由决策日志的保留天数。路由日志只保存无正文摘要，供效果调优；
+    # 到期后由后台维护任务清理，避免随团队规模无限增长。
+    operation_log_retention_days: int = Field(180, ge=7, le=3650)
+    intent_route_log_retention_days: int = Field(180, ge=7, le=3650)
     # 仅用于加密 settings 表中的模型 API Key；必须保留在部署环境，绝不写入数据库。
     config_encryption_key: str = ""
 

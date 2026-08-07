@@ -1,8 +1,6 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-5xl mx-auto space-y-5">
-      <PageHeader title="检索测试" description="使用指定知识库和检索方式，快速验证召回与重排效果。" />
-
+    <div class="space-y-5">
       <SurfaceCard class="space-y-4">
         <n-input v-model:value="query" type="textarea" :rows="3" placeholder="输入测试查询语句..." />
         <div class="flex flex-wrap items-center gap-3">
@@ -87,7 +85,6 @@ import { searchTest } from '@/api/search'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import FileTypeIcon from '@/components/common/FileTypeIcon.vue'
 import ScoreTag from '@/components/common/ScoreTag.vue'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import { evidenceStatusMeta as getEvidenceStatusMeta } from '@/utils/evidenceStatus'
 

@@ -1,7 +1,7 @@
 import {
   ChatbubbleEllipsesOutline, LibraryOutline, DocumentTextOutline, SearchOutline,
   SettingsOutline, PeopleOutline, ShieldOutline, TimeOutline, GitNetworkOutline,
-  HardwareChipOutline, PulseOutline,
+  HardwareChipOutline, PulseOutline, BarChartOutline,
 } from '@vicons/ionicons5'
 
 // 问答工作台与管理后台使用两套独立菜单。权限仍以既有 menu:* 为准；
@@ -16,6 +16,7 @@ export const ADMIN_MENU_GROUPS = [
 ]
 
 export const ADMIN_MENU_ITEMS = [
+  { to: '/admin/dashboard', label: '数据看板', icon: BarChartOutline, permission: 'menu:dashboard', group: 'knowledge' },
   { to: '/admin/knowledge', label: '知识库管理', icon: LibraryOutline, permission: 'menu:knowledge', group: 'knowledge', match: ['/admin/knowledge'] },
   { to: '/admin/documents', label: '文档管理', icon: DocumentTextOutline, permission: 'menu:documents', group: 'knowledge', match: ['/admin/documents'] },
   { to: '/admin/search-test', label: '检索测试', icon: SearchOutline, permission: 'menu:search_test', group: 'knowledge' },

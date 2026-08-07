@@ -30,6 +30,7 @@ MENU_USERS = "menu:users"
 MENU_ROLES = "menu:roles"
 MENU_LOGIN_LOGS = "menu:login_logs"
 MENU_RAG_TRACES = "menu:rag_traces"
+MENU_DASHBOARD = "menu:dashboard"
 
 DERIVED_MENU_KEYS: tuple[str, ...] = (
     MENU_CHAT,
@@ -42,6 +43,7 @@ DERIVED_MENU_KEYS: tuple[str, ...] = (
     MENU_ROLES,
     MENU_LOGIN_LOGS,
     MENU_RAG_TRACES,
+    MENU_DASHBOARD,
 )
 
 
@@ -67,6 +69,7 @@ TERMINOLOGY_MANAGE = "terminology:manage"
 USER_MANAGE = "user:manage"
 ROLE_MANAGE = "role:manage"
 LOG_READ = "log:read"
+DASHBOARD_READ = "dashboard:read"
 
 # Historical key retained only while old databases are upgraded.  Scope is now
 # represented by Role.scope_mode and role_knowledge_bases, not this key.
@@ -245,6 +248,15 @@ CAPABILITY_DEFINITIONS: tuple[dict[str, Any], ...] = (
         "risk": "high",
         "requires": (),
     },
+    {
+        "key": DASHBOARD_READ,
+        "group": "knowledge",
+        "module": "dashboard",
+        "label": "查看数据看板",
+        "description": "查看系统规模、问答质量、性能与内容热度的聚合统计。",
+        "risk": "medium",
+        "requires": (),
+    },
 )
 
 CAPABILITY_BY_KEY: dict[str, dict[str, Any]] = {
@@ -322,10 +334,12 @@ MENU_REQUIRE_ANY: dict[str, frozenset[str]] = {
     MENU_ROLES: frozenset({ROLE_MANAGE}),
     MENU_LOGIN_LOGS: frozenset({LOG_READ}),
     MENU_RAG_TRACES: frozenset({LOG_READ}),
+    MENU_DASHBOARD: frozenset({DASHBOARD_READ}),
 }
 
 MENUS: list[dict[str, Any]] = [
     {"key": MENU_CHAT, "route": "chat", "title": "智能问答", "permission": MENU_CHAT, "derived": True},
+    {"key": MENU_DASHBOARD, "route": "dashboard", "title": "数据看板", "permission": MENU_DASHBOARD, "derived": True},
     {"key": MENU_KNOWLEDGE, "route": "knowledge", "title": "知识库", "permission": MENU_KNOWLEDGE, "derived": True},
     {"key": MENU_DOCUMENTS, "route": "documents", "title": "文档管理", "permission": MENU_DOCUMENTS, "derived": True},
     {"key": MENU_SEARCH_TEST, "route": "search-test", "title": "检索测试", "permission": MENU_SEARCH_TEST, "derived": True},
@@ -351,6 +365,7 @@ MODULE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {"key": "users", "group": "system", "label": "用户管理", "description": "用户账号与角色分配。", "menu": MENU_USERS},
     {"key": "roles", "group": "system", "label": "角色管理", "description": "角色、能力和知识库范围。", "menu": MENU_ROLES},
     {"key": "audit_logs", "group": "system", "label": "审计与追踪", "description": "登录、操作审计记录与 RAG 调用链诊断。", "menu": MENU_LOGIN_LOGS},
+    {"key": "dashboard", "group": "knowledge", "label": "数据看板", "description": "系统规模、问答质量与性能聚合统计。", "menu": MENU_DASHBOARD},
 )
 
 
@@ -398,9 +413,9 @@ ROLE_TEMPLATES: tuple[dict[str, Any], ...] = (
     {
         "code": "auditor",
         "name": "审计员",
-        "description": "只读查看登录、操作审计日志和 RAG 调用链。",
+        "description": "只读查看数据看板、登录/操作审计日志和 RAG 调用链。",
         "scope_mode": KB_SCOPE_NONE,
-        "capabilities": (LOG_READ,),
+        "capabilities": (LOG_READ, DASHBOARD_READ),
         "is_assignable": True,
     },
     {
@@ -415,7 +430,7 @@ ROLE_TEMPLATES: tuple[dict[str, Any], ...] = (
 
 
 PERMISSION_CATALOG: dict[str, Any] = {
-    "version": 5,
+    "version": 6,
     "capabilities": [dict(item) for item in CAPABILITY_DEFINITIONS],
     "groups": (
         {"key": "workspace", "label": "问答工作台"},

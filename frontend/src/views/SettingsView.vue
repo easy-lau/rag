@@ -1,23 +1,13 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
     <n-spin :show="settingsStore.loading">
-      <div class="max-w-6xl mx-auto space-y-5">
-        <PageHeader
-          title="系统设置"
-          description="管理检索策略与站点品牌信息。模型服务配置请前往“模型管理”。"
-        >
-          <template #meta>
-            <n-tag :type="canWrite ? 'success' : 'warning'" :bordered="false" round>
-              {{ canWrite ? '可编辑' : '仅查看' }}
-            </n-tag>
-          </template>
-        </PageHeader>
+      <div class="space-y-5">
         <div v-if="!canWrite" class="mb-5 flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200">
           <n-icon :size="17"><LockClosedOutline /></n-icon>
           当前账号仅可查看系统设置，不能修改或上传站点资源。
         </div>
         <!-- 检索参数 -->
-        <SurfaceCard padding="lg" class="mt-6">
+        <SurfaceCard padding="lg">
           <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4 flex items-center gap-2">
             <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
             检索参数
@@ -156,7 +146,6 @@ import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
 import { useSiteStore } from '@/stores/site'
 import { uploadLogo } from '@/api/settings'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 
 const settingsStore = useSettingsStore()

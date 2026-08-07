@@ -1,14 +1,6 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-6xl mx-auto space-y-6">
-      <PageHeader title="智能路由" description="分别展示模型语义决定与后端编译合同；只有通过策略和权限门禁后，任务才会进入检索或回答流程。">
-        <template #meta>
-          <n-tag :type="routingActive ? 'success' : 'default'" :bordered="false" round>
-            {{ canRead ? (routingActive ? '路由已启用' : '路由未启用') : '无访问权限' }}
-          </n-tag>
-        </template>
-      </PageHeader>
-
+    <div class="space-y-6">
       <SurfaceCard
         v-if="!canRead"
         class="px-6 py-12 text-center"
@@ -32,6 +24,9 @@
               <p class="mt-1 text-xs text-gray-400">模型只表达操作、会话关系和证据需求；回答模式、检索策略和执行授权由服务端确定性编译，并继续受权限校验约束。</p>
             </div>
             <div class="flex items-center gap-3">
+              <n-tag :type="routingActive ? 'success' : 'default'" :bordered="false" round>
+                {{ routingActive ? '路由已启用' : '路由未启用' }}
+              </n-tag>
               <span v-if="!canManage" class="text-xs text-gray-400">当前仅可查看</span>
               <n-button v-if="canManage" type="primary" :loading="savingConfig" @click="saveConfig">保存策略</n-button>
             </div>
@@ -436,7 +431,6 @@ import {
 } from '@/api/intentRouting'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import RowActions from '@/components/ui/RowActions.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'

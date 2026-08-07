@@ -1,15 +1,6 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-6xl mx-auto space-y-5">
-      <PageHeader title="知识库管理" description="创建并维护可检索的知识库，文档会在对应知识库内统一管理。">
-        <template #actions>
-          <n-button v-if="canCreateKb" type="primary" @click="showCreate = true">
-            <template #icon><n-icon><AddOutline /></n-icon></template>
-            创建知识库
-          </n-button>
-        </template>
-      </PageHeader>
-
+    <div class="space-y-5">
       <n-spin :show="kbStore.loading">
         <SurfaceCard
           v-if="!kbStore.list.length && !kbStore.loading"
@@ -18,10 +9,24 @@
           <n-icon :size="40" class="mb-2 text-slate-400"><LibraryOutline /></n-icon>
           <p class="text-sm text-slate-600 dark:text-slate-300">暂无知识库</p>
           <p class="mt-1 text-xs text-slate-400">
-            {{ canCreateKb ? '可从右上角创建第一个知识库' : '当前角色尚未被授权可访问的知识库' }}
+            {{ canCreateKb ? '创建第一个知识库后，即可开始上传和管理文档' : '当前角色尚未被授权可访问的知识库' }}
           </p>
+          <n-button v-if="canCreateKb" type="primary" class="mt-4" @click="showCreate = true">
+            <template #icon><n-icon><AddOutline /></n-icon></template>
+            创建知识库
+          </n-button>
         </SurfaceCard>
-        <div v-else class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div v-else class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
+          <button
+            v-if="canCreateKb"
+            type="button"
+            class="kb-create-card"
+            @click="showCreate = true"
+          >
+            <span class="kb-create-card__icon"><n-icon :size="22"><AddOutline /></n-icon></span>
+            <strong>创建知识库</strong>
+            <span>新建一个可独立授权和管理文档的知识空间</span>
+          </button>
           <SurfaceCard
             v-for="kb in kbStore.list" :key="kb.id"
             padding="sm"
@@ -147,7 +152,6 @@ import { NButton, NIcon, NSpin, NForm, NFormItem, NInput, useMessage } from 'nai
 import { AddOutline, LibraryOutline, TrashOutline, PencilOutline } from '@vicons/ionicons5'
 import { useKnowledgeStore } from '@/stores/knowledge'
 import { useAuthStore } from '@/stores/auth'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'
 import AppModal from '@/components/ui/AppModal.vue'
@@ -259,6 +263,54 @@ async function handleEdit() {
 .kb-card {
   min-height: 164px;
   transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+.kb-create-card {
+  display: flex;
+  min-height: 164px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  padding: 18px;
+  border: 1px dashed var(--ui-border-strong);
+  border-radius: var(--ui-radius-card);
+  background: color-mix(in srgb, var(--ui-primary-subtle) 42%, var(--ui-surface));
+  color: var(--ui-text-secondary);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 160ms ease, background-color 160ms ease, transform 160ms ease;
+}
+
+.kb-create-card:hover {
+  border-color: var(--ui-primary);
+  background: var(--ui-primary-subtle);
+  transform: translateY(-2px);
+}
+
+.kb-create-card__icon {
+  display: inline-flex;
+  width: 42px;
+  height: 42px;
+  align-items: center;
+  justify-content: center;
+  color: var(--ui-primary);
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: 13px;
+}
+
+.kb-create-card strong {
+  color: var(--ui-text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.kb-create-card > span:last-child {
+  max-width: 220px;
+  color: var(--ui-text-tertiary);
+  font-size: 11px;
+  line-height: 1.55;
 }
 
 .kb-card:hover {

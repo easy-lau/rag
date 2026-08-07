@@ -38,6 +38,7 @@
   --ui-info: #3b82f6;
   --ui-info-hover: #256fe5;
   --ui-info-pressed: #1d5fca;
+  --ui-accent-violet: #7657d9;
   --ui-success: #209a6b;
   --ui-success-hover: #17855a;
   --ui-success-pressed: #126e4a;
@@ -97,6 +98,7 @@
   --admin-ui-info: #366ef4;
   --admin-ui-info-hover: #004bff;
   --admin-ui-info-pressed: #003ad9;
+  --admin-ui-accent-violet: #7657d9;
   --admin-ui-success: #209a6b;
   --admin-ui-success-hover: #17855a;
   --admin-ui-success-pressed: #126e4a;
@@ -173,6 +175,7 @@ body.dark,
   --ui-info: #68a1f5;
   --ui-info-hover: #84b4fa;
   --ui-info-pressed: #4d89e7;
+  --ui-accent-violet: #a78bfa;
   --ui-success: #49bf8d;
   --ui-success-hover: #63ce9f;
   --ui-success-pressed: #35a979;
@@ -217,6 +220,7 @@ body.dark,
   --admin-ui-info: #6b9bff;
   --admin-ui-info-hover: #85adff;
   --admin-ui-info-pressed: #4f83ee;
+  --admin-ui-accent-violet: #a78bfa;
   --admin-ui-success: #49bf8d;
   --admin-ui-success-hover: #63ce9f;
   --admin-ui-success-pressed: #35a979;

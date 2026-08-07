@@ -90,7 +90,9 @@ Token 是唯一视觉来源，名称和实际值以 `src/styles/tokens.css` 为�
 
 ## 7. 页面与代码组织
 
-- 后台页面使用统一的 `PageHeader + SurfaceCard / DataTable` 骨架；顶栏只提供全局上下文和账户操作。
+- 后台页面标题由 `AdminLayout` 根据路由 `meta.title` 统一显示在顶栏，业务页面不再重复渲染 `PageHeader`、眉题或说明性副标题。
+- 后台操作必须与业务内容就近组合：新增操作放进列表/集合标题，刷新放进筛选区，状态放进对应卡片标题；禁止让单个按钮或 Tag 独占一整行空工具栏。
+- 后台内容区使用 `SurfaceCard / DataTable` 骨架并占满可用宽度，禁止恢复 `max-w-5xl/max-w-6xl + mx-auto` 的固定居中页面容器。
 - 问答工作台中，会话侧栏负责“新对话”和历史管理；当前会话标题、检索结果等会话级工具放在 `AppHeader`，消息区不再重复设置工具栏。
 - 共享 UI 放在 `src/components/ui/`；业务组件只保留业务数据、事件和页面特有布局。
 - 新增全局颜色、圆角、阴影、断点时，先修改 token / theme，再在业务组件中使用。

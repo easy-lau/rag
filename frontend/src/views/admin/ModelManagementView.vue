@@ -1,18 +1,7 @@
 <template>
   <div class="model-management h-full overflow-y-auto p-4 sm:p-6">
     <n-spin :show="settingsStore.loading">
-      <div class="mx-auto max-w-6xl space-y-5">
-        <PageHeader
-          title="模型管理"
-          description="集中配置对话、意图识别、向量和多模态模型服务。配置保存在数据库中，服务器环境变量不再承载模型密钥。"
-        >
-          <template #meta>
-            <n-tag :type="canWrite ? 'success' : 'warning'" :bordered="false" round>
-              {{ canWrite ? '可编辑' : '仅查看' }}
-            </n-tag>
-          </template>
-        </PageHeader>
-
+      <div class="space-y-5">
         <div v-if="!canWrite" class="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900/70 dark:bg-amber-950/30 dark:text-amber-200">
           <n-icon :size="17"><LockClosedOutline /></n-icon>
           当前账号仅可查看模型配置，不能修改或测试模型服务。
@@ -237,7 +226,6 @@ import { getAvailableModels, testModelConnection } from '@/api/settings'
 import { normalizeOptionalModel, resolveOptionalLlmModel } from '@/utils/modelSettings'
 import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 
 const settingsStore = useSettingsStore()

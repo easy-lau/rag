@@ -1,15 +1,6 @@
 <template>
   <div class="trace-page">
     <div class="trace-page__inner">
-      <PageHeader
-        title="调用链路"
-        description="按 Trace、会话和时间定位一次问答的意图判断、检索、重排、证据筛选与生成过程。"
-      >
-        <template #actions>
-          <n-button :loading="loading" @click="loadRuns">刷新</n-button>
-        </template>
-      </PageHeader>
-
       <SurfaceCard padding="md">
         <div class="trace-filters">
           <n-input
@@ -50,6 +41,7 @@
           <div class="trace-filters__actions">
             <n-button type="primary" @click="applyFilters">查询</n-button>
             <n-button @click="resetFilters">重置</n-button>
+            <n-button secondary :loading="loading" @click="loadRuns">刷新</n-button>
           </div>
         </div>
       </SurfaceCard>
@@ -219,7 +211,6 @@ import {
   NTag,
   useMessage,
 } from 'naive-ui'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import AuditDetailDrawer from '@/components/ui/AuditDetailDrawer.vue'
 import AppModal from '@/components/ui/AppModal.vue'
@@ -766,10 +757,7 @@ onMounted(loadRuns)
 }
 
 .trace-page__inner {
-  /* 与用户、角色、文档等后台列表页保持 max-w-6xl 的内容基线，
-     避免调用链表格在宽屏上横向铺满。 */
-  max-width: 72rem;
-  margin: 0 auto;
+  width: 100%;
   display: grid;
   gap: 20px;
 }

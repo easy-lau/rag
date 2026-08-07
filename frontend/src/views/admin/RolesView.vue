@@ -1,16 +1,17 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-6xl mx-auto space-y-5">
-      <PageHeader title="角色管理" description="按岗位配置可用能力和知识库范围；页面入口会随对应能力自动开放。">
-        <template #actions>
+    <div class="space-y-5">
+      <SurfaceCard padding="none" class="overflow-hidden">
+        <div class="admin-card-toolbar">
+          <div class="admin-card-toolbar__copy">
+            <strong>角色列表</strong>
+            <span>共 {{ roles.length }} 个角色</span>
+          </div>
           <n-button type="primary" @click="openCreate">
             <template #icon><n-icon><AddOutline /></n-icon></template>
             新建角色
           </n-button>
-        </template>
-      </PageHeader>
-
-      <SurfaceCard padding="none" class="overflow-hidden">
+        </div>
         <n-data-table
           :columns="columns" :data="roles" :loading="loading"
           :pagination="pagination" :scroll-x="940"
@@ -388,7 +389,6 @@ import { getRoles, createRole, updateRole, deleteRole, getPermissionCatalog } fr
 import { getKnowledgeBases } from '@/api/knowledge'
 import { useUiStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import RowActions from '@/components/ui/RowActions.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'

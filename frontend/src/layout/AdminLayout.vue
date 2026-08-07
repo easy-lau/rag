@@ -27,7 +27,7 @@
           </n-button>
           <div class="min-w-0 flex items-center gap-2">
             <span class="admin-topbar__status w-2 h-2 rounded-full" aria-hidden="true"></span>
-            <span class="admin-topbar__title text-sm leading-5 font-semibold">管理后台</span>
+            <span class="admin-topbar__title text-sm leading-5 font-semibold">{{ pageTitle }}</span>
           </div>
         </div>
 
@@ -142,6 +142,7 @@ const siteStore = useSiteStore()
 const ui = useUiStore()
 const message = useMessage()
 const adminThemeOverrides = computed(() => createAdminNaiveThemeOverrides(ui.mode))
+const pageTitle = computed(() => route.meta?.title || '管理后台')
 
 const userName = computed(() => authStore.user?.display_name || authStore.user?.username || '用户')
 const userInitial = computed(() => userName.value.slice(0, 1))
@@ -244,6 +245,7 @@ async function changeCurrentPassword() {
   --ui-primary-subtle: var(--admin-ui-primary-subtle);
   --ui-text-on-primary: var(--admin-ui-text-on-primary);
   --ui-info: var(--admin-ui-info);
+  --ui-accent-violet: var(--admin-ui-accent-violet);
   --ui-success: var(--admin-ui-success);
   --ui-warning: var(--admin-ui-warning);
   --ui-danger: var(--admin-ui-danger);

@@ -9,6 +9,7 @@ from sqlalchemy import text
 from api import (
     auth,
     chat,
+    dashboard,
     document,
     intent_routing,
     knowledge,
@@ -25,6 +26,7 @@ from config import get_settings
 from core.logging_config import configure_application_logging
 from core.settings_crypto import SettingsEncryptionError
 from core.login_security import login_log_cleanup_loop
+from core.log_retention import log_retention_cleanup_loop
 from core.document_jobs import run_document_worker
 from core.rag_trace_store import start_rag_trace_store, stop_rag_trace_store
 from core.query_analysis_execution import (
@@ -68,6 +70,7 @@ async def lifespan(app: FastAPI):
             name="embedded-document-worker",
         )
     login_log_cleanup_task = asyncio.create_task(login_log_cleanup_loop())
+    log_retention_task = asyncio.create_task(log_retention_cleanup_loop())
     await start_rag_trace_store()
     await start_query_analysis_execution_runtime()
     try:
@@ -82,6 +85,9 @@ async def lifespan(app: FastAPI):
         login_log_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await login_log_cleanup_task
+        log_retention_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await log_retention_task
 
 
 app = FastAPI(title="RAG 检索系统", version="1.0.0", lifespan=lifespan)
@@ -115,6 +121,7 @@ app.include_router(search.router, prefix="/api")
 app.include_router(settings.router, prefix="/api")
 app.include_router(intent_routing.router, prefix="/api")
 app.include_router(uploads.router, prefix="/api")
+app.include_router(dashboard.router, prefix="/api")
 
 # 品牌图需要在登录页公开显示；文档原图由 uploads 路由鉴权后返回，不能
 # 再把整个 upload_dir 作为无鉴权静态目录挂载。

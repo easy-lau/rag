@@ -1,31 +1,31 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-6xl mx-auto space-y-5">
-      <PageHeader title="文档管理" description="上传、审阅和维护知识库中的文档内容与检索标签。">
-        <template #actions>
+    <div class="space-y-5">
+      <SurfaceCard padding="sm" class="document-toolbar">
+        <div class="flex flex-wrap items-center justify-between gap-3">
           <div class="flex flex-wrap items-center gap-2">
             <n-button secondary size="small" aria-label="返回知识库管理" @click="$router.push({ name: 'knowledge' })">
               <template #icon><n-icon><ArrowBackOutline /></n-icon></template>
               <span class="hidden sm:inline">返回知识库</span>
             </n-button>
-        <n-select v-model:value="selectedKbId" :options="kbOptions" placeholder="选择知识库" class="w-48" clearable />
-        <template v-if="canCreateDocument">
-          <n-button :disabled="!selectedKbId" @click="showUpload = true">
-            <template #icon><n-icon><CloudUploadOutline /></n-icon></template>
-            上传文档
-          </n-button>
-          <n-button :disabled="!selectedKbId" @click="showImageUpload = true">
-            <template #icon><n-icon><ImageOutline /></n-icon></template>
-            上传图片
-          </n-button>
-          <n-button type="primary" :disabled="!selectedKbId" @click="openTextEditor">
-            <template #icon><n-icon><CreateOutline /></n-icon></template>
-            手动输入
-          </n-button>
-        </template>
+            <n-select v-model:value="selectedKbId" :options="kbOptions" placeholder="选择知识库" class="w-48" clearable />
           </div>
-        </template>
-      </PageHeader>
+          <div v-if="canCreateDocument" class="flex flex-wrap items-center gap-2">
+            <n-button :disabled="!selectedKbId" @click="showUpload = true">
+              <template #icon><n-icon><CloudUploadOutline /></n-icon></template>
+              上传文档
+            </n-button>
+            <n-button :disabled="!selectedKbId" @click="showImageUpload = true">
+              <template #icon><n-icon><ImageOutline /></n-icon></template>
+              上传图片
+            </n-button>
+            <n-button type="primary" :disabled="!selectedKbId" @click="openTextEditor">
+              <template #icon><n-icon><CreateOutline /></n-icon></template>
+              手动输入
+            </n-button>
+          </div>
+        </div>
+      </SurfaceCard>
 
     <!-- 未选知识库时的友好空状态（正常从知识库卡片进入会带 kb，不会到这里） -->
     <SurfaceCard v-if="!selectedKbId" class="flex flex-col items-center justify-center py-24 text-center">
@@ -377,7 +377,6 @@ import { useKnowledgeStore } from '@/stores/knowledge'
 import { useAuthStore } from '@/stores/auth'
 import { getAllDocuments, uploadDocument, uploadImageDocument, ingestDocument, deleteDocument, toggleDocument, createTextDocument, getDocument, getDocumentImage, updateTextDocument, updateDocumentTags } from '@/api/document'
 import { getDocumentTags } from '@/api/knowledge'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 import RowActions from '@/components/ui/RowActions.vue'
 import DangerConfirm from '@/components/ui/DangerConfirm.vue'

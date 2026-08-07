@@ -1,7 +1,6 @@
 <template>
   <div class="p-4 sm:p-6 h-full overflow-y-auto">
-    <div class="max-w-6xl mx-auto space-y-5">
-      <PageHeader title="审计日志" description="查看后台管理操作与账号访问记录，详情保留完整的审计元数据。" />
+    <div class="space-y-5">
       <SurfaceCard padding="none" class="overflow-hidden">
         <n-tabs v-model:value="tab" type="line" animated class="audit-log-tabs">
           <n-tab-pane name="operation" tab="操作日志">
@@ -21,7 +20,6 @@ import { ref } from 'vue'
 import { NTabs, NTabPane } from 'naive-ui'
 import OperationLogsPanel from '@/components/admin/OperationLogsPanel.vue'
 import LoginLogsPanel from '@/components/admin/LoginLogsPanel.vue'
-import PageHeader from '@/components/ui/PageHeader.vue'
 import SurfaceCard from '@/components/ui/SurfaceCard.vue'
 
 const tab = ref('operation')
