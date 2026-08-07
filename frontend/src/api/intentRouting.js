@@ -10,7 +10,7 @@ export const createIntentCategory = (data) => http.post('/intent-routing/categor
 export const updateIntentCategory = (id, data) => http.put(`/intent-routing/categories/${id}`, data)
 export const deleteIntentCategory = (id) => http.delete(`/intent-routing/categories/${id}`)
 
-// 在线调试与路由日志。question 保留给旧后端，current_input/context_messages/
+// 在线调试。question 保留给旧后端，current_input/context_messages/
 // selected_kb_count 是新语义合同的调试上下文；服务端只做路由，不应据此读取真实知识库。
 export const testIntentRouting = (data = {}) => {
   const currentInput = String(data.current_input ?? data.question ?? '').trim()
@@ -30,6 +30,3 @@ export const testIntentRouting = (data = {}) => {
     selected_kb_count: selectedKbCount,
   })
 }
-export const getIntentRouteLogs = (params) => http.get('/intent-routing/logs', { params })
-export const submitIntentRouteFeedback = (id, feedback) =>
-  http.post(`/intent-routing/logs/${id}/feedback`, { feedback })

@@ -333,26 +333,6 @@
             </div>
           </section>
           </div>
-
-          <!-- 路由日志 -->
-          <SurfaceCard padding="none" class="overflow-hidden">
-          <div class="px-5 sm:px-6 py-5 flex flex-wrap items-start justify-between gap-3 border-b border-gray-100 dark:border-gray-700">
-            <div>
-              <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-200 flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full bg-green-500 inline-block"></span>
-                路由日志
-              </h3>
-              <p class="mt-1 text-xs text-gray-400">默认显示决策元数据，便于观察命中情况；不依赖完整问题正文进行调优。</p>
-            </div>
-            <n-button secondary size="small" :loading="logsLoading" @click="loadLogs">刷新日志</n-button>
-          </div>
-
-          <n-data-table
-            remote :columns="logColumns" :data="logs" :loading="logsLoading"
-            :pagination="logPagination" :scroll-x="1580"
-            class="intent-routing-table"
-          />
-          </SurfaceCard>
         </div>
       </n-spin>
     </div>
@@ -426,8 +406,8 @@ import {
 import { AddOutline, LockClosedOutline } from '@vicons/ionicons5'
 import {
   createIntentCategory, deleteIntentCategory, getIntentCategories,
-  getIntentRouteLogs, getIntentRoutingConfig, submitIntentRouteFeedback,
-  testIntentRouting, updateIntentCategory, updateIntentRoutingConfig,
+  getIntentRoutingConfig, testIntentRouting, updateIntentCategory,
+  updateIntentRoutingConfig,
 } from '@/api/intentRouting'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
@@ -455,10 +435,8 @@ const DEFAULT_CONFIG = {
 
 const config = ref({ ...DEFAULT_CONFIG })
 const categories = ref([])
-const logs = ref([])
 const initialLoading = ref(false)
 const categoriesLoading = ref(false)
-const logsLoading = ref(false)
 const savingConfig = ref(false)
 const savingCategory = ref(false)
 const testing = ref(false)
@@ -507,21 +485,6 @@ const fallbackOptions = computed(() => {
   return items
 })
 
-const logPagination = reactive({
-  page: 1,
-  pageSize: 10,
-  itemCount: 0,
-  showSizePicker: true,
-  pageSizes: [10, 20, 30, 50],
-  prefix: ({ itemCount }) => `共 ${itemCount} 条`,
-  onUpdatePage: (page) => { logPagination.page = page; loadLogs() },
-  onUpdatePageSize: (pageSize) => {
-    logPagination.pageSize = pageSize
-    logPagination.page = 1
-    loadLogs()
-  },
-})
-
 const categoryColumns = [
   { title: '名称', key: 'name', width: 150, align: 'left', titleAlign: 'left', ellipsis: { tooltip: true } },
   {
@@ -553,130 +516,6 @@ const categoryColumns = [
         h(NButton, { text: true, type: 'error', size: 'small', disabled: !canManage.value, onClick: () => openDeleteCategory(row) }, () => '删除'),
       ],
     }),
-  },
-]
-
-const logColumns = [
-  {
-    title: '时间', key: 'created_at', width: 160, align: 'center', titleAlign: 'center',
-    render: row => h('span', { class: 'whitespace-nowrap' }, formatTime(row.created_at)),
-  },
-  {
-    title: '语义决定', key: 'intent_code', width: 210, align: 'left', titleAlign: 'left',
-    render: row => {
-      const operation = semanticOperationFor(row)
-      const readiness = semanticReadinessFor(row)
-      const semanticName = taskContractFor(row)?.intent_name || row.intent_name || operationLabel(operation)
-      return h('div', { class: 'flex min-w-0 flex-col items-start gap-1 py-1' }, [
-        h('span', { class: 'text-sm truncate' }, semanticName),
-        h('code', {
-          class: 'truncate text-xs text-blue-600 dark:text-blue-400',
-          title: operation,
-        }, operation || '—'),
-        readiness
-          ? h(NTag, { size: 'small', type: readinessTagType(readiness), bordered: false }, () => readinessLabel(readiness))
-          : null,
-      ])
-    },
-  },
-  {
-    title: '会话 / 证据', key: 'relation', width: 145, align: 'left', titleAlign: 'left',
-    render: row => {
-      const relation = relationFor(row)
-      const scope = evidenceScopeFor(row)
-      if (!relation && !scope) {
-        return h(NTag, { size: 'small', type: actionTagType(row.action), bordered: false }, () => actionLabel(row.action))
-      }
-      return h('div', { class: 'flex min-w-0 flex-col items-start gap-1 py-1' }, [
-        h('span', { class: 'text-sm' }, relationLabel(relation)),
-        h('span', { class: 'truncate text-xs text-gray-400', title: scope }, evidenceScopeLabel(scope)),
-      ])
-    },
-  },
-  {
-    title: '判定', key: 'decision_source', width: 115, align: 'center', titleAlign: 'center',
-    render: row => {
-      const diagnostics = diagnosticsFor(row)
-      const decision = explicitRouteDecisionFor(row)
-      return h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
-        h('span', { class: 'text-sm' }, sourceLabel(diagnostics.source || row.decision_source || row.source)),
-        h('span', { class: 'text-xs text-gray-400' }, formatConfidence(decision?.confidence ?? row.confidence)),
-        diagnostics.repair_used
-          ? h('span', { class: 'text-xs text-amber-600 dark:text-amber-400' }, '已修复格式')
-          : null,
-      ])
-    },
-  },
-  {
-    title: '最终策略', key: 'retrieval_policy', width: 230, align: 'left', titleAlign: 'left',
-    render: row => {
-      const contract = taskContractFor(row)
-      return h('div', { class: 'flex min-w-0 flex-col gap-1.5 py-1' }, [
-        h('div', { class: 'flex items-center gap-1.5 whitespace-nowrap' }, [
-          h(NTag, { size: 'small', type: responseModeTagType(responseModeFor(row)), bordered: false }, () => responseModeLabel(responseModeFor(row))),
-          h(NTag, { size: 'small', type: retrievalPolicyTagType(retrievalPolicyFor(row)), bordered: false }, () => retrievalPolicyLabel(retrievalPolicyFor(row))),
-        ]),
-        h('span', { class: 'text-xs text-gray-500 dark:text-gray-400' }, `最终检索：${booleanDecisionLabel(needsRetrievalValue(row))}`),
-        contract
-          ? h('span', { class: 'text-xs text-gray-400' }, `合同：${readinessLabel(contract.readiness)} · ${contract.dispatch_authorized ? '允许执行' : '禁止执行'}`)
-          : null,
-      ])
-    },
-  },
-  {
-    title: '策略原因', key: 'decision_reason', width: 220, align: 'left', titleAlign: 'left',
-    render: row => {
-      const reason = decisionReasonFor(row)
-      return h('div', { class: 'flex min-w-0 flex-col gap-0.5 py-1' }, [
-        h('span', { class: 'truncate text-sm', title: decisionReasonLabel(reason) }, decisionReasonLabel(reason)),
-        h('code', { class: 'truncate text-xs text-gray-400', title: reason }, reason || '—'),
-      ])
-    },
-  },
-  {
-    title: '执行 / 证据', key: 'evidence_status', width: 180, align: 'left', titleAlign: 'left',
-    render: row => {
-      const status = evidenceStatusFor(row)
-      return h('div', { class: 'flex min-w-0 flex-col items-start gap-1 py-1' }, [
-        h(NTag, { size: 'small', type: evidenceStatusTagType(status), bordered: false }, () => evidenceStatusLabel(status)),
-        h('span', { class: 'truncate text-xs text-gray-500 dark:text-gray-400' }, retrievalExecutionLabel(row)),
-        status === 'hit'
-          ? h('span', { class: 'text-xs text-gray-400' }, `有效命中：${Number(row.hit_count ?? 0)} 条`)
-          : null,
-      ])
-    },
-  },
-  {
-    title: '上下文', key: 'selected_kb_count', width: 125, align: 'center', titleAlign: 'center',
-    render: row => {
-      const diagnostics = diagnosticsFor(row)
-      const selectedKbCount = taskContractFor(row)?.selected_kb_count
-        ?? row.selected_kb_count ?? row.context?.selected_kb_count ?? 0
-      const latencyMs = diagnostics.latency_ms ?? row.latency_ms
-      const resolutionMode = queryResolutionModeFor(row)
-      return h('div', { class: 'flex flex-col items-center gap-0.5 whitespace-nowrap' }, [
-        h('span', { class: 'text-sm' }, `${selectedKbCount} 个知识库`),
-        resolutionMode ? h('span', { class: 'text-xs text-gray-400' }, queryResolutionLabel(resolutionMode)) : null,
-        h('span', { class: 'text-xs text-gray-400' }, latencyMs === undefined || latencyMs === null ? '耗时 —' : `${latencyMs} ms`),
-      ])
-    },
-  },
-  {
-    title: '反馈', key: 'feedback', width: 100, align: 'center', titleAlign: 'center',
-    render: row => h(NTag, { size: 'small', type: feedbackTagType(row.feedback), bordered: false }, () => feedbackLabel(row.feedback)),
-  },
-  {
-    title: '操作', key: 'actions', width: 145, align: 'center', titleAlign: 'center',
-    render: row => h('div', { style: 'display:flex;justify-content:center;gap:6px;align-items:center' }, [
-      h(NButton, {
-        text: true, type: 'success', size: 'small', disabled: !canManage.value || !!row.feedback,
-        onClick: () => saveFeedback(row, 'correct'),
-      }, () => '正确'),
-      h(NButton, {
-        text: true, type: 'error', size: 'small', disabled: !canManage.value || !!row.feedback,
-        onClick: () => saveFeedback(row, 'incorrect'),
-      }, () => '错误'),
-    ]),
   },
 ]
 
@@ -729,7 +568,7 @@ async function loadPage() {
   if (!canRead.value) return
   initialLoading.value = true
   try {
-    await Promise.all([loadConfig(), loadCategories(), loadLogs()])
+    await Promise.all([loadConfig(), loadCategories()])
   } finally {
     initialLoading.value = false
   }
@@ -753,20 +592,6 @@ async function loadCategories() {
     showError(error, '加载意图分类失败')
   } finally {
     categoriesLoading.value = false
-  }
-}
-
-async function loadLogs() {
-  if (!canRead.value) return
-  logsLoading.value = true
-  try {
-    const data = await getIntentRouteLogs({ page: logPagination.page, page_size: logPagination.pageSize })
-    logs.value = normalizeItems(data, 'logs')
-    logPagination.itemCount = Number(data?.total ?? logs.value.length)
-  } catch (error) {
-    showError(error, '加载路由日志失败')
-  } finally {
-    logsLoading.value = false
   }
 }
 
@@ -930,18 +755,6 @@ function normalizeTestResult(data) {
     retrieval_executed: data?.retrieval_executed ?? legacyDecision?.retrieval_executed,
     evidence_status: data?.evidence_status ?? legacyDecision?.evidence_status,
     hit_count: data?.hit_count ?? legacyDecision?.hit_count,
-  }
-}
-
-async function saveFeedback(log, feedback) {
-  if (!canManage.value || log.feedback) return
-  try {
-    const data = await submitIntentRouteFeedback(log.id, feedback)
-    const updated = data?.log || data
-    logs.value = logs.value.map(item => item.id === log.id ? { ...item, ...updated, feedback } : item)
-    msg.success(feedback === 'correct' ? '已标记为正确' : '已标记为错误')
-  } catch (error) {
-    showError(error, '保存反馈失败')
   }
 }
 
@@ -1252,14 +1065,6 @@ function sourceLabel(source) {
   return { rule: '规则', llm: '模型', fallback: '兜底', policy_fallback: '策略兜底' }[source] || source || '—'
 }
 
-function feedbackLabel(feedback) {
-  return { correct: '正确', incorrect: '错误' }[feedback] || '未标注'
-}
-
-function feedbackTagType(feedback) {
-  return { correct: 'success', incorrect: 'error' }[feedback] || 'default'
-}
-
 function formatConfidence(value) {
   const numeric = Number(value)
   return Number.isFinite(numeric) ? `${Math.round(numeric * 100)}%` : '—'
@@ -1301,12 +1106,6 @@ function structuredOutputLabel(diagnostics) {
   if (diagnostics?.json_object_fallback_used === true) return 'JSON Object 兼容模式'
   if (diagnostics?.strict_schema_used === true) return 'Strict JSON Schema'
   return '未记录'
-}
-
-function formatTime(value) {
-  if (!value) return '—'
-  const time = new Date(value)
-  return Number.isNaN(time.getTime()) ? String(value) : time.toLocaleString('zh-CN')
 }
 
 function showError(error, fallback) {

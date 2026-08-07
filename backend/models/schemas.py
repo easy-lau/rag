@@ -500,7 +500,6 @@ IntentEvidenceStatus = Literal[
     "needs_clarification",
     "error",
 ]
-IntentFeedback = Literal["correct", "incorrect"]
 
 
 class IntentRouterConfigOut(BaseModel):
@@ -600,39 +599,3 @@ class IntentRouteTestResponse(BaseModel):
     task_contract: dict[str, Any] | None = None
     diagnostics: dict[str, Any] = Field(default_factory=dict)
     latency_ms: int = Field(..., ge=0)
-
-
-class IntentRouteLogOut(BaseModel):
-    id: uuid.UUID
-    user_id: uuid.UUID | None = None
-    conversation_id: uuid.UUID | None = None
-    intent_code: str
-    intent_name: str
-    action: IntentAction
-    response_mode: IntentResponseMode
-    retrieval_policy: IntentRetrievalPolicy
-    need_retrieval: bool
-    decision_reason: str
-    confidence: float
-    source: str
-    latency_ms: int
-    selected_kb_count: int
-    retrieval_executed: bool | None = None
-    evidence_status: IntentEvidenceStatus | None = None
-    hit_count: int | None = None
-    trace_id: str | None = None
-    route_summary: dict[str, Any] | None = None
-    feedback: IntentFeedback | None = None
-    feedback_at: datetime | None = None
-    created_at: datetime
-
-    model_config = {"from_attributes": True}
-
-
-class IntentRouteLogPage(BaseModel):
-    items: list[IntentRouteLogOut]
-    total: int
-
-
-class IntentRouteFeedbackUpdate(BaseModel):
-    feedback: IntentFeedback

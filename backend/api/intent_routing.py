@@ -2,8 +2,8 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.audit import AuditLogger, get_audit
@@ -20,15 +20,12 @@ from core.query_route_compiler import TASK_CONTRACT_SCHEMA_VERSION
 from core.query_route_contract import ROUTE_DECISION_SCHEMA_VERSION
 from core.permissions import INTENT_MANAGE, INTENT_READ
 from database import get_db
-from models.db_models import IntentCategory, IntentRouteLog, IntentRouterConfig, User, now_utc
+from models.db_models import IntentCategory, IntentRouterConfig, User
 from models.schemas import (
     IntentCategoryCreate,
     IntentCategoryOut,
     IntentCategoryUpdate,
     IntentDecisionOut,
-    IntentRouteFeedbackUpdate,
-    IntentRouteLogOut,
-    IntentRouteLogPage,
     IntentRouteTestRequest,
     IntentRouteTestResponse,
     IntentRouterConfigOut,
@@ -292,64 +289,3 @@ async def test_route(
         diagnostics=result.diagnostics,
         latency_ms=result.latency_ms,
     )
-
-
-@router.get("/logs", response_model=IntentRouteLogPage)
-async def get_logs(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    intent_code: str | None = Query(None, max_length=64),
-    feedback: str | None = Query(None, pattern="^(correct|incorrect)$"),
-    user_id: uuid.UUID | None = None,
-    db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_permission(INTENT_READ)),
-):
-    conds = []
-    if intent_code:
-        conds.append(IntentRouteLog.intent_code == intent_code)
-    if feedback:
-        conds.append(IntentRouteLog.feedback == feedback)
-    if user_id:
-        conds.append(IntentRouteLog.user_id == user_id)
-
-    count_stmt = select(func.count()).select_from(IntentRouteLog)
-    rows_stmt = select(IntentRouteLog)
-    for cond in conds:
-        count_stmt = count_stmt.where(cond)
-        rows_stmt = rows_stmt.where(cond)
-    total = (await db.execute(count_stmt)).scalar_one()
-    rows = (await db.execute(
-        rows_stmt
-        .order_by(IntentRouteLog.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )).scalars().all()
-    return IntentRouteLogPage(
-        items=[IntentRouteLogOut.model_validate(row) for row in rows],
-        total=total,
-    )
-
-
-@router.post("/logs/{log_id}/feedback", response_model=IntentRouteLogOut)
-async def update_log_feedback(
-    log_id: uuid.UUID,
-    payload: IntentRouteFeedbackUpdate,
-    db: AsyncSession = Depends(get_db),
-    audit: AuditLogger = Depends(get_audit),
-    _: User = Depends(require_permission(INTENT_MANAGE)),
-):
-    log = await db.get(IntentRouteLog, log_id)
-    if log is None:
-        raise HTTPException(status_code=404, detail="路由日志不存在")
-    log.feedback = payload.feedback
-    log.feedback_at = now_utc()
-    audit.log(
-        db,
-        "intent_router.log.feedback",
-        target_type="intent_route_log",
-        target_id=log.id,
-        detail={"feedback": payload.feedback},
-    )
-    await db.commit()
-    await db.refresh(log)
-    return IntentRouteLogOut.model_validate(log)
