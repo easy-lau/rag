@@ -34,7 +34,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
             for item in plan.requirements
         ))
 
-    def test_scope_partitions_clone_bridge_graph_per_partition(self) -> None:
+    def test_scope_partitions_clone_direct_answer_per_partition(self) -> None:
         base = plan_query_locally("普通员工的餐补是多少")
         plan = partition_plan_by_applicability_scopes(
             base,
@@ -44,14 +44,16 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(len(plan.requirements), 4)
-        for offset in (0, 2):
-            answer, bridge = plan.requirements[offset:offset + 2]
-            self.assertEqual(answer.augmentation_requirement_ids, (bridge.id,))
-            self.assertEqual(
-                answer.applicability_scope.fingerprint,
-                bridge.applicability_scope.fingerprint,
-            )
+        self.assertEqual(len(plan.requirements), 2)
+        self.assertTrue(all(item.role == "answer" for item in plan.requirements))
+        self.assertTrue(all(
+            item.augmentation_requirement_ids == ()
+            for item in plan.requirements
+        ))
+        self.assertEqual(
+            {item.applicability_scope.version for item in plan.requirements},
+            {"6", "7"},
+        )
 
     def test_recognizes_generic_answer_shapes(self) -> None:
         cases = {
@@ -203,7 +205,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
             ["answer", "bridge"],
         )
 
-    def test_entity_group_classification_is_an_optional_augmentation(self) -> None:
+    def test_entity_group_queries_remain_direct_user_tasks(self) -> None:
         cases = (
             "普通员工的餐补是多少",
             "合同工住宿标准",
@@ -221,20 +223,28 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
             with self.subTest(question=question):
                 plan = plan_query_locally(question)
 
-                self.assertEqual(plan.answer_shape, "fact")
-                self.assertEqual(len(plan.requirements), 2)
+                self.assertEqual(len(plan.requirements), 1)
                 self.assertEqual(plan.requirements[0].role, "answer")
-                self.assertEqual(plan.requirements[1].role, "bridge")
-                self.assertEqual(plan.requirements[1].source, "inferred")
                 self.assertEqual(
                     plan.requirements[0].depends_on_requirement_ids,
                     (),
                 )
                 self.assertEqual(
                     plan.requirements[0].augmentation_requirement_ids,
-                    (plan.requirements[1].id,),
+                    (),
                 )
-                self.assertEqual(len(plan.retrieval_queries), 2)
+                self.assertEqual(plan.retrieval_queries, (question,))
+
+    def test_interface_lookup_never_invents_a_classification_bridge(self) -> None:
+        question = "我查询钉钉用户列表是用的哪个接口"
+
+        plan = plan_query_locally(question)
+
+        self.assertEqual(plan.retrieval_queries, (question,))
+        self.assertEqual([item.role for item in plan.requirements], ["answer"])
+        self.assertEqual(plan.requirements[0].description, question)
+        self.assertEqual(plan.requirements[0].depends_on_requirement_ids, ())
+        self.assertEqual(plan.requirements[0].augmentation_requirement_ids, ())
 
     def test_named_entity_strategy_question_is_a_direct_attribute(self) -> None:
         plan = plan_query_locally("供应商甲的风险处置措施是什么")
@@ -253,12 +263,12 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
     def test_compact_prepositional_conditions_never_gain_classification_bridges(
         self,
     ) -> None:
-        cases = {
-            "总经理在北京住宿标准": ("总经理",),
-            "合同工在一线城市住宿标准": ("合同工",),
-            "客户A在项目P1审批额度": (),
-        }
-        for question, expected_subjects in cases.items():
+        cases = (
+            "总经理在北京住宿标准",
+            "合同工在一线城市住宿标准",
+            "客户A在项目P1审批额度",
+        )
+        for question in cases:
             with self.subTest(question=question):
                 plan = plan_query_locally(question)
                 bridges = tuple(
@@ -266,14 +276,14 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                     for item in plan.requirements
                     if item.role == "bridge"
                 )
-                self.assertEqual(bridges, expected_subjects)
+                self.assertEqual(bridges, ())
                 self.assertEqual(
                     plan.requirements[0].depends_on_requirement_ids,
                     (),
                 )
                 self.assertEqual(
                     plan.requirements[0].augmentation_requirement_ids,
-                    tuple(item.id for item in plan.requirements[1:]),
+                    (),
                 )
 
     def test_ambiguous_compact_preposition_does_not_invent_a_condition(
@@ -284,7 +294,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
         bridges = [
             item for item in plan.requirements if item.role == "bridge"
         ]
-        self.assertEqual([item.bridge_subject for item in bridges], ["总经理"])
+        self.assertEqual(bridges, [])
 
     def test_condition_scope_is_direct_and_never_a_classification_augmentation(
         self,
@@ -314,13 +324,13 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                     item.augmentation_requirement_ids == () for item in answers
                 ))
 
-    def test_implicit_mapping_coverage_distinguishes_policy_and_entity_attributes(
+    def test_policy_coverage_does_not_require_an_inferred_mapping(
         self,
     ) -> None:
         for question in ("总经理的出差标准是什么",):
             with self.subTest(question=question):
                 collection_plan = plan_query_locally(question)
-                self.assertEqual(collection_plan.answer_shape, "fact")
+                self.assertEqual(collection_plan.answer_shape, "overview")
                 self.assertEqual(
                     collection_plan.requirements[0].coverage_mode,
                     "collection",
@@ -329,9 +339,10 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                     collection_plan.requirements[0].coverage_contract,
                     "document_policy",
                 )
+                self.assertEqual(len(collection_plan.requirements), 1)
                 self.assertEqual(
-                    collection_plan.requirements[1].coverage_mode,
-                    "single",
+                    collection_plan.requirements[0].augmentation_requirement_ids,
+                    (),
                 )
 
         for question in (
@@ -352,7 +363,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                 self.assertEqual(answer.coverage_mode, "single")
                 self.assertEqual(answer.coverage_contract, "single_claim")
 
-    def test_explicit_applicability_scope_is_not_part_of_bridge_subject(self) -> None:
+    def test_explicit_applicability_scope_stays_on_direct_query(self) -> None:
         cases = (
             "云枢8.6普通员工的餐补标准是多少",
             "CloudPivot 8.6 普通员工的住宿标准是多少",
@@ -367,19 +378,15 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                 plan = plan_query_locally(question)
 
                 self.assertEqual(plan.answer_shape, "fact")
-                bridge = next(
-                    item for item in plan.requirements if item.role == "bridge"
-                )
                 answer = next(
                     item for item in plan.requirements if item.role == "answer"
                 )
                 self.assertEqual(answer.depends_on_requirement_ids, ())
-                self.assertEqual(answer.augmentation_requirement_ids, (bridge.id,))
-                self.assertTrue(bridge.description.startswith("确认普通员工对应"))
-                self.assertNotIn("8.6", bridge.description)
-                self.assertNotIn("8.2.75", bridge.description)
-                self.assertNotIn("2025", bridge.description)
-                self.assertNotIn("中青建安", bridge.description)
+                self.assertEqual(answer.augmentation_requirement_ids, ())
+                self.assertFalse(any(
+                    item.role == "bridge" for item in plan.requirements
+                ))
+                self.assertEqual(plan.retrieval_queries, (question,))
 
     def test_scope_suffix_without_a_subject_falls_back_to_original_question(
         self,
@@ -387,12 +394,14 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
         plan = plan_query_locally("普通员工的云枢8.6配置权限是什么")
 
         self.assertEqual(plan.answer_shape, "fact")
-        bridge = next(item for item in plan.requirements if item.role == "bridge")
         answer = next(item for item in plan.requirements if item.role == "answer")
         self.assertEqual(answer.depends_on_requirement_ids, ())
-        self.assertEqual(answer.augmentation_requirement_ids, (bridge.id,))
-        self.assertTrue(bridge.description.startswith("确认普通员工对应"))
-        self.assertIn("云枢8.6配置权限", bridge.description)
+        self.assertEqual(answer.augmentation_requirement_ids, ())
+        self.assertFalse(any(item.role == "bridge" for item in plan.requirements))
+        self.assertEqual(
+            plan.retrieval_queries,
+            ("普通员工的云枢8.6配置权限是什么",),
+        )
 
     def test_direct_configuration_and_topic_phrases_do_not_gain_a_bridge(self) -> None:
         cases = {
@@ -580,21 +589,19 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                 (
                     "普通员工的住宿标准是多少",
                     "普通员工的餐补是多少",
-                    "普通员工 对应的适用分类 等级 类别 职级 角色 版本 档位 阶段",
                 ),
-                ("answer", "answer", "bridge"),
-                ((), (), None),
-                (("r3",), ("r3",), None),
+                ("answer", "answer"),
+                ((), ()),
+                ((), ()),
             ),
             "合同工的住宿标准与交通补贴是多少": (
                 (
                     "合同工的住宿标准是多少",
                     "合同工的交通补贴是多少",
-                    "合同工 对应的适用分类 等级 类别 职级 角色 版本 档位 阶段",
                 ),
-                ("answer", "answer", "bridge"),
-                ((), (), None),
-                (("r3",), ("r3",), None),
+                ("answer", "answer"),
+                ((), ()),
+                ((), ()),
             ),
             "云枢8.6版本的并发上限和附件上限是多少": (
                 (
@@ -652,7 +659,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                 )
                 self.assertEqual(len(plan.requirements), 1)
 
-    def test_coordinated_identity_scope_keeps_one_critical_bridge(self) -> None:
+    def test_coordinated_identity_scope_keeps_only_explicit_answer_targets(self) -> None:
         cases = (
             "普通员工的交通、住宿和餐补标准分别是多少？",
             "普通员工交通、住宿和餐补标准分别是多少？",
@@ -666,20 +673,17 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
                 self.assertEqual(plan.answer_shape, "multi_part")
                 self.assertEqual(
                     [item.role for item in plan.requirements],
-                    ["answer", "answer", "answer", "bridge"],
+                    ["answer", "answer", "answer"],
                 )
                 self.assertTrue(all(
                     item.is_required_answer for item in plan.requirements[:3]
                 ))
-                self.assertEqual(plan.requirements[3].importance, "helpful")
-                self.assertEqual(plan.requirements[3].source, "inferred")
-                self.assertIn("普通员工", plan.requirements[3].description)
                 self.assertTrue(all(
                     item.depends_on_requirement_ids == ()
                     for item in plan.requirements[:3]
                 ))
                 self.assertTrue(all(
-                    item.augmentation_requirement_ids == ("r4",)
+                    item.augmentation_requirement_ids == ()
                     for item in plan.requirements[:3]
                 ))
                 self.assertEqual(
@@ -708,7 +712,7 @@ class ConservativeLocalQueryPlannerTests(unittest.TestCase):
             if item.role == "answer"
             for dependency in (item.augmentation_requirement_ids or ())
         }
-        self.assertEqual(len(bridge_ids), 1)
+        self.assertEqual(len(bridge_ids), 0)
 
     def test_coordinated_explicit_scope_does_not_invent_a_bridge(self) -> None:
         cases = (

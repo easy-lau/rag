@@ -100,10 +100,9 @@ class QueryAnalysisV2CompilerTests(unittest.TestCase):
         answers = [item for item in compiled.plan.requirements if item.role == "answer"]
         bridges = [item for item in compiled.plan.requirements if item.role == "bridge"]
         self.assertEqual(len(answers), 3)
-        self.assertEqual(len(bridges), 1)
-        self.assertEqual(bridges[0].bridge_kind, "classification")
+        self.assertEqual(bridges, [])
         self.assertTrue(all(
-            answer.augmentation_requirement_ids == (bridges[0].id,)
+            answer.augmentation_requirement_ids == ()
             for answer in answers
         ))
         self.assertTrue(all(answer.depends_on_requirement_ids == () for answer in answers))

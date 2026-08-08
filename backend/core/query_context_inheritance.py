@@ -2,10 +2,10 @@
 
 An earlier user turn is not a bag of independently reusable words.  Its
 subject, product/version/project boundary and operational conditions form one
-applicability envelope.  A later V3 catalog selection may therefore inherit
+applicability envelope. A later semantic selection may therefore inherit
 only a *single, exact entity span* from a source whose envelope is otherwise
 empty.  This module is deliberately shared by the deterministic ellipsis path
-and the model-backed V3 compiler so one path cannot keep an entity after the
+and the model-backed compiler so one path cannot keep an entity after the
 other path has rejected the source's scope or condition.
 
 It does not select evidence, create retrieval queries or inspect assistant

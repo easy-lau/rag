@@ -180,7 +180,7 @@
                 <n-form-item>
                   <template #label>
                     <span class="inline-flex items-center gap-1">
-                      结构化输出模式
+                      对话结构化输出模式
                       <n-tooltip trigger="hover" placement="top">
                         <template #trigger>
                           <n-icon :size="15" class="text-gray-400 cursor-help" aria-label="结构化输出模式说明">
@@ -195,12 +195,38 @@
                   </template>
                   <n-select v-model:value="form.llm_structured_output_mode" :options="structuredOutputModeOptions" />
                 </n-form-item>
-                <n-form-item label="关闭模型思考模式">
+                <n-form-item label="关闭对话模型思考模式">
                   <div class="flex w-full items-center justify-between gap-4">
                     <span class="text-xs leading-5 text-[var(--ui-text-secondary)]">
                       仅当当前兼容接口明确支持 thinking 控制时开启；不再根据模型名称自动判断。
                     </span>
                     <n-switch v-model:value="form.llm_disable_thinking" />
+                  </div>
+                </n-form-item>
+                <n-form-item>
+                  <template #label>
+                    <span class="inline-flex items-center gap-1">
+                      裁决结构化输出模式
+                      <n-tooltip trigger="hover" placement="top">
+                        <template #trigger>
+                          <n-icon :size="15" class="text-gray-400 cursor-help" aria-label="裁决结构化输出模式说明">
+                            <HelpCircleOutline />
+                          </n-icon>
+                        </template>
+                        <div class="max-w-xs text-xs leading-relaxed">
+                          仅用于证据重排和联合语义裁决。测试重排模型会执行与正式问答相同的裁决合同，并回填实际可用模式。
+                        </div>
+                      </n-tooltip>
+                    </span>
+                  </template>
+                  <n-select v-model:value="form.rerank_structured_output_mode" :options="structuredOutputModeOptions" />
+                </n-form-item>
+                <n-form-item label="关闭裁决模型思考模式">
+                  <div class="flex w-full items-center justify-between gap-4">
+                    <span class="text-xs leading-5 text-[var(--ui-text-secondary)]">
+                      裁决是低延迟结构化任务；默认关闭长思考，不影响最终回答模型。
+                    </span>
+                    <n-switch v-model:value="form.rerank_disable_thinking" />
                   </div>
                 </n-form-item>
               </div>
@@ -365,6 +391,15 @@ for (const service of Object.keys(modelServiceConfig)) {
     }
   })
 }
+watch(
+  () => String(form.value.rerank_model || '').trim(),
+  (nextModel, previousModel) => {
+    if (nextModel !== previousModel) {
+      form.value.rerank_structured_output_mode = 'auto'
+      connectionTests.value.rerank.loading = false
+    }
+  },
+)
 function createConnectionPayload(service) {
   const config = modelServiceConfig[service]
   const payload = { service }
@@ -374,6 +409,11 @@ function createConnectionPayload(service) {
   if (apiKey) payload.api_key = apiKey
   if (baseUrl?.trim()) payload.base_url = baseUrl.trim()
   if (model?.trim()) payload.model = model.trim()
+  if (service === 'llm') {
+    payload.purpose = 'chat'
+    payload.structured_output_mode = form.value.llm_structured_output_mode
+    payload.disable_thinking = Boolean(form.value.llm_disable_thinking)
+  }
   return payload
 }
 function resetConnectionTests() { Object.values(connectionTests.value).forEach(state => { state.loading = false }) }
@@ -404,6 +444,7 @@ async function handleTestIntentModel() {
   state.loading = true
   try {
     const payload = createConnectionPayload('llm')
+    payload.purpose = 'intent'
     payload.model = resolveOptionalLlmModel(form.value.intent_model, form.value.chat_model)
     const result = await testModelConnection(payload)
     const success = result.ok === true
@@ -420,9 +461,16 @@ async function handleTestRerankModel() {
   state.loading = true
   try {
     const payload = createConnectionPayload('llm')
+    payload.purpose = 'rerank'
     payload.model = resolveOptionalLlmModel(form.value.rerank_model, form.value.chat_model)
+    payload.structured_output_mode = form.value.rerank_structured_output_mode
+    payload.disable_thinking = Boolean(form.value.rerank_disable_thinking)
+    payload.timeout_seconds = form.value.rerank_timeout_seconds
     const result = await testModelConnection(payload)
     const success = result.ok === true
+    if (success && result.structured_output_mode) {
+      form.value.rerank_structured_output_mode = result.structured_output_mode
+    }
     const message = result.message || (success ? '重排模型连接成功' : '连接测试失败，请检查模型配置后重试。')
     if (success) msg.success(message)
     else msg.error(message)
@@ -440,6 +488,8 @@ async function handleSave() {
       llm_disable_thinking: Boolean(form.value.llm_disable_thinking),
       intent_model: normalizeOptionalModel(form.value.intent_model),
       rerank_model: normalizeOptionalModel(form.value.rerank_model),
+      rerank_structured_output_mode: form.value.rerank_structured_output_mode,
+      rerank_disable_thinking: Boolean(form.value.rerank_disable_thinking),
       temperature: form.value.temperature,
       max_tokens: form.value.max_tokens,
       rerank_timeout_seconds: form.value.rerank_timeout_seconds,

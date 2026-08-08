@@ -34,6 +34,8 @@ EDITABLE_SETTING_KEYS = frozenset({
     "llm_disable_thinking",
     "intent_model",
     "rerank_model",
+    "rerank_structured_output_mode",
+    "rerank_disable_thinking",
     "temperature",
     "max_tokens",
     "rerank_timeout_seconds",
@@ -69,7 +71,14 @@ def coerce_setting_value(key: str, value: str, settings) -> object:
     current = getattr(
         settings,
         key,
-        "auto" if key == "llm_structured_output_mode" else None,
+        (
+            "auto"
+            if key in {
+                "llm_structured_output_mode",
+                "rerank_structured_output_mode",
+            }
+            else None
+        ),
     )
     if isinstance(current, bool):
         return value.strip().lower() in ("true", "1", "yes")

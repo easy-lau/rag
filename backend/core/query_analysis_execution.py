@@ -9,11 +9,10 @@ coverage and proof edges remain baseline/backend owned.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 from dataclasses import dataclass, replace
-from typing import Any, Awaitable, Callable, Iterable, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from core.query_analysis_compiler import (
     CompiledQueryAnalysisPlan,
@@ -26,14 +25,13 @@ from core.query_analysis_validation import (
     query_plan_fingerprint,
     validate_query_analysis_for_execution,
 )
-from core.query_analyzer import QueryAnalysisRunResult, analyze_query
 from core.query_semantics import ResolvedTurnSemantics
 from core.rag_trace import content_fields, trace_event
 from core.rag_v2.contracts import QueryPlanV2
 from core.rag_v2.task_graph import RagExecutionBundle, compile_rag_execution_bundle
 
 
-AnalysisExecutionMode = Literal["active", "shadow", "deterministic"]
+AnalysisExecutionMode = Literal["deterministic"]
 AnalysisDecision = Literal[
     "applied",
     "observed",
@@ -477,135 +475,8 @@ class QueryAnalysisExecutionResult:
             else None,
         }
 
-
-class _TryAcquireCapacity:
-    """Event-loop-local, non-queueing capacity counter.
-
-    ``try_acquire`` has no await point, so two tasks in the same event loop
-    cannot both reserve the last slot.  This intentionally rejects excess work
-    instead of creating an invisible semaphore wait queue.
-    """
-
-    def __init__(self) -> None:
-        self._inflight = 0
-
-    @property
-    def inflight(self) -> int:
-        return self._inflight
-
-    def try_acquire(self, maximum: int) -> bool:
-        bounded_maximum = max(0, int(maximum))
-        if bounded_maximum < 1 or self._inflight >= bounded_maximum:
-            return False
-        self._inflight += 1
-        return True
-
-    def release(self) -> None:
-        if self._inflight <= 0:
-            raise RuntimeError("query-analysis capacity released without acquisition")
-        self._inflight -= 1
-
-
-class ShadowAnalysisDispatcher:
-    """Lifecycle-owned sampled shadow executor with no waiting queue."""
-
-    def __init__(self) -> None:
-        self._inflight = 0
-        self._closing = False
-        self._tasks: set[asyncio.Task[None]] = set()
-
-    @property
-    def inflight(self) -> int:
-        return self._inflight
-
-    @property
-    def task_count(self) -> int:
-        return len(self._tasks)
-
-    def start(self) -> None:
-        self._closing = False
-
-    def try_submit(
-        self,
-        job: Callable[[], Awaitable[None]],
-        *,
-        maximum: int,
-        name: str,
-    ) -> bool:
-        bounded_maximum = max(0, int(maximum))
-        if self._closing or bounded_maximum < 1 or self._inflight >= bounded_maximum:
-            return False
-        self._inflight += 1
-
-        async def run() -> None:
-            try:
-                await job()
-            finally:
-                self._inflight -= 1
-
-        task = asyncio.create_task(run(), name=name)
-        self._tasks.add(task)
-
-        def discard(completed: asyncio.Task[None]) -> None:
-            self._tasks.discard(completed)
-            if completed.cancelled():
-                return
-            try:
-                completed.result()
-            except Exception:
-                # ``run_shadow`` writes a request-correlated trace for handled
-                # analyzer failures.  There is no request response to leak an
-                # unexpected background error into here.
-                return
-
-        task.add_done_callback(discard)
-        return True
-
-    async def shutdown(self) -> None:
-        self._closing = True
-        tasks = tuple(self._tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
-        # A task cancelled before entering ``run`` may not execute its finally.
-        self._inflight = 0
-
-
-_ACTIVE_CAPACITY = _TryAcquireCapacity()
-_SHADOW_DISPATCHER = ShadowAnalysisDispatcher()
-
-
-def _sampled(*, trace_id: str, sample_rate: float) -> bool:
-    rate = max(0.0, min(float(sample_rate), 1.0))
-    if rate <= 0:
-        return False
-    if rate >= 1:
-        return True
-    digest = hashlib.sha256(str(trace_id).encode("utf-8")).digest()
-    bucket = int.from_bytes(digest[:8], "big") / float(1 << 64)
-    return bucket < rate
-
-
 class QueryAnalysisExecutionService:
-    """Single owner of active/shadow analyzer execution decisions."""
-
-    @staticmethod
-    def _applied_decision_for_mode(mode: AnalysisExecutionMode) -> AnalysisDecision:
-        return "observed" if mode == "shadow" else "applied"
-
-    @staticmethod
-    def _fallback_decision_for_mode(mode: AnalysisExecutionMode) -> AnalysisDecision:
-        return "observed" if mode == "shadow" else "fallback"
-
-    @staticmethod
-    def _bundle_for_mode(
-        *,
-        mode: AnalysisExecutionMode,
-        baseline: ExecutionBaseline,
-    ) -> RagExecutionBundle | None:
-        return None if mode == "shadow" else baseline.execution_bundle
+    """Compile the bounded local contextual-ellipsis contract."""
 
     def _compile_analysis(
         self,
@@ -647,13 +518,10 @@ class QueryAnalysisExecutionService:
         if not validation.accepted:
             result = QueryAnalysisExecutionResult(
                 mode=mode,
-                decision=self._fallback_decision_for_mode(mode),
+                decision="fallback",
                 reason="execution_validation_rejected",
                 baseline=baseline,
-                execution_bundle=self._bundle_for_mode(
-                    mode=mode,
-                    baseline=baseline,
-                ),
+                execution_bundle=baseline.execution_bundle,
                 validation=validation,
                 analysis_latency_ms=analysis_latency_ms,
             )
@@ -673,11 +541,11 @@ class QueryAnalysisExecutionService:
         )
         result = QueryAnalysisExecutionResult(
             mode=mode,
-            decision=self._applied_decision_for_mode(mode),
+            decision="applied",
             reason=applied_reason or compilation.compiler_decision,
             baseline=baseline,
             execution_bundle=(
-                compilation.execution_bundle if mode != "shadow" else None
+                compilation.execution_bundle
             ),
             validation=validation,
             analysis_latency_ms=analysis_latency_ms,
@@ -720,88 +588,6 @@ class QueryAnalysisExecutionService:
             user_id=user_id,
         )
         return result
-
-    async def _evaluate(
-        self,
-        *,
-        mode: AnalysisExecutionMode,
-        baseline: ExecutionBaseline,
-        trace_id: str,
-        conversation_id: str,
-        user_id: str,
-        timeout_seconds: float,
-    ) -> QueryAnalysisExecutionResult:
-        try:
-            analysis_result: QueryAnalysisRunResult = await analyze_query(
-                question=baseline.question,
-                route_context=baseline.route_context,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                mode=mode,
-                timeout_seconds=timeout_seconds,
-            )
-            if analysis_result.analysis is None:
-                result = QueryAnalysisExecutionResult(
-                    mode=mode,
-                    decision=self._fallback_decision_for_mode(mode),
-                    reason=analysis_result.fallback_reason or "analysis_unavailable",
-                    baseline=baseline,
-                    execution_bundle=self._bundle_for_mode(
-                        mode=mode,
-                        baseline=baseline,
-                    ),
-                    analysis_latency_ms=analysis_result.latency_ms,
-                )
-                self._trace_decision(
-                    result,
-                    trace_id=trace_id,
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                )
-                return result
-            return self._compile_analysis(
-                mode=mode,
-                analysis=analysis_result.analysis,
-                baseline=baseline,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                analysis_latency_ms=analysis_result.latency_ms,
-            )
-        except asyncio.CancelledError:
-            trace_event(
-                "query.analysis.cancelled",
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                mode=mode,
-                baseline_fingerprint=baseline.fingerprint,
-            )
-            raise
-        except Exception as exc:
-            result = QueryAnalysisExecutionResult(
-                mode=mode,
-                decision=self._fallback_decision_for_mode(mode),
-                reason="analysis_execution_failed",
-                baseline=baseline,
-                execution_bundle=self._bundle_for_mode(
-                    mode=mode,
-                    baseline=baseline,
-                ),
-            )
-            trace_event(
-                "query.analysis.execution_decision",
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                mode=mode,
-                decision=result.decision,
-                reason=result.reason,
-                baseline=result.baseline.safe_summary(),
-                error=exc,
-            )
-            return result
 
     def _trace_decision(
         self,
@@ -924,202 +710,11 @@ class QueryAnalysisExecutionService:
             )
             return result
 
-    async def run_active(
-        self,
-        *,
-        baseline: ExecutionBaseline,
-        trace_id: str,
-        conversation_id: str,
-        user_id: str,
-        timeout_seconds: float,
-        maximum_inflight: int,
-    ) -> QueryAnalysisExecutionResult:
-        if not baseline.is_runnable:
-            result = QueryAnalysisExecutionResult(
-                mode="active",
-                decision="clarification",
-                reason="baseline_not_runnable",
-                baseline=baseline,
-                execution_bundle=None,
-            )
-            self._trace_decision(
-                result,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-            )
-            return result
-        if not _ACTIVE_CAPACITY.try_acquire(maximum_inflight):
-            result = QueryAnalysisExecutionResult(
-                mode="active",
-                decision="fallback",
-                reason="active_capacity_exhausted",
-                baseline=baseline,
-                execution_bundle=baseline.execution_bundle,
-            )
-            self._trace_decision(
-                result,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-            )
-            return result
-        try:
-            return await self._evaluate(
-                mode="active",
-                baseline=baseline,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                timeout_seconds=timeout_seconds,
-            )
-        finally:
-            _ACTIVE_CAPACITY.release()
-
-    async def run_shadow(
-        self,
-        *,
-        baseline: ExecutionBaseline,
-        trace_id: str,
-        conversation_id: str,
-        user_id: str,
-        timeout_seconds: float,
-    ) -> QueryAnalysisExecutionResult:
-        if not baseline.is_runnable:
-            result = QueryAnalysisExecutionResult(
-                mode="shadow",
-                decision="skipped",
-                reason="baseline_not_runnable",
-                baseline=baseline,
-                execution_bundle=None,
-            )
-            self._trace_decision(
-                result,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-            )
-            return result
-        return await self._evaluate(
-            mode="shadow",
-            baseline=baseline,
-            trace_id=trace_id,
-            conversation_id=conversation_id,
-            user_id=user_id,
-            timeout_seconds=timeout_seconds,
-        )
-
-    def submit_shadow(
-        self,
-        *,
-        baseline: ExecutionBaseline,
-        trace_id: str,
-        conversation_id: str,
-        user_id: str,
-        timeout_seconds: float,
-        maximum_inflight: int,
-        sample_rate: float,
-        submission_phase: str,
-    ) -> bool:
-        """Try to start shadow work; excess load is deliberately discarded."""
-
-        if not baseline.is_runnable:
-            trace_event(
-                "query.analysis.skipped",
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                mode="shadow",
-                reason="baseline_not_runnable",
-                baseline=baseline.safe_summary(),
-                submission_phase=submission_phase,
-            )
-            return False
-        if not _sampled(trace_id=trace_id, sample_rate=sample_rate):
-            trace_event(
-                "query.analysis.skipped",
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                mode="shadow",
-                reason="shadow_not_sampled",
-                baseline_fingerprint=baseline.fingerprint,
-                submission_phase=submission_phase,
-            )
-            return False
-        accepted = _SHADOW_DISPATCHER.try_submit(
-            lambda: self.run_shadow(
-                baseline=baseline,
-                trace_id=trace_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                timeout_seconds=timeout_seconds,
-            ),
-            maximum=maximum_inflight,
-            name=f"rag-query-analysis-shadow-{trace_id[:12]}",
-        )
-        event = (
-            "query.analysis.shadow_submitted"
-            if accepted
-            else "query.analysis.skipped"
-        )
-        trace_event(
-            event,
-            trace_id=trace_id,
-            conversation_id=conversation_id,
-            user_id=user_id,
-            mode="shadow",
-            reason="submitted" if accepted else "shadow_capacity_exhausted",
-            baseline_fingerprint=baseline.fingerprint,
-            submission_phase=submission_phase,
-            inflight=_SHADOW_DISPATCHER.inflight,
-            maximum_inflight=max(0, int(maximum_inflight)),
-        )
-        return accepted
-
-
-def should_attempt_active_analysis(
-    *,
-    question: str,
-    local_surface_plan: QueryPlanV2,
-    query_mode: str,
-) -> bool:
-    """Whether V2 may obtain its one source-anchored semantic contract.
-
-    The previous implementation treated model analysis as an optional
-    late-stage optimisation and skipped ordinary-looking one-liners.  That
-    makes ``餐补呢`` and ``普通员工餐补是多少`` take different semantic paths
-    even though both require the same qualifier/target contract.  V2 now uses
-    one bounded analysis attempt for every non-clarification grounded request;
-    model failure keeps the current-turn deterministic baseline and never
-    recreates a text-concatenation fallback.
-    """
-
-    del query_mode
-    if not str(question or "").strip():
-        return False
-    if local_surface_plan.needs_clarification:
-        return False
-    return True
-
-
 _SERVICE = QueryAnalysisExecutionService()
 
 
 def get_query_analysis_execution_service() -> QueryAnalysisExecutionService:
     return _SERVICE
-
-
-async def start_query_analysis_execution_runtime() -> None:
-    """Make the lifecycle-owned shadow dispatcher available for submissions."""
-
-    _SHADOW_DISPATCHER.start()
-
-
-async def stop_query_analysis_execution_runtime() -> None:
-    """Cancel and await all shadow telemetry before process shutdown."""
-
-    await _SHADOW_DISPATCHER.shutdown()
 
 
 __all__ = [
@@ -1130,12 +725,8 @@ __all__ = [
     "QueryAnalysisExecutionResult",
     "QueryAnalysisExecutionService",
     "QueryExecutionGate",
-    "ShadowAnalysisDispatcher",
     "build_execution_baseline",
     "build_execution_clarification_baseline",
     "evaluate_query_execution_gate",
     "get_query_analysis_execution_service",
-    "should_attempt_active_analysis",
-    "start_query_analysis_execution_runtime",
-    "stop_query_analysis_execution_runtime",
 ]

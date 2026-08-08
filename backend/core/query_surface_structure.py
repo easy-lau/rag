@@ -381,7 +381,7 @@ QuestionOperator = Literal[
 # from any knowledge-base domain vocabulary.  A population question may need
 # an optional ``population -> class`` lookup before a policy value can be
 # found, whereas an identity/relationship question must be answered directly.
-# Keeping this policy next to the surface parser gives V2 planning and V3
+# Keeping this policy next to the surface parser gives planning and
 # source-span compilation one authority for the decision.
 _DIRECT_ANSWER_ATTRIBUTE_RE = re.compile(
     r"(?:名称|姓名|全称|简称|联系人(?:名称|姓名)?|联系方式|联系电话|电话|手机号?|"

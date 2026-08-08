@@ -9,7 +9,6 @@ from fastapi import HTTPException
 from api.chat import _select_rag_pipeline_version, send_message
 from core.clarification import ClarificationContract, build_clarification_state
 from core.conversation_context import ConversationContext
-from core.query_analysis_execution import QueryAnalysisExecutionResult
 from core.query_route_compiler import (
     CompiledAnswerRequirement,
     RagTaskContract,
@@ -468,10 +467,8 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
                 return_value=SimpleNamespace(
                     rag_trace_include_content=False,
                     rag_pipeline_version="v2",
-                    rag_query_analyzer_mode="off",
                 ),
             ),
-            patch("api.chat.run_rag_stream") as v1_stream,
             patch("api.chat.run_rag_v2_stream", new=v2_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
@@ -487,114 +484,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
             )
             chunks = [chunk async for chunk in response.body_iterator]
 
-        return received_kwargs, v1_stream, trace, chunks
-
-    async def _consume_analyzer_timing_dispatch(
-        self,
-        *,
-        analyzer_mode: str,
-        service,
-    ):
-        conversation_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        kb_id = uuid.uuid4()
-        conversation = SimpleNamespace(
-            id=conversation_id,
-            user_id=user_id,
-            pending_route_state=None,
-            route_state_revision=0,
-        )
-        user = SimpleNamespace(id=user_id, is_superadmin=False)
-        request_db = _RequestDB(conversation)
-        save_db = _SaveDB()
-        context = ConversationContext(
-            is_followup=False,
-            followup_reason="standalone_question",
-            standalone_query="普通员工的住宿标准和餐补是多少",
-            history_messages=(),
-            carryover_sources=(),
-        )
-        routing_result = self._ready_analysis_routing_result()
-        runner_started: list[int] = []
-
-        async def v2_stream(**_kwargs):
-            runner_started.append(request_db.commit_count)
-            yield "data: " + json.dumps(
-                {
-                    "type": "search_results",
-                    "results": [],
-                    "answer_sources": [],
-                    "retrieval_executed": True,
-                    "evidence_status": "error",
-                    "displayed_result_count": 0,
-                    "direct_evidence_count": 0,
-                    "related_reference_count": 0,
-                }
-            ) + "\n\n"
-            yield "data: " + json.dumps(
-                {"type": "text_delta", "content": "V2 dispatch"},
-                ensure_ascii=False,
-            ) + "\n\n"
-            yield "data: " + json.dumps(
-                {"type": "done", "conversation_id": str(conversation_id)}
-            ) + "\n\n"
-
-        with (
-            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
-            patch(
-                "api.chat.prepare_conversation_context",
-                new=AsyncMock(return_value=context),
-            ),
-            patch(
-                "api.chat.resolve_routed_conversation_context",
-                new=AsyncMock(return_value=context),
-            ),
-            patch(
-                "api.chat.classify_intent_result",
-                new=AsyncMock(return_value=routing_result),
-            ),
-            patch(
-                "api.chat.get_settings",
-                return_value=SimpleNamespace(
-                    rag_trace_include_content=False,
-                    rag_pipeline_version="v2",
-                    rag_query_analyzer_mode=analyzer_mode,
-                    rag_query_analyzer_active_timeout_seconds=0.5,
-                    rag_query_analyzer_active_max_inflight=1,
-                    rag_query_analyzer_shadow_timeout_seconds=0.5,
-                    rag_query_analyzer_shadow_max_inflight=1,
-                    rag_query_analyzer_shadow_sample_rate=1.0,
-                ),
-            ),
-            patch("api.chat.get_query_analysis_execution_service", return_value=service),
-            patch("api.chat.run_rag_v2_stream", new=v2_stream),
-            patch("database.AsyncSessionLocal", return_value=save_db),
-            patch("api.chat.trace_event"),
-        ):
-            response = await send_message(
-                ChatRequest(
-                    question="普通员工的住宿标准和餐补是多少",
-                    conversation_id=conversation_id,
-                    knowledge_base_ids=[kb_id],
-                ),
-                db=request_db,
-                user=user,
-            )
-            iterator = response.body_iterator
-            first = await anext(iterator)
-            before_second_event = request_db.commit_count
-            service_calls_after_first = list(getattr(service, "calls", ()))
-            second = await anext(iterator)
-            remaining = [chunk async for chunk in iterator]
-        return {
-            "first": first,
-            "second": second,
-            "remaining": remaining,
-            "request_db": request_db,
-            "runner_started": runner_started,
-            "commit_count_after_first": before_second_event,
-            "service_calls_after_first": service_calls_after_first,
-        }
+        return received_kwargs, trace, chunks
 
     async def test_eligible_request_calls_only_v2_and_traces_selection(self) -> None:
         conversation_id = uuid.uuid4()
@@ -685,10 +575,8 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
                 return_value=SimpleNamespace(
                     rag_trace_include_content=False,
                     rag_pipeline_version="v2",
-                    rag_query_analyzer_mode="off",
                 ),
             ),
-            patch("api.chat.run_rag_stream") as v1_stream,
             patch("api.chat.run_rag_v2_stream", new=v2_stream),
             patch(
                 "api.chat.TaskReadSessionLocal",
@@ -709,7 +597,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
             chunks = [chunk async for chunk in response.body_iterator]
 
         self.assertTrue(chunks)
-        v1_stream.assert_not_called()
         self.assertEqual(len(received_kwargs), 1)
         self.assertEqual(
             set(received_kwargs[0]),
@@ -757,60 +644,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(selection.kwargs["version"], "v2")
         self.assertEqual(selection.kwargs["reason"], "eligible_grounded_qa")
-
-    async def test_active_analysis_runs_only_after_commit_and_first_sse(self) -> None:
-        class ActiveService:
-            def __init__(self):
-                self.calls = []
-
-            async def run_active(self, **kwargs):
-                self.calls.append(kwargs)
-                baseline = kwargs["baseline"]
-                return QueryAnalysisExecutionResult(
-                    mode="active",
-                    decision="fallback",
-                    reason="analysis_timeout",
-                    baseline=baseline,
-                    execution_bundle=baseline.execution_bundle,
-                    analysis_latency_ms=0,
-                )
-
-        service = ActiveService()
-        result = await self._consume_analyzer_timing_dispatch(
-            analyzer_mode="active",
-            service=service,
-        )
-        first_payload = json.loads(result["first"].removeprefix("data: ").strip())
-        self.assertEqual(first_payload["type"], "conversation_started")
-        self.assertEqual(result["service_calls_after_first"], [])
-        self.assertEqual(len(service.calls), 1)
-        self.assertGreaterEqual(result["commit_count_after_first"], 1)
-        self.assertGreaterEqual(service.calls[0]["maximum_inflight"], 1)
-        self.assertEqual(service.calls[0]["timeout_seconds"], 0.5)
-        self.assertEqual(result["runner_started"], [result["request_db"].commit_count])
-
-    async def test_shadow_submission_runs_only_after_commit_and_first_sse(self) -> None:
-        class ShadowService:
-            def __init__(self):
-                self.calls = []
-
-            def submit_shadow(self, **kwargs):
-                self.calls.append(kwargs)
-                return True
-
-        service = ShadowService()
-        result = await self._consume_analyzer_timing_dispatch(
-            analyzer_mode="shadow",
-            service=service,
-        )
-        first_payload = json.loads(result["first"].removeprefix("data: ").strip())
-        self.assertEqual(first_payload["type"], "conversation_started")
-        self.assertEqual(result["service_calls_after_first"], [])
-        self.assertEqual(len(service.calls), 1)
-        submission = service.calls[0]
-        self.assertEqual(submission["submission_phase"], "post_commit_post_first_sse")
-        self.assertEqual(submission["sample_rate"], 1.0)
-        self.assertGreaterEqual(result["commit_count_after_first"], 1)
 
     async def test_verified_general_chat_calls_only_direct_runner(self) -> None:
         conversation_id = uuid.uuid4()
@@ -901,7 +734,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
                     rag_pipeline_version="v2",
                 ),
             ),
-            patch("api.chat.run_rag_stream") as v1_stream,
             patch("api.chat.run_rag_v2_stream") as v2_stream,
             patch("api.chat.run_direct_response_stream", new=direct_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
@@ -920,7 +752,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(chunks)
         self.assertEqual(len(received_kwargs), 1)
-        v1_stream.assert_not_called()
         v2_stream.assert_not_called()
         selection = next(
             call
@@ -1093,7 +924,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
                     rag_pipeline_version="v2",
                 ),
             ),
-            patch("api.chat.run_rag_stream") as v1_stream,
             patch("api.chat.run_rag_v2_stream", new=v2_stream),
             patch("database.AsyncSessionLocal", return_value=save_db),
             patch("api.chat.trace_event") as trace,
@@ -1111,7 +941,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(chunks)
         classify.assert_not_awaited()
-        v1_stream.assert_not_called()
         self.assertEqual(len(received_kwargs), 1)
         scope_filter = received_kwargs[0]["evidence_scope_filter"]
         self.assertEqual(scope_filter["mode"], "single")
@@ -1237,7 +1066,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
                     rag_pipeline_version="v2",
                 ),
             ),
-            patch("api.chat.run_rag_stream") as v1_stream,
             patch("api.chat.run_rag_v2_stream", new=v2_stream),
             patch(
                 "api.chat._validate_stream_answer_sources",
@@ -1259,7 +1087,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(chunks)
         classify.assert_not_awaited()
-        v1_stream.assert_not_called()
         self.assertIsNone(conversation.pending_route_state)
         self.assertEqual(conversation.route_state_revision, 4)
 
@@ -1317,7 +1144,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
             route_log_id=None,
         )
 
-        received, v1_stream, trace, chunks = await self._run_mocked_v2_dispatch(
+        received, trace, chunks = await self._run_mocked_v2_dispatch(
             question="那餐补呢",
             kb_id=kb_id,
             conversation=conversation,
@@ -1327,7 +1154,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(chunks)
-        v1_stream.assert_not_called()
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]["question"], "那餐补呢")
         self.assertEqual(received[0]["standalone_query"], "那餐补呢")
@@ -1395,7 +1221,7 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
             route_log_id=None,
         )
 
-        received, v1_stream, trace, chunks = await self._run_mocked_v2_dispatch(
+        received, trace, chunks = await self._run_mocked_v2_dispatch(
             question="云枢8.2.75版本",
             kb_id=kb_id,
             conversation=conversation,
@@ -1405,7 +1231,6 @@ class RagPipelineDispatchTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(chunks)
-        v1_stream.assert_not_called()
         self.assertEqual(len(received), 1)
         self.assertIsNone(received[0]["evidence_scope_filter"])
         self.assertIn(pending["original_query"], received[0]["question"])

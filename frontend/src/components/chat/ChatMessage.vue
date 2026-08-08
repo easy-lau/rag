@@ -104,7 +104,7 @@
                 <span>{{ choice.label }}</span>
               </button>
               <button
-                v-if="clarification.choices.length > 1"
+                v-if="clarification.allowed_actions.includes('select_all') && clarification.choices.length > 1"
                 type="button"
                 class="message-clarification__choice message-clarification__choice--compare"
                 :disabled="!clarificationCanSubmit"

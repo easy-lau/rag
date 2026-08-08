@@ -31,13 +31,14 @@ test('chat store 只消费统一 clarification_state 生命周期事件', () => 
   assert.ok(chatStoreSource.includes('aiMsg = reactive(aiMsg)'))
 })
 
-test('澄清选项使用原生 button 并提供序号、aria 与都对比操作', () => {
+test('澄清选项使用原生 button，且都对比操作受服务端契约控制', () => {
   assert.match(
     chatMessageSource,
     /<button[\s\S]*v-for="choice in clarification\.choices"[\s\S]*type="button"/,
   )
   assert.ok(chatMessageSource.includes(':aria-label="`选择第 ${choice.index} 项：${choice.label}`"'))
   assert.ok(chatMessageSource.includes("selectClarification('都对比')"))
+  assert.ok(chatMessageSource.includes("clarification.allowed_actions.includes('select_all')"))
   assert.ok(chatMessageSource.includes('可直接在输入框补充条件'))
   assert.ok(chatMessageSource.includes(':disabled="!clarificationCanSubmit"'))
   assert.ok(chatMessageSource.includes('以下选项已失效。请重新提问'))
@@ -49,6 +50,9 @@ test('组件选择事件经 ChatView 回到 store 的统一 sendMessage 链', ()
   assert.ok(chatViewSource.includes('chatStore.submitClarification(message, reply)'))
   assert.ok(chatStoreSource.includes('void sendMessage(reply, {'))
   assert.ok(chatStoreSource.includes('clarificationSource: target'))
+  assert.ok(chatStoreSource.includes('clarificationReply,'))
+  assert.ok(chatStoreSource.includes("action: 'select_all'"))
+  assert.ok(chatStoreSource.includes("action: 'select'"))
   assert.ok(chatStoreSource.includes('knowledgeBaseIds: clarification.selected_kb_ids_snapshot'))
   assert.ok(chatStoreSource.includes("content: displayQuestion"))
   assert.ok(chatStoreSource.includes("? '选择：都对比'"))

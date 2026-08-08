@@ -393,6 +393,28 @@ class ChatTurnProtocolTests(unittest.IsolatedAsyncioTestCase):
             request_context_fingerprint(base),
             request_context_fingerprint(reordered),
         )
+        selected = build_turn_request_context(
+            question="c1",
+            conversation_id=conversation_id,
+            knowledge_base_ids=[first_kb],
+            search_config={"method": "hybrid", "rerank": True, "top_k": 5},
+            pending_route_revision=3,
+            pending_state_id="state-3",
+            clarification_reply={"action": "select", "choice_keys": ["c1"]},
+        )
+        different_choice = build_turn_request_context(
+            question="c1",
+            conversation_id=conversation_id,
+            knowledge_base_ids=[first_kb],
+            search_config={"method": "hybrid", "rerank": True, "top_k": 5},
+            pending_route_revision=3,
+            pending_state_id="state-3",
+            clarification_reply={"action": "select", "choice_keys": ["c2"]},
+        )
+        self.assertNotEqual(
+            request_context_fingerprint(selected),
+            request_context_fingerprint(different_choice),
+        )
         turn = ChatTurn(
             id=uuid.uuid4(),
             conversation_id=conversation_id,

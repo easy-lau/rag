@@ -1,5 +1,6 @@
 import uuid
 import unittest
+from pydantic import ValidationError
 
 from core.clarification import (
     CLARIFICATION_EVENT_SCHEMA,
@@ -10,6 +11,7 @@ from core.clarification import (
     resolve_clarification_reply,
     validate_clarification_state,
 )
+from models.schemas import ChatRequest
 
 
 class ClarificationContractTests(unittest.TestCase):
@@ -22,6 +24,7 @@ class ClarificationContractTests(unittest.TestCase):
             dimension="product_version",
             reason_code="multiple_authorized_versions",
             selection_mode="choice",
+            selection_policy="single_or_all",
             choices=(
                 {
                     "key": "scope1",
@@ -119,6 +122,74 @@ class ClarificationContractTests(unittest.TestCase):
         self.assertEqual(event["choices"][0]["label"], "云枢 版本 6")
         self.assertNotIn("kb_ids", event["choices"][0])
         self.assertNotIn("doc_ids", event["choices"][0])
+
+    def test_single_selection_contract_does_not_infer_select_all(self) -> None:
+        contract = ClarificationContract(
+            adapter="evidence",
+            dimension="document",
+            reason_code="multiple_retrieval_matches",
+            selection_mode="choice",
+            choices=self.contract.choices,
+        )
+
+        self.assertEqual(
+            contract.to_dict()["allowed_actions"],
+            ["select", "cancel", "new_question"],
+        )
+
+    def test_structured_selection_is_bound_to_choice_keys_and_policy(self) -> None:
+        selected = resolve_clarification_reply(
+            "scope2",
+            self.state,
+            command={"action": "select", "choice_keys": ["scope2"]},
+        )
+        self.assertEqual(selected.action, "single")
+        self.assertEqual(selected.choices[0]["key"], "scope2")
+
+        compared = resolve_clarification_reply(
+            "都对比",
+            self.state,
+            command={
+                "action": "select_all",
+                "choice_keys": ["scope1", "scope2"],
+            },
+        )
+        self.assertEqual(compared.action, "all")
+
+        single_only_state = build_clarification_state(
+            contract=ClarificationContract(
+                adapter="evidence",
+                dimension="document",
+                reason_code="multiple_retrieval_matches",
+                selection_mode="choice",
+                choices=self.contract.choices,
+            ),
+            original_query="查询接口",
+            selected_kb_ids=[self.kb_id],
+            base_user_message_id=uuid.uuid4(),
+            clarification_message_id=uuid.uuid4(),
+        )
+        rejected = resolve_clarification_reply(
+            "都对比",
+            single_only_state,
+            command={
+                "action": "select_all",
+                "choice_keys": ["scope1", "scope2"],
+            },
+        )
+        self.assertEqual(rejected.action, "repeat")
+
+    def test_chat_request_validates_structured_clarification_command(self) -> None:
+        request = ChatRequest(
+            question="scope2",
+            clarification_reply={"action": "select", "choice_keys": ["scope2"]},
+        )
+        self.assertEqual(request.clarification_reply.choice_keys, ["scope2"])
+        with self.assertRaises(ValidationError):
+            ChatRequest(
+                question="都对比",
+                clarification_reply={"action": "select_all", "choice_keys": ["scope1"]},
+            )
 
 
 if __name__ == "__main__":

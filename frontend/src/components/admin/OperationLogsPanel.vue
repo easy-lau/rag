@@ -125,10 +125,12 @@ const FIELD_LABELS = {
   name: '名称', description: '描述', permissions: '权限', kb_ids: '可访问知识库',
   enabled: '启用状态', mode: '判定模式', intent_model: '意图模型',
   rerank_model: '检索重排模型',
+  rerank_structured_output_mode: '裁决结构化输出模式',
+  rerank_disable_thinking: '关闭裁决模型思考模式',
   confidence_threshold: '置信度阈值', fallback_intent_code: '兜底意图',
   allow_general_chat: '通用问答开关', examples: '示例问题', action: '路由动作',
   priority: '优先级', code: '意图编码', feedback: '反馈结果', file_type: '文件类型',
-  service: '模型类型', model: '模型名称', host: '服务地址', ok: '测试结果',
+  service: '模型类型', purpose: '测试用途', model: '模型名称', host: '服务地址', ok: '测试结果',
   latency_ms: '耗时（毫秒）', error_code: '错误标识', model_count: '模型数量',
 }
 const INTENT_ACTION_LABELS = {

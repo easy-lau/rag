@@ -29,6 +29,7 @@ from core.document_parser import (
 )
 from core.document_content import normalize_document_markdown
 from core.embeddings import embed_batch
+from core.knowledge_records import extract_knowledge_records
 from core.runtime_settings import apply_stored_settings
 from core.vision import image_to_markdown
 from database import AsyncSessionLocal
@@ -36,6 +37,7 @@ from models.db_models import (
     Document,
     DocumentChunk,
     DocumentProcessingJob,
+    KnowledgeRecord,
     now_utc,
 )
 
@@ -305,8 +307,9 @@ async def _complete_job(
         ):
             return False
         await db.execute(delete(DocumentChunk).where(DocumentChunk.doc_id == doc.id))
-        db.add_all([
+        chunk_models = [
             DocumentChunk(
+                id=uuid.uuid4(),
                 doc_id=doc.id,
                 kb_id=doc.kb_id,
                 content=str(item["content"]),
@@ -315,7 +318,26 @@ async def _complete_job(
                 metadata_=item.get("metadata"),
             )
             for index, item in enumerate(chunks_data)
-        ])
+        ]
+        record_models: list[KnowledgeRecord] = []
+        for chunk, item in zip(chunk_models, chunks_data, strict=True):
+            for record in extract_knowledge_records(str(item["content"])):
+                record_models.append(KnowledgeRecord(
+                    kb_id=doc.kb_id,
+                    doc_id=doc.id,
+                    chunk_id=chunk.id,
+                    record_type=str(record["record_type"]),
+                    subject=str(record["subject"]),
+                    predicate=(
+                        str(record["predicate"])
+                        if record.get("predicate") is not None
+                        else None
+                    ),
+                    object_value=str(record["object_value"]),
+                    search_text=str(record["search_text"]),
+                    metadata_=dict(record.get("metadata") or {}),
+                ))
+        db.add_all([*chunk_models, *record_models])
         doc.status = "ready"
         doc.chunk_count = len(chunks_data)
         if raw_content is not None:

@@ -65,6 +65,25 @@ def _configured_initial_mode(*, provider_identity: object, model: object) -> Str
     return None
 
 
+def _preferred_initial_mode(
+    preferred_mode: object,
+    *,
+    provider_identity: object,
+    model: object,
+) -> StructuredOutputMode | None:
+    """Resolve an optional role-specific mode before the global default."""
+
+    normalized = str(preferred_mode or "auto").strip().casefold()
+    if normalized in _MODE_ORDER:
+        return normalized  # type: ignore[return-value]
+    if normalized != "auto":
+        raise ValueError("structured_output_mode 无效")
+    return _configured_initial_mode(
+        provider_identity=provider_identity,
+        model=model,
+    )
+
+
 def _configured_disable_thinking() -> bool:
     """Read the administrator-declared transport capability."""
 
@@ -290,6 +309,7 @@ async def create_structured_completion(
     provider_identity: object,
     model: object,
     disable_thinking: bool | None = None,
+    structured_output_mode: object = "auto",
 ) -> StructuredOutputResult:
     """Create one completion using the strongest supported JSON transport.
 
@@ -298,13 +318,17 @@ async def create_structured_completion(
     weaken the caller's schema or source-contract parser.
     """
 
-    deadline = time.perf_counter() + max(0.1, float(timeout_seconds))
+    total_timeout = max(0.1, float(timeout_seconds))
+    deadline = time.perf_counter() + total_timeout
     key = _cache_key(provider_identity=provider_identity, model=model)
-    configured_mode = _configured_initial_mode(
+    configured_mode = _preferred_initial_mode(
+        structured_output_mode,
         provider_identity=provider_identity,
         model=model,
     )
-    initial_mode = configured_mode or _CAPABILITY_CACHE.get(key, "json_schema")
+    cached_mode = _CAPABILITY_CACHE.get(key)
+    capability_verified = configured_mode is not None or cached_mode is not None
+    initial_mode = configured_mode or cached_mode or "json_schema"
     initial_index = _MODE_ORDER.index(initial_mode)
     attempted: list[StructuredOutputMode] = []
     base_request = dict(request)
@@ -316,14 +340,24 @@ async def create_structured_completion(
     for mode in _MODE_ORDER[initial_index:]:
         while True:
             remaining = deadline - time.perf_counter()
-            if remaining <= 0.05:
+            if remaining <= 0.005:
                 raise TimeoutError("structured_output_deadline_exhausted")
+            mode_index = _MODE_ORDER.index(mode)
+            has_compatibility_mode = mode_index + 1 < len(_MODE_ORDER)
+            attempt_timeout = remaining
+            if not capability_verified and has_compatibility_mode:
+                # An unprobed transport must not consume the complete request
+                # deadline.  Reserve a bounded tail for the next compatible
+                # mode; administrator-selected and process-cached modes retain
+                # the full deadline because their capability is already known.
+                reserve = min(5.0, max(0.01, total_timeout * 0.35))
+                attempt_timeout = max(0.005, remaining - reserve)
             call_request = dict(base_request)
             if thinking_control_enabled:
                 call_request = _with_disabled_thinking(call_request)
             if mode != "json_schema":
                 call_request = _with_json_only_instruction(call_request)
-            call_request["timeout"] = remaining
+            call_request["timeout"] = attempt_timeout
             if mode == "json_schema":
                 call_request["response_format"] = dict(strict_response_format)
             elif mode == "json_object":
@@ -333,7 +367,7 @@ async def create_structured_completion(
             try:
                 response = await asyncio.wait_for(
                     client.chat.completions.create(**call_request),
-                    timeout=remaining,
+                    timeout=attempt_timeout,
                 )
             except asyncio.TimeoutError as exc:
                 # Some gateways keep an unsupported json_schema request open
@@ -342,11 +376,8 @@ async def create_structured_completion(
                 # unreachable. Only the strongest mode gets a fresh retry budget.
                 if mode == "json_schema":
                     # A timeout may be transient, so do not persist a capability
-                    # downgrade. The current request still gets a compatibility
-                    # retry; a later request should be allowed to probe again.
-                    deadline = time.perf_counter() + max(
-                        0.1, min(float(timeout_seconds), 5.0)
-                    )
+                    # downgrade.  The reserved part of the original absolute
+                    # deadline still permits a compatibility attempt now.
                     try:
                         setattr(exc, "structured_output_attempted_modes", tuple(attempted))
                     except (AttributeError, TypeError):

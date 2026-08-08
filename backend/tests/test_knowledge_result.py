@@ -4,7 +4,10 @@ import json
 import unittest
 import uuid
 
-from core.knowledge_result import run_knowledge_result_stream
+from core.knowledge_result import (
+    authorize_knowledge_result,
+    run_knowledge_result_stream,
+)
 from core.query_semantics import KnowledgeRequestSemantics
 from models.db_models import Document, DocumentChunk, KnowledgeBase
 
@@ -85,13 +88,16 @@ class KnowledgeResultRunnerTests(unittest.IsolatedAsyncioTestCase):
             search_config={},
             conversation_id=str(uuid.uuid4()),
             db=db,
-            knowledge_request=request,
-            result_sources=[{
-                "handle": "r_t1_001",
-                "kb_id": str(kb_id),
-                "doc_id": str(doc_id),
-                "filename": "第一篇文章.md",
-            }],
+            authorized_result=authorize_knowledge_result(
+                [{
+                    "kb_id": str(kb_id),
+                    "doc_id": str(doc_id),
+                    "filename": "第一篇文章.md",
+                }],
+                operation=request.operation,
+                answer_form=request.answer_form,
+                provenance="route_result_handles",
+            ),
         ))
 
         search = next(item for item in events if item["type"] == "search_results")
@@ -165,13 +171,17 @@ class KnowledgeResultRunnerTests(unittest.IsolatedAsyncioTestCase):
             search_config={},
             conversation_id=str(uuid.uuid4()),
             db=db,
-            knowledge_request=request,
-            result_sources=[{
-                "handle": "r_t1_001",
-                "kb_id": str(kb_id),
-                "doc_id": str(doc_id),
-                "filename": "升级说明.docx",
-            }],
+            authorized_result=authorize_knowledge_result(
+                [{
+                    "handle": "r_t1_001",
+                    "kb_id": str(kb_id),
+                    "doc_id": str(doc_id),
+                    "filename": "升级说明.docx",
+                }],
+                operation=request.operation,
+                answer_form=request.answer_form,
+                provenance="route_result_handles",
+            ),
         ))
 
         answer = "".join(

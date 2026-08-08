@@ -7,6 +7,13 @@ const MAX_KB_SNAPSHOT_ITEMS = 100
 
 const CLARIFICATION_STATE_SCHEMA = 'rag_clarification_state.v1'
 const CLARIFICATION_DIMENSION_RE = /^[a-z][a-z0-9_]{0,63}$/
+const CLARIFICATION_ACTIONS = new Set([
+  'select',
+  'select_all',
+  'refine',
+  'cancel',
+  'new_question',
+])
 
 function recordValue(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : null
@@ -121,6 +128,10 @@ export function normalizeClarification(value) {
   const lastSubmittedReply = boundedText(payload.last_submitted_reply, MAX_REPLY_CHARS)
   const revision = routeStateRevision(payload.route_state_revision)
   const selectedKbIdsSnapshot = boundedIdentifierList(payload.selected_kb_ids_snapshot)
+  const allowedActions = Array.isArray(payload.allowed_actions)
+    ? [...new Set(payload.allowed_actions
+      .filter(action => typeof action === 'string' && CLARIFICATION_ACTIONS.has(action)))]
+    : []
   const persisted = payload.persisted === true
   const status = ['proposed', 'active'].includes(payload.status)
     ? payload.status
@@ -134,6 +145,10 @@ export function normalizeClarification(value) {
     selection_mode: ['choice', 'refine'].includes(payload.selection_mode)
       ? payload.selection_mode
       : null,
+    selection_policy: ['single', 'single_or_all'].includes(payload.selection_policy)
+      ? payload.selection_policy
+      : 'single',
+    allowed_actions: allowedActions,
     reason: boundedText(payload.reason_code || payload.reason, 160),
     choices,
     requires_refinement: rawChoices.length > MAX_CLARIFICATION_CHOICES || choices.length === 0,
@@ -392,7 +407,9 @@ export function markClarificationSubmitted(
   if (!target || !canSubmit || !normalizedReply) return false
   if (!allowFreeText) {
     const isChoiceReply = clarification.choices.some(choice => choice.reply === normalizedReply)
-    const isCompareReply = clarification.choices.length > 1 && normalizedReply === '都对比'
+    const isCompareReply = clarification.allowed_actions.includes('select_all')
+      && clarification.choices.length > 1
+      && normalizedReply === '都对比'
     if (!isChoiceReply && !isCompareReply) return false
   }
 

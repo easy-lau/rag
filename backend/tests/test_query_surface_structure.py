@@ -92,7 +92,7 @@ class CurrentTurnSurfaceStructureTests(unittest.TestCase):
         )
         self.assertNotIn("住宿补贴", plan.retrieval_queries)
 
-    def test_shared_subject_bridge_attaches_to_each_policy_sibling(self) -> None:
+    def test_shared_subject_remains_literal_on_each_policy_sibling(self) -> None:
         plan = plan_query_locally("普通员工的交通、住宿和餐补这些分别是多少")
         answers = [item for item in plan.requirements if item.role == "answer"]
 
@@ -103,8 +103,9 @@ class CurrentTurnSurfaceStructureTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.augmentation_requirement_ids for item in answers],
-            [("r4",), ("r4",), ("r4",)],
+            [(), (), ()],
         )
+        self.assertFalse(any(item.role == "bridge" for item in plan.requirements))
 
 
 class QuerySurfaceFrameTests(unittest.TestCase):

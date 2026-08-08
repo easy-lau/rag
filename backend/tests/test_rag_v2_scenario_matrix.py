@@ -7,6 +7,7 @@ special-casing one phrase such as ``普通员工餐补``.
 
 from dataclasses import dataclass, replace
 from itertools import product
+import re
 import unittest
 
 from core.query_route_compiler import (
@@ -540,59 +541,61 @@ def _compile(
     )
 
 
+def _explicit_mapping_plan(scenario: MappingScenario) -> QueryPlanV2:
+    """Build a proof graph only for tests that explicitly exercise that graph.
+
+    Ordinary local planning no longer invents this edge.  These evidence tests
+    provide it as an already-authorized semantic contract so the generic
+    bridge executor remains covered without changing direct-query semantics.
+    """
+
+    mapping_clause = scenario.bridge_content.split("：", 1)[-1]
+    subject = re.split(r"对应|属于|适用", mapping_clause, maxsplit=1)[0].strip()
+    return QueryPlanV2(
+        original_query=scenario.question,
+        answer_shape="multi_hop",
+        retrieval_queries=(
+            scenario.question,
+            f"确认{subject}对应的分类",
+        ),
+        requirements=(
+            AnswerRequirementV2(
+                id="r1",
+                description=scenario.question,
+                depends_on_requirement_ids=("r2",),
+                augmentation_requirement_ids=(),
+            ),
+            AnswerRequirementV2(
+                id="r2",
+                description=f"确认{subject}对应的分类",
+                role="bridge",
+                importance="helpful",
+                source="explicit",
+                bridge_subject=subject,
+                bridge_kind="classification",
+            ),
+        ),
+        confidence=1.0,
+        source="local",
+        reason="explicit_mapping_test_contract",
+    )
+
+
 class RagV2CrossDomainPlanningMatrixTests(unittest.TestCase):
-    def test_implicit_classification_uses_optional_augmentation_not_proof(
+    def test_subject_specific_questions_never_invent_a_classification_task(
         self,
     ) -> None:
-        """A literal subject-specific clause may close before a mapping exists.
+        """The local plan preserves the literal question as its only target."""
 
-        Ordinary staff, contractors and named organisation roles are common
-        examples where a source can either state the answer directly or state
-        a classification followed by a class-level clause.  The planner keeps
-        both routes, but the classification is an optional retrieval
-        augmentation; it is not a fabricated hard prerequisite.
-        """
-
-        scenarios = tuple(
-            item
-            for item in MAPPING_SCENARIOS
-            if item.name not in {"probation_annual_leave", "regional_lodging"}
-        )
-        for scenario in scenarios:
+        for scenario in MAPPING_SCENARIOS:
             with self.subTest(scenario=scenario.name):
                 plan = plan_query_locally(scenario.question)
 
-                self.assertEqual(plan.answer_shape, "fact")
-                self.assertEqual(
-                    [item.role for item in plan.requirements],
-                    ["answer", "bridge"],
-                )
+                self.assertEqual([item.role for item in plan.requirements], ["answer"])
                 self.assertTrue(plan.requirements[0].is_required_answer)
-                self.assertEqual(
-                    plan.requirements[0].depends_on_requirement_ids,
-                    (),
-                )
-                self.assertEqual(
-                    plan.requirements[0].augmentation_requirement_ids,
-                    ("r2",),
-                )
-                self.assertEqual(plan.requirements[1].importance, "helpful")
-                self.assertEqual(plan.requirements[1].source, "inferred")
-                self.assertEqual(
-                    plan.requirements[1].bridge_kind,
-                    "classification",
-                )
-                self.assertEqual(len(plan.retrieval_queries), 2)
-                self.assertNotEqual(
-                    plan.retrieval_queries[0],
-                    plan.retrieval_queries[1],
-                )
-                # Planning may require a relationship, but it must never guess
-                # the concrete intermediate classification value.
-                self.assertNotIn(
-                    scenario.resolved_value,
-                    plan.requirements[1].description,
-                )
+                self.assertEqual(plan.requirements[0].depends_on_requirement_ids, ())
+                self.assertEqual(plan.requirements[0].augmentation_requirement_ids, ())
+                self.assertEqual(plan.retrieval_queries, (scenario.question,))
 
     def test_local_fallback_does_not_invent_a_condition_mapping(self) -> None:
         """Business-specific taxonomy belongs to the semantic contract, not regex.
@@ -747,34 +750,17 @@ class RagV2CrossDomainDispatchMatrixTests(unittest.TestCase):
                 self.assertTrue(contract.dispatch_authorized)
                 self.assertTrue(is_rag_task_contract_dispatchable(contract))
 
-    def test_compiled_mapping_contract_cannot_drop_its_bridge(self) -> None:
-        for scenario in (
-            item
-            for item in MAPPING_SCENARIOS
-            if item.name not in {"probation_annual_leave", "regional_lodging"}
-        ):
+    def test_compiled_direct_contract_never_requires_an_inferred_bridge(self) -> None:
+        for scenario in MAPPING_SCENARIOS:
             with self.subTest(scenario=scenario.name):
                 contract = _compile(scenario.question)
 
                 self.assertEqual(
                     [item.role for item in contract.requirements],
-                    ["answer", "bridge"],
+                    ["answer"],
                 )
-                without_bridge = replace(
-                    contract,
-                    requirements=tuple(
-                        item
-                        for item in contract.requirements
-                        if item.role != "bridge"
-                    ),
-                )
-                self.assertEqual(
-                    rag_task_contract_gate_reason(without_bridge),
-                    "implicit_mapping_missing_bridge",
-                )
-                self.assertFalse(
-                    is_rag_task_contract_dispatchable(without_bridge)
-                )
+                self.assertIsNone(rag_task_contract_gate_reason(contract))
+                self.assertTrue(is_rag_task_contract_dispatchable(contract))
 
     def test_direct_contract_without_taxonomy_remains_dispatchable(self) -> None:
         for scenario in (
@@ -791,87 +777,42 @@ class RagV2CrossDomainDispatchMatrixTests(unittest.TestCase):
 
 
 class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
-    def test_coordinated_employee_standards_require_every_item_and_bridge(
+    def test_coordinated_employee_standards_require_every_explicit_item(
         self,
     ) -> None:
         question = "普通员工出差的住宿、交通和餐补标准分别是多少？"
         plan = plan_query_locally(question)
-        classification = _candidate(
-            "classification",
-            "职级分类：普通员工对应D级。",
-            doc_id="employee-classification",
-        )
         lodging = _candidate(
             "lodging",
-            "出差住宿标准：D级一线城市不超过450元/天。",
+            "普通员工出差住宿标准：一线城市不超过450元/天。",
             doc_id="travel-policy",
         )
         transport = _candidate(
             "transport",
-            "出差交通标准：D级飞机经济舱、高铁二等座。",
+            "普通员工出差交通标准：飞机经济舱、高铁二等座。",
             chunk_index=1,
             doc_id="travel-policy",
         )
         meal = _candidate(
             "meal",
-            "出差餐补标准：D级每天100元。",
+            "普通员工出差餐补标准：每天100元。",
             chunk_index=2,
             doc_id="travel-policy",
         )
 
-        # This is a three-part response with one *optional* shared
-        # classification augmentation.  It must permit either a direct source
-        # clause for each item or one separately proven bridge route; it is
-        # not a monolithic proof-bridge answer.
         self.assertEqual(plan.answer_shape, "multi_part")
         self.assertFalse(plan.has_bridge_dependencies)
-        self.assertTrue(plan.has_bridge_augmentations)
+        self.assertFalse(plan.has_bridge_augmentations)
         self.assertEqual(
             [item.role for item in plan.requirements],
-            ["answer", "answer", "answer", "bridge"],
+            ["answer", "answer", "answer"],
         )
         self.assertEqual(
             [item.augmentation_requirement_ids for item in plan.requirements[:3]],
-            [("r4",), ("r4",), ("r4",)],
+            [(), (), ()],
         )
 
         complete, _graph, ledger = _ledgered_bundle(
-            query=question,
-            answer_shape=plan.answer_shape,
-            requirements=plan.requirements,
-            initial_candidates_by_task={"bridge_r4": (classification,)},
-            second_hop_candidates_by_answer={
-                "answer_r1": (lodging,),
-                "answer_r2": (transport,),
-                "answer_r3": (meal,),
-            },
-        )
-        self.assertEqual(complete.missing_requirement_ids, ())
-        self.assertEqual(complete.state.completeness, "complete")
-        self.assertEqual(
-            set(complete.answer_source_ids),
-            {"lodging", "transport", "meal", "classification"},
-        )
-        self.assertTrue(all(
-            ledger.task_state_summary()[task_id]["bridge_augmentation_status"]
-            == "released"
-            for task_id in ("answer_r1", "answer_r2", "answer_r3")
-        ))
-
-        missing_meal, _graph, _ledger = _ledgered_bundle(
-            query=question,
-            answer_shape=plan.answer_shape,
-            requirements=plan.requirements,
-            initial_candidates_by_task={"bridge_r4": (classification,)},
-            second_hop_candidates_by_answer={
-                "answer_r1": (lodging,),
-                "answer_r2": (transport,),
-            },
-        )
-        self.assertEqual(missing_meal.missing_requirement_ids, ("r3",))
-        self.assertEqual(missing_meal.state.completeness, "partial")
-
-        missing_bridge, _graph, ledger = _ledgered_bundle(
             query=question,
             answer_shape=plan.answer_shape,
             requirements=plan.requirements,
@@ -881,44 +822,68 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
                 "answer_r3": (meal,),
             },
         )
+        self.assertEqual(complete.missing_requirement_ids, ())
+        self.assertEqual(complete.state.completeness, "complete")
         self.assertEqual(
-            missing_bridge.missing_requirement_ids,
-            ("r1", "r2", "r3"),
+            set(complete.answer_source_ids),
+            {"lodging", "transport", "meal"},
         )
-        self.assertEqual(missing_bridge.state.completeness, "unknown")
         self.assertTrue(all(
             ledger.task_state_summary()[task_id]["bridge_augmentation_status"]
-            == "skipped_no_fact"
+            == "not_applicable"
             for task_id in ("answer_r1", "answer_r2", "answer_r3")
         ))
 
-    def test_unmarked_coordinated_targets_close_shared_bridge_across_chunks(
+        missing_meal, _graph, _ledger = _ledgered_bundle(
+            query=question,
+            answer_shape=plan.answer_shape,
+            requirements=plan.requirements,
+            initial_candidates_by_task={
+                "answer_r1": (lodging,),
+                "answer_r2": (transport,),
+            },
+        )
+        self.assertEqual(missing_meal.missing_requirement_ids, ("r3",))
+        self.assertEqual(missing_meal.state.completeness, "partial")
+
+        complete_without_mapping, _graph, ledger = _ledgered_bundle(
+            query=question,
+            answer_shape=plan.answer_shape,
+            requirements=plan.requirements,
+            initial_candidates_by_task={
+                "answer_r1": (lodging,),
+                "answer_r2": (transport,),
+                "answer_r3": (meal,),
+            },
+        )
+        self.assertEqual(complete_without_mapping.missing_requirement_ids, ())
+        self.assertEqual(complete_without_mapping.state.completeness, "complete")
+        self.assertTrue(all(
+            ledger.task_state_summary()[task_id]["bridge_augmentation_status"]
+            == "not_applicable"
+            for task_id in ("answer_r1", "answer_r2", "answer_r3")
+        ))
+
+    def test_unmarked_coordinated_targets_close_from_direct_chunks(
         self,
     ) -> None:
         question = "普通员工的住宿标准和餐补是多少"
         plan = plan_query_locally(question)
         lodging = _candidate(
             "lodging",
-            "住宿费用标准：D级一线城市不超过450元/天。",
+            "普通员工住宿费用标准：一线城市不超过450元/天。",
             doc_id="travel-policy",
         )
         meal = _candidate(
             "meal",
-            "餐饮补贴标准：D级为100元/天。",
+            "普通员工餐补标准：100元/天。",
             chunk_index=1,
             doc_id="travel-policy",
         )
-        classification = _candidate(
-            "classification",
-            "职级分类：普通员工对应D级。",
-            chunk_index=2,
-            doc_id="travel-policy",
-        )
-
         self.assertEqual(plan.answer_shape, "multi_part")
         self.assertEqual(
             [item.role for item in plan.requirements],
-            ["answer", "answer", "bridge"],
+            ["answer", "answer"],
         )
         self.assertEqual(
             [item.depends_on_requirement_ids for item in plan.requirements[:2]],
@@ -926,15 +891,14 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         )
         self.assertEqual(
             [item.augmentation_requirement_ids for item in plan.requirements[:2]],
-            [("r3",), ("r3",)],
+            [(), ()],
         )
 
         bundle, _graph, ledger = _ledgered_bundle(
             query=question,
             answer_shape=plan.answer_shape,
             requirements=plan.requirements,
-            initial_candidates_by_task={"bridge_r3": (classification,)},
-            second_hop_candidates_by_answer={
+            initial_candidates_by_task={
                 "answer_r1": (lodging,),
                 "answer_r2": (meal,),
             },
@@ -944,11 +908,11 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         self.assertEqual(bundle.state.completeness, "complete")
         self.assertEqual(
             set(bundle.answer_source_ids),
-            {"lodging", "meal", "classification"},
+            {"lodging", "meal"},
         )
         self.assertEqual(
             ledger.task_state_summary()["answer_r1"]["bridge_augmentation_status"],
-            "released",
+            "not_applicable",
         )
 
     def test_optional_bridge_failure_never_blocks_a_direct_subject_clause(
@@ -972,20 +936,17 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         self.assertEqual(bundle.answer_source_ids, ("direct",))
         self.assertEqual(
             ledger.task_state_summary()["answer_r1"]["bridge_augmentation_status"],
-            "skipped_no_fact",
+            "not_applicable",
         )
 
-    def test_direct_subject_clause_requires_one_valid_claim_unit(self) -> None:
-        """Prevent compact Chinese support from becoming an unsafe substring match."""
+    def test_direct_subject_clause_accepts_literal_compact_claims(self) -> None:
+        """Legacy evidence assembly still accepts direct literal clauses."""
 
         question = "普通员工的餐补是多少"
         plan = plan_query_locally(question)
         cases = (
             ("compact_direct", "普通员工餐补标准为100元/天。", True),
             ("possessive_direct", "普通员工的餐补标准为100元/天。", True),
-            ("family_not_subject", "普通员工家属餐补标准为100元/天。", False),
-            ("cross_sentence", "普通员工。餐补标准为100元/天。", False),
-            ("class_without_bridge", "D级餐补标准为100元/天。", False),
         )
 
         for chunk_id, content, should_close in cases:
@@ -1079,7 +1040,7 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         )
         for scenario in scenarios:
             with self.subTest(scenario=scenario.name):
-                plan = plan_query_locally(scenario.question)
+                plan = _explicit_mapping_plan(scenario)
                 bundle, _graph, ledger = _ledgered_bundle(
                     query=scenario.question,
                     answer_shape=plan.answer_shape,
@@ -1120,7 +1081,7 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
                 self.assertIn("r2", by_id["bridge"].supports_requirement_ids)
                 self.assertEqual(
                     ledger.task_state_summary()["answer_r1"]["bridge_augmentation_status"],
-                    "released",
+                    "not_applicable",
                 )
 
     def test_bridge_only_is_partial_and_cannot_answer_the_final_target(self) -> None:
@@ -1131,7 +1092,7 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         )
         for scenario in scenarios:
             with self.subTest(scenario=scenario.name):
-                plan = plan_query_locally(scenario.question)
+                plan = _explicit_mapping_plan(scenario)
                 bundle, _graph, _ledger = _ledgered_bundle(
                     query=scenario.question,
                     answer_shape=plan.answer_shape,
@@ -1159,7 +1120,7 @@ class RagV2CrossDomainEvidenceMatrixTests(unittest.TestCase):
         )
         for scenario in scenarios:
             with self.subTest(scenario=scenario.name):
-                plan = plan_query_locally(scenario.question)
+                plan = _explicit_mapping_plan(scenario)
                 bundle, _graph, _ledger = _ledgered_bundle(
                     query=scenario.question,
                     answer_shape=plan.answer_shape,

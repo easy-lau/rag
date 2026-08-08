@@ -35,8 +35,6 @@ _MAX_RETENTION_DAYS = 30
 _DAY_TRUNC = func.date_trunc(literal_column("'day'"), RagTraceRun.started_at)
 _TOKEN_EVENT_NAMES = (
     "intent.model_result",
-    "query.analysis.completed",
-    "query.understanding.v3.completed",
     "generation.completed",
 )
 _REPORT_MAX_TOKENS = 1800

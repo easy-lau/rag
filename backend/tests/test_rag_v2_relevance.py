@@ -1,8 +1,9 @@
 import unittest
 
-from core.rag_v2.relevance import (
+from core.evidence_admission import (
     MAX_DOC_VECTOR_GAP,
     MIN_VECTOR_SCORE,
+    admit_evidence_candidates,
     assess_document_relevance,
 )
 
@@ -18,6 +19,67 @@ def _candidate(doc_id: str, **signals) -> dict:
 
 
 class DocumentRelevanceAdmissionTests(unittest.TestCase):
+    def test_candidate_admission_rejects_rank_only_noise(self) -> None:
+        admission = admit_evidence_candidates(
+            [
+                _candidate(
+                    "noise",
+                    retrieval_score=1 / 61,
+                    fusion_rank=1,
+                ),
+            ],
+            query="查询用户列表使用哪个接口",
+        )
+
+        self.assertEqual(admission.status, "rejected")
+        self.assertFalse(admission.candidates)
+        self.assertEqual(len(admission.rejections), 1)
+        self.assertEqual(
+            admission.rejections[0].reason,
+            "document_relevance_gate",
+        )
+
+    def test_candidate_admission_keeps_strong_document_and_rejects_noise(
+        self,
+    ) -> None:
+        admission = admit_evidence_candidates(
+            [
+                _candidate("target", vector_score=0.86),
+                _candidate("noise", vector_score=0.60),
+            ],
+            query="查询用户列表使用哪个接口",
+        )
+
+        self.assertEqual(admission.status, "admitted")
+        self.assertEqual(
+            [item["doc_id"] for item in admission.candidates],
+            ["target"],
+        )
+        self.assertEqual(
+            [item.doc_id for item in admission.rejections],
+            ["noise"],
+        )
+
+    def test_structured_record_score_anchors_its_source_document(self) -> None:
+        record = _candidate(
+            "catalog",
+            source_kind="knowledge_record",
+            record_id="record-1",
+            structured_score=0.42,
+        )
+        chunk = _candidate("catalog", vector_score=0.40)
+
+        admission = admit_evidence_candidates(
+            [record, chunk],
+            query="查询用户列表使用哪个接口",
+        )
+
+        self.assertEqual(len(admission.candidates), 2)
+        self.assertEqual(
+            admission.candidates[1]["admission_reason"],
+            "structured_record_document_anchor",
+        )
+
     def test_empty_and_invalid_document_candidates_admit_nothing(self) -> None:
         empty = assess_document_relevance([])
         invalid = assess_document_relevance([

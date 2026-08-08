@@ -259,7 +259,7 @@ _NON_SEMANTIC_QUERY_PLACEHOLDER_RE = re.compile(
 
 @dataclass(frozen=True)
 class ImplicitBridgePlan:
-    """Machine-readable bridge inferred from the user's own syntax."""
+    """Explicit relation edge compiled from the user's own syntax."""
 
     subject: str
     description: str
@@ -267,7 +267,7 @@ class ImplicitBridgePlan:
     # This is inferred only from the grammatical relation used to create the
     # bridge.  It never contains a business value and is preserved all the way
     # to source-table verification.
-    kind: BridgeRequirementKind = "classification"
+    kind: BridgeRequirementKind
 
 
 def _strip_query_tail(value: str) -> str:
@@ -370,7 +370,7 @@ def _answer_coverage_contract(
     normalized = re.sub(r"\s+", " ", str(question or "")).strip()
     # Configuration operations are source-authored assignments, not ordered
     # human procedures.  The shared semantic classifier recognizes both
-    # ``如何配置`` and ``如何修改`` forms; use that result here so V3 and the
+    # ``如何配置`` and ``如何修改`` forms; use that result here so the
     # local planner compile the same evidence closure.  A config block can
     # therefore close through typed key/value claims even when it has no
     # numbered step declaration.
@@ -380,7 +380,7 @@ def _answer_coverage_contract(
     # Keep generic operational how-to questions (for example ``如何配置VPN``)
     # as structured collections because a valid answer may be one declarative
     # operation rather than a multi-step sequence.  Both the local planner and
-    # the V3 compiler call this helper, so timeout fallback and model
+    # semantic compiler call this helper, so timeout fallback and model
     # compilation retain identical closure semantics.
     if (
         answer_shape == "process"
@@ -465,12 +465,9 @@ def _clean_implicit_subject(value: str) -> str:
     subject = re.sub(r"\s+", " ", str(value or "")).strip(" ，,。；;：:！!？?（）()[]【】")
     subject = re.sub(r"^(?:请问|请|查询|确认|了解|帮我看一下|帮我查一下)\s*", "", subject)
     # Product/version/project applicability is an independent hard scope, not
-    # part of the entity whose classification must be resolved.  Keeping a
-    # leading scope such as ``产品甲8.6`` inside ``产品甲8.6普通员工`` makes the
-    # evidence layer search for a nonexistent mapping subject and used to
-    # discard the valid ``普通员工 -> D级`` bridge.  Remove only a source-text
-    # constraint that is explicitly recognized at the beginning; unknown
-    # prefixes remain untouched and can never be guessed away here.
+    # part of an explicitly requested relation operand.  Remove only a
+    # source-text constraint recognized at the beginning; unknown prefixes
+    # remain untouched and can never be guessed away here.
     constraints = extract_query_constraints(subject)
     matched_scope = str(constraints.matched_text or "").strip()
     if matched_scope and subject.casefold().startswith(matched_scope.casefold()):
@@ -750,45 +747,14 @@ def _with_shared_coordinated_bridges(
 
 
 def infer_implicit_bridges(question: object) -> tuple[ImplicitBridgePlan, ...]:
-    """Return at most one bridge, preserving its surface semantics.
-
-    A classification inferred from an ordinary noun phrase is only a possible
-    retrieval enhancement.  It must therefore originate from an explicit
-    ``entity`` qualifier in :func:`parse_query_surface_frame`; a condition
-    (place, duration, phase, threshold or status) never becomes an invented
-    classification axis merely because it appears before a policy noun.
-
-    Explicit relation syntax is handled by :func:`infer_implicit_bridge` as a
-    proof bridge.  There is deliberately no second pass that turns every
-    prepositional condition into another category lookup.
-    """
+    """Return at most one relation that is explicit in the user's wording."""
 
     bridge = infer_implicit_bridge(question)
     return (bridge,) if bridge is not None else ()
 
 
-def _implicit_bridge_description(subject: str, target: str) -> str:
-    """Build a bounded, domain-neutral bridge claim for evidence matching."""
-
-    subject = _clean_implicit_subject(subject)
-    target = _strip_query_tail(target)
-    # Do not include a guessed concrete level/category.  The bridge is only
-    # the relationship that evidence must establish; the value remains an
-    # evidence-derived fact in the answer requirement.
-    return (
-        f"确认{subject}对应的适用分类、等级、类别、职级、角色、版本、"
-        f"档位或阶段（用于确定{target}）"
-    )[:500]
-
-
 def infer_implicit_bridge(question: object) -> ImplicitBridgePlan | None:
-    """Infer a safe intermediate mapping from query *shape* only.
-
-    Returns a typed bridge plan when the wording exposes a
-    concrete qualifier and an answer attribute.  It intentionally returns
-    ``None`` for underspecified phrases instead of inventing a business
-    taxonomy.  Callers must still prove the bridge with retrieved evidence.
-    """
+    """Compile an explicit mapping/decision relation, never a guessed class."""
 
     normalized = _normalize_query(question)
     if not normalized:
@@ -815,10 +781,9 @@ def infer_implicit_bridge(question: object) -> ImplicitBridgePlan | None:
 
     frame = parse_query_surface_frame(one_line)
 
-    # Explicit relation wording is a hard proof edge, not a helpful
-    # classification guess.  Preserve the legacy ``由…决定`` form as well as
-    # ``对应``; the frame supplies a normalized right-hand target where one is
-    # syntactically present (for example ``对应什么职级`` -> ``职级``).
+    # Explicit relation wording is a hard proof edge. Preserve ``由…决定`` as
+    # well as ``对应``; the frame supplies a normalized right-hand target where
+    # one is syntactically present (for example ``对应什么职级`` -> ``职级``).
     relation = _IMPLICIT_RELATION_RE.search(one_line)
     if relation:
         left = _clean_implicit_subject(relation.group("left"))
@@ -858,41 +823,6 @@ def infer_implicit_bridge(question: object) -> ImplicitBridgePlan | None:
                 kind="condition",
             )
 
-    if frame is None:
-        return None
-    # Only the explicit entity span may request a speculative classification
-    # lookup.  Conditions and scopes retain their literal terms in the direct
-    # answer query, so a directly applicable clause remains answerable even
-    # when no mapping table exists.
-    if frame.question_operator == "relation":
-        return None
-    target = _strip_query_tail(frame.answer_target)
-    for qualifier_span in frame.entity_qualifiers:
-        qualifier = _clean_implicit_subject(qualifier_span.text)
-        if not _is_implicit_subject(qualifier):
-            continue
-        # A stable identifier makes this an attribute request about one named
-        # entity (for example ``供应商甲`` / ``客户A`` / ``部门D01``), not a
-        # population whose answer needs speculative class expansion.  Direct
-        # evidence is sufficient unless explicit relation syntax above has
-        # already created a typed proof edge.
-        if _has_stable_entity_identifier(qualifier):
-            continue
-        if not answer_target_semantics(
-            one_line,
-            answer_target=target,
-            entity_qualifier=qualifier,
-        ).classification_augmentation_allowed:
-            continue
-        description = _implicit_bridge_description(qualifier, target)
-        return ImplicitBridgePlan(
-            subject=qualifier,
-            description=description,
-            retrieval_query=(
-                f"{qualifier} 对应的适用分类 等级 类别 职级 角色 版本 档位 阶段"
-            ),
-            kind="classification",
-        )
     return None
 
 
@@ -1019,8 +949,8 @@ def _expand_coordinated_body_tail(
         stems = list(raw_parts)
 
     # ``普通员工的`` is grammatical scope for every coordinated target, not
-    # merely the first one.  Retaining it also lets the bridge detector prove
-    # the same classification dependency for every answer item.
+    # merely the first one. Retaining it keeps every retrieval query faithful
+    # to the complete user-authored scope.
     first_prefix = ""
     if "的" in stems[0]:
         prefix, first_target = stems[0].rsplit("的", 1)
@@ -1196,15 +1126,9 @@ def _build_multi_answer_plan(
                 coverage_mode=coverage_mode,
             ),
             depends_on_requirement_ids=tuple(
-                bridge_id_by_key[key]
-                for key in keys
-                if unique_bridges[key].kind != "classification"
+                bridge_id_by_key[key] for key in keys
             ),
-            augmentation_requirement_ids=tuple(
-                bridge_id_by_key[key]
-                for key in keys
-                if unique_bridges[key].kind == "classification"
-            ),
+            augmentation_requirement_ids=(),
             applicability_scope=extract_query_constraints(query),
         )
         for index, (query, keys, coverage_mode) in enumerate(
@@ -1649,22 +1573,6 @@ def plan_query_locally(question: object) -> QueryPlanV2:
             bridge_ids = tuple(
                 f"r{index}" for index in range(2, 2 + len(implicit_bridges))
             )
-            proof_bridge_ids = tuple(
-                bridge_id
-                for bridge_id, implicit_bridge in zip(
-                    bridge_ids,
-                    implicit_bridges,
-                )
-                if implicit_bridge.kind != "classification"
-            )
-            augmentation_bridge_ids = tuple(
-                bridge_id
-                for bridge_id, implicit_bridge in zip(
-                    bridge_ids,
-                    implicit_bridges,
-                )
-                if implicit_bridge.kind == "classification"
-            )
             requirements = (
                 AnswerRequirementV2(
                     id="r1",
@@ -1676,8 +1584,8 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                         normalized,
                         coverage_mode=coverage_mode,
                     ),
-                    depends_on_requirement_ids=proof_bridge_ids,
-                    augmentation_requirement_ids=augmentation_bridge_ids,
+                    depends_on_requirement_ids=bridge_ids,
+                    augmentation_requirement_ids=(),
                     applicability_scope=local_scope,
                 ),
                 *(
@@ -1697,29 +1605,11 @@ def plan_query_locally(question: object) -> QueryPlanV2:
                     )
                 ),
             )
-            # A surface-derived classification (for example ``普通员工``)
-            # improves recall only.  The literal user question remains a
-            # complete direct task even if no source ever proves that mapping.
-            # Explicit ``对应`` / ``由…决定`` syntax is different: it requests
-            # a relation and therefore keeps the proof-oriented multi-hop
-            # answer shape.
-            answer_shape = (
-                "multi_hop"
-                if proof_bridge_ids
-                else "list"
-                if (frame := parse_query_surface_frame(normalized)) is not None
-                and frame.question_operator == "enumeration"
-                else "fact"
-            )
             return _ready_plan(
                 normalized,
-                answer_shape=answer_shape,
+                answer_shape="multi_hop",
                 confidence=0.94,
-                reason=(
-                    "explicit_relation_dependency"
-                    if proof_bridge_ids
-                    else "implicit_classification_augmentation"
-                ),
+                reason="explicit_relation_dependency",
                 retrieval_queries=(
                     normalized,
                     *(
@@ -1801,8 +1691,7 @@ def plan_query_locally(question: object) -> QueryPlanV2:
             # A bounded value question is a direct fact once governing-policy
             # heads and explicit process/list structures have been handled
             # above.  This is particularly important for named-entity
-            # attributes: removing an unjustified classification augmentation
-            # must not strand the direct lookup in ``unknown``.
+            # attributes: a direct lookup must not be stranded in ``unknown``.
             return _ready_plan(
                 normalized,
                 answer_shape="fact",

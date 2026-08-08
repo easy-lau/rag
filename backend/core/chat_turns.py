@@ -132,6 +132,7 @@ def build_turn_request_context(
     search_config: object = None,
     pending_route_revision: int = 0,
     pending_state_id: str | None = None,
+    clarification_reply: object = None,
 ) -> dict[str, Any]:
     """Build the canonical envelope protected by the idempotency key.
 
@@ -140,7 +141,7 @@ def build_turn_request_context(
     different KB scope, search mode, or clarification revision.
     """
 
-    return {
+    context = {
         "schema_version": "chat_turn_request.v1",
         # Keep only the digest in the durable envelope; the transcript owns
         # business text and the idempotency ledger does not need another copy.
@@ -155,6 +156,11 @@ def build_turn_request_context(
             else None,
         },
     }
+    # Preserve the fingerprint of ordinary requests created by older rolling
+    # versions.  A structured picker command is material only when present.
+    if isinstance(clarification_reply, dict):
+        context["clarification_reply"] = clarification_reply
+    return context
 
 
 def request_context_fingerprint(context: dict[str, Any]) -> str:
@@ -175,6 +181,7 @@ def request_fingerprint(
     search_config: object = None,
     pending_route_revision: int = 0,
     pending_state_id: str | None = None,
+    clarification_reply: object = None,
 ) -> str:
     return request_context_fingerprint(
         build_turn_request_context(
@@ -184,6 +191,7 @@ def request_fingerprint(
             search_config=search_config,
             pending_route_revision=pending_route_revision,
             pending_state_id=pending_state_id,
+            clarification_reply=clarification_reply,
         )
     )
 
@@ -458,6 +466,7 @@ async def reserve_turn(
     search_config: object = None,
     pending_route_revision: int = 0,
     pending_state_id: str | None = None,
+    clarification_reply: object = None,
 ) -> tuple[ChatTurn, bool]:
     """Get or create a conversation-scoped turn.
 
@@ -475,6 +484,7 @@ async def reserve_turn(
         search_config=search_config,
         pending_route_revision=pending_route_revision,
         pending_state_id=pending_state_id,
+        clarification_reply=clarification_reply,
     )
     fingerprint = request_context_fingerprint(request_context)
     requested_turn_id = turn_id

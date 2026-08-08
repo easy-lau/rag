@@ -23,15 +23,12 @@ from api.chat import (
     _scoped_evidence_query,
     send_message,
 )
-from core.conversation_context import ConversationContext, RouteTurnCandidate
+from core.conversation_context import ConversationContext
 from core.clarification import ClarificationContract, build_clarification_state
 from core.authorized_scope import (
     AuthorizedScopeChoice,
     AuthorizedScopeClarification,
 )
-from core.query_analysis_execution import get_query_analysis_execution_service
-from core.query_analysis_contract import QueryAnalysisSourceRef
-from core.query_semantics import ResolvedAnswerUnit, ResolvedTurnSemantics
 from core.evidence_ambiguity import detect_post_evidence_document_ambiguity
 from core.query_route_compiler import (
     RouteCategoryPolicy,
@@ -53,8 +50,6 @@ from core.rag_v2.evidence_graph import (
 )
 from core.rag_v2.pipeline import _post_evidence_document_assessments
 from core.rag_shared import _normalize_evidence_scope_filter
-from core.rag_v2.query_plan import plan_query_locally
-from core.rag_v2.task_graph import compile_rag_execution_bundle
 from config import get_settings
 from models.db_models import Document, DocumentChunk, IntentRouteLog, KnowledgeBase
 from models.schemas import ChatRequest, IntentEvidenceStatus
@@ -184,6 +179,7 @@ def _evidence_pending_state(
         dimension="version",
         reason_code="multiple_mutually_exclusive_scopes",
         selection_mode="choice",
+        selection_policy="single_or_all",
         choices=(
             {
                 "key": "c1",
@@ -339,346 +335,6 @@ class _SourceValidationDB:
 
     async def rollback(self):
         self.rollback_calls += 1
-
-
-class QuerySemanticApiHandoffTests(unittest.IsolatedAsyncioTestCase):
-    async def test_v2_uses_semantic_rendering_after_active_analysis(self) -> None:
-        # This covers the deliberately retained ``legacy`` semantic entry.
-        # V3 is the production default and has its own catalog-bound handoff
-        # coverage; do not let a global default silently change the authority
-        # exercised by this legacy regression.
-        legacy_settings = get_settings().model_copy(
-            update={
-                "rag_semantic_entry": "legacy",
-                "rag_query_analyzer_mode": "active",
-            }
-        )
-        conversation_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        kb_id = uuid.uuid4()
-        conv = SimpleNamespace(
-            id=conversation_id,
-            user_id=user_id,
-            pending_route_state=None,
-            route_state_revision=0,
-        )
-        user = SimpleNamespace(id=user_id, is_superadmin=False)
-        request_db = _RouteStateDB(conv)
-        save_db = _SaveStateDB(conv)
-        raw_question = "餐补呢"
-        context = ConversationContext(
-            is_followup=False,
-            followup_reason="standalone_question",
-            standalone_query="餐补呢。普通员工的住宿标准是多少",
-            history_messages=(),
-            carryover_sources=(),
-        )
-        semantic_context = ConversationContext(
-            is_followup=True,
-            followup_reason="resolved_turn_semantics_contextual",
-            standalone_query="普通员工 餐补",
-            history_messages=[
-                {"role": "user", "content": "普通员工的住宿标准是多少"},
-            ],
-            carryover_sources=(),
-            relation="followup",
-            query_resolution_mode="contextualize",
-            context_turn_keys=("t1",),
-        )
-        target = QueryAnalysisSourceRef(
-            turn_key="current",
-            start=0,
-            end=2,
-            span="餐补",
-        )
-        qualifier = QueryAnalysisSourceRef(
-            turn_key="t1",
-            start=0,
-            end=4,
-            span="普通员工",
-        )
-        semantics = ResolvedTurnSemantics(
-            schema_version="resolved_turn_semantics.v1",
-            relation="followup",
-            self_contained=False,
-            selected_context_turn_keys=("t1",),
-            request_kind="single_fact",
-            answer_units=(ResolvedAnswerUnit(
-                id="a1",
-                target_source_ref=target,
-                qualifier_source_refs=(qualifier,),
-                bridge_candidate_ids=(),
-            ),),
-            bridge_candidates=(),
-            canonical_retrieval_queries=("普通员工 餐补",),
-            canonical_retrieval_query="普通员工 餐补",
-        )
-        _route, _contract, routing_result = _route_and_contract(
-            intent_code="knowledge_qa",
-            action="retrieve",
-            evidence_scope="enterprise_kb",
-            selected_kb_count=1,
-        )
-        active_result = SimpleNamespace(
-            applied=True,
-            semantics=semantics,
-            # ``applied`` is a semantic/bundle pair in the production
-            # contract.  Use a real ledgered bundle rather than a permissive
-            # mock that would mask a split-authority handoff.
-            execution_bundle=compile_rag_execution_bundle(
-                plan_query_locally("普通员工的餐补是多少")
-            ),
-            decision="applied",
-            reason="generic_baseline_replaced",
-            analysis_latency_ms=1,
-        )
-        service = SimpleNamespace(
-            run_active=AsyncMock(return_value=active_result),
-            submit_shadow=lambda **_kwargs: False,
-        )
-        received_kwargs: list[dict] = []
-
-        async def answer_stream(**kwargs):
-            received_kwargs.append(kwargs)
-            yield 'data: {"type":"search_results","results":[],"answer_sources":[],"retrieval_executed":true,"evidence_status":"no_hit"}\n\n'
-            yield 'data: {"type":"text_delta","content":"未找到。"}\n\n'
-            yield "data: " + json.dumps(
-                {"type": "done", "conversation_id": str(conversation_id)}
-            ) + "\n\n"
-
-        with (
-            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
-            patch("api.chat.prepare_conversation_context", new=AsyncMock(return_value=context)),
-            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=routing_result)),
-            patch("api.chat.get_query_analysis_execution_service", return_value=service),
-            patch("api.chat.apply_resolved_turn_semantics", new=AsyncMock(return_value=semantic_context)),
-            patch("api.chat.run_rag_v2_stream", new=answer_stream),
-            patch("api.chat.get_settings", return_value=legacy_settings),
-            patch("database.AsyncSessionLocal", return_value=save_db),
-        ):
-            response = await send_message(
-                ChatRequest(
-                    question=raw_question,
-                    conversation_id=conversation_id,
-                    knowledge_base_ids=[kb_id],
-                ),
-                db=request_db,
-                user=user,
-            )
-            [chunk async for chunk in response.body_iterator]
-
-        self.assertEqual(len(received_kwargs), 1)
-        handoff = received_kwargs[0]
-        self.assertEqual(handoff["question"], raw_question)
-        self.assertEqual(handoff["standalone_query"], "普通员工 餐补")
-        self.assertTrue(handoff["is_followup"])
-        self.assertEqual(handoff["conversation_history"], semantic_context.history_messages)
-        self.assertNotIn("住宿标准", handoff["standalone_query"])
-
-    async def test_v2_resolves_strict_contextual_ellipsis_before_model_analysis(self) -> None:
-        # This is the compatibility-path contract.  Production V3 resolves
-        # the same source pair through its catalog-bound deterministic
-        # producer and is covered separately in test_chat_v3_integration.
-        legacy_settings = get_settings().model_copy(
-            update={
-                "rag_semantic_entry": "legacy",
-                "rag_query_analyzer_mode": "off",
-            }
-        )
-        conversation_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        kb_id = uuid.uuid4()
-        conv = SimpleNamespace(
-            id=conversation_id,
-            user_id=user_id,
-            pending_route_state=None,
-            route_state_revision=0,
-        )
-        user = SimpleNamespace(id=user_id, is_superadmin=False)
-        request_db = _RouteStateDB(conv)
-        save_db = _SaveStateDB(conv)
-        raw_question = "那住宿呢"
-        prior = "普通员工的出差标准是什么"
-        context = ConversationContext(
-            is_followup=True,
-            followup_reason="short_elliptical_question",
-            standalone_query=raw_question,
-            history_messages=(),
-            carryover_sources=(),
-            route_turn_candidates=(RouteTurnCandidate(
-                candidate_key="t1",
-                user_question=prior,
-                assistant_answer="普通员工对应 D级。",
-            ),),
-            relation="followup",
-            query_resolution_mode="contextualize",
-            context_turn_keys=("t1",),
-        )
-        semantic_context = ConversationContext(
-            is_followup=True,
-            followup_reason="resolved_turn_semantics_contextual",
-            standalone_query="普通员工 住宿",
-            history_messages=[{"role": "user", "content": prior}],
-            carryover_sources=(),
-            route_turn_candidates=context.route_turn_candidates,
-            relation="followup",
-            query_resolution_mode="contextualize",
-            context_turn_keys=("t1",),
-        )
-        _route, _contract, routing_result = _route_and_contract(
-            intent_code="knowledge_qa",
-            action="retrieve",
-            evidence_scope="enterprise_kb",
-            selected_kb_count=1,
-        )
-        actual_service = get_query_analysis_execution_service()
-
-        async def deterministic(**kwargs):
-            return await actual_service.run_deterministic_contextual_ellipsis(**kwargs)
-
-        deterministic_call = AsyncMock(side_effect=deterministic)
-        service = SimpleNamespace(
-            run_deterministic_contextual_ellipsis=deterministic_call,
-            run_active=AsyncMock(),
-            submit_shadow=lambda **_kwargs: False,
-        )
-        received_kwargs: list[dict] = []
-
-        async def answer_stream(**kwargs):
-            received_kwargs.append(kwargs)
-            yield 'data: {"type":"search_results","results":[],"answer_sources":[],"retrieval_executed":true,"evidence_status":"no_hit"}\n\n'
-            yield 'data: {"type":"text_delta","content":"未找到。"}\n\n'
-            yield "data: " + json.dumps(
-                {"type": "done", "conversation_id": str(conversation_id)}
-            ) + "\n\n"
-
-        with (
-            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
-            patch("api.chat.prepare_conversation_context", new=AsyncMock(return_value=context)),
-            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=routing_result)),
-            patch("api.chat.get_query_analysis_execution_service", return_value=service),
-            patch("api.chat.apply_resolved_turn_semantics", new=AsyncMock(return_value=semantic_context)),
-            patch("api.chat.run_rag_v2_stream", new=answer_stream),
-            patch("api.chat.get_settings", return_value=legacy_settings),
-            patch("database.AsyncSessionLocal", return_value=save_db),
-        ):
-            response = await send_message(
-                ChatRequest(
-                    question=raw_question,
-                    conversation_id=conversation_id,
-                    knowledge_base_ids=[kb_id],
-                ),
-                db=request_db,
-                user=user,
-            )
-            [chunk async for chunk in response.body_iterator]
-
-        self.assertEqual(len(received_kwargs), 1)
-        handoff = received_kwargs[0]
-        self.assertEqual(handoff["standalone_query"], "普通员工 住宿")
-        self.assertTrue(handoff["is_followup"])
-        self.assertEqual(handoff["conversation_history"], semantic_context.history_messages)
-        deterministic_call.assert_awaited_once()
-        service.run_active.assert_not_awaited()
-
-    async def test_v2_keeps_route_candidate_history_out_after_analysis_fallback(self) -> None:
-        """A timed-out/rejected analyzer must not revive legacy follow-up state.
-
-        The route context is intentionally populated with the old concatenated
-        query, history and a carry-over source.  The V2 hand-off must contain
-        none of them unless a ResolvedTurnSemantics object was applied.
-        """
-
-        conversation_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        kb_id = uuid.uuid4()
-        conv = SimpleNamespace(
-            id=conversation_id,
-            user_id=user_id,
-            pending_route_state=None,
-            route_state_revision=0,
-        )
-        user = SimpleNamespace(id=user_id, is_superadmin=False)
-        request_db = _RouteStateDB(conv)
-        save_db = _SaveStateDB(conv)
-        raw_question = "餐补呢"
-        legacy_route_context = ConversationContext(
-            is_followup=True,
-            followup_reason="route_contextualized",
-            standalone_query="餐补呢。普通员工的住宿标准是多少",
-            history_messages=(
-                {"role": "user", "content": "普通员工的住宿标准是多少"},
-                {"role": "assistant", "content": "已按 D 级查到住宿标准。"},
-            ),
-            carryover_sources=(
-                {"id": str(uuid.uuid4()), "content": "D级住宿标准"},
-            ),
-            relation="followup",
-            query_resolution_mode="contextualize",
-            context_turn_keys=("t1",),
-        )
-        _route, _contract, routing_result = _route_and_contract(
-            intent_code="knowledge_qa",
-            action="retrieve",
-            evidence_scope="enterprise_kb",
-            selected_kb_count=1,
-            relation="followup",
-        )
-        active_result = SimpleNamespace(
-            applied=False,
-            semantics=None,
-            execution_bundle=None,
-            decision="fallback",
-            reason="analysis_timeout",
-            analysis_latency_ms=1,
-        )
-        service = SimpleNamespace(
-            run_active=AsyncMock(return_value=active_result),
-            submit_shadow=lambda **_kwargs: False,
-        )
-        received_kwargs: list[dict] = []
-
-        async def answer_stream(**kwargs):
-            received_kwargs.append(kwargs)
-            yield 'data: {"type":"search_results","results":[],"answer_sources":[],"retrieval_executed":true,"evidence_status":"no_hit"}\n\n'
-            yield 'data: {"type":"text_delta","content":"未找到。"}\n\n'
-            yield "data: " + json.dumps(
-                {"type": "done", "conversation_id": str(conversation_id)}
-            ) + "\n\n"
-
-        with (
-            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
-            patch(
-                "api.chat.prepare_conversation_context",
-                new=AsyncMock(return_value=legacy_route_context),
-            ),
-            patch("api.chat.classify_intent_result", new=AsyncMock(return_value=routing_result)),
-            patch(
-                "api.chat.resolve_routed_conversation_context",
-                new=AsyncMock(return_value=legacy_route_context),
-            ),
-            patch("api.chat.get_query_analysis_execution_service", return_value=service),
-            patch("api.chat.run_rag_v2_stream", new=answer_stream),
-            patch("database.AsyncSessionLocal", return_value=save_db),
-        ):
-            response = await send_message(
-                ChatRequest(
-                    question=raw_question,
-                    conversation_id=conversation_id,
-                    knowledge_base_ids=[kb_id],
-                ),
-                db=request_db,
-                user=user,
-            )
-            [chunk async for chunk in response.body_iterator]
-
-        self.assertEqual(len(received_kwargs), 1)
-        handoff = received_kwargs[0]
-        self.assertEqual(handoff["standalone_query"], raw_question)
-        self.assertFalse(handoff["is_followup"])
-        self.assertEqual(handoff["conversation_history"], [])
-        self.assertEqual(handoff["carryover_sources"], [])
-        self.assertEqual(handoff["followup_reason"], "v2_current_turn_baseline")
 
 
 class EvidenceSourceValidationTests(unittest.IsolatedAsyncioTestCase):
@@ -1425,6 +1081,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 dimension="product_version",
                 reason_code="multiple_authorized_versions",
                 selection_mode="choice",
+                selection_policy="single_or_all",
                 choices=choices,
             ),
             original_query=original,
@@ -2146,9 +1803,7 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             _evidence_scope_reply_display_text("都对比", comparison),
-            "选择：都对比（"
-            + "；".join(choice["label"] for choice in pending["contract"]["choices"])
-            + "）",
+            "选择：对比全部范围",
         )
         self.assertEqual(
             _evidence_scope_reply_display_text("新的业务问题", None),
@@ -2421,7 +2076,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 "api.chat.classify_intent_result",
                 new=AsyncMock(return_value=routing_result),
             ),
-            patch("api.chat.run_rag_stream", new=AsyncMock()) as rag_stream,
             patch("api.chat.trace_event"),
         ):
             response = await send_message(
@@ -2440,7 +2094,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 async for chunk in response.body_iterator
             ]
 
-        rag_stream.assert_not_awaited()
         self.assertIsNotNone(conv.pending_route_state)
         self.assertEqual(
             conv.pending_route_state["schema_version"],
@@ -3200,6 +2853,10 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                     question="c2",
                     conversation_id=conversation_id,
                     knowledge_base_ids=[kb_id],
+                    clarification_reply={
+                        "action": "select",
+                        "choice_keys": ["c2"],
+                    },
                 ),
                 db=request_db,
                 user=user,
@@ -3696,7 +3353,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=context),
             ),
             patch("api.chat.classify_intent_result", new=AsyncMock()) as classify,
-            patch("api.chat.run_rag_stream") as rag_stream,
             patch("api.chat.trace_event") as trace,
         ):
             response = await send_message(
@@ -3716,7 +3372,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         classify.assert_not_awaited()
-        rag_stream.assert_not_called()
         self.assertIs(conv.pending_route_state, pending)
         self.assertEqual(conv.route_state_revision, 2)
         event_types = [item["type"] for item in payloads if item]
@@ -4061,7 +3716,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=_context(pending_route_state=pending)),
             ),
             patch("api.chat.classify_intent_result", new=AsyncMock()) as classify,
-            patch("api.chat.run_rag_stream") as rag_stream,
         ):
             response = await send_message(
                 ChatRequest(
@@ -4080,7 +3734,6 @@ class PendingRouteStateTests(unittest.IsolatedAsyncioTestCase):
             ]
 
         classify.assert_not_awaited()
-        rag_stream.assert_not_called()
         self.assertIsNone(conv.pending_route_state)
         self.assertEqual(conv.route_state_revision, 4)
         self.assertEqual(

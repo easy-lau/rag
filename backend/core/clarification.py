@@ -16,12 +16,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Mapping, Sequence
 
 
-CLARIFICATION_CONTRACT_SCHEMA = "rag_clarification_contract.v1"
+CLARIFICATION_CONTRACT_SCHEMA = "rag_clarification_contract.v2"
 CLARIFICATION_STATE_SCHEMA = "rag_clarification_state.v1"
 CLARIFICATION_EVENT_SCHEMA = "rag_clarification_state.v1"
 
 ClarificationAdapter = Literal["semantic", "evidence"]
 ClarificationSelectionMode = Literal["choice", "refine"]
+ClarificationSelectionPolicy = Literal["single", "single_or_all"]
 ClarificationAction = Literal[
     "single",
     "all",
@@ -29,6 +30,13 @@ ClarificationAction = Literal[
     "cancel",
     "new_question",
     "repeat",
+]
+ClarificationCommandAction = Literal[
+    "select",
+    "select_all",
+    "refine",
+    "cancel",
+    "new_question",
 ]
 
 _MAX_CHOICES = 20
@@ -42,6 +50,7 @@ _CHOICE_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,119}")
 _UUID_FIELDS = (
     "kb_ids",
     "doc_ids",
+    "record_ids",
     "anchor_doc_ids",
     "companion_doc_ids",
 )
@@ -222,6 +231,7 @@ class ClarificationContract:
     dimension: str
     reason_code: str
     selection_mode: ClarificationSelectionMode
+    selection_policy: ClarificationSelectionPolicy = "single"
     choices: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
@@ -233,6 +243,10 @@ class ClarificationContract:
             raise ValueError("clarification reason_code is invalid")
         if self.selection_mode not in {"choice", "refine"}:
             raise ValueError("clarification selection_mode is invalid")
+        if self.selection_policy not in {"single", "single_or_all"}:
+            raise ValueError("clarification selection_policy is invalid")
+        if self.selection_mode == "refine" and self.selection_policy != "single":
+            raise ValueError("refine clarification cannot allow multi-selection")
         normalized: list[dict[str, Any]] = []
         for raw in self.choices:
             choice = normalize_choice(raw)
@@ -264,10 +278,15 @@ class ClarificationContract:
             "dimension": self.dimension,
             "reason_code": self.reason_code,
             "selection_mode": self.selection_mode,
+            "selection_policy": self.selection_policy,
             "choices": choices,
             "allowed_actions": [
                 "select",
-                *( ["select_all"] if len(choices) > 1 else [] ),
+                *(
+                    ["select_all"]
+                    if self.selection_policy == "single_or_all" and len(choices) > 1
+                    else []
+                ),
                 "cancel",
                 "new_question",
             ] if self.selection_mode == "choice" else [
@@ -295,6 +314,7 @@ def contract_from_dict(value: object) -> ClarificationContract | None:
             dimension=str(value.get("dimension") or ""),
             reason_code=str(value.get("reason_code") or ""),
             selection_mode=str(value.get("selection_mode") or ""),  # type: ignore[arg-type]
+            selection_policy=str(value.get("selection_policy") or "single"),  # type: ignore[arg-type]
             choices=tuple(choices),
         )
     except (TypeError, ValueError):
@@ -521,6 +541,8 @@ class ClarificationResolution:
 def resolve_clarification_reply(
     question: str,
     state: Mapping[str, Any],
+    *,
+    command: Mapping[str, Any] | None = None,
 ) -> ClarificationResolution:
     normalized_state = validate_clarification_state(state)
     text = _bounded_text(question, _MAX_REPLY)
@@ -528,6 +550,39 @@ def resolve_clarification_reply(
         return ClarificationResolution("repeat")
     contract = contract_from_dict(normalized_state["contract"])
     assert contract is not None
+    if command is not None:
+        action = str(command.get("action") or "").strip().casefold()
+        raw_keys = command.get("choice_keys")
+        if not isinstance(raw_keys, (list, tuple)):
+            return ClarificationResolution("repeat")
+        keys = [str(value or "").strip() for value in raw_keys]
+        if any(not _CHOICE_KEY_RE.fullmatch(value) for value in keys):
+            return ClarificationResolution("repeat")
+        if len(set(keys)) != len(keys):
+            return ClarificationResolution("repeat")
+        choices_by_key = {str(choice["key"]): choice for choice in contract.choices}
+        selected = tuple(choices_by_key[key] for key in keys if key in choices_by_key)
+        if len(selected) != len(keys):
+            return ClarificationResolution("repeat")
+        if action == "select" and len(selected) == 1:
+            return ClarificationResolution(
+                "single",
+                choices=selected,
+                answer=str(selected[0]["label"]),
+            )
+        if (
+            action == "select_all"
+            and contract.selection_policy == "single_or_all"
+            and len(selected) > 1
+        ):
+            return ClarificationResolution("all", choices=selected, answer=text)
+        if action == "refine" and contract.selection_mode == "refine" and not keys:
+            return ClarificationResolution("refine", answer=text)
+        if action == "cancel" and not keys:
+            return ClarificationResolution("cancel")
+        if action == "new_question" and not keys:
+            return ClarificationResolution("new_question")
+        return ClarificationResolution("repeat")
     if _CANCEL_RE.fullmatch(text):
         return ClarificationResolution("cancel")
     if contract.selection_mode == "refine":
@@ -536,6 +591,8 @@ def resolve_clarification_reply(
         return ClarificationResolution("refine", answer=text)
     choices = contract.choices
     if _ALL_RE.fullmatch(text):
+        if contract.selection_policy != "single_or_all":
+            return ClarificationResolution("repeat")
         return ClarificationResolution("all", choices=choices, answer=text)
 
     normalized_reply = _normalized_text(text)
@@ -598,7 +655,11 @@ def resolve_clarification_reply(
             choices=(matched[0],),
             answer=str(matched[0]["label"]),
         )
-    if len(matched) > 1 and comparison_requested:
+    if (
+        len(matched) > 1
+        and comparison_requested
+        and contract.selection_policy == "single_or_all"
+    ):
         return ClarificationResolution(
             "all",
             choices=tuple(matched),
@@ -616,6 +677,7 @@ __all__ = [
     "CLARIFICATION_EVENT_SCHEMA",
     "CLARIFICATION_STATE_SCHEMA",
     "ClarificationContract",
+    "ClarificationCommandAction",
     "ClarificationResolution",
     "build_clarification_state",
     "contract_from_dict",

@@ -58,6 +58,8 @@ class SettingsCryptoTests(unittest.TestCase):
         self.assertEqual(settings.chat_model, "gpt-4o")
         self.assertEqual(settings.intent_model, "")
         self.assertEqual(settings.rerank_model, "")
+        self.assertEqual(settings.rerank_structured_output_mode, "auto")
+        self.assertTrue(settings.rerank_disable_thinking)
         self.assertEqual(settings.embedding_dimensions, 2560)
         self.assertEqual(settings.temperature, 0.7)
         self.assertEqual(settings.top_k, 5)
@@ -137,8 +139,11 @@ def _runtime_settings(**overrides):
         "llm_base_url": "https://llm.example.test/v1",
         "chat_model": "chat-model",
         "llm_structured_output_mode": "auto",
+        "llm_disable_thinking": False,
         "intent_model": "",
         "rerank_model": "",
+        "rerank_structured_output_mode": "auto",
+        "rerank_disable_thinking": True,
         "temperature": 0.7,
         "max_tokens": 2048,
         "rerank_timeout_seconds": 15.0,
@@ -460,6 +465,8 @@ class StoredSettingsTests(unittest.IsolatedAsyncioTestCase):
             ("llm_base_url", "https://other.example.test/v1"),
             ("chat_model", "next-chat"),
             ("rerank_model", "next-reranker"),
+            ("rerank_structured_output_mode", "json_object"),
+            ("rerank_disable_thinking", False),
             ("llm_structured_output_mode", "plain_json"),
         ):
             with self.subTest(field=field):
@@ -692,9 +699,15 @@ class SettingsDisplayAndTestConfigTests(unittest.TestCase):
 
 class ModelConnectionTestTests(unittest.IsolatedAsyncioTestCase):
     async def test_llm_connection_test_probes_structured_output_capability(self) -> None:
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content='{"ok":true}'),
+            )]
+        )
         client = SimpleNamespace(
             chat=SimpleNamespace(
-                completions=SimpleNamespace(create=AsyncMock(return_value=SimpleNamespace()))
+                completions=SimpleNamespace(create=AsyncMock(return_value=response))
             ),
             close=AsyncMock(),
         )
@@ -710,10 +723,83 @@ class ModelConnectionTestTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.structured_output_mode, "json_schema")
         self.assertEqual(result.structured_output_attempted_modes, ["json_schema"])
+        self.assertEqual(result.output_chars, len('{"ok":true}'))
+        self.assertEqual(result.finish_reason, "stop")
         self.assertEqual(client.chat.completions.create.await_count, 1)
         request = client.chat.completions.create.await_args.kwargs
         self.assertEqual(request["response_format"]["type"], "json_schema")
         self.assertNotIn("sk-never-log-this", repr(request))
+        client.close.assert_awaited_once()
+
+    async def test_llm_connection_test_rejects_empty_structured_content(self) -> None:
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                finish_reason="length",
+                message=SimpleNamespace(content=""),
+            )]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=AsyncMock(return_value=response))
+            ),
+            close=AsyncMock(),
+        )
+
+        with patch("api.settings.AsyncOpenAI", return_value=client):
+            result = await _run_model_connection_test(
+                ModelConnectionTest(service="llm"),
+                api_key="sk-never-log-this",
+                base_url="https://llm.example.test/v1",
+                model="chat-model",
+            )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_code, "structured_output_empty_content")
+        self.assertEqual(result.output_chars, 0)
+        self.assertEqual(result.finish_reason, "length")
+        client.close.assert_awaited_once()
+
+    async def test_rerank_connection_test_uses_production_contract_options(self) -> None:
+        client = SimpleNamespace(close=AsyncMock())
+        probe = SimpleNamespace(
+            structured_output_mode="json_object",
+            structured_output_attempted_modes=("json_object",),
+            thinking_disabled=True,
+            elapsed_ms=4100,
+            output_chars=640,
+            finish_reason="stop",
+        )
+        payload = ModelConnectionTest(
+            service="llm",
+            purpose="rerank",
+            structured_output_mode="json_object",
+            disable_thinking=True,
+            timeout_seconds=15,
+        )
+
+        with (
+            patch("api.settings.AsyncOpenAI", return_value=client),
+            patch(
+                "api.settings.probe_rerank_connection",
+                new=AsyncMock(return_value=probe),
+            ) as connection_probe,
+        ):
+            result = await _run_model_connection_test(
+                payload,
+                api_key="sk-never-log-this",
+                base_url="https://llm.example.test/v1",
+                model="rerank-model",
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.structured_output_mode, "json_object")
+        self.assertTrue(result.thinking_disabled)
+        self.assertEqual(result.output_chars, 640)
+        connection_probe.assert_awaited_once()
+        probe_kwargs = connection_probe.await_args.kwargs
+        self.assertEqual(probe_kwargs["timeout_seconds"], 15)
+        self.assertEqual(probe_kwargs["structured_output_mode"], "json_object")
+        self.assertTrue(probe_kwargs["disable_thinking"])
         client.close.assert_awaited_once()
 
     async def test_model_test_returns_safe_failure_and_closes_client(self) -> None:

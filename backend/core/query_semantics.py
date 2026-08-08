@@ -122,7 +122,7 @@ _KNOWLEDGE_ANSWER_FORMS = frozenset({
 })
 
 # This grammar identifies a *resource operation surface*, not a business
-# topic.  It is used only to prevent speculative vector prefetch before V3 has
+# topic. It is used only to keep retrieval anchored to the current topic before
 # selected an execution capability.  The model still supplies the bounded
 # semantic request and the backend still validates/executes it under RBAC.
 _DOCUMENT_CATALOG_RESOURCE_RE = re.compile(
@@ -255,7 +255,7 @@ class RouteClarificationContinuation:
     ``current_answer`` is the literal latest user input and
     ``original_query`` is the immutable task root.  The combined rendering is
     intentionally produced once for retrieval/generation only; it must never
-    be parsed as a new user sentence by V3 or the local query planner.
+    be parsed as a new user sentence by the local query planner.
     """
 
     schema_version: Literal["route_clarification_continuation.v1"]
@@ -399,7 +399,7 @@ def answer_shape_for_request_kind(kind: RequestKind) -> str:
 def request_kind_for_question(question: object, *, answer_count: int = 1) -> RequestKind:
     """Return the shared, business-agnostic request kind for one question.
 
-    V3 and the local planner must make the same distinction between an
+    The local planner must make the same distinction between an
     ordered human procedure and a configuration assignment.  Keeping this
     small public projection here prevents one compiler from treating every
     ``如何修改`` question as an ordered-step collection while another stage
@@ -463,7 +463,7 @@ class KnowledgeRequestSemantics:
     status_filter: KnowledgeStatusFilter = "any"
     result_handles: tuple[str, ...] = ()
     result_labels: tuple[str, ...] = ()
-    # The answer form is semantic intent, not execution authority.  V3 may
+    # The answer form is semantic intent, not execution authority. The planner may
     # choose only this closed enum; the backend compiles it into the existing
     # bounded answer-shape and evidence-coverage contracts.  It contains no
     # topic keyword, fact, scope, document id or retrieval instruction.
@@ -580,7 +580,7 @@ def document_catalog_surface_operation(
     """Return an explicit catalog surface without choosing execution facts.
 
     This is a conservative preflight used to suppress vector prefetch.  A
-    request executes the catalog capability only after the strict V3 contract
+    request executes the catalog capability only after the strict contract
     selects it; an uncertain surface returns ``None`` and grants nothing.
     """
 

@@ -197,6 +197,25 @@ class SearchConfig(BaseModel):
     top_k: int = Field(5, ge=1, le=20)
 
 
+class ClarificationReplyCommand(BaseModel):
+    action: Literal["select", "select_all", "refine", "cancel", "new_question"]
+    choice_keys: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def validate_action_shape(self):
+        keys = [str(value or "").strip() for value in self.choice_keys]
+        if any(not key or len(key) > 120 for key in keys) or len(set(keys)) != len(keys):
+            raise ValueError("clarification choice_keys are invalid")
+        if self.action == "select" and len(keys) != 1:
+            raise ValueError("select clarification requires exactly one choice")
+        if self.action == "select_all" and len(keys) < 2:
+            raise ValueError("select_all clarification requires multiple choices")
+        if self.action in {"refine", "cancel", "new_question"} and keys:
+            raise ValueError(f"{self.action} clarification cannot include choices")
+        self.choice_keys = keys
+        return self
+
+
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=12000)
     conversation_id: uuid.UUID | None = None
@@ -211,6 +230,7 @@ class ChatRequest(BaseModel):
     # them into the request fingerprint and rejects a stale selection with 409.
     pending_route_revision: int | None = Field(default=None, ge=0)
     pending_state_id: str | None = Field(default=None, min_length=1, max_length=128)
+    clarification_reply: ClarificationReplyCommand | None = None
     knowledge_base_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
     search_config: SearchConfig = Field(default_factory=SearchConfig)
 

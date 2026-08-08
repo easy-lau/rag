@@ -155,7 +155,7 @@
               <div class="card-heading token-card__heading">
                 <div>
                   <h3>Token 消耗趋势</h3>
-                  <p>包含意图路由、查询分析、V3 理解和回答生成中已返回 usage 的模型调用</p>
+                  <p>包含意图路由、查询分析和回答生成中已返回 usage 的模型调用</p>
                 </div>
                 <div class="token-chart-legend" aria-label="Token 图例">
                   <span><i class="token-chart-legend__input" />输入 Token</span>
@@ -496,8 +496,6 @@ const noAnswerCount = computed(() => (
 const TOKEN_STAGE_LABELS = {
   'generation.completed': '回答生成',
   'intent.model_result': '意图路由',
-  'query.analysis.completed': '查询分析',
-  'query.understanding.v3.completed': 'V3 语义理解',
 }
 const tokenStageEntries = computed(() => (tokens.value.by_stage || []).map(item => ({
   ...item,

@@ -150,9 +150,7 @@ class ContextualEllipsisExecutionTests(unittest.IsolatedAsyncioTestCase):
         with patch(
             "core.query_analysis_execution.trace_event",
             side_effect=lambda event, **payload: traces.append((event, payload)),
-        ), patch(
-            "core.query_analysis_execution.analyze_query",
-        ) as analyze_query:
+        ):
             result = await get_query_analysis_execution_service().run_deterministic_contextual_ellipsis(
                 baseline=_baseline("那住宿呢"),
                 trace_id="contextual-ellipsis",
@@ -178,7 +176,6 @@ class ContextualEllipsisExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision_trace["reason"], "previous_turn_unique_entity_qualifier")
         self.assertEqual(decision_trace["current_target_range"], [1, 3])
         self.assertEqual(decision_trace["historical_qualifier_range"], [0, 4])
-        analyze_query.assert_not_awaited()
 
     async def test_non_match_retains_the_baseline_without_calling_a_model(self):
         baseline = _baseline("那这个呢")

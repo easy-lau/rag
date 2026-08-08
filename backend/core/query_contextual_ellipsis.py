@@ -4,8 +4,7 @@ This module is intentionally not a conversational rewrite utility.  It does
 not concatenate history into a new question, inspect assistant text, infer a
 business fact, or choose evidence.  It first derives a reusable, exact
 source-span selection; compatibility callers can then project that selection
-into ``query_analysis.v2``, while the V3 entry projects the *same* selection
-into its catalog-bound contract.
+into ``query_analysis.v2`` and the current retrieval contract.
 
 The accepted form is deliberately small:
 
@@ -45,7 +44,7 @@ class ContextualEllipsisSourceSpan:
     """One exact literal source range selected by trusted local grammar.
 
     This deliberately stays independent from both V2's source-ref protocol
-    and V3's catalog ids.  The grammar establishes only a source fact: which
+    and the current source-selection contract. The grammar establishes only a source fact: which
     literal range can safely be inherited.  Each execution entry must still
     bind it to its own strict contract before it may affect retrieval.
     """
@@ -192,7 +191,7 @@ def _previous_unique_entity_span(
     request (for example, ``普通员工在上海出差的餐补`` → ``普通员工住宿``).
 
     The shared historical-context policy is the sole syntactic authority here
-    and in the V3 model compiler.  Keeping it centralized prevents a model
+    and in the semantic compiler. Keeping it centralized prevents a model
     selection from retaining an entity that this deterministic path has
     already rejected because the same prior turn carried scope or conditions.
     """
@@ -249,7 +248,7 @@ def derive_contextual_ellipsis_source_selection(
     """Derive a strict source selection without an LLM or execution plan.
 
     The result has no retrieval, KB, evidence, fact, scope or bridge meaning.
-    It proves only one narrow source relationship.  V2/V3 adapters must each
+    It proves only one narrow source relationship. Adapters must each
     rebind it through their respective strict contracts before execution.
     """
 
@@ -307,7 +306,7 @@ def contextual_ellipsis_requires_clarification(
     It only closes execution when the current turn *explicitly* asks to carry
     context and the immediate prior user source cannot be inherited without
     dropping an applicability dimension.  A self-contained current question
-    still remains eligible for normal V3 analysis.
+    still remains eligible for normal semantic analysis.
     """
 
     if not isinstance(selection, ContextualEllipsisSourceSelection):

@@ -41,6 +41,8 @@ function proposed(overrides = {}) {
     dimension: 'product_version',
     reason_code: 'multiple_authorized_versions',
     selection_mode: 'choice',
+    selection_policy: 'single',
+    allowed_actions: ['select', 'cancel', 'new_question'],
     choices: [choice(1), choice(2)],
     pending_state_id: null,
     clarification_message_id: null,
@@ -170,6 +172,22 @@ test('点击候选与自然语言补充共用同一提交生命周期', () => {
     ),
     true,
   )
+})
+
+test('都对比只能由服务端显式动作开放，不能根据候选数量推断', () => {
+  const singleOnly = { role: 'assistant' }
+  applyClarificationLifecycleEvent(singleOnly, proposed())
+  activateClarification(singleOnly, active())
+  assert.equal(markClarificationSubmitted(singleOnly, '都对比'), false)
+
+  const compareEnabled = { role: 'assistant' }
+  const comparePayload = {
+    selection_policy: 'single_or_all',
+    allowed_actions: ['select', 'select_all', 'cancel', 'new_question'],
+  }
+  applyClarificationLifecycleEvent(compareEnabled, proposed(comparePayload))
+  activateClarification(compareEnabled, active(comparePayload))
+  assert.equal(markClarificationSubmitted(compareEnabled, '都对比'), true)
 })
 
 test('错误、无 active 的 done 和主动失效都不会留下可点击候选', () => {

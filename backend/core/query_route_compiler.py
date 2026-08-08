@@ -86,52 +86,10 @@ _LOCAL_DIRECT_DECISION_REASONS = frozenset(
     }
 )
 
-# V3 can inspect only the literal current question and server-authorised prior
-# *user* turns.  A route model's unresolved-slot role is therefore a request
-# to select from that bounded text, not permission to resolve account, RBAC,
-# profile or knowledge-base state.  Keep this as a positive vocabulary: an
-# unknown role fails closed instead of becoming a future path around a new
-# external-state field.
-_SOURCE_TEXT_RESOLVABLE_UNRESOLVED_ROLES = frozenset(
-    {
-        "subject",
-        "topic",
-        "object",
-        "target",
-        "qualifier",
-        "condition",
-        "constraint",
-        "context_object",
-        "context_reference",
-        "reference",
-        "product",
-        "version",
-        "project",
-        "document",
-        "section",
-        "policy",
-        "rule",
-        "procedure",
-        "parameter",
-        "configuration",
-        "scope",
-        "applicability_scope",
-        "location",
-        "city",
-        "region",
-        "date",
-        "time",
-    }
-)
-_SOURCE_TEXT_RESOLVABLE_UNRESOLVED_REASONS = frozenset(
-    {"missing", "ambiguous"}
-)
-
 ResponseMode = Literal["grounded_qa", "general_chat", "writing", "platform_help"]
 RetrievalPolicy = Literal["required", "skip"]
 RequirementImportance = Literal["required", "helpful"]
 RequirementSource = Literal["explicit", "inferred"]
-SemanticEntryDisposition = Literal["dispatch", "defer_to_v3", "blocked"]
 
 _SOURCE_RE = re.compile(r"^[a-z][a-z0-9_:-]{0,63}$")
 
@@ -142,74 +100,6 @@ class TaskContractCompilationError(ValueError):
 
 class TaskContractDispatchError(RuntimeError):
     """Raised when a task contract does not pass the final execution gate."""
-
-
-@dataclass(frozen=True)
-class RagSemanticEntryGate:
-    """Classify a route contract at the V3 semantic-entry boundary.
-
-    ``RagTaskContract.dispatch_authorized`` is intentionally strict: it
-    includes both resource/policy failures and a route model's request for
-    semantic clarification.  That is correct for the legacy path, but it
-    would make the route model a second semantic authority when V3 is the
-    selected source-bound understanding entry.
-
-    This small, deterministic gate keeps the two concerns separate without
-    weakening the regular runner gate:
-
-    * ``dispatch``: the original contract is already executable;
-    * ``defer_to_v3``: only route-owned semantic readiness is unresolved.  A
-      sanitized, current-turn-only policy contract is supplied to V3/V2;
-    * ``blocked``: a real execution invariant (for example no KB for a
-      required retrieval) remains unsatisfied and must not be bypassed.
-
-    The model's requirements, relation and historical turn projection are
-    deliberately removed from the deferred contract.  V3 must establish all
-    of those semantics from its server-issued source-span catalog before V2
-    may execute.
-    """
-
-    disposition: SemanticEntryDisposition
-    reason: str
-    route_contract: "RagTaskContract"
-    execution_contract: "RagTaskContract | None"
-
-    def __post_init__(self) -> None:
-        if self.disposition not in {"dispatch", "defer_to_v3", "blocked"}:
-            raise ValueError("unsupported semantic entry disposition")
-        if not isinstance(self.reason, str) or not self.reason:
-            raise ValueError("semantic entry gate requires a reason")
-        if not isinstance(self.route_contract, RagTaskContract):
-            raise ValueError("semantic entry gate requires a route contract")
-        if self.disposition == "blocked":
-            if self.execution_contract is not None:
-                raise ValueError("blocked semantic entry gate cannot expose an execution contract")
-        elif not isinstance(self.execution_contract, RagTaskContract):
-            raise ValueError("eligible semantic entry gate requires an execution contract")
-
-    @property
-    def may_enter_v3(self) -> bool:
-        return self.disposition == "defer_to_v3"
-
-    @property
-    def may_dispatch(self) -> bool:
-        return self.disposition in {"dispatch", "defer_to_v3"}
-
-    def safe_summary(self) -> dict[str, object]:
-        return {
-            "disposition": self.disposition,
-            "reason": self.reason,
-            "route_dispatch_authorized": self.route_contract.dispatch_authorized,
-            "execution_dispatch_authorized": (
-                self.execution_contract.dispatch_authorized
-                if self.execution_contract is not None
-                else False
-            ),
-            "execution_contract_replaced": (
-                self.execution_contract is not None
-                and self.execution_contract != self.route_contract
-            ),
-        }
 
 
 @dataclass(frozen=True)
@@ -843,207 +733,6 @@ def require_rag_task_contract_dispatchable(
         raise TaskContractDispatchError(f"RAG 任务合同不可执行: {reason}")
 
 
-def _current_turn_semantic_entry_requirements(
-    question: str,
-) -> tuple[CompiledAnswerRequirement, ...]:
-    """Build a minimal server-owned requirement projection for V3 hand-off.
-
-    The ordinary route contract may contain model-authored summaries and
-    inferred bridge descriptions.  They are useful for legacy routing audit,
-    but cannot remain executable semantics after a semantic clarification is
-    deferred to V3.  The runner still requires a well-formed task contract,
-    so retain only the literal current question and a deterministic bridge
-    inferred from that same source text.
-    """
-
-    normalized = str(question or "").strip()
-    if not normalized:
-        raise ValueError("V3 semantic entry requires a non-empty question")
-    requirements: list[CompiledAnswerRequirement] = [
-        CompiledAnswerRequirement(
-            id="r1",
-            role="answer",
-            origin="user_text",
-            description=normalized,
-            importance="required",
-            source="explicit",
-        )
-    ]
-    inferred_bridge = infer_implicit_bridge(normalized)
-    if inferred_bridge is not None:
-        requirements.append(
-            CompiledAnswerRequirement(
-                id="r2",
-                role="bridge",
-                origin="semantically_entailed",
-                description=inferred_bridge.description,
-                importance="helpful",
-                source="inferred",
-            )
-        )
-    return tuple(requirements)
-
-
-def _clarification_slots_are_source_text_resolvable(
-    clarification: RouteClarification,
-) -> bool:
-    """Whether V3 may attempt to resolve every outstanding route slot.
-
-    The V3 catalog is deliberately restricted to the current question plus
-    route-authorised historical *user* text.  It cannot read the current
-    account, identity, permissions, user profile, selected KB state, or any
-    other external system.  Treating a model-labelled missing slot as
-    generally deferable previously converted those external-state
-    clarifications into retrieval attempts.
-
-    This is a capability check, not an NLP classifier.  The role is
-    model-originated, so only a small source-text semantic vocabulary is
-    accepted; every unknown role fails closed.  ``unavailable`` is also never
-    deferable because the route contract explicitly asserts that no usable
-    current/history source exists.  Candidate keys may narrow historical user
-    text, but cannot turn external state into an admissible source.
-    """
-
-    if not isinstance(clarification, RouteClarification):
-        return False
-    slots = clarification.unresolved
-    return bool(slots) and all(
-        slot.role in _SOURCE_TEXT_RESOLVABLE_UNRESOLVED_ROLES
-        and slot.reason in _SOURCE_TEXT_RESOLVABLE_UNRESOLVED_REASONS
-        for slot in slots
-    )
-
-
-def assess_rag_semantic_entry_gate(
-    contract: RagTaskContract,
-    *,
-    question: str,
-    selected_kb_count: int,
-) -> RagSemanticEntryGate:
-    """Separate a strict dispatch gate from V3-deferable semantic readiness.
-
-    This function accepts a *compiled* route contract only.  It never grants
-    permission, widens KB scope, trusts a route turn selection, or turns a
-    direct response into retrieval.  The only permitted normalization is to
-    replace a ``needs_clarification`` retrieval contract with a fresh
-    current-turn policy shell that is then checked by the exact same strict
-    runner gate used in production.
-
-    A successful normalization proves that the original failure was confined
-    to model-owned semantic fields.  Any remaining strict-gate failure is a
-    hard block and the legacy clarification path is retained.
-    """
-
-    if not isinstance(contract, RagTaskContract):
-        raise ValueError("semantic entry gate requires a RagTaskContract")
-    if isinstance(selected_kb_count, bool) or not isinstance(selected_kb_count, int):
-        raise ValueError("selected_kb_count 必须是整数")
-    if selected_kb_count < 0:
-        raise ValueError("selected_kb_count 不能为负数")
-
-    strict_reason = rag_task_contract_gate_reason(
-        contract,
-        selected_kb_count=selected_kb_count,
-    )
-    if strict_reason is None:
-        return RagSemanticEntryGate(
-            disposition="dispatch",
-            reason="route_contract_dispatchable",
-            route_contract=contract,
-            execution_contract=contract,
-        )
-
-    # A route that is not explicitly in the non-dispatchable clarification
-    # state is malformed or policy-invalid.  V3 is not a repair mechanism for
-    # arbitrary contracts.
-    if (
-        contract.readiness != "needs_clarification"
-        or contract.dispatch_authorized
-    ):
-        return RagSemanticEntryGate(
-            disposition="blocked",
-            reason=f"route_contract_not_deferable:{strict_reason}",
-            route_contract=contract,
-            execution_contract=None,
-        )
-
-    # V3 compiles into the V2 retrieval graph.  A route-owned clarification
-    # for a direct response remains a clarification rather than silently
-    # changing the answer mode or invoking a second semantic path.
-    if (
-        not contract.need_retrieval
-        or contract.response_mode not in {"grounded_qa", "writing"}
-        or contract.retrieval_policy != "required"
-    ):
-        return RagSemanticEntryGate(
-            disposition="blocked",
-            reason="non_retrieval_clarification_not_deferable",
-            route_contract=contract,
-            execution_contract=None,
-        )
-
-    # KB selection is current request/RBAC state, not an input span.  Preserve
-    # its established hard-gate reason before the generic clarification-slot
-    # capability policy below runs.
-    if selected_kb_count == 0:
-        return RagSemanticEntryGate(
-            disposition="blocked",
-            reason="semantic_entry_hard_gate:required_retrieval_without_kb",
-            route_contract=contract,
-            execution_contract=None,
-        )
-
-    if not _clarification_slots_are_source_text_resolvable(
-        contract.clarification,
-    ):
-        return RagSemanticEntryGate(
-            disposition="blocked",
-            reason="clarification_not_source_text_resolvable",
-            route_contract=contract,
-            execution_contract=None,
-        )
-
-    try:
-        execution_contract = replace(
-            contract,
-            readiness="ready",
-            dispatch_authorized=True,
-            # These three fields are route-model semantic projections.  V3
-            # will choose source spans and reload history (if any) itself.
-            relation="new",
-            query_mode="current",
-            context_turn_keys=(),
-            requirements=_current_turn_semantic_entry_requirements(question),
-            clarification=RouteClarification(question="", unresolved=()),
-            decision_reason="v3_semantic_entry_deferred",
-        )
-    except (TypeError, ValueError) as exc:
-        return RagSemanticEntryGate(
-            disposition="blocked",
-            reason=f"semantic_entry_projection_invalid:{type(exc).__name__}",
-            route_contract=contract,
-            execution_contract=None,
-        )
-
-    projection_reason = rag_task_contract_gate_reason(
-        execution_contract,
-        selected_kb_count=selected_kb_count,
-    )
-    if projection_reason is not None:
-        return RagSemanticEntryGate(
-            disposition="blocked",
-            reason=f"semantic_entry_hard_gate:{projection_reason}",
-            route_contract=contract,
-            execution_contract=None,
-        )
-    return RagSemanticEntryGate(
-        disposition="defer_to_v3",
-        reason="route_semantics_deferred_to_v3",
-        route_contract=contract,
-        execution_contract=execution_contract,
-    )
-
-
 def safe_rag_task_contract_summary(contract: RagTaskContract) -> dict[str, Any]:
     """Build a trace-safe summary without questions or requirement prose."""
 
@@ -1087,7 +776,6 @@ __all__ = [
     "GroundingPolicy",
     "VersionResolutionMode",
     "RagTaskContract",
-    "RagSemanticEntryGate",
     "RouteCategoryPolicy",
     "RouteCompilerConfig",
     "TaskContractCompilationError",
@@ -1095,7 +783,6 @@ __all__ = [
     "compile_rag_task_contract",
     "grounding_policy_for_scope",
     "version_resolution_mode_for_query",
-    "assess_rag_semantic_entry_gate",
     "is_rag_task_contract_dispatchable",
     "rag_task_contract_gate_reason",
     "require_rag_task_contract_dispatchable",

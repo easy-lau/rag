@@ -11,6 +11,8 @@ export const useSettingsStore = defineStore('settings', () => {
     llm_disable_thinking: false,
     intent_model: '',
     rerank_model: '',
+    rerank_structured_output_mode: 'auto',
+    rerank_disable_thinking: true,
     temperature: 0.7,
     max_tokens: 2048,
     rerank_timeout_seconds: 15,

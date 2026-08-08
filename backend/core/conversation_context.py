@@ -392,7 +392,6 @@ V2ExecutionContextMode = Literal[
     "active_task_state",
     "verified_followup_baseline",
     "resolved_turn_semantics",
-    "v3_catalog_context",
 ]
 
 
@@ -447,7 +446,7 @@ class V2ExecutionContext:
                 raise ValueError(
                     "verified follow-up baseline requires sources without history"
                 )
-        elif self.mode not in {"resolved_turn_semantics", "v3_catalog_context"}:
+        elif self.mode != "resolved_turn_semantics":
             raise ValueError("unsupported V2 execution context mode")
         object.__setattr__(self, "retrieval_query", query)
 
@@ -559,40 +558,6 @@ def has_verified_deterministic_followup_context(
     )
 
 
-def build_v3_catalog_candidate_context(
-    *,
-    context: ConversationContext,
-    current_question: str,
-) -> ConversationContext:
-    """Clear provisional history before V3 selects a catalog-bound span.
-
-    ``prepare_conversation_context`` retains a legacy heuristic projection for
-    the explicit compatibility entry.  V3 must never treat that projection as
-    execution state: route candidates are only a bounded, authorised source
-    catalog and the literal current question remains the immutable anchor
-    until ``apply_v3_catalog_context_selection`` has validated a selection and
-    reloaded its evidence under the current request scope.
-    """
-
-    if not isinstance(context, ConversationContext):
-        raise ValueError("context must be a ConversationContext")
-    query = str(current_question or "").strip()
-    if not query:
-        raise ValueError("V3 catalog candidate context requires current question")
-    return replace(
-        context,
-        is_followup=False,
-        followup_reason="v3_catalog_candidate_pool",
-        standalone_query=query,
-        history_messages=(),
-        carryover_sources=(),
-        unresolved_reference=False,
-        relation="new",
-        query_resolution_mode="v3_catalog_candidate_pool",
-        context_turn_keys=(),
-    )
-
-
 def build_resolved_v2_execution_context(
     *,
     context: ConversationContext,
@@ -620,41 +585,6 @@ def build_resolved_v2_execution_context(
     return V2ExecutionContext(
         mode="resolved_turn_semantics",
         retrieval_query=context.standalone_query,
-        conversation_history=tuple(context.history_messages),
-        carryover_sources=tuple(context.carryover_sources),
-        is_followup=context.is_followup,
-        followup_reason=context.followup_reason,
-        context_turn_keys=context.context_turn_keys,
-    )
-
-
-def build_v3_catalog_v2_execution_context(
-    *,
-    context: ConversationContext,
-    current_question: str,
-) -> V2ExecutionContext:
-    """Project a trusted V3 catalog selection into V2 execution inputs.
-
-    The V3 compiler already carries historical qualifier text in its answer
-    task descriptions.  The retrieval anchor must nevertheless remain the
-    literal current question, rather than the old history-concatenated
-    standalone query.  Selected history is available only as bounded dialogue
-    context and freshly reloaded carry-over evidence.
-    """
-
-    if not isinstance(context, ConversationContext):
-        raise ValueError("context must be a ConversationContext")
-    query = str(current_question or "").strip()
-    if not query:
-        raise ValueError("V3 catalog execution requires the current question")
-    if context.standalone_query != query:
-        raise ValueError("V3 catalog context must retain the current question")
-    expected_followup = bool(context.context_turn_keys)
-    if context.is_followup != expected_followup:
-        raise ValueError("V3 catalog context follow-up state does not match keys")
-    return V2ExecutionContext(
-        mode="v3_catalog_context",
-        retrieval_query=query,
         conversation_history=tuple(context.history_messages),
         carryover_sources=tuple(context.carryover_sources),
         is_followup=context.is_followup,
@@ -738,7 +668,7 @@ class RouteTurnCandidate:
         *,
         allowed_kb_ids: Iterable[uuid.UUID] | None = None,
     ) -> dict[str, Any]:
-        """Return the source-catalog view used by strict V3 understanding."""
+        """Return the bounded historical view used by route analysis."""
 
         return {
             "candidate_key": self.candidate_key,
@@ -1482,7 +1412,7 @@ def apply_active_task_context(
         # Entity reuse means the same entity reappears in a complete question.
         # Concatenating the historical question would turn a bounded evidence
         # reuse into a fabricated new fact; keep the literal current question
-        # as the retrieval anchor, exactly like the V3 catalog boundary does.
+        # as the retrieval anchor.
         standalone_query = current
     else:
         standalone_query = build_standalone_query(
@@ -1781,91 +1711,6 @@ async def apply_resolved_turn_semantics(
         relation=semantics.relation,
         query_resolution_mode=("contextualize" if is_contextual else "current"),
         context_turn_keys=semantics.selected_context_turn_keys,
-    )
-
-
-async def apply_v3_catalog_context_selection(
-    db: AsyncSession,
-    *,
-    context: ConversationContext,
-    current_question: str,
-    selected_context_turn_keys: Iterable[str],
-    kb_ids: Iterable[uuid.UUID],
-    read_session_factory: ReadSessionFactory | None = None,
-) -> ConversationContext:
-    """Apply only V3 catalog-selected history under current authorisation.
-
-    A V3 model cannot name a database message, document or source.  It can
-    only select a ``tN`` span from the route-authorised catalog.  This adapter
-    re-resolves those keys against the request-local candidates, reloads any
-    reusable evidence inside an owned read transaction, and retains the raw
-    *current* question as the retrieval anchor.  It deliberately does not
-    concatenate historical user text into a new query or fabricate a
-    ``ResolvedTurnSemantics`` object from V3 data.
-    """
-
-    if not isinstance(context, ConversationContext):
-        raise ValueError("context must be a ConversationContext")
-    query = str(current_question or "").strip()
-    if not query:
-        raise ValueError("V3 catalog context selection requires current question")
-    requested = tuple(str(key or "").strip() for key in selected_context_turn_keys)
-    if len(requested) > 3 or len(set(requested)) != len(requested):
-        raise ValueError("V3 catalog context keys are invalid")
-    candidate_by_key = {
-        item.candidate_key: item for item in context.route_turn_candidates
-    }
-    selected: list[RouteTurnCandidate] = []
-    for key in requested:
-        candidate = candidate_by_key.get(key)
-        if candidate is None:
-            raise ValueError("V3 catalog references unavailable context turn")
-        selected.append(candidate)
-
-    raw_sources: list[dict[str, Any]] = []
-    for candidate in selected:
-        raw_sources.extend(candidate.raw_sources)
-    carryover_sources = await _reload_carryover_sources(
-        db,
-        raw_sources,
-        kb_ids,
-        read_session_factory=read_session_factory,
-    ) if selected else ()
-
-    history_messages: tuple[dict[str, str], ...] = ()
-    if selected:
-        prepared: list[_SyntheticMessage] = []
-        for candidate in reversed(selected):
-            if candidate.user_question:
-                prepared.append(_SyntheticMessage(
-                    role="user",
-                    content=candidate.user_question[:HISTORY_MESSAGE_CHARS],
-                ))
-            if candidate.assistant_answer:
-                prepared.append(_SyntheticMessage(
-                    role="assistant",
-                    content=candidate.assistant_answer[:HISTORY_MESSAGE_CHARS],
-                ))
-        history_messages = _bounded_history(prepared)
-
-    return replace(
-        context,
-        is_followup=bool(selected),
-        followup_reason=(
-            "query_understanding_v3_contextual"
-            if selected
-            else "query_understanding_v3_current"
-        ),
-        standalone_query=query,
-        history_messages=history_messages,
-        carryover_sources=carryover_sources,
-        previous_user_question=(
-            selected[0].user_question if selected else context.previous_user_question
-        ),
-        unresolved_reference=False,
-        relation="followup" if selected else "new",
-        query_resolution_mode="v3_catalog",
-        context_turn_keys=tuple(candidate.candidate_key for candidate in selected),
     )
 
 

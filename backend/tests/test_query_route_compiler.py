@@ -6,7 +6,6 @@ from core.query_route_compiler import (
     RouteCompilerConfig,
     TaskContractCompilationError,
     TaskContractDispatchError,
-    assess_rag_semantic_entry_gate,
     compile_rag_task_contract,
     is_rag_task_contract_dispatchable,
     rag_task_contract_gate_reason,
@@ -291,222 +290,8 @@ class RagTaskCompilerPolicyTests(unittest.TestCase):
         self.assertFalse(contract.dispatch_authorized)
 
 
-class RagSemanticEntryGateTests(unittest.TestCase):
-    def test_ready_contract_keeps_its_original_execution_contract(self) -> None:
-        contract = _compile(_route(), selected_kb_count=1)
-
-        gate = assess_rag_semantic_entry_gate(
-            contract,
-            question="普通员工的餐补是多少？",
-            selected_kb_count=1,
-        )
-
-        self.assertEqual(gate.disposition, "dispatch")
-        self.assertIs(gate.execution_contract, contract)
-        self.assertTrue(gate.may_dispatch)
-        self.assertFalse(gate.may_enter_v3)
-
-    def test_semantic_clarification_becomes_current_turn_v3_policy_shell(self) -> None:
-        route = _route(
-            readiness="needs_clarification",
-            relation="continuation",
-            mode="contextualize",
-            turn_keys=["t1"],
-            requirements=[
-                {
-                    "role": "answer",
-                    "origin": "user_text",
-                    "description": "模型摘要的旧语义",
-                }
-            ],
-            clarification={
-                "question": "请补充具体对象。",
-                "unresolved": [
-                    {"role": "subject", "reason": "missing", "candidate_keys": ["t1"]}
-                ],
-            },
-        )
-        contract = _compile(
-            route,
-            selected_kb_count=1,
-            question="普通员工的住宿标准和餐补还有出差津贴分别是多少？",
-        )
-
-        gate = assess_rag_semantic_entry_gate(
-            contract,
-            question="普通员工的住宿标准和餐补还有出差津贴分别是多少？",
-            selected_kb_count=1,
-        )
-
-        self.assertEqual(gate.disposition, "defer_to_v3")
-        self.assertTrue(gate.may_enter_v3)
-        execution = gate.execution_contract
-        self.assertIsNotNone(execution)
-        self.assertTrue(execution.dispatch_authorized)
-        self.assertEqual(execution.readiness, "ready")
-        self.assertEqual(execution.relation, "new")
-        self.assertEqual(execution.query_mode, "current")
-        self.assertEqual(execution.context_turn_keys, ())
-        self.assertEqual(execution.decision_reason, "v3_semantic_entry_deferred")
-        self.assertEqual(
-            [item.description for item in execution.requirements if item.role == "answer"],
-            ["普通员工的住宿标准和餐补还有出差津贴分别是多少？"],
-        )
-        self.assertTrue(is_rag_task_contract_dispatchable(execution, selected_kb_count=1))
-
-    def test_missing_kb_remains_a_hard_block(self) -> None:
-        route = _route(
-            readiness="needs_clarification",
-            clarification={
-                "question": "请先选择知识库。",
-                "unresolved": [
-                    {"role": "subject", "reason": "missing", "candidate_keys": []}
-                ],
-            },
-        )
-        contract = _compile(route, selected_kb_count=0)
-
-        gate = assess_rag_semantic_entry_gate(
-            contract,
-            question="普通员工的餐补是多少？",
-            selected_kb_count=0,
-        )
-
-        self.assertEqual(gate.disposition, "blocked")
-        self.assertIsNone(gate.execution_contract)
-        self.assertIn("required_retrieval_without_kb", gate.reason)
-
-    def test_direct_semantic_clarification_is_not_silently_reclassified_as_retrieval(self) -> None:
-        route = _route(
-            intent_code="general_chat",
-            evidence_scope="general_world",
-            readiness="needs_clarification",
-            clarification={
-                "question": "请补充你想讨论的对象。",
-                "unresolved": [
-                    {"role": "subject", "reason": "missing", "candidate_keys": []}
-                ],
-            },
-        )
-        contract = _compile(route, selected_kb_count=0)
-
-        gate = assess_rag_semantic_entry_gate(
-            contract,
-            question="这个呢？",
-            selected_kb_count=0,
-        )
-
-        self.assertEqual(gate.disposition, "blocked")
-        self.assertEqual(gate.reason, "non_retrieval_clarification_not_deferable")
-
-    def test_source_text_semantic_slots_can_defer_to_v3(self) -> None:
-        """V3 may resolve only bounded semantic slots from user text."""
-
-        cases = (
-            ("subject", "missing", ()),
-            ("condition", "missing", ("t1",)),
-            ("product", "ambiguous", ("t1", "t2")),
-            ("version", "ambiguous", ("t1", "t2")),
-            ("project", "missing", ("t1",)),
-            ("context_object", "missing", ("t1",)),
-            ("document", "missing", ()),
-            ("section", "missing", ()),
-        )
-        for role, reason, candidate_keys in cases:
-            with self.subTest(role=role, reason=reason):
-                contract = _compile(_route(
-                    readiness="needs_clarification",
-                    clarification={
-                        "question": "请补充需要查询的具体内容。",
-                        "unresolved": [{
-                            "role": role,
-                            "reason": reason,
-                            "candidate_keys": list(candidate_keys),
-                        }],
-                    },
-                ))
-
-                gate = assess_rag_semantic_entry_gate(
-                    contract,
-                    question="普通员工的餐补是多少？",
-                    selected_kb_count=1,
-                )
-
-                self.assertEqual(gate.disposition, "defer_to_v3")
-                self.assertTrue(gate.may_enter_v3)
-
-    def test_external_or_unknown_clarification_slots_cannot_defer_to_v3(self) -> None:
-        """External state is not a source span and must remain durable state."""
-
-        external_roles = (
-            "user_grade",
-            "user_identity",
-            "user_attribute",
-            "account",
-            "permission",
-            "knowledge_base",
-            "tenant_scope",
-            "unrecognized_slot",
-        )
-        for role in external_roles:
-            with self.subTest(role=role):
-                contract = _compile(_route(
-                    readiness="needs_clarification",
-                    clarification={
-                        "question": "请补充当前账户的必要信息。",
-                        "unresolved": [{
-                            "role": role,
-                            "reason": "missing",
-                            "candidate_keys": ["t1"],
-                        }],
-                    },
-                ))
-
-                gate = assess_rag_semantic_entry_gate(
-                    contract,
-                    question="我的餐补是多少？",
-                    selected_kb_count=1,
-                )
-
-                self.assertEqual(gate.disposition, "blocked")
-                self.assertEqual(
-                    gate.reason,
-                    "clarification_not_source_text_resolvable",
-                )
-                self.assertIsNone(gate.execution_contract)
-                self.assertEqual(gate.route_contract.clarification, contract.clarification)
-
-    def test_unavailable_semantic_slot_cannot_defer_to_v3(self) -> None:
-        """`unavailable` proves there is no current/history source to bind."""
-
-        contract = _compile(_route(
-            readiness="needs_clarification",
-            clarification={
-                "question": "请补充要查询的对象。",
-                "unresolved": [{
-                    "role": "subject",
-                    "reason": "unavailable",
-                    "candidate_keys": [],
-                }],
-            },
-        ))
-
-        gate = assess_rag_semantic_entry_gate(
-            contract,
-            question="这个标准是多少？",
-            selected_kb_count=1,
-        )
-
-        self.assertEqual(gate.disposition, "blocked")
-        self.assertEqual(
-            gate.reason,
-            "clarification_not_source_text_resolvable",
-        )
-        self.assertIsNone(gate.execution_contract)
-
-
 class RagTaskCompilerContractTests(unittest.TestCase):
-    def test_implicit_mapping_gets_local_bridge_when_route_model_omits_it(self) -> None:
+    def test_direct_question_does_not_gain_a_local_bridge(self) -> None:
         contract = _compile(_route(requirements=[{
             "role": "answer",
             "origin": "user_text",
@@ -515,19 +300,11 @@ class RagTaskCompilerContractTests(unittest.TestCase):
 
         self.assertEqual(
             [item.role for item in contract.requirements],
-            ["answer", "bridge"],
+            ["answer"],
         )
-        self.assertEqual(contract.requirements[1].source, "inferred")
-        removed_bridge = replace(
-            contract,
-            requirements=(contract.requirements[0],),
-        )
-        self.assertEqual(
-            rag_task_contract_gate_reason(removed_bridge),
-            "implicit_mapping_missing_bridge",
-        )
+        self.assertIsNone(rag_task_contract_gate_reason(contract))
 
-    def test_original_question_restores_bridge_after_model_summary_drops_qualifier(self) -> None:
+    def test_original_question_does_not_restore_an_unrequested_bridge(self) -> None:
         contract = _compile(_route(requirements=[{
             "role": "answer",
             "origin": "user_text",
@@ -536,10 +313,9 @@ class RagTaskCompilerContractTests(unittest.TestCase):
 
         self.assertEqual(
             [item.role for item in contract.requirements],
-            ["answer", "bridge"],
+            ["answer"],
         )
-        self.assertIn("普通员工", contract.requirements[1].description)
-        self.assertNotIn("D级", contract.requirements[1].description)
+        self.assertEqual(contract.requirements[0].description, "查询出差标准")
 
     def test_requirements_receive_stable_ids_and_safe_coverage_semantics(self) -> None:
         route = _route(

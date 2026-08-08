@@ -8,11 +8,8 @@ from core.conversation_context import (
     RouteTurnCandidate,
     UNRESOLVED_REFERENCE_MESSAGE,
     apply_resolved_turn_semantics,
-    apply_v3_catalog_context_selection,
     build_current_turn_v2_execution_context,
     build_resolved_v2_execution_context,
-    build_v3_catalog_candidate_context,
-    build_v3_catalog_v2_execution_context,
     build_verified_followup_v2_execution_context,
     build_standalone_query,
     detect_followup,
@@ -90,40 +87,6 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(execution.semantic_context_applied)
         self.assertEqual(execution.conversation_history, ())
         self.assertEqual(len(execution.carryover_sources), 1)
-
-    def test_v3_candidate_context_clears_legacy_projection_but_keeps_authorised_catalog(self) -> None:
-        candidate = RouteTurnCandidate(
-            candidate_key="t1",
-            user_question="普通员工的住宿标准是多少",
-            assistant_answer="上一轮回答",
-            raw_sources=({"id": str(uuid.uuid4())},),
-        )
-        legacy = ConversationContext(
-            is_followup=True,
-            followup_reason="route_contextualized",
-            standalone_query="餐补呢。普通员工的住宿标准是多少",
-            history_messages=(
-                {"role": "user", "content": candidate.user_question},
-                {"role": "assistant", "content": candidate.assistant_answer},
-            ),
-            carryover_sources=({"id": str(uuid.uuid4())},),
-            route_turn_candidates=(candidate,),
-            relation="followup",
-            query_resolution_mode="contextualize",
-            context_turn_keys=("t1",),
-        )
-
-        current = build_v3_catalog_candidate_context(
-            context=legacy,
-            current_question="那餐补呢",
-        )
-
-        self.assertEqual(current.standalone_query, "那餐补呢")
-        self.assertFalse(current.is_followup)
-        self.assertEqual(current.history_messages, ())
-        self.assertEqual(current.carryover_sources, ())
-        self.assertEqual(current.context_turn_keys, ())
-        self.assertEqual(current.route_turn_candidates, (candidate,))
 
     async def test_resolved_semantics_reloads_only_selected_history_without_text_join(self) -> None:
         conversation_id = uuid.uuid4()
@@ -208,56 +171,6 @@ class ConversationContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             execution_context.retrieval_query,
             "普通员工 餐补",
-        )
-
-    async def test_v3_catalog_context_keeps_current_question_as_retrieval_anchor(self) -> None:
-        conversation_id = uuid.uuid4()
-        now = datetime.now(timezone.utc)
-        previous_user = Message(
-            id=uuid.uuid4(),
-            conversation_id=conversation_id,
-            role="user",
-            content="普通员工的住宿标准是多少",
-            created_at=now - timedelta(seconds=2),
-        )
-        previous_assistant = Message(
-            id=uuid.uuid4(),
-            conversation_id=conversation_id,
-            role="assistant",
-            content="按职级和城市核验住宿标准。",
-            sources=[],
-            created_at=now - timedelta(seconds=1),
-        )
-        db = _FakeDB([previous_assistant, previous_user], [])
-        current = "餐补呢"
-        prepared = await prepare_conversation_context(
-            db,
-            conversation_id=conversation_id,
-            question=current,
-            kb_ids=[],
-        )
-
-        resolved = await apply_v3_catalog_context_selection(
-            db,
-            context=prepared,
-            current_question=current,
-            selected_context_turn_keys=("t1",),
-            kb_ids=[],
-        )
-        execution_context = build_v3_catalog_v2_execution_context(
-            context=resolved,
-            current_question=current,
-        )
-
-        self.assertTrue(resolved.is_followup)
-        self.assertEqual(resolved.context_turn_keys, ("t1",))
-        self.assertEqual(resolved.standalone_query, current)
-        self.assertEqual(execution_context.mode, "v3_catalog_context")
-        self.assertEqual(execution_context.retrieval_query, current)
-        self.assertTrue(execution_context.semantic_context_applied)
-        self.assertEqual(
-            [message["role"] for message in execution_context.conversation_history],
-            ["user", "assistant"],
         )
 
     async def test_semantic_followup_can_use_current_query_and_reuse_evidence(self) -> None:

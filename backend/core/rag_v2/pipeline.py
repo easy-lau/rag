@@ -113,7 +113,7 @@ from core.rag_v2.task_execution import (
     sanitize_untrusted_task_metadata,
 )
 from core.terminology_runtime import TerminologyRuntimeResolution
-from core.rag_v2.relevance import assess_document_relevance
+from core.evidence_admission import assess_document_relevance
 from core.retriever import (
     fetch_small_document_candidates,
     fetch_structural_neighbors,
@@ -173,14 +173,6 @@ class _EvidenceExecutionDecision:
 # 企业知识问答优先保证证据忠实度。后台通用 temperature 仍可用于普通聊天，
 # RAG 生成单独使用低温度；显式设置为 0 时保持 0。
 RAG_GENERATION_TEMPERATURE = 0.1
-ANCHOR_RETRIEVAL_SNAPSHOT_SCHEMA_VERSION = "rag_v2.anchor_retrieval_snapshot.v1"
-MAX_ANCHOR_PREFLIGHT_QUERY_CHARS = 8_000
-MAX_ANCHOR_PREFLIGHT_REVISION_CHARS = 160
-_ANCHOR_SNAPSHOT_STATUSES = frozenset({
-    "ready",
-    "unavailable",
-    "timeout",
-})
 
 # A short-lived read session factory is intentionally injectable.  The request
 # session owns durable chat state and cannot be shared across ``gather`` task
@@ -333,567 +325,6 @@ def _general_fallback_system_prompt(*, evidence_status: str) -> str:
     )
 
 
-def _normalise_anchor_preflight_text(
-    value: object,
-    *,
-    field: str,
-    maximum_chars: int,
-) -> str:
-    """Validate one opaque preflight identity component without rewriting it.
-
-    The preflight is allowed to save I/O only when it is *exactly* the same
-    retrieval operation that the finally compiled task graph would issue.
-    Whitespace at the outer boundary is not semantically meaningful to the
-    existing V2 runner, but every remaining character is retained.  In
-    particular, this helper deliberately does not case-fold, segment or apply
-    terminology aliases to a query.
-    """
-
-    if not isinstance(value, str):
-        raise ValueError(f"{field} must be a string")
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError(f"{field} must not be empty")
-    if len(normalized) > maximum_chars:
-        raise ValueError(f"{field} exceeds maximum length")
-    return normalized
-
-
-def _normalise_anchor_preflight_method(value: object) -> str:
-    if not isinstance(value, str):
-        raise ValueError("anchor preflight method must be a string")
-    method = value.strip().casefold()
-    if method not in {"hybrid", "vector", "keyword"}:
-        raise ValueError("anchor preflight method is unsupported")
-    return method
-
-
-def _normalise_anchor_preflight_uuid_scope(
-    values: Sequence[uuid.UUID | str] | None,
-    *,
-    field: str,
-    allow_none: bool,
-    require_non_empty: bool,
-) -> tuple[uuid.UUID, ...] | None:
-    """Return one stable UUID allow-list, rejecting malformed broadening.
-
-    ``None`` means the caller intentionally permits all documents inside the
-    already-authorised KB set.  An explicit empty list is not equivalent: it
-    would otherwise make an invalid selected scope silently broaden to every
-    document.  It is rejected by callers that need an actual document scope.
-    """
-
-    if values is None:
-        if allow_none:
-            return None
-        raise ValueError(f"{field} must not be None")
-    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise ValueError(f"{field} must be a sequence of UUIDs")
-    result: list[uuid.UUID] = []
-    seen: set[str] = set()
-    for raw in values:
-        try:
-            parsed = uuid.UUID(str(raw))
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise ValueError(f"{field} contains an invalid UUID") from exc
-        key = str(parsed)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(parsed)
-    if require_non_empty and not result:
-        raise ValueError(f"{field} must not be empty")
-    # Scope membership is a set, not an input-order contract.  Canonicalising
-    # here lets a V3 preflight produced before a harmless UI ordering change
-    # reuse the same security scope while still rejecting any real widening.
-    return tuple(sorted(result, key=str))
-
-
-def _anchor_preflight_candidate_limit(value: object) -> int:
-    """Use the exact cap used by a normal static task-group retrieval."""
-
-    if isinstance(value, bool):
-        raise ValueError("anchor preflight candidate limit must be numeric")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("anchor preflight candidate limit must be numeric") from exc
-    if parsed <= 0:
-        raise ValueError("anchor preflight candidate limit must be positive")
-    return min(parsed, MAX_GLOBAL_PLAN_QUERY_CANDIDATES)
-
-
-class _FrozenAnchorSnapshotMapping(dict):
-    """A ``dict``-compatible immutable carrier for cached retriever rows.
-
-    Several legacy evidence helpers intentionally recognise concrete ``dict``
-    metadata.  A generic mapping proxy would make those helpers silently drop
-    useful document metadata.  This small immutable subclass preserves that
-    compatibility while preventing a caller that retains a snapshot reference
-    from changing its content between preflight and final graph compilation.
-    """
-
-    def __init__(self, values: Mapping[str, Any]) -> None:
-        dict.__init__(self, values)
-
-    @staticmethod
-    def _readonly(*_args: Any, **_kwargs: Any) -> None:
-        raise TypeError("anchor retrieval snapshot candidates are immutable")
-
-    __setitem__ = _readonly
-    __delitem__ = _readonly
-    clear = _readonly
-    pop = _readonly
-    popitem = _readonly
-    setdefault = _readonly
-    update = _readonly
-    __ior__ = _readonly
-
-
-def _freeze_anchor_snapshot_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return _FrozenAnchorSnapshotMapping({
-            str(key): _freeze_anchor_snapshot_value(item)
-            for key, item in value.items()
-        })
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return tuple(_freeze_anchor_snapshot_value(item) for item in value)
-    return value
-
-
-def _copy_verified_anchor_preflight_candidate(
-    candidate: Mapping[str, Any],
-    *,
-    kb_ids: tuple[str, ...],
-    document_ids: tuple[str, ...] | None,
-) -> dict[str, Any]:
-    """Copy a preflight row only after the retrieval security boundary.
-
-    A snapshot is an I/O cache, never a provenance cache.  It carries no task
-    ownership, answer support or previous-run lineage.  Requiring the
-    explicit ``authorized=True`` marker makes manually constructed or stale
-    retriever rows fail closed; ``_authorized_candidates`` sets that marker
-    only after it has applied the request KB allow-list.
-    """
-
-    if candidate.get("authorized") is not True:
-        raise ValueError("anchor preflight candidate is not authorization filtered")
-    if str(candidate.get("kb_id") or "").strip() not in set(kb_ids):
-        raise ValueError("anchor preflight candidate escapes authorised KB scope")
-    if document_ids is not None and (
-        str(candidate.get("doc_id") or "").strip() not in set(document_ids)
-    ):
-        raise ValueError("anchor preflight candidate escapes document scope")
-    return _freeze_anchor_snapshot_value(
-        sanitize_untrusted_task_metadata(candidate)
-    )
-
-
-@dataclass(frozen=True)
-class AnchorRetrievalSnapshot:
-    """A bounded, request-revisioned cache of a safe anchor retrieval.
-
-    V3 starts this retrieval in parallel with model understanding.  It is not
-    evidence and has no task lineage: after the final plan exists, the V2
-    executor validates this immutable identity again, then performs the usual
-    scope/relevance admission and records a *new* execution in that plan's
-    request-local ledger.  A stale or incompatible snapshot is deliberately
-    cheaper to discard than to reinterpret.
-    """
-
-    revision: str
-    query: str
-    kb_ids: tuple[uuid.UUID | str, ...]
-    document_ids: tuple[uuid.UUID | str, ...] | None
-    method: str
-    candidate_limit: int
-    candidates: tuple[Mapping[str, Any], ...] = ()
-    status: str = "ready"
-    failure_reason: str | None = None
-    elapsed_ms: int = 0
-    schema_version: str = ANCHOR_RETRIEVAL_SNAPSHOT_SCHEMA_VERSION
-
-    def __post_init__(self) -> None:
-        if self.schema_version != ANCHOR_RETRIEVAL_SNAPSHOT_SCHEMA_VERSION:
-            raise ValueError("unsupported anchor preflight snapshot schema")
-        revision = _normalise_anchor_preflight_text(
-            self.revision,
-            field="anchor preflight revision",
-            maximum_chars=MAX_ANCHOR_PREFLIGHT_REVISION_CHARS,
-        )
-        query = _normalise_anchor_preflight_text(
-            self.query,
-            field="anchor preflight query",
-            maximum_chars=MAX_ANCHOR_PREFLIGHT_QUERY_CHARS,
-        )
-        kb_uuid_ids = _normalise_anchor_preflight_uuid_scope(
-            self.kb_ids,
-            field="anchor preflight KB ids",
-            allow_none=False,
-            require_non_empty=True,
-        )
-        document_uuid_ids = _normalise_anchor_preflight_uuid_scope(
-            self.document_ids,
-            field="anchor preflight document ids",
-            allow_none=True,
-            require_non_empty=True,
-        )
-        method = _normalise_anchor_preflight_method(self.method)
-        candidate_limit = _anchor_preflight_candidate_limit(self.candidate_limit)
-        status = str(self.status or "").strip().casefold()
-        if status not in _ANCHOR_SNAPSHOT_STATUSES:
-            raise ValueError("anchor preflight snapshot status is unsupported")
-        if isinstance(self.elapsed_ms, bool):
-            raise ValueError("anchor preflight elapsed_ms must be numeric")
-        try:
-            elapsed_ms = int(self.elapsed_ms)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("anchor preflight elapsed_ms must be numeric") from exc
-        if elapsed_ms < 0:
-            raise ValueError("anchor preflight elapsed_ms must not be negative")
-        if self.failure_reason is not None:
-            failure_reason = _normalise_anchor_preflight_text(
-                self.failure_reason,
-                field="anchor preflight failure reason",
-                maximum_chars=200,
-            )
-        else:
-            failure_reason = None
-        if status == "ready" and failure_reason is not None:
-            raise ValueError("ready anchor preflight snapshot cannot have a failure")
-        if status != "ready" and tuple(self.candidates):
-            raise ValueError("failed anchor preflight snapshot cannot retain candidates")
-        allowed_kbs = tuple(str(item) for item in kb_uuid_ids or ())
-        allowed_docs = (
-            None
-            if document_uuid_ids is None
-            else tuple(str(item) for item in document_uuid_ids)
-        )
-        safe_candidates = tuple(
-            _copy_verified_anchor_preflight_candidate(
-                item,
-                kb_ids=allowed_kbs,
-                document_ids=allowed_docs,
-            )
-            for item in self.candidates
-            if isinstance(item, Mapping)
-        )
-        if len(safe_candidates) != len(tuple(self.candidates)):
-            raise ValueError("anchor preflight snapshot contains a malformed candidate")
-        object.__setattr__(self, "revision", revision)
-        object.__setattr__(self, "query", query)
-        object.__setattr__(self, "kb_ids", allowed_kbs)
-        object.__setattr__(self, "document_ids", allowed_docs)
-        object.__setattr__(self, "method", method)
-        object.__setattr__(self, "candidate_limit", candidate_limit)
-        object.__setattr__(self, "candidates", safe_candidates)
-        object.__setattr__(self, "status", status)
-        object.__setattr__(self, "failure_reason", failure_reason)
-        object.__setattr__(self, "elapsed_ms", elapsed_ms)
-
-    @property
-    def reusable(self) -> bool:
-        return self.status == "ready"
-
-    def match_reason(
-        self,
-        *,
-        revision: object,
-        query: object,
-        kb_ids: Sequence[uuid.UUID | str],
-        document_ids: Sequence[uuid.UUID | str] | None,
-        method: object,
-        candidate_limit: object,
-    ) -> str:
-        """Return a stable rejection code, or ``matched`` for exact reuse."""
-
-        if not self.reusable:
-            return "snapshot_not_ready"
-        try:
-            expected_revision = _normalise_anchor_preflight_text(
-                revision,
-                field="anchor preflight revision",
-                maximum_chars=MAX_ANCHOR_PREFLIGHT_REVISION_CHARS,
-            )
-        except ValueError:
-            return "revision_invalid"
-        if expected_revision != self.revision:
-            return "revision_mismatch"
-        try:
-            expected_query = _normalise_anchor_preflight_text(
-                query,
-                field="anchor preflight query",
-                maximum_chars=MAX_ANCHOR_PREFLIGHT_QUERY_CHARS,
-            )
-        except ValueError:
-            return "query_invalid"
-        if expected_query != self.query:
-            return "query_mismatch"
-        try:
-            expected_kbs = _normalise_anchor_preflight_uuid_scope(
-                kb_ids,
-                field="anchor preflight KB ids",
-                allow_none=False,
-                require_non_empty=True,
-            )
-            expected_docs = _normalise_anchor_preflight_uuid_scope(
-                document_ids,
-                field="anchor preflight document ids",
-                allow_none=True,
-                require_non_empty=True,
-            )
-        except ValueError:
-            return "scope_invalid"
-        if tuple(str(item) for item in expected_kbs or ()) != self.kb_ids:
-            return "kb_scope_mismatch"
-        normalized_docs = (
-            None
-            if expected_docs is None
-            else tuple(str(item) for item in expected_docs)
-        )
-        if normalized_docs != self.document_ids:
-            return "document_scope_mismatch"
-        try:
-            expected_method = _normalise_anchor_preflight_method(method)
-        except ValueError:
-            return "method_invalid"
-        if expected_method != self.method:
-            return "method_mismatch"
-        try:
-            expected_limit = _anchor_preflight_candidate_limit(candidate_limit)
-        except ValueError:
-            return "candidate_limit_invalid"
-        if self.candidate_limit < expected_limit:
-            return "candidate_limit_insufficient"
-        return "matched"
-
-    def safe_summary(self) -> dict[str, Any]:
-        return {
-            "schema_version": self.schema_version,
-            "status": self.status,
-            "revision_present": bool(self.revision),
-            "kb_count": len(self.kb_ids),
-            "document_scope_count": (
-                None if self.document_ids is None else len(self.document_ids)
-            ),
-            "method": self.method,
-            "candidate_limit": self.candidate_limit,
-            "candidate_count": len(self.candidates),
-            "failure_reason": self.failure_reason,
-            "elapsed_ms": self.elapsed_ms,
-        }
-
-
-def _anchor_preflight_failure_snapshot(
-    *,
-    revision: str,
-    query: str,
-    kb_ids: tuple[uuid.UUID, ...],
-    document_ids: tuple[uuid.UUID, ...] | None,
-    method: str,
-    candidate_limit: int,
-    status: str,
-    failure_reason: str,
-    elapsed_ms: int,
-) -> AnchorRetrievalSnapshot:
-    return AnchorRetrievalSnapshot(
-        revision=revision,
-        query=query,
-        kb_ids=kb_ids,
-        document_ids=document_ids,
-        method=method,
-        candidate_limit=candidate_limit,
-        candidates=(),
-        status=status,
-        failure_reason=failure_reason,
-        elapsed_ms=elapsed_ms,
-    )
-
-
-async def retrieve_anchor_retrieval_snapshot(
-    *,
-    db: AsyncSession,
-    revision: str,
-    query: str,
-    kb_ids: Sequence[uuid.UUID | str],
-    document_ids: Sequence[uuid.UUID | str] | None = None,
-    method: str = "hybrid",
-    candidate_limit: int = MAX_GLOBAL_PLAN_QUERY_CANDIDATES,
-    timeout_seconds: float = DEFAULT_RETRIEVAL_TIMEOUT_SECONDS,
-    trace_id: str | None = None,
-    task_read_session_factory: TaskReadSessionFactory | None,
-) -> AnchorRetrievalSnapshot | None:
-    """Fetch a V3 preflight anchor without touching request-owned state.
-
-    The caller creates one opaque ``revision`` before launching this coroutine
-    and passes the same value to the final V2 execution.  This routine does
-    not compile a plan, create a ledger, inspect terminology, or mutate a
-    request session.  A failure is represented as a non-reusable snapshot;
-    invalid invocation data returns ``None``.  Both cases are intentionally
-    safe for the final runner to ignore and fall back to its normal anchor.
-    """
-
-    started_at = time.perf_counter()
-    try:
-        normalized_revision = _normalise_anchor_preflight_text(
-            revision,
-            field="anchor preflight revision",
-            maximum_chars=MAX_ANCHOR_PREFLIGHT_REVISION_CHARS,
-        )
-        normalized_query = _normalise_anchor_preflight_text(
-            query,
-            field="anchor preflight query",
-            maximum_chars=MAX_ANCHOR_PREFLIGHT_QUERY_CHARS,
-        )
-        normalized_kbs = _normalise_anchor_preflight_uuid_scope(
-            kb_ids,
-            field="anchor preflight KB ids",
-            allow_none=False,
-            require_non_empty=True,
-        )
-        normalized_docs = _normalise_anchor_preflight_uuid_scope(
-            document_ids,
-            field="anchor preflight document ids",
-            allow_none=True,
-            require_non_empty=True,
-        )
-        normalized_method = _normalise_anchor_preflight_method(method)
-        normalized_limit = _anchor_preflight_candidate_limit(candidate_limit)
-        if isinstance(timeout_seconds, bool):
-            raise ValueError("anchor preflight timeout must be numeric")
-        normalized_timeout = float(timeout_seconds)
-        if not math.isfinite(normalized_timeout) or normalized_timeout <= 0:
-            raise ValueError("anchor preflight timeout must be positive")
-    except (TypeError, ValueError) as exc:
-        trace_event(
-            "retrieval.anchor_preflight.rejected",
-            trace_id=trace_id,
-            pipeline_version=PIPELINE_VERSION,
-            reason="preflight_input_invalid",
-            error=type(exc).__name__,
-        )
-        return None
-
-    if task_read_session_factory is None:
-        snapshot = _anchor_preflight_failure_snapshot(
-            revision=normalized_revision,
-            query=normalized_query,
-            kb_ids=normalized_kbs or (),
-            document_ids=normalized_docs,
-            method=normalized_method,
-            candidate_limit=normalized_limit,
-            status="unavailable",
-            failure_reason="read_session_factory_required",
-            elapsed_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
-        )
-        trace_event(
-            "retrieval.anchor_preflight.completed",
-            trace_id=trace_id,
-            pipeline_version=PIPELINE_VERSION,
-            **snapshot.safe_summary(),
-            **content_fields("query", normalized_query),
-        )
-        return snapshot
-
-    diagnostics: dict[str, Any] = {}
-    try:
-        # Preflight intentionally insists on an owned read session.  Borrowing
-        # ``db`` here would race the request's conversation/message writes and
-        # could poison them if an optional read fails in PostgreSQL.
-        async with _task_read_session(
-            db=db,
-            session_factory=task_read_session_factory,
-        ) as read_db:
-            if normalized_docs is None:
-                raw_candidates = await asyncio.wait_for(
-                    hybrid_search(
-                        read_db,
-                        normalized_query,
-                        list(normalized_kbs or ()),
-                        normalized_limit,
-                        normalized_method,
-                        trace_id=trace_id,
-                        surface="chat_v2_anchor_preflight",
-                        diagnostics=diagnostics,
-                    ),
-                    timeout=normalized_timeout,
-                )
-            else:
-                raw_candidates = await asyncio.wait_for(
-                    search_within_documents(
-                        read_db,
-                        queries=[normalized_query],
-                        kb_ids=list(normalized_kbs or ()),
-                        doc_ids=list(normalized_docs),
-                        method=normalized_method,
-                        per_document_limit=6,
-                        total_limit=normalized_limit,
-                        max_document_count=min(max(len(normalized_docs), 1), 30),
-                        trace_id=trace_id,
-                        surface="chat_v2_anchor_preflight_scope",
-                    ),
-                    timeout=normalized_timeout,
-                )
-        authorized = _authorized_candidates(
-            raw_candidates,
-            kb_ids=list(normalized_kbs or ()),
-        )
-        if normalized_docs is not None:
-            authorized = _filter_candidates_to_documents(
-                authorized,
-                {str(item) for item in normalized_docs},
-            )
-        snapshot = AnchorRetrievalSnapshot(
-            revision=normalized_revision,
-            query=normalized_query,
-            kb_ids=normalized_kbs or (),
-            document_ids=normalized_docs,
-            method=normalized_method,
-            candidate_limit=normalized_limit,
-            candidates=tuple(authorized[:normalized_limit]),
-            elapsed_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
-        )
-    except asyncio.CancelledError:
-        raise
-    except (asyncio.TimeoutError, TimeoutError):
-        snapshot = _anchor_preflight_failure_snapshot(
-            revision=normalized_revision,
-            query=normalized_query,
-            kb_ids=normalized_kbs or (),
-            document_ids=normalized_docs,
-            method=normalized_method,
-            candidate_limit=normalized_limit,
-            status="timeout",
-            failure_reason="anchor_preflight_timeout",
-            elapsed_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
-        )
-    except Exception as exc:
-        snapshot = _anchor_preflight_failure_snapshot(
-            revision=normalized_revision,
-            query=normalized_query,
-            kb_ids=normalized_kbs or (),
-            document_ids=normalized_docs,
-            method=normalized_method,
-            candidate_limit=normalized_limit,
-            status="unavailable",
-            failure_reason="anchor_preflight_retrieval_failed",
-            elapsed_ms=max(0, round((time.perf_counter() - started_at) * 1000)),
-        )
-        logger.warning(
-            "[RAG v2] anchor preflight retrieval failed error=%s",
-            type(exc).__name__,
-        )
-    trace_event(
-        "retrieval.anchor_preflight.completed",
-        trace_id=trace_id,
-        pipeline_version=PIPELINE_VERSION,
-        diagnostics_degraded=bool(diagnostics.get("vector_channel_failed")),
-        **snapshot.safe_summary(),
-        **content_fields("query", normalized_query),
-    )
-    return snapshot
-
-
 def _remaining_stage_timeout(
     *,
     deadline: float,
@@ -1043,92 +474,6 @@ def _task_group_retrieval_scope(
         document_id for document_id in group_documents
         if document_id in allowed_documents
     ]
-
-
-def _anchor_preflight_candidates_for_group(
-    *,
-    snapshot: AnchorRetrievalSnapshot | None,
-    expected_revision: str | None,
-    group: PhysicalRetrievalGroup,
-    request_kb_ids: Sequence[uuid.UUID],
-    request_document_ids: Sequence[uuid.UUID],
-    method: str,
-    candidate_k: int,
-) -> tuple[list[dict[str, Any]] | None, str]:
-    """Return one safe cached anchor pool for an exactly matching group.
-
-    Matching is intentionally stricter than a cache key lookup.  The final
-    graph remains authoritative for physical group scope, and every cached
-    row is checked again against that final scope before it can reach the
-    relevance gate or ledger.  A mismatch returns no candidates rather than a
-    partial pool, so the caller performs the ordinary V2 retrieval instead.
-    """
-
-    if snapshot is None:
-        return None, "snapshot_not_provided"
-    if not isinstance(snapshot, AnchorRetrievalSnapshot):
-        return None, "snapshot_type_invalid"
-    if "anchor_root" not in group.task_ids:
-        return None, "not_anchor_group"
-    if group.terminology_variant_origin != "original":
-        return None, "anchor_variant_not_original"
-    if expected_revision is None:
-        return None, "revision_not_supplied"
-
-    effective_kb_ids, effective_document_ids = _task_group_retrieval_scope(
-        group,
-        request_kb_ids=request_kb_ids,
-        request_document_ids=request_document_ids,
-    )
-    if not effective_kb_ids or effective_document_ids == []:
-        return None, "final_scope_empty"
-    reason = snapshot.match_reason(
-        revision=expected_revision,
-        query=group.query,
-        kb_ids=effective_kb_ids,
-        document_ids=effective_document_ids,
-        method=method,
-        candidate_limit=min(candidate_k, MAX_GLOBAL_PLAN_QUERY_CANDIDATES),
-    )
-    if reason != "matched":
-        return None, reason
-
-    # The dataclass validates at creation, but never rely on shallow frozen
-    # state for a security boundary: an external caller can still mutate a
-    # nested mapping after construction.  Any dropped row invalidates the
-    # whole cache entry instead of allowing a subset of stale data through.
-    expected_count = len(snapshot.candidates)
-    authorized = _authorized_candidates(
-        snapshot.candidates,
-        kb_ids=effective_kb_ids,
-    )
-    if len(authorized) != expected_count:
-        return None, "snapshot_candidate_authorization_rejected"
-    if effective_document_ids is not None:
-        authorized = _filter_candidates_to_documents(
-            authorized,
-            {str(value) for value in effective_document_ids},
-        )
-        if len(authorized) != expected_count:
-            return None, "snapshot_candidate_document_scope_rejected"
-    try:
-        safe = [
-            _copy_verified_anchor_preflight_candidate(
-                item,
-                kb_ids=tuple(str(value) for value in effective_kb_ids),
-                document_ids=(
-                    None
-                    if effective_document_ids is None
-                    else tuple(str(value) for value in effective_document_ids)
-                ),
-            )
-            for item in authorized
-        ]
-    except (TypeError, ValueError):
-        return None, "snapshot_candidate_validation_rejected"
-    if len(safe) != expected_count:
-        return None, "snapshot_candidate_validation_rejected"
-    return safe, "matched"
 
 
 _CARRYOVER_RANKING_FIELDS = (
@@ -1600,8 +945,6 @@ async def _retrieve_task_graph_initial_candidates(
     max_parallelism: int,
     terminology_resolution: TerminologyRuntimeResolution | None = None,
     maximum_terminology_aliases: int = 0,
-    anchor_retrieval_snapshot: AnchorRetrievalSnapshot | None = None,
-    anchor_retrieval_revision: str | None = None,
 ) -> _TaskGraphInitialRetrieval:
     """Run only static prerequisite waves of the task graph.
 
@@ -1763,70 +1106,7 @@ async def _retrieve_task_graph_initial_candidates(
             for group in stage_groups
         ]
         group_execution_ids.extend(zip(stage_groups, execution_ids))
-        prefetched_by_group_id: dict[str, _TaskGroupFetchResult] = {}
-        fresh_groups: list[PhysicalRetrievalGroup] = []
-        for group in stage_groups:
-            prefetched_candidates, preflight_reason = (
-                _anchor_preflight_candidates_for_group(
-                    snapshot=anchor_retrieval_snapshot,
-                    expected_revision=anchor_retrieval_revision,
-                    group=group,
-                    request_kb_ids=kb_ids,
-                    request_document_ids=scoped_doc_uuid_ids,
-                    method=method,
-                    candidate_k=candidate_k,
-                )
-            )
-            if prefetched_candidates is None:
-                fresh_groups.append(group)
-                # No snapshot is the normal V2 path, not an operational
-                # event.  A supplied snapshot that cannot be used is useful
-                # trace evidence, however: operators can distinguish a
-                # revision fence from a live retrieval regression.
-                if (
-                    anchor_retrieval_snapshot is not None
-                    and "anchor_root" in group.task_ids
-                ):
-                    trace_event(
-                        "retrieval.anchor_preflight.rejected",
-                        trace_id=trace_id,
-                        pipeline_version=PIPELINE_VERSION,
-                        wave=wave,
-                        stage_id=stage.stage_id,
-                        task_ids=list(group.task_ids),
-                        reason=preflight_reason,
-                        snapshot=(
-                            anchor_retrieval_snapshot.safe_summary()
-                            if isinstance(
-                                anchor_retrieval_snapshot,
-                                AnchorRetrievalSnapshot,
-                            )
-                            else {"present": True}
-                        ),
-                    )
-                continue
-            prefetched_by_group_id[group.group_id] = _TaskGroupFetchResult(
-                raw_candidates=tuple(
-                    _mark_task_graph_candidates(
-                        prefetched_candidates,
-                        origin="anchor_preflight_reused",
-                    )
-                ),
-                diagnostics={"anchor_preflight_reused": True},
-                elapsed_ms=0,
-            )
-            trace_event(
-                "retrieval.anchor_preflight.reused",
-                trace_id=trace_id,
-                pipeline_version=PIPELINE_VERSION,
-                wave=wave,
-                stage_id=stage.stage_id,
-                task_ids=list(group.task_ids),
-                candidate_count=len(prefetched_candidates),
-                snapshot=anchor_retrieval_snapshot.safe_summary(),
-                **content_fields("query", group.query),
-            )
-
+        fresh_groups: list[PhysicalRetrievalGroup] = list(stage_groups)
         fresh_results = await _fetch_task_stage(
             groups=tuple(fresh_groups),
             db=db,
@@ -1846,11 +1126,7 @@ async def _retrieve_task_graph_initial_candidates(
             group.group_id: result
             for group, result in zip(fresh_groups, fresh_results)
         }
-        fetched = tuple(
-            prefetched_by_group_id.get(group.group_id)
-            or fresh_by_group_id[group.group_id]
-            for group in stage_groups
-        )
+        fetched = tuple(fresh_by_group_id[group.group_id] for group in stage_groups)
         for group, execution_id, fetched_result in zip(
             stage_groups,
             execution_ids,
@@ -3743,11 +3019,6 @@ class _TaskGraphDAGExecutionRequest:
     trace_include_content: bool
     terminology_resolution: TerminologyRuntimeResolution | None = None
     maximum_terminology_aliases: int = 0
-    # V3 may have started a bounded anchor query while model understanding was
-    # in flight.  This remains optional for all V2 callers and is accepted
-    # only with the matching immutable compilation revision.
-    anchor_retrieval_snapshot: AnchorRetrievalSnapshot | None = None
-    anchor_retrieval_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3911,8 +3182,6 @@ async def _execute_task_graph_static_stage(
         max_parallelism=request.max_parallelism,
         terminology_resolution=request.terminology_resolution,
         maximum_terminology_aliases=request.maximum_terminology_aliases,
-        anchor_retrieval_snapshot=request.anchor_retrieval_snapshot,
-        anchor_retrieval_revision=request.anchor_retrieval_revision,
     )
     states = request.ledger.task_state_summary()
     if initial.errors and not any(
@@ -5962,10 +5231,10 @@ async def run_rag_v2_stream(
     active_task_scope: ResolvedActiveTask | None = None,
     # The API provides a short-lived read-session factory for DAG waves.
     task_read_session_factory: TaskReadSessionFactory | None = None,
-    # Optional V3 preflight.  The caller must use an opaque revision generated
-    # before concurrent analysis/retrieval and pass that same revision here.
-    anchor_retrieval_snapshot: AnchorRetrievalSnapshot | None = None,
-    anchor_retrieval_revision: str | None = None,
+    # Older direct callers may still pass the removed preflight fields. They
+    # are intentionally ignored; retrieval is always executed by the current
+    # task graph and never reuses an external snapshot.
+    **_removed_preflight_options: Any,
 ) -> AsyncGenerator[str, None]:
     """Run evidence-grounded QA/writing with the v1-compatible SSE contract."""
 
@@ -6089,7 +5358,6 @@ async def run_rag_v2_stream(
     # immutable task graph.  ``not_ready`` is not an exception: it is a
     # verified pre-retrieval clarification result, which must travel through
     # the normal SSE/persistence path rather than become a generic 500.  This
-    # is essential when a V3 candidate legitimately falls back to an
     # unresolved local floor after the first SSE has already been emitted.
     if execution_bundle.uses_task_ledger and execution_bundle.task_graph is None:
         raise ValueError("ledgered RAG v2 bundle requires a task graph")
@@ -6098,11 +5366,9 @@ async def run_rag_v2_stream(
     active_execution_bundle = execution_bundle
     plan = execution_bundle.plan
     active_task_graph = execution_bundle.task_graph
-    # ``plan.original_query`` is the immutable anchor contract.  In
-    # particular, a standalone/follow-up reconstruction is a routing input,
-    # not permission to replace the final graph's root query after a V3
-    # preflight has already started.  Scoped clarification still constrains
-    # its KB/document set below; it does not alter this identity.
+    # ``plan.original_query`` is the immutable anchor contract. Scoped
+    # clarification constrains its KB/document set below; it does not alter
+    # this identity.
     immutable_anchor_query = plan.original_query
     task_execution_ledger = (
         TaskExecutionLedger(active_task_graph)
@@ -6411,8 +5677,6 @@ async def run_rag_v2_stream(
             trace_include_content=trace_include_content,
             terminology_resolution=terminology_resolution,
             maximum_terminology_aliases=maximum_terminology_aliases,
-            anchor_retrieval_snapshot=anchor_retrieval_snapshot,
-            anchor_retrieval_revision=anchor_retrieval_revision,
         )
         task_graph_dag_execution = await _execute_task_graph_static_stage(
             task_graph_request,
@@ -8370,17 +7634,7 @@ async def run_rag_v2_stream(
     yield _done_event(conversation_id)
 
 
-# The V2 pipeline is now the normal evidence runner.  Keep one stable public
-# name for callers while the internal module name remains useful for rollout
-# diagnostics and historical trace labels.
-run_rag_stream = run_rag_v2_stream
-
-
 __all__ = [
-    "ANCHOR_RETRIEVAL_SNAPSHOT_SCHEMA_VERSION",
-    "AnchorRetrievalSnapshot",
     "PIPELINE_VERSION",
-    "retrieve_anchor_retrieval_snapshot",
-    "run_rag_stream",
     "run_rag_v2_stream",
 ]

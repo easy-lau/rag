@@ -30,10 +30,6 @@ from core.login_security import login_log_cleanup_loop
 from core.log_retention import log_retention_cleanup_loop
 from core.document_jobs import run_document_worker
 from core.rag_trace_store import start_rag_trace_store, stop_rag_trace_store
-from core.query_analysis_execution import (
-    start_query_analysis_execution_runtime,
-    stop_query_analysis_execution_runtime,
-)
 from database import engine
 
 _settings = get_settings()
@@ -73,7 +69,6 @@ async def lifespan(app: FastAPI):
     login_log_cleanup_task = asyncio.create_task(login_log_cleanup_loop())
     log_retention_task = asyncio.create_task(log_retention_cleanup_loop())
     await start_rag_trace_store()
-    await start_query_analysis_execution_runtime()
     try:
         yield
     finally:
@@ -81,7 +76,6 @@ async def lifespan(app: FastAPI):
             document_worker_task.cancel()
             with suppress(asyncio.CancelledError):
                 await document_worker_task
-        await stop_query_analysis_execution_runtime()
         await stop_rag_trace_store()
         login_log_cleanup_task.cancel()
         with suppress(asyncio.CancelledError):

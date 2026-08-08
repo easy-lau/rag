@@ -15,12 +15,10 @@ from core.query_route_compiler import (
 )
 from core.query_route_contract import parse_rag_route_decision
 from core.rag_v2.pipeline import (
-    AnchorRetrievalSnapshot,
     _admit_and_bind_expansion_candidates,
     _evidence_execution_decision,
     _should_use_general_model_fallback,
     _should_model_adjudicate_evidence,
-    retrieve_anchor_retrieval_snapshot,
     run_rag_v2_stream,
 )
 from core.evidence_contract import AdjudicationOutcome
@@ -1833,248 +1831,6 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             "普通员工的餐补是多少",
             "普通员工的出差补贴是多少",
         }.issubset(executed_queries))
-
-    async def test_anchor_preflight_snapshot_reused_by_final_task_graph(self) -> None:
-        """A V3 preflight cache saves one anchor I/O, not final provenance."""
-
-        question = "普通员工的餐补是多少"
-        kb_id = uuid.uuid4()
-        doc_id = uuid.uuid4()
-        candidate = _candidate(
-            kb_id=kb_id,
-            doc_id=doc_id,
-            chunk_index=3,
-            content="普通员工的餐补标准为100元/天。",
-        )
-        # A snapshot cannot be populated with a raw adapter row.  The explicit
-        # flag mirrors `_authorized_candidates` after the preflight boundary.
-        candidate["authorized"] = True
-        snapshot = AnchorRetrievalSnapshot(
-            revision="analysis-revision-1",
-            query=question,
-            kb_ids=(kb_id,),
-            document_ids=None,
-            method="hybrid",
-            candidate_limit=6,
-            candidates=(candidate,),
-        )
-
-        payloads, client, search, _fetch, _scoped = await self._run(
-            question=question,
-            kb_id=kb_id,
-            initial=[candidate],
-            full_document=[],
-            execution_bundle=_direct_test_execution_bundle(question),
-            anchor_retrieval_snapshot=snapshot,
-            anchor_retrieval_revision="analysis-revision-1",
-        )
-
-        result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "hit")
-        self.assertEqual(result["missing_requirement_ids"], [])
-        self.assertEqual(len(client.completions.calls), 1)
-        # The graph's direct task is physically coalesced with its anchor, so
-        # successful cache reuse means there is no duplicate hybrid call.
-        search.assert_not_awaited()
-        reuse_events = [
-            call.kwargs
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "retrieval.anchor_preflight.reused"
-        ]
-        self.assertEqual(len(reuse_events), 1)
-        self.assertEqual(reuse_events[0]["candidate_count"], 1)
-
-    async def test_anchor_preflight_query_mismatch_is_rejected_then_falls_back(self) -> None:
-        """A stale cache must never be reinterpreted for a different graph."""
-
-        question = "普通员工的餐补是多少"
-        kb_id = uuid.uuid4()
-        doc_id = uuid.uuid4()
-        candidate = _candidate(
-            kb_id=kb_id,
-            doc_id=doc_id,
-            chunk_index=3,
-            content="普通员工的餐补标准为100元/天。",
-        )
-        candidate["authorized"] = True
-        snapshot = AnchorRetrievalSnapshot(
-            revision="analysis-revision-2",
-            query="普通员工的住宿标准是多少",
-            kb_ids=(kb_id,),
-            document_ids=None,
-            method="hybrid",
-            candidate_limit=6,
-            candidates=(candidate,),
-        )
-
-        payloads, _client, search, _fetch, _scoped = await self._run(
-            question=question,
-            kb_id=kb_id,
-            initial=[candidate],
-            full_document=[],
-            execution_bundle=_direct_test_execution_bundle(question),
-            anchor_retrieval_snapshot=snapshot,
-            anchor_retrieval_revision="analysis-revision-2",
-        )
-
-        result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "hit")
-        self.assertEqual(search.await_count, 1)
-        rejection_events = [
-            call.kwargs
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "retrieval.anchor_preflight.rejected"
-        ]
-        self.assertEqual(len(rejection_events), 1)
-        self.assertEqual(rejection_events[0]["reason"], "query_mismatch")
-
-    async def test_anchor_preflight_revision_and_scope_identity_are_strict(self) -> None:
-        """Revision and authorized range are cache identity, never hints."""
-
-        kb_id = uuid.uuid4()
-        other_kb_id = uuid.uuid4()
-        doc_id = uuid.uuid4()
-        snapshot = AnchorRetrievalSnapshot(
-            revision="analysis-revision-identity",
-            query="普通员工的餐补是多少",
-            kb_ids=(kb_id,),
-            document_ids=None,
-            method="hybrid",
-            candidate_limit=6,
-        )
-        common = {
-            "query": "普通员工的餐补是多少",
-            "kb_ids": (kb_id,),
-            "document_ids": None,
-            "method": "hybrid",
-            "candidate_limit": 6,
-        }
-        self.assertEqual(
-            snapshot.match_reason(revision="other-revision", **common),
-            "revision_mismatch",
-        )
-        self.assertEqual(
-            snapshot.match_reason(
-                revision="analysis-revision-identity",
-                **{**common, "kb_ids": (other_kb_id,)},
-            ),
-            "kb_scope_mismatch",
-        )
-        self.assertEqual(
-            snapshot.match_reason(
-                revision="analysis-revision-identity",
-                **{**common, "document_ids": (doc_id,)},
-            ),
-            "document_scope_mismatch",
-        )
-
-    async def test_anchor_preflight_timeout_falls_back_to_normal_v2_anchor(self) -> None:
-        """A timed-out optional preflight must not turn a healthy final run red."""
-
-        question = "普通员工的餐补是多少"
-        kb_id = uuid.uuid4()
-        doc_id = uuid.uuid4()
-        candidate = _candidate(
-            kb_id=kb_id,
-            doc_id=doc_id,
-            chunk_index=3,
-            content="普通员工的餐补标准为100元/天。",
-        )
-
-        @asynccontextmanager
-        async def read_session_factory():
-            session = SimpleNamespace()
-
-            async def rollback():
-                return None
-
-            session.rollback = rollback
-            yield session
-
-        with patch(
-            "core.rag_v2.pipeline.hybrid_search",
-            new=AsyncMock(side_effect=asyncio.TimeoutError()),
-        ):
-            snapshot = await retrieve_anchor_retrieval_snapshot(
-                db=SimpleNamespace(),
-                revision="analysis-revision-3",
-                query=question,
-                kb_ids=(kb_id,),
-                method="hybrid",
-                candidate_limit=6,
-                timeout_seconds=0.2,
-                task_read_session_factory=read_session_factory,
-            )
-        self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot.status, "timeout")
-        self.assertFalse(snapshot.reusable)
-
-        payloads, _client, search, _fetch, _scoped = await self._run(
-            question=question,
-            kb_id=kb_id,
-            initial=[candidate],
-            full_document=[],
-            execution_bundle=_direct_test_execution_bundle(question),
-            anchor_retrieval_snapshot=snapshot,
-            anchor_retrieval_revision="analysis-revision-3",
-        )
-        result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertEqual(result["evidence_status"], "hit")
-        self.assertEqual(search.await_count, 1)
-        rejection_events = [
-            call.kwargs
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "retrieval.anchor_preflight.rejected"
-        ]
-        self.assertEqual(rejection_events[0]["reason"], "snapshot_not_ready")
-
-    async def test_anchor_preflight_uses_owned_read_session_not_request_session(self) -> None:
-        """Concurrent V3 preflight cannot borrow the request's DB session."""
-
-        kb_id = uuid.uuid4()
-        doc_id = uuid.uuid4()
-        candidate = _candidate(
-            kb_id=kb_id,
-            doc_id=doc_id,
-            chunk_index=2,
-            content="餐饮补贴标准：D级100元/天。",
-        )
-
-        class RequestSession:
-            async def execute(self, *_args, **_kwargs):
-                raise AssertionError("preflight must not execute on request session")
-
-        read_sessions: list[SimpleNamespace] = []
-
-        @asynccontextmanager
-        async def read_session_factory():
-            session = SimpleNamespace(rollback_count=0)
-
-            async def rollback():
-                session.rollback_count += 1
-
-            session.rollback = rollback
-            read_sessions.append(session)
-            yield session
-
-        search = AsyncMock(return_value=[candidate])
-        with patch("core.rag_v2.pipeline.hybrid_search", new=search):
-            snapshot = await retrieve_anchor_retrieval_snapshot(
-                db=RequestSession(),
-                revision="analysis-revision-4",
-                query="普通员工的餐补是多少",
-                kb_ids=(kb_id,),
-                method="hybrid",
-                candidate_limit=6,
-                timeout_seconds=0.2,
-                task_read_session_factory=read_session_factory,
-            )
-        self.assertIsNotNone(snapshot)
-        self.assertTrue(snapshot.reusable)
-        self.assertEqual(len(snapshot.candidates), 1)
-        self.assertIs(search.await_args.args[0], read_sessions[0])
-        self.assertEqual(read_sessions[0].rollback_count, 1)
-        self.assertTrue(snapshot.candidates[0]["authorized"])
 
     async def test_registry_read_failure_isolated_from_request_and_baseline_retrieval(self) -> None:
         """Optional registry failure cannot poison a usable RAG request.
@@ -5373,7 +5129,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(client.completions.calls, [])
 
-    async def test_global_plan_query_timeout_keeps_primary_evidence_degraded(
+    async def test_direct_question_does_not_schedule_a_speculative_plan_query(
         self,
     ) -> None:
         kb_id = uuid.uuid4()
@@ -5398,31 +5154,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        # The surviving D-grade clause does not prove that the user-supplied
-        # subject belongs to D grade.  A timed-out bridge query may degrade
-        # availability, but it must never expose the unjoined amount as an
-        # answer source or invoke generation with it.
-        self.assertEqual(result["evidence_status"], "needs_clarification")
-        self.assertEqual(result["evidence_availability"], "degraded")
-        self.assertEqual(result["answer_sources"], [])
-        # Retrieval no longer executes a positional global query plan.  The
-        # failed bridge is represented by its typed task lifecycle, which
-        # keeps the surviving amount candidate from being mistaken for a
-        # joined answer.
-        self.assertIn(
-            "task_query_retrieval_timeout",
-            result["evidence_state"]["reasons"],
-        )
-        self.assertIn(
-            "bridge_retrieval_failed",
-            result["evidence_state"]["reasons"],
-        )
-        self.assertNotIn(
-            "plan_query_retrieval_timeout",
-            result["evidence_state"]["reasons"],
-        )
-        self.assertEqual(search.await_count, 2)
-        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(result["evidence_status"], "hit")
+        self.assertGreater(len(result["answer_sources"]), 0)
+        self.assertEqual(search.await_count, 1)
+        self.assertEqual(len(client.completions.calls), 1)
         answer_text = "".join(
             item.get("content", "")
             for item in payloads
@@ -5548,15 +5283,13 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
 
         result = next(item for item in payloads if item["type"] == "search_results")
-        self.assertTrue(any(
+        self.assertFalse(any(
             "对应的适用分类" in query for query in executed_queries
         ))
-        self.assertTrue(any(
-            "D级" in query and "8.6" in query for query in executed_queries
-        ))
+        self.assertTrue(any("8.6" in query for query in executed_queries))
         self.assertEqual(
             {item["doc_id"] for item in result["answer_sources"]},
-            {str(answer_doc_id), str(bridge_doc_id)},
+            {str(answer_doc_id)},
         )
         self.assertNotIn(
             str(wrong_version_doc_id),
@@ -5567,17 +5300,11 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("版本：8.6", prompt)
         self.assertNotIn("版本：7", prompt)
-        completed_scope_admissions = [
-            call.kwargs
-            for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "retrieval.task_query_completed"
+        self.assertFalse(any(
+            call.args and call.args[0] == "retrieval.task_query_completed"
             and call.kwargs.get("task_ids") == ["bridge_r2"]
-        ]
-        self.assertTrue(completed_scope_admissions)
-        self.assertGreaterEqual(
-            completed_scope_admissions[0]["scope_rejection_count"],
-            1,
-        )
+            for call in self._last_trace.call_args_list
+        ))
 
     async def test_narrow_fact_uses_one_small_document_without_scoped_search(self) -> None:
         kb_id = uuid.uuid4()
@@ -5726,7 +5453,7 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
             result["evidence_state"]["reasons"],
         )
         self.assertEqual(len(client.completions.calls), 1)
-        self.assertEqual(search.await_count, 2)
+        self.assertEqual(search.await_count, 1)
         scoped.assert_awaited_once()
         # The carryover phase consumed the shared remainder.  Expansion must
         # fail before starting new I/O, while the first-pass evidence survives.
@@ -6066,13 +5793,10 @@ class RagV2PipelineTests(unittest.IsolatedAsyncioTestCase):
         fetch_full.assert_not_awaited()
         scoped.assert_not_awaited()
         search.assert_awaited_once()
-        blocked = next(
-            call.kwargs
+        self.assertFalse(any(
+            call.args and call.args[0] == "retrieval.task_query_blocked"
             for call in self._last_trace.call_args_list
-            if call.args and call.args[0] == "retrieval.task_query_blocked"
-        )
-        self.assertEqual(blocked["task_ids"], ["bridge_r2"])
-        self.assertEqual(blocked["blocked_by_task_ids"], ["anchor_root"])
+        ))
 
     async def test_candidate_without_raw_quality_signal_is_no_hit(self) -> None:
         kb_id = uuid.uuid4()

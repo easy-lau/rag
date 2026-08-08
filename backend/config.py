@@ -82,56 +82,6 @@ class Settings(BaseSettings):
         ge=1.0,
         le=300.0,
     )
-    # 语义理解入口由此开关单独决定。默认 V3：模型只能选择服务器签发的
-    # source span，随后由后端编译
-    # V2 任务图。``legacy`` 仅保留给已知回滚场景使用 query_analysis.v2。
-    rag_semantic_entry: Literal["legacy", "v3"] = "v3"
-    # V3 是当前生产语义入口：模型只能选择服务器签发的 source span，随后由
-    # 后端编译为 V2 任务图。模型失败、schema 拒绝或容量不足时原子回退当前轮
-    # 本地计划；本地 planner 的未知/不可运行不再能在 V3 前提前拦截请求。
-    rag_query_understanding_v3_mode: Literal["off", "shadow", "active"] = "active"
-    # ``None`` means that V3 has no separate short deadline and instead shares
-    # the normal LLM request deadline.  Set a numeric value only when the
-    # deployment explicitly needs to trade V3 understanding quality for a
-    # tighter first-answer latency budget.
-    rag_query_understanding_v3_active_timeout_seconds: float | None = Field(
-        None,
-        ge=0.5,
-        le=300.0,
-    )
-    rag_query_understanding_v3_active_max_inflight: int = Field(2, ge=1, le=32)
-    # 与 V3 模型理解并发的不可变 anchor 预取。超过这个短期限直接丢弃，由
-    # 正常 V2 DAG 重新召回，不能为了缓存而延迟用户首个检索阶段。
-    rag_query_understanding_v3_anchor_prefetch_enabled: bool = True
-    rag_query_understanding_v3_anchor_prefetch_timeout_seconds: float = Field(
-        2.5,
-        ge=0.5,
-        le=15.0,
-    )
-    # 旧 query_analysis.v2 仅为回滚/对照保留，不能与 V3 同时成为生产语义
-    # authority；默认关闭，避免同一请求连续等待两次模型分析。
-    rag_query_analyzer_mode: Literal["off", "shadow", "active"] = "off"
-    # Direct/unit callers retain this legacy default.  Production active and
-    # shadow execution below each declare their own bounded budget explicitly.
-    rag_query_analyzer_timeout_seconds: float = Field(5.0, ge=0.5, le=30.0)
-    # Active mode sits on the request path, so it has a separate short budget.
-    # Shadow analysis remains asynchronous and may use the diagnostic budget.
-    rag_query_analyzer_active_timeout_seconds: float = Field(
-        1.5,
-        ge=0.5,
-        le=10.0,
-    )
-    rag_query_analyzer_active_max_inflight: int = Field(2, ge=1, le=32)
-    rag_query_analyzer_shadow_timeout_seconds: float = Field(
-        5.0,
-        ge=0.5,
-        le=30.0,
-    )
-    rag_query_analyzer_shadow_max_inflight: int = Field(2, ge=1, le=32)
-    # Deterministic per-trace sampling; 0 disables background telemetry and 1
-    # observes every eligible request without changing its retrieval result.
-    rag_query_analyzer_shadow_sample_rate: float = Field(0.1, ge=0.0, le=1.0)
-
     # Docker Compose 会显式覆盖；该默认值仅用于宿主机本地开发的端口约定。
     database_url: str = "postgresql+asyncpg://rag:password@127.0.0.1:5433/rag_prod"
 
@@ -168,6 +118,24 @@ class Settings(BaseSettings):
     # 检索重排与对话共用 LLM 服务凭据；留空时运行时自动复用 chat_model。
     rerank_model: str = Field(
         "", validation_alias="__DATABASE_SETTINGS_ONLY_RERANK_MODEL"
+    )
+    # 证据裁决是低延迟结构化任务，与最终回答模型的传输能力分开管理。
+    # 默认关闭裁决模型思考：兼容网关若明确拒绝 thinking 参数，共享适配器会
+    # 在同一输出模式内移除该参数重试，不按模型名称建立供应商特判。
+    rerank_structured_output_mode: Literal[
+        "auto",
+        "json_schema",
+        "json_object",
+        "plain_json",
+    ] = Field(
+        "auto",
+        validation_alias=(
+            "__DATABASE_SETTINGS_ONLY_RERANK_STRUCTURED_OUTPUT_MODE"
+        ),
+    )
+    rerank_disable_thinking: bool = Field(
+        True,
+        validation_alias="__DATABASE_SETTINGS_ONLY_RERANK_DISABLE_THINKING",
     )
     temperature: float = Field(
         0.7, validation_alias="__DATABASE_SETTINGS_ONLY_TEMPERATURE"

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -16,7 +17,11 @@ from core.audit import AuditLogger, get_audit
 from core.deps import require_permission
 from core.openai_client import get_service_credentials
 from core.permissions import SETTINGS_READ, SETTINGS_WRITE
-from core.reranker import clear_rerank_circuit_breakers
+from core.reranker import (
+    RerankConnectionProbeError,
+    clear_rerank_circuit_breakers,
+    probe_rerank_connection,
+)
 from core.runtime_settings import (
     EDITABLE_SETTING_KEYS,
     coerce_setting_value as _coerce_setting_value,
@@ -71,6 +76,10 @@ class SettingsOut(BaseModel):
     llm_disable_thinking: bool
     intent_model: str
     rerank_model: str
+    rerank_structured_output_mode: Literal[
+        "auto", "json_schema", "json_object", "plain_json"
+    ]
+    rerank_disable_thinking: bool
     temperature: float
     max_tokens: int
     rerank_timeout_seconds: float
@@ -106,6 +115,10 @@ class SettingsUpdate(BaseModel):
     llm_disable_thinking: bool | None = None
     intent_model: str | None = Field(None, max_length=255)
     rerank_model: str | None = Field(None, max_length=255)
+    rerank_structured_output_mode: Literal[
+        "auto", "json_schema", "json_object", "plain_json"
+    ] | None = None
+    rerank_disable_thinking: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     rerank_timeout_seconds: float | None = Field(None, ge=1.0, le=120.0)
@@ -137,9 +150,15 @@ if frozenset(SettingsUpdate.model_fields) != EDITABLE_SETTING_KEYS:
 
 class ModelConnectionTest(BaseModel):
     service: Literal["llm", "embedding", "vision"]
+    purpose: Literal["chat", "intent", "rerank"] = "chat"
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
+    structured_output_mode: Literal[
+        "auto", "json_schema", "json_object", "plain_json"
+    ] | None = None
+    disable_thinking: bool | None = None
+    timeout_seconds: float | None = Field(None, ge=1.0, le=120.0)
 
 
 class ModelConnectionTestOut(BaseModel):
@@ -153,6 +172,8 @@ class ModelConnectionTestOut(BaseModel):
     ] | None = None
     structured_output_attempted_modes: list[str] = Field(default_factory=list)
     thinking_disabled: bool | None = None
+    output_chars: int | None = None
+    finish_reason: str | None = None
 
 
 class ModelListRequest(BaseModel):
@@ -283,7 +304,12 @@ _OPTIONAL_MODEL_FIELDS = frozenset({
     "rag_general_fallback_model",
 })
 _TIMEOUT_FIELDS = ("rerank_timeout_seconds",)
-_BOOL_FIELDS = ("llm_disable_thinking", "rerank_enabled", "show_sources")
+_BOOL_FIELDS = (
+    "llm_disable_thinking",
+    "rerank_disable_thinking",
+    "rerank_enabled",
+    "show_sources",
+)
 
 
 def _validate_settings_contract(
@@ -369,7 +395,14 @@ def _value_from_database(db_map: dict[str, str | None], key: str, settings):
     default = getattr(
         settings,
         key,
-        "auto" if key == "llm_structured_output_mode" else None,
+        (
+            "auto"
+            if key in {
+                "llm_structured_output_mode",
+                "rerank_structured_output_mode",
+            }
+            else None
+        ),
     )
     if value is None:
         return default
@@ -397,6 +430,16 @@ async def _load(db: AsyncSession) -> dict:
         ),
         "intent_model": _value_from_database(db_map, "intent_model", settings),
         "rerank_model": _value_from_database(db_map, "rerank_model", settings),
+        "rerank_structured_output_mode": _value_from_database(
+            db_map,
+            "rerank_structured_output_mode",
+            settings,
+        ),
+        "rerank_disable_thinking": _value_from_database(
+            db_map,
+            "rerank_disable_thinking",
+            settings,
+        ),
         "temperature": _value_from_database(db_map, "temperature", settings),
         "max_tokens": _value_from_database(db_map, "max_tokens", settings),
         "rerank_timeout_seconds": _value_from_database(
@@ -486,7 +529,13 @@ def _test_config(payload: ModelConnectionTest) -> tuple[str, str, str, str]:
         submitted_api_key=payload.api_key,
         submitted_base_url=payload.base_url,
     )
+    if payload.service == "llm" and payload.purpose in {"intent", "rerank"}:
+        model_field = (
+            "intent_model" if payload.purpose == "intent" else "rerank_model"
+        )
     model = (payload.model or "").strip() or getattr(settings, model_field)
+    if not model and payload.service == "llm":
+        model = str(settings.chat_model)
 
     if not model:
         raise HTTPException(status_code=400, detail="请先填写模型名称或推理接入点 ID")
@@ -655,6 +704,61 @@ async def _run_model_connection_test(
                 latency_ms=elapsed_ms(),
             )
 
+        settings = get_settings()
+        if payload.purpose == "rerank":
+            rerank_mode = (
+                payload.structured_output_mode
+                or settings.rerank_structured_output_mode
+            )
+            rerank_disable_thinking = (
+                payload.disable_thinking
+                if payload.disable_thinking is not None
+                else settings.rerank_disable_thinking
+            )
+            rerank_timeout = (
+                payload.timeout_seconds
+                if payload.timeout_seconds is not None
+                else settings.rerank_timeout_seconds
+            )
+            try:
+                probe = await probe_rerank_connection(
+                    client,
+                    model=model,
+                    provider_identity=base_url,
+                    timeout_seconds=rerank_timeout,
+                    structured_output_mode=rerank_mode,
+                    disable_thinking=rerank_disable_thinking,
+                )
+            except RerankConnectionProbeError as exc:
+                logger.warning(
+                    "[系统设置] 裁决模型真实合同测试失败 code=%s",
+                    exc.code,
+                )
+                return ModelConnectionTestOut(
+                    ok=False,
+                    message=(
+                        "裁决模型连接成功，但未通过真实证据裁决合同测试；"
+                        "请检查结构化输出模式和思考模式设置"
+                    ),
+                    latency_ms=elapsed_ms(),
+                    error_code=exc.code,
+                )
+            return ModelConnectionTestOut(
+                ok=True,
+                message=(
+                    "裁决模型已通过真实证据裁决合同测试"
+                    f"（{probe.structured_output_mode}）"
+                ),
+                latency_ms=probe.elapsed_ms,
+                structured_output_mode=probe.structured_output_mode,
+                structured_output_attempted_modes=list(
+                    probe.structured_output_attempted_modes
+                ),
+                thinking_disabled=probe.thinking_disabled,
+                output_chars=probe.output_chars,
+                finish_reason=probe.finish_reason,
+            )
+
         structured = await create_structured_completion(
             client,
             request={
@@ -685,7 +789,65 @@ async def _run_model_connection_test(
             timeout_seconds=15,
             provider_identity=base_url,
             model=model,
+            structured_output_mode=(
+                payload.structured_output_mode
+                or settings.llm_structured_output_mode
+            ),
+            disable_thinking=(
+                payload.disable_thinking
+                if payload.disable_thinking is not None
+                else settings.llm_disable_thinking
+            ),
         )
+        response = structured.response
+        choices = list(getattr(response, "choices", None) or [])
+        choice = choices[0] if choices else None
+        message = getattr(choice, "message", None) if choice is not None else None
+        raw = getattr(message, "content", None) if message is not None else None
+        if not isinstance(raw, str) or not raw.strip():
+            return ModelConnectionTestOut(
+                ok=False,
+                message="模型连接成功，但结构化输出内容为空",
+                latency_ms=elapsed_ms(),
+                error_code="structured_output_empty_content",
+                structured_output_mode=structured.mode,
+                structured_output_attempted_modes=list(structured.attempted_modes),
+                thinking_disabled=structured.thinking_disabled,
+                output_chars=0,
+                finish_reason=(
+                    str(getattr(choice, "finish_reason", "") or "") or None
+                ),
+            )
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return ModelConnectionTestOut(
+                ok=False,
+                message="模型连接成功，但没有返回合法 JSON",
+                latency_ms=elapsed_ms(),
+                error_code="structured_output_invalid_json",
+                structured_output_mode=structured.mode,
+                structured_output_attempted_modes=list(structured.attempted_modes),
+                thinking_disabled=structured.thinking_disabled,
+                output_chars=len(raw),
+                finish_reason=(
+                    str(getattr(choice, "finish_reason", "") or "") or None
+                ),
+            )
+        if parsed != {"ok": True}:
+            return ModelConnectionTestOut(
+                ok=False,
+                message="模型连接成功，但结构化输出未满足测试合同",
+                latency_ms=elapsed_ms(),
+                error_code="structured_output_contract_invalid",
+                structured_output_mode=structured.mode,
+                structured_output_attempted_modes=list(structured.attempted_modes),
+                thinking_disabled=structured.thinking_disabled,
+                output_chars=len(raw),
+                finish_reason=(
+                    str(getattr(choice, "finish_reason", "") or "") or None
+                ),
+            )
         return ModelConnectionTestOut(
             ok=True,
             message=f"模型连接及结构化输出测试成功（{structured.mode}）",
@@ -693,6 +855,10 @@ async def _run_model_connection_test(
             structured_output_mode=structured.mode,
             structured_output_attempted_modes=list(structured.attempted_modes),
             thinking_disabled=structured.thinking_disabled,
+            output_chars=len(raw),
+            finish_reason=(
+                str(getattr(choice, "finish_reason", "") or "") or None
+            ),
         )
     except Exception as exc:
         error_code = type(exc).__name__
@@ -742,6 +908,7 @@ async def test_model_connection(
         target_type="settings",
         detail={
             "service": payload.service,
+            "purpose": payload.purpose,
             "model": model,
             "host": host,
             "ok": result.ok,
@@ -897,6 +1064,9 @@ async def update_settings(
             "chat_model",
             "llm_structured_output_mode",
             "llm_disable_thinking",
+            "rerank_model",
+            "rerank_structured_output_mode",
+            "rerank_disable_thinking",
         )
     ):
         # 端点、模型或管理员选择变化后，旧能力结论不能污染新配置。
@@ -907,6 +1077,8 @@ async def update_settings(
             "llm_base_url",
             "chat_model",
             "rerank_model",
+            "rerank_structured_output_mode",
+            "rerank_disable_thinking",
             "llm_structured_output_mode",
             "llm_disable_thinking",
             "rerank_timeout_seconds",

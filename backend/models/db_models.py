@@ -159,6 +159,54 @@ class DocumentChunk(Base):
     document: Mapped["Document"] = relationship(back_populates="chunks")
 
 
+class KnowledgeRecord(Base):
+    """One source-addressable structured fact extracted during ingestion.
+
+    Records never replace document chunks: they provide a precise lookup lane
+    for tables, mappings, parameters and API catalogs while retaining the
+    original chunk as the citation and authorization boundary.
+    """
+
+    __tablename__ = "knowledge_records"
+    __table_args__ = (
+        CheckConstraint(
+            "record_type IN ('table_row', 'key_value')",
+            name="ck_knowledge_records_type",
+        ),
+        Index("ix_knowledge_records_kb_id", "kb_id"),
+        Index("ix_knowledge_records_doc_id", "doc_id"),
+        Index("ix_knowledge_records_chunk_id", "chunk_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    kb_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    doc_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_chunks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    record_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    predicate: Mapped[str | None] = mapped_column(Text)
+    object_value: Mapped[str] = mapped_column(Text, nullable=False)
+    search_text: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=now_utc
+    )
+
+
 class TerminologyConcept(Base):
     """A stable, human-reviewed business concept.
 

@@ -19,10 +19,6 @@
 | `APP_VERSION` / `APP_REVISION` | `dev` / 空 | 发布版本和 Git revision，由镜像构建自动注入 |
 | `LOG_LEVEL` | `INFO` | Python 日志级别 |
 | `DEVELOPMENT_LOG_DIR` | `<项目根>/logs/development` | 开发环境每个后端进程的独立日志文件目录；生产环境不写本地文件 |
-| `RAG_SEMANTIC_ENTRY` | `v3` | 选择语义理解 authority；`v3` 只允许模型选择服务器签发的原文 span，`legacy` 才启用旧 `query_analysis.v2` |
-| `RAG_QUERY_UNDERSTANDING_V3_MODE` | `active` | V3 的 `off / shadow / active` 模式；`active` 的失败只回退当前轮本地基线，不重跑旧语义模型 |
-| `RAG_QUERY_UNDERSTANDING_V3_ACTIVE_TIMEOUT_SECONDS` / `...MAX_INFLIGHT` | 未设置（继承 `LLM_REQUEST_TIMEOUT_SECONDS`，默认 `60`）/ `2` | V3 首次 SSE 后的等待预算和并发上限；删除该变量即不设置 V3 专用硬限制，仍受全局 LLM 请求超时保护；设置数值（`0.5`–`300` 秒）可显式收紧该阶段 |
-| `RAG_QUERY_UNDERSTANDING_V3_ANCHOR_PREFETCH_ENABLED` / `...TIMEOUT_SECONDS` | `true` / `2.5` | 是否与 V3 并发预取原问题 anchor；超时或未通过围栏时丢弃，正常 V2 DAG 会自行召回 |
 | `RAG_V2_MODEL_EVIDENCE_ADJUDICATION_TIMEOUT_SECONDS` | 未设置（继承 `LLM_REQUEST_TIMEOUT_SECONDS`，默认 `60`） | 证据模型判定等待预算；删除该变量即不设置该阶段专用硬限制，仍受全局 LLM 请求超时保护；设置数值（`0.5`–`300` 秒）可显式收紧 |
 
 本地以 `uvicorn main:app --reload --port 8000` 启动时，后端会在
@@ -44,21 +40,16 @@
 | `conversation.reference_unresolved` | 追问缺少可消解对象，直接要求用户补充信息且不盲目检索 |
 | `intent.model_result` / `intent.model_error` | 意图模型原始分类是否被接受、精确拒绝原因、模型与 Prompt 版本；空响应同时记录 `finish_reason`、choice 数、推理内容长度和 token 用量，但不记录模型推理正文 |
 | `intent.routing_decision` | 规则、模型和安全策略合并后的最终响应模式与检索策略 |
-| `intent.semantic_entry_gate` | V3 语义入口三态判定：`dispatch` 直接执行、`defer_to_v3` 仅把路由层的语义未决交给 V3、`blocked` 保留知识库/权限/合同等硬性拦截；该阶段属于有界导出的核心因果链 |
 | `chat.pipeline_selected` | 本轮唯一执行器：显式回滚 `v1`、知识检索 `v2` 或无检索 `direct`；V2 合同异常不会静默回退 V1 |
 | `chat.turn_reclaimed` | 同一 `request_id` 的 `accepted/generating` 执行租约已过期，由当前请求安全接管并重新执行 |
 | `direct.plan` | 已验证的通用交流、平台帮助或内联写作直答计划；该链路明确不执行检索 |
 | `query.plan` | V2 本地查询形状、检索子问题、answer/bridge requirement 与**规划本身**是否需要澄清；不会因为执行层拒绝而被改写 |
 | `query.execution` | `rag_query_execution.v1` 的最终 plan/bundle 执行闸门。`ready` 才可进入检索；`needs_clarification` 固定使用 `query_execution` 未解决项，区分“计划不明确”与“计划存在但不可安全执行” |
-| `query.understanding.v3.requested` / `completed` / `validated` | 请求、收到并校验 V3 **source-span catalog 选择**；模型只能返回服务器签发的 span ID，不能生成检索词、事实、权限或范围。开发正文追踪开启时可展开 catalog、原始 JSON 和已校验选择 |
-| `query.understanding.v3.deterministic_contextual_ellipsis` / `context_preflight` | 严格本地追问 Span 选择与预检：仅接受“那/那么 + 明确单一目标 + 呢”，并只绑定重新授权的上一轮唯一用户实体。历史轮若带产品/版本/项目、地点或其他条件，或主体不唯一，预检会直接关闭执行并要求本轮重申，不会把裸目标交给模型或检索 |
-| `query.understanding.v3.execution_validated` / `compiled` / `execution_decision` / `fallback` | 后端核验 catalog 选择是否可编译，并以可信编译器生成 V2 任务图；超时、容量不足、协议拒绝或编译拒绝均原子回退本轮本地基线，不会再调用旧语义模型 |
-| `query.understanding.v3.revision_fence` | V3 结果的 created / adopted / rejected / sealed 生命周期。只有问题、会话、KB/doc 范围、路由候选和 revision 全部匹配，已编译结果才能进入 V2 |
-| `retrieval.anchor_prefetch.*` / `retrieval.anchor_preflight.*` | 与 V3 并发的原问题 anchor 预取及 V2 的复用校验。预取不是最终证据；只有围栏匹配、查询/范围/方法一致且 V2 再次准入后才可复用 |
-| `query.analysis.*` | 仅在显式 `RAG_SEMANTIC_ENTRY=legacy` 时出现的旧 `query_analysis.v2` 调用链，不能与 V3 视为同一 semantic authority |
 | `retrieval.plan` | 是否检索、检索策略、候选数、Top K 和查询硬约束 |
 | `retrieval.candidate` | 每个召回片段的向量、关键词、三元组、RRF 排名和分数 |
 | `retrieval.completed` | 召回是否成功、候选数、激活通道与耗时 |
+| `evidence.retrieval.started` / `evidence.retrieval.completed` | 独立证据服务的授权检索、跨通道融合、可选校验和统一终态；校验失败只降低验证状态，不会清空已经召回的候选 |
+| `evidence.admission.completed` | 高召回候选进入语义校验前的统一准入结果；记录原始、准入、拒绝候选和文档数量，不记录被拒候选正文 |
 | `retrieval.channel_error` / `retrieval.error` | 单通道或整体召回失败，以及是否由其它通道或上一轮合法证据恢复 |
 | `rerank.candidate` | 主题相关度、可回答性、产品/版本约束、证据角色和模型理由 |
 | `rerank.completed` | 重排是否尝试、成功、降级原因、候选数和耗时 |
@@ -84,25 +75,43 @@
 - `constraint_status`：`exact`、`compatible`、`unknown`、`mismatch` 或 `neutral`。
 - `evidence_role`：`direct` 是回答依据，`related` 是相近资料，`irrelevant` 不进入上下文。
 - `results` / `displayed_result_count`：右侧检索面板展示的候选及其数量，可能包含直接依据和相近资料，不等于生成依据。
+- `admission_status` / `admitted_candidate_count` / `rejected_candidate_count`：Candidate Admission 的确定性结果。准入只接受真实词面得分、校准后的原始向量分或达到统一阈值的结构化记录；RRF 只负责排序，不能证明相关性。
 - `answer_sources` / `answer_source_count`：实际进入本轮生成上下文、随后可随历史回答保存的片段及其数量；它与 `results` 明确分离。
 - `answer_provenance`：`knowledge_base` 表示知识库证据链或其确定性终态提示，`general_model` 表示后台明确允许的通用模型参考回答。后者不会改变原始 `evidence_status`，且 `answer_sources` 必须为空。
 - `context_evidence_count`：实际注入生成模型的片段数，正常情况下等于 `answer_source_count`；单独保留该指标便于检查生成上下文是否与持久化来源一致。
 - `hit_count` / `direct_evidence_count`：通过直接证据门控的数量。Trace schema `v2` 中两者语义一致；历史 `v1.hit_count` 曾表示前端候选数，只能按旧口径解释。
 
-## 当前 V3 语义理解与 V2 检索证据链路
+## 当前检索优先主链路
+
+1. 普通知识问答先使用用户原始问题执行授权范围内的结构化记录检索和 chunk 混合检索。路由只决定是否允许进入知识库，不改写检索问题，也不能删除已经召回的候选。
+2. Markdown 表格在入库时同时产生 `knowledge_records` 行级记录，但记录始终绑定原始 `kb_id / doc_id / chunk_id`；权限、文档状态、版本和引用仍由原文 chunk 校验。
+3. 跨通道融合后必须先执行统一 Candidate Admission。原始候选可以保留噪声供面板和 Trace 诊断，但只有准入候选可以进入语义校验；没有候选通过准入时终态是 `insufficient_evidence`，不得调用校验或生成模型。
+4. 单个经校验且完整覆盖问题的来源可直接返回原文行。显式存在多个互斥语义候选时进入统一 evidence clarification；校验超时、格式错误或未能提升候选时，只保留已经准入的候选，并以未验证证据执行受约束生成。
+5. 比较、总结、原因、流程和多目标问题在首次检索后进入有界综合生成。模型只看到已准入且仍在当前授权范围内的候选，不能增加来源、扩大范围或反向修改准入集合；生成失败且尚未输出正文时退化为抽取式回答。
+6. 检索状态固定为 `hit / no_hit / service_unavailable`，准入状态固定为 `admitted / rejected / not_applied`，校验状态独立为 `verified / ambiguous / unverified / not_requested`，回答终态固定为 `answered / needs_clarification / no_hit / insufficient_evidence / service_unavailable`。只有检索通道正常完成且原始候选为空才是 `no_hit`。
+7. 生产检索执行器是独立的 `evidence_retrieval.v1`，Chat 只负责把 Evidence Pack 转换为 SSE、澄清或受约束回答；不存在 V3 语义入口、影子执行或 anchor 预取兼容分支。
+
+主链路中的三个集合必须始终分离：
+
+```text
+raw candidates（高召回，可含噪声）
+  → admitted candidates（确定性相关性准入）
+  → selected evidence（可选语义校验后的回答依据）
+```
+
+校验器只能缩小或标注 `admitted candidates`，不能重新引入被拒候选。校验器不可用时的降级集合也只能来自 `admitted candidates`，不能退回全部 Top K。
+
+## 证据契约与回答边界
 
 1. 后端先编译并校验 `rag_task_contract.v1`。知识问答和“依据知识库写作”进入当前 V2 证据执行器；问候、平台帮助和已附原文写作进入独立 `direct` runner。V2 合同缺失、漂移或越权一律拒绝执行，不回退旧主链。
 2. V2 本地规划器只按问题结构拆分 `fact / process / list / comparison / multi_part / multi_hop`。诸如“普通员工的餐补”会生成最终 answer requirement 和身份到等级的 bridge requirement，不在代码中猜测 D 级、金额或其它业务值。规划完成后，`rag_query_execution.v1` 以不可变 plan/bundle 对单独判定能否执行；`query.plan` 的语义不会被该闸门覆盖。
-3. 默认语义入口是 `RAG_SEMANTIC_ENTRY=v3`。V3 模型只从服务器签发的 source-span catalog 中选择当前问题的答案目标、限定词及必要历史上下文 span；它不能编造检索词、别名、职级/金额等事实、KB/文档/权限、产品版本范围、coverage 或 DAG 边。可信编译器才可把已验证选择编译为多个 answer task，原问题始终保留为 `anchor_root`。已有显式 answer/proof 不会被模型降级，桥接最多经后端独立规则成为 optional augmentation，绝不成为 proof。
-4. V3 运行前会清空路由层和启发式层预选的历史投影；路由候选只作为可选 catalog。对于严格满足“那/那么 + 明确单一目标 + 呢”的追问，服务器会先选择当前目标和上一轮唯一用户实体的**精确原文 Span**，再把它绑定回同一 V3 catalog、可信编译器和 V2 证据任务图；此路径不读取 assistant 回答、不重写/拼接问题，也不继承产品版本、项目、条件或多个主体。若该显式追问的上一轮含范围/条件或主体不唯一，预检直接进入标准澄清，不能因模型超时或容量不足而退化成裸目标检索。未命中严格语法时，模型仍只能选择来源于“纯单实体”历史轮的精确实体 span；一旦选择了带范围/条件、多个主体或非实体历史片段，可信编译器会将其作为终态范围澄清，而非回退到可执行的裸当前轮。其他历史 span 才会由独立只读会话按当前 RBAC、KB 和文档状态重新加载，并重新投影进 V2。模型超时、容量不足、协议拒绝、普通编译失败或 revision fence 不匹配时，整轮只执行当前问题的安全基线，不携带未经验证的 history/carryover，也不调用 legacy 语义器。
-5. V3 与不可变的原问题 anchor 预取并发开始。预取结果没有任务谱系或证据权限，只有最终 V3 结果被 revision fence 接受且 snapshot 的 revision、query、KB/doc scope 和检索方法都匹配时才传给 V2；V2 仍会按本轮任务图重做证据准入。预取未及时完成即取消，不能造成“思考中”卡住。
-6. 向量、PostgreSQL FTS 和 `pg_trgm` 并行召回，使用 RRF 做稳定排序。文档准入只接受真实词面得分或达到绝对门槛且接近本轮最佳值的原始向量分；RRF 名次本身不能冒充相关性。
-7. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
-8. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
-9. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
-10. V2 先对已授权、任务图限量召回后的候选执行确定性证据闭合；只有该路径无法形成可生成答案时，才调用结构化证据裁判。`rerank.completed` 会记录 `mode=model_evidence_adjudication`、是否成功、耗时，或以 `skip_reason=deterministic_evidence_closed` 说明模型被跳过。模型只能标注片段对原问题的支撑关系，不能改写原问题、扩大 KB/文档范围或绕过最终图、覆盖和来源校验；超时、异常或结构无效时保留确定性候选链。最终知识库回答模型仍只看到预算内的已授权 evidence bundle。后台“系统设置 → 知识库未命中策略”默认保持严格模式；管理员可选择仅在 `no_hit`，或在 `no_hit / insufficient_evidence` 时生成独立标记的通用模型参考回答。该回答不注入本轮知识库上下文、不保留回答来源、不写入可复用证据，原始 `evidence_status` 保持不变，并以 `answer_provenance=general_model` 和固定免责声明展示。`error`、`scope_mismatch`、澄清和权限拒绝始终禁止兜底。正常聊天路径会在 V3 语义 barrier 后把 `not_ready` 统一转成 route clarification，禁止派发 V2；V2 保留的 `not_ready` SSE 分支只是供 direct/兼容调用者防御性终止，避免在流尾抛出 500。
-
-旧 V1 仍保留作为显式紧急回滚路径。V1 的 `rerank.candidate` 明细与 V2 的模型裁判不是同一执行口径；V2 无论模型标注为何，最终仍以 `evidence.selection`、完整覆盖和来源校验为准，不能将模型分数单独当作可生成答案的证明。
+3. 结构化记录命中时先在记录级筛选；单条完整记录可直接回答，多条候选只有在校验器成功确认存在互斥语义时才进入澄清，其余情况执行受约束综合。记录扩展失败时保留普通 chunk 检索结果，不把整张表交给模型。
+4. 综合问题才调用一次回答模型；模型只能读取已经授权且通过 Candidate Admission 的候选。校验成功的候选标记为 `verified`；校验不可用时标记为 `unverified` 并采用更严格的受约束提示，不能生成新的检索条件、来源或权限范围。
+5. 向量、PostgreSQL FTS 和 `pg_trgm` 并行召回，使用 RRF 做稳定排序。文档准入只接受真实词面得分或达到绝对门槛且接近本轮最佳值的原始向量分；RRF 名次本身不能冒充相关性。
+6. 小文档全文和结构邻居扩展只发生在已授权、已由首轮候选锚定的文档内，并受文档数、片段数、字符数和共享期限限制。扩展超时只标记降级并保留首轮证据；主检索失败与正常零命中严格区分。
+7. 产品、版本、项目和用户选择的文档范围在代码层硬过滤。互斥且都相关的版本/产品必须先产生结构化澄清；选择后仅查询服务端保存并重新授权的 KB/doc allow-list，禁止退回全库。
+8. 每个进入上下文的片段必须有正向 evidence role 和 `supports_requirement_ids`。多跳答案必须同时证明 bridge，并用同一个中间值连接最终标准；“普通员工→D级”不能与“A级标准”拼成完整答案。缺 bridge 或子问题覆盖不全时保持 partial/insufficient，不能伪报 complete。
+9. Chat 证据状态只允许 `hit / unverified / no_hit / insufficient_evidence / needs_clarification / error` 等统一终态，并同时保留独立的检索、准入、校验和回答终态；没有证据时禁止伪造来源，通用模型兜底若启用也必须独立标记为 `general_model`。
 
 ## 回答交付与恢复
 

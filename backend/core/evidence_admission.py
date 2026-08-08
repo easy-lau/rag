@@ -1,9 +1,9 @@
-"""Deterministic document admission for RAG v2 retrieval candidates.
+"""Deterministic admission between high-recall retrieval and answer evidence.
 
-The gate deliberately consumes retrieval signals only.  It does not infer a
-business topic, use RRF ``score`` values as semantic confidence, or call an
-external model.  Candidates are aggregated by document so one strong chunk can
-anchor its document without allowing a weaker document to borrow that signal.
+Retrieval is allowed to return noisy nearest neighbours.  Admission consumes
+only calibrated retrieval signals and decides which authorized candidates may
+reach semantic verification or answer generation.  RRF ranks are ordering
+metadata and never count as relevance evidence.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from core.evidence_contract import AdmissionStatus, CandidateRejection
+from core.knowledge_records import STRUCTURED_RECORD_MIN_SCORE
 from core.query_constraints import (
     canonical_product_name,
     extract_document_constraint_identity,
@@ -21,10 +23,6 @@ from core.query_constraints import (
 
 MIN_VECTOR_SCORE = 0.78
 MAX_DOC_VECTOR_GAP = 0.035
-# PostgreSQL ``ts_rank`` is not a calibrated probability, but a tiny positive
-# value is still distinguishable from a real lexical match.  Rank numbers and
-# ``active_channels`` are ordering metadata and cannot establish relevance on
-# their own.  The trigram floor mirrors the retriever's SQL candidate floor.
 MIN_KEYWORD_SCORE = 1e-4
 MIN_TRIGRAM_SCORE = 0.12
 _FLOAT_COMPARISON_EPSILON = 1e-12
@@ -32,8 +30,6 @@ _FLOAT_COMPARISON_EPSILON = 1e-12
 
 @dataclass(frozen=True)
 class DocumentRelevanceDecision:
-    """Result of applying the deterministic document relevance gate."""
-
     admitted_doc_ids: tuple[str, ...]
     rejected_doc_ids: tuple[str, ...]
     reason: str
@@ -43,6 +39,33 @@ class DocumentRelevanceDecision:
             "admitted_doc_ids": list(self.admitted_doc_ids),
             "rejected_doc_ids": list(self.rejected_doc_ids),
             "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class CandidateAdmission:
+    """One immutable high-recall-to-answer admission result."""
+
+    status: AdmissionStatus
+    candidates: tuple[dict[str, Any], ...]
+    rejections: tuple[CandidateRejection, ...]
+    reason: str
+    document_decision: DocumentRelevanceDecision
+    raw_candidate_count: int
+
+    def to_trace_dict(self) -> dict[str, Any]:
+        return {
+            "admission_status": self.status,
+            "admission_reason": self.reason,
+            "raw_candidate_count": self.raw_candidate_count,
+            "admitted_candidate_count": len(self.candidates),
+            "rejected_candidate_count": len(self.rejections),
+            "admitted_document_count": len(
+                self.document_decision.admitted_doc_ids
+            ),
+            "rejected_document_count": len(
+                self.document_decision.rejected_doc_ids
+            ),
         }
 
 
@@ -68,14 +91,6 @@ def _number_at_least(value: object, minimum: float) -> bool:
 
 
 def _has_lexical_hit(candidate: Mapping[str, Any]) -> bool:
-    """Recognize a scored FTS/trigram observation.
-
-    ``keyword_rank``/``trigram_rank`` and ``active_channels`` only describe
-    ordering.  Treating them as evidence admitted arbitrary near-zero or
-    adapter-synthesized hits and was the main path by which unrelated Chinese
-    documents entered a grounded answer.
-    """
-
     return bool(
         _number_at_least(candidate.get("keyword_score"), MIN_KEYWORD_SCORE)
         or _number_at_least(candidate.get("trigram_score"), MIN_TRIGRAM_SCORE)
@@ -96,20 +111,9 @@ def assess_document_relevance(
     max_doc_vector_gap: float = MAX_DOC_VECTOR_GAP,
     query: str | None = None,
 ) -> DocumentRelevanceDecision:
-    """Admit documents supported by lexical evidence or a strong vector score.
+    """Admit documents with real lexical evidence or calibrated vectors."""
 
-    A document is admitted when at least one candidate has a keyword/trigram
-    retrieval hit, or when the document's best raw ``vector_score`` satisfies
-    both the absolute minimum and the maximum gap from the best document in the
-    current candidate pool.  Rank-fusion ``score`` and ``retrieval_score`` are
-    intentionally ignored because they express ordering rather than calibrated
-    semantic relevance.
-    """
-
-    minimum = _validated_threshold(
-        min_vector_score,
-        field_name="min_vector_score",
-    )
+    minimum = _validated_threshold(min_vector_score, field_name="min_vector_score")
     maximum_gap = _validated_threshold(
         max_doc_vector_gap,
         field_name="max_doc_vector_gap",
@@ -132,7 +136,6 @@ def assess_document_relevance(
             signals = _DocumentSignals()
             signals_by_document[doc_id] = signals
             document_order.append(doc_id)
-
         signals.lexical_hit = signals.lexical_hit or _has_lexical_hit(candidate)
         vector_score = _finite_number(candidate.get("vector_score"))
         if vector_score is not None and (
@@ -150,28 +153,28 @@ def assess_document_relevance(
         if signals.best_vector_score is not None
     ]
     global_best_vector = max(vector_scores) if vector_scores else None
-
-    admitted: list[str] = []
-    rejected: list[str] = []
-    admitted_by_lexical = False
-    admitted_by_vector = False
-    admitted_by_version = False
     query_constraints = extract_query_constraints(query or "") if query else None
     version_representatives: dict[str, tuple[str, float]] = {}
-    if query_constraints is not None and query_constraints.product and not query_constraints.explicit_version:
+    if (
+        query_constraints is not None
+        and query_constraints.product
+        and not query_constraints.explicit_version
+    ):
         requested_product = canonical_product_name(query_constraints.product)
         for doc_id in document_order:
             doc_candidates = [
-                candidate for candidate in candidates
-                if isinstance(candidate, Mapping)
-                and str(candidate.get("doc_id") or "").strip() == doc_id
+                item
+                for item in candidates
+                if isinstance(item, Mapping)
+                and str(item.get("doc_id") or "").strip() == doc_id
             ]
             versions = {
                 version.casefold()
                 for item in doc_candidates
                 for version in extract_document_constraint_identity(item).versions
                 if version
-                and requested_product in set(
+                and requested_product
+                in set(
                     extract_document_constraint_identity(item).canonical_products
                 )
             }
@@ -182,6 +185,12 @@ def assess_document_relevance(
                 current = version_representatives.get(version)
                 if current is None or best > current[1]:
                     version_representatives[version] = (doc_id, best)
+
+    admitted: list[str] = []
+    rejected: list[str] = []
+    admitted_by_lexical = False
+    admitted_by_vector = False
+    admitted_by_version = False
     for doc_id in document_order:
         signals = signals_by_document[doc_id]
         vector_admitted = False
@@ -192,17 +201,10 @@ def assess_document_relevance(
         ):
             gap = global_best_vector - signals.best_vector_score
             vector_admitted = gap <= maximum_gap + _FLOAT_COMPARISON_EPSILON
-
         version_representative = any(
             representative_doc_id == doc_id
             for representative_doc_id, _ in version_representatives.values()
         )
-        # Admission is a recall decision, not a one-chunk proof decision.  A
-        # long natural-language question may be supported by several chunks
-        # in one document, so a lexical n-gram coverage ratio over each
-        # individual chunk cannot safely veto a calibrated retrieval hit.
-        # Scope, evidence binding and citation validity remain strict in the
-        # downstream evidence graph.
         if signals.lexical_hit or vector_admitted or version_representative:
             admitted.append(doc_id)
             admitted_by_lexical = admitted_by_lexical or signals.lexical_hit
@@ -228,11 +230,126 @@ def assess_document_relevance(
     )
 
 
+def _candidate_identity(candidate: Mapping[str, Any]) -> str:
+    return str(
+        candidate.get("record_id")
+        or candidate.get("id")
+        or candidate.get("chunk_id")
+        or ""
+    ).strip()
+
+
+def admit_evidence_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    query: str,
+) -> CandidateAdmission:
+    """Admit answer candidates while retaining content-free rejections."""
+
+    raw = [dict(item) for item in candidates if isinstance(item, Mapping)]
+    if not raw:
+        return CandidateAdmission(
+            status="not_applied",
+            candidates=(),
+            rejections=(),
+            reason="no_candidates",
+            document_decision=DocumentRelevanceDecision(
+                (),
+                (),
+                "no_candidates",
+            ),
+            raw_candidate_count=0,
+        )
+    chunk_candidates = [
+        item
+        for item in raw
+        if str(item.get("source_kind") or "document_chunk")
+        != "knowledge_record"
+    ]
+    document_decision = assess_document_relevance(
+        chunk_candidates,
+        query=query,
+    )
+    admitted_doc_ids = set(document_decision.admitted_doc_ids)
+    admitted_record_ids = {
+        _candidate_identity(item)
+        for item in raw
+        if str(item.get("source_kind") or "") == "knowledge_record"
+        and _number_at_least(
+            item.get("structured_score"),
+            STRUCTURED_RECORD_MIN_SCORE,
+        )
+    }
+    structured_admitted_doc_ids = {
+        str(item.get("doc_id") or "").strip()
+        for item in raw
+        if _candidate_identity(item) in admitted_record_ids
+    }
+    admitted_doc_ids.update(structured_admitted_doc_ids)
+
+    admitted: list[dict[str, Any]] = []
+    rejections: list[CandidateRejection] = []
+    for item in raw:
+        candidate_id = _candidate_identity(item)
+        doc_id = str(item.get("doc_id") or "").strip()
+        source_kind = str(
+            item.get("source_kind") or "document_chunk"
+        ).strip()
+        is_record = source_kind == "knowledge_record"
+        accepted = (
+            candidate_id in admitted_record_ids
+            if is_record
+            else doc_id in admitted_doc_ids
+        )
+        if accepted:
+            item["admission_status"] = "admitted"
+            item["admission_reason"] = (
+                "structured_record_score"
+                if is_record
+                else (
+                    "structured_record_document_anchor"
+                    if doc_id in structured_admitted_doc_ids
+                    and doc_id not in document_decision.admitted_doc_ids
+                    else document_decision.reason
+                )
+            )
+            admitted.append(item)
+            continue
+        rejections.append(CandidateRejection(
+            candidate_id=candidate_id,
+            doc_id=doc_id,
+            source_kind=source_kind,
+            reason=(
+                "structured_record_below_threshold"
+                if is_record
+                else "document_relevance_gate"
+            ),
+        ))
+
+    status: AdmissionStatus = "admitted" if admitted else "rejected"
+    if admitted_record_ids and admitted:
+        reason = "structured_or_document_evidence_admitted"
+    elif admitted:
+        reason = document_decision.reason
+    else:
+        reason = "no_candidate_met_admission_gate"
+    return CandidateAdmission(
+        status=status,
+        candidates=tuple(admitted),
+        rejections=tuple(rejections),
+        reason=reason,
+        document_decision=document_decision,
+        raw_candidate_count=len(raw),
+    )
+
+
 __all__ = [
+    "CandidateAdmission",
     "DocumentRelevanceDecision",
     "MAX_DOC_VECTOR_GAP",
     "MIN_KEYWORD_SCORE",
     "MIN_TRIGRAM_SCORE",
     "MIN_VECTOR_SCORE",
+    "admit_evidence_candidates",
     "assess_document_relevance",
 ]

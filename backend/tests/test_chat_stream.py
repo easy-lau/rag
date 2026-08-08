@@ -799,6 +799,48 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response_trace.kwargs["hit_count"], 0)
         self.assertEqual(response_trace.kwargs["sources"], [])
 
+    async def test_technical_error_without_sources_preserves_specific_message(self) -> None:
+        event = {
+            "type": "search_results",
+            "results": [],
+            "answer_sources": [],
+            "total": 0,
+            "displayed_result_count": 0,
+            "context_evidence_count": 0,
+            "hit_count": 0,
+            "retrieval_executed": True,
+            "evidence_status": "error",
+            "error_code": "retrieval_service_unavailable",
+            "direct_evidence_count": 0,
+            "related_reference_count": 0,
+        }
+        producer_state = {
+            "resumed_after_search": False,
+            "closed": False,
+        }
+
+        payloads, assistant, route_log, response_trace = (
+            await self._run_successful_stream(
+                event,
+                producer_state=producer_state,
+            )
+        )
+
+        text_deltas = [
+            item["content"]
+            for item in payloads
+            if item and item.get("type") == "text_delta"
+        ]
+        self.assertEqual(text_deltas, ["测试回答"])
+        self.assertEqual(assistant.content, "测试回答")
+        self.assertEqual(assistant.sources, [])
+        self.assertEqual(route_log.evidence_status, "error")
+        self.assertFalse(
+            response_trace.kwargs["evidence_source_validation_locked"]
+        )
+        self.assertTrue(producer_state["resumed_after_search"])
+        self.assertTrue(producer_state["closed"])
+
     async def test_non_answer_statuses_fail_closed_on_claimed_answer_sources(self) -> None:
         claimed_source = self._source(role="direct", filename="错误携带的证据.md")
         for evidence_status in (
@@ -940,6 +982,48 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route_log.evidence_status, "partial")
         self.assertEqual(response_trace.kwargs["hit_count"], 0)
 
+    async def test_unverified_evidence_pack_sources_remain_available(self) -> None:
+        source = self._source(role="unverified", filename="检索候选.md")
+        source["id"] = source["chunk_id"]
+        source["source_verification"] = "unverified"
+        source["verification_basis"] = "ranked_retrieval_candidate"
+        event = {
+            "type": "search_results",
+            "results": [source],
+            "answer_sources": [source],
+            "total": 1,
+            "displayed_result_count": 1,
+            "context_evidence_count": 1,
+            "hit_count": 0,
+            "retrieval_executed": True,
+            "retrieval_status": "hit",
+            "verification_status": "unverified",
+            "outcome_status": "answered",
+            "evidence_status": "unverified",
+            "direct_evidence_count": 0,
+            "related_reference_count": 0,
+            "unverified_generation": True,
+            "source_verification": "unverified",
+        }
+
+        payloads, assistant, route_log, response_trace = (
+            await self._run_successful_stream(event)
+        )
+
+        search_event = next(
+            item for item in payloads if item and item["type"] == "search_results"
+        )
+        self.assertEqual(search_event["evidence_status"], "unverified")
+        self.assertEqual(len(assistant.sources), 1)
+        self.assertEqual(
+            assistant.sources[0]["source_verification"],
+            "unverified",
+        )
+        self.assertEqual(route_log.evidence_status, "unverified")
+        self.assertFalse(
+            response_trace.kwargs["evidence_source_validation_locked"]
+        )
+
     async def test_positive_status_without_valid_sources_locks_generation(self) -> None:
         event = {
             "type": "search_results",
@@ -1063,6 +1147,200 @@ class ChatAnswerSourcePersistenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ordinal_memory_dispatches_immutable_selected_document(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        kb_id = uuid.uuid4()
+        first_doc_id = uuid.uuid4()
+        second_doc_id = uuid.uuid4()
+        conversation = SimpleNamespace(
+            id=conversation_id,
+            user_id=user_id,
+            pending_route_state=None,
+            route_state_revision=0,
+            active_task_state=None,
+            active_task_revision=0,
+            result_reference_memory={"persisted": "numbered-list"},
+            result_reference_revision=1,
+        )
+        user = SimpleNamespace(id=user_id, is_superadmin=False)
+        db = _ChatDB(conversation)
+        initial_context = ConversationContext(
+            is_followup=False,
+            followup_reason="standalone_question",
+            standalone_query="我要看第二个",
+            history_messages=(),
+            carryover_sources=(),
+        )
+        selected_source = {
+            "source_kind": "document_result_reference",
+            "id": str(second_doc_id),
+            "doc_id": str(second_doc_id),
+            "kb_id": str(kb_id),
+            "filename": "8.6多租户升级补丁步骤",
+            "status": "ready",
+            "evidence_role": "direct",
+        }
+        resolved_reference = SimpleNamespace(
+            source=selected_source,
+            correction=False,
+            acknowledgement=None,
+            memory=SimpleNamespace(root_query="我知识库里面有多少文章"),
+            safe_summary=lambda: {
+                "index": 2,
+                "doc_id": str(second_doc_id),
+                "filename": "8.6多租户升级补丁步骤",
+            },
+        )
+        result_calls: list[dict] = []
+
+        async def result_stream(**kwargs):
+            result_calls.append(kwargs)
+            yield "data: " + json.dumps({
+                "type": "search_results",
+                "results": [],
+                "answer_sources": [],
+                "retrieval_executed": True,
+                "evidence_status": "no_hit",
+                "displayed_result_count": 0,
+                "direct_evidence_count": 0,
+                "related_reference_count": 0,
+            }) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "text_delta",
+                "content": "已读取第二篇。",
+            }, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({
+                "type": "done",
+                "conversation_id": str(conversation_id),
+            }) + "\n\n"
+
+        async def vector_stream(**_kwargs):
+            raise AssertionError("ordinal result must not enter vector retrieval")
+            yield  # pragma: no cover
+
+        with (
+            patch("api.chat.get_accessible_kb_ids", new=AsyncMock(return_value=None)),
+            patch(
+                "api.chat.prepare_conversation_context",
+                new=AsyncMock(return_value=initial_context),
+            ),
+            patch(
+                "api.chat.resolve_result_reference_memory",
+                new=AsyncMock(return_value=resolved_reference),
+            ),
+            patch(
+                "api.chat.classify_intent_result",
+                new=AsyncMock(return_value=_routing_result(selected_kb_count=1)),
+            ),
+            patch("api.chat.run_rag_v2_stream", new=vector_stream),
+            patch("api.chat.run_knowledge_result_stream", new=result_stream),
+            patch(
+                "api.chat.resolve_result_reference_sources",
+                side_effect=AssertionError("persisted ordinal must not parse route handles"),
+            ),
+            patch("database.AsyncSessionLocal", return_value=_SaveDB()),
+            patch("api.chat.trace_event"),
+        ):
+            response = await send_message(
+                ChatRequest(
+                    question="我要看第二个",
+                    conversation_id=conversation_id,
+                    knowledge_base_ids=[kb_id],
+                ),
+                db=db,
+                user=user,
+            )
+            _ = [chunk async for chunk in response.body_iterator]
+
+        self.assertEqual(len(result_calls), 1)
+        authorized = result_calls[0]["authorized_result"]
+        self.assertEqual(authorized.operation, "read")
+        self.assertEqual(authorized.answer_form, "overview")
+        self.assertEqual(authorized.provenance, "result_reference_memory")
+        self.assertEqual(len(authorized.sources), 1)
+        self.assertEqual(authorized.sources[0]["doc_id"], str(second_doc_id))
+        self.assertNotEqual(authorized.sources[0]["doc_id"], str(first_doc_id))
+
+    async def test_request_preparation_cancellation_has_one_lifecycle_owner(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        turn = SimpleNamespace(status="accepted")
+
+        async def cancelled_prepare(_payload, _db, _user, *, lifecycle):
+            lifecycle.bind(
+                turn=turn,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+            raise asyncio.CancelledError
+
+        async def mark_terminal(**kwargs):
+            turn.status = kwargs["status"]
+
+        with (
+            patch("api.chat._prepare_send_message", new=cancelled_prepare),
+            patch("api.chat._mark_turn_terminal", new=AsyncMock(side_effect=mark_terminal)) as marker,
+            patch("api.chat.trace_event") as trace,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await send_message(
+                    ChatRequest(question="任意问题", knowledge_base_ids=[]),
+                    db=SimpleNamespace(),
+                    user=SimpleNamespace(id=user_id),
+                )
+
+        marker.assert_awaited_once()
+        self.assertEqual(marker.await_args.kwargs["status"], "cancelled")
+        self.assertEqual(
+            marker.await_args.kwargs["error_code"],
+            "request_preparation_cancelled",
+        )
+        self.assertEqual(trace.call_args.args[0], "chat.cancelled")
+        self.assertEqual(trace.call_args.kwargs["stage"], "request_preparation")
+
+    async def test_cancellation_before_stream_generator_start_is_terminal(self) -> None:
+        conversation_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        turn = SimpleNamespace(status="generating")
+
+        async def cancelled_body():
+            raise asyncio.CancelledError
+            yield ""  # pragma: no cover
+
+        async def prepared_response(_payload, _db, _user, *, lifecycle):
+            lifecycle.bind(
+                turn=turn,
+                conversation_id=conversation_id,
+                user_id=user_id,
+            )
+            return SimpleNamespace(body_iterator=cancelled_body())
+
+        async def mark_terminal(**kwargs):
+            turn.status = kwargs["status"]
+
+        with (
+            patch("api.chat._prepare_send_message", new=prepared_response),
+            patch("api.chat._mark_turn_terminal", new=AsyncMock(side_effect=mark_terminal)) as marker,
+            patch("api.chat.trace_event") as trace,
+        ):
+            response = await send_message(
+                ChatRequest(question="任意问题", knowledge_base_ids=[]),
+                db=SimpleNamespace(),
+                user=SimpleNamespace(id=user_id),
+            )
+            with self.assertRaises(asyncio.CancelledError):
+                _ = [chunk async for chunk in response.body_iterator]
+
+        marker.assert_awaited_once()
+        self.assertEqual(marker.await_args.kwargs["status"], "cancelled")
+        self.assertEqual(
+            marker.await_args.kwargs["error_code"],
+            "request_stream_cancelled",
+        )
+        self.assertEqual(trace.call_args.args[0], "chat.cancelled")
+        self.assertEqual(trace.call_args.kwargs["stage"], "response_stream")
+
     async def test_unresolved_reference_returns_clarification_without_model_or_retrieval(self) -> None:
         conversation_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -1085,7 +1363,6 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=context),
             ),
             patch("api.chat.classify_intent_result", new=AsyncMock()) as classify,
-            patch("api.chat.run_rag_stream") as rag_stream,
             patch("api.chat.trace_event") as trace,
         ):
             response = await send_message(
@@ -1107,7 +1384,6 @@ class ChatUnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
         ]
         payloads = [payload for payload in payloads if payload]
         classify.assert_not_awaited()
-        rag_stream.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in trace.call_args_list],
             [

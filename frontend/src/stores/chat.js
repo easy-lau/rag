@@ -345,6 +345,7 @@ export const useChatStore = defineStore('chat', () => {
       turn_id: turnId || undefined,
       pending_route_revision: clarificationIdentity?.route_state_revision ?? undefined,
       pending_state_id: clarificationIdentity?.pending_state_id || undefined,
+      clarification_reply: options.clarificationReply || undefined,
     }, { requestId })
     abortFn = abort
     let sawDone = false
@@ -727,7 +728,17 @@ export const useChatStore = defineStore('chat', () => {
     if (!target || target !== latestPendingClarificationMessage()) return false
     const clarification = normalizeClarification(target.clarification)
     if (!isClarificationSubmittable(clarification)) return false
+    if (reply === '都对比' && !clarification.allowed_actions.includes('select_all')) return false
     const selected = clarification.choices.find(choice => choice.reply === reply)
+    const clarificationReply = reply === '都对比'
+      ? {
+          action: 'select_all',
+          choice_keys: clarification.choices.map(choice => choice.key).filter(Boolean),
+        }
+      : (selected?.key
+          ? { action: 'select', choice_keys: [selected.key] }
+          : null)
+    if (!clarificationReply) return false
     const displayContent = reply === '都对比'
       ? '选择：都对比'
       : (selected ? `选择：${selected.label}` : reply)
@@ -737,6 +748,7 @@ export const useChatStore = defineStore('chat', () => {
       clarificationSource: target,
       allowFreeText: false,
       displayContent,
+      clarificationReply,
       // A picker is a continuation of its originating evidence scope, rather
       // than a new query under a possibly changed global KB filter.  Backend
       // authorization remains authoritative and rechecks this snapshot.

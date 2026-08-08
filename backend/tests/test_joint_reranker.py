@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock, patch
 
 from core.reranker import (
     AnswerRequirement,
+    RerankConnectionProbeError,
     RerankOutcome,
-    _joint_rerank_attempt_budgets,
     clear_rerank_circuit_breakers,
     joint_rerank_with_coverage,
+    probe_rerank_connection,
     rerank_with_status,
     select_small_document_evidence_with_coverage,
 )
@@ -17,7 +18,10 @@ from core.structured_output import clear_structured_output_capability_cache
 
 def _client_with_payload(payload: dict):
     response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content=json.dumps(payload)),
+        )]
     )
     return SimpleNamespace(
         chat=SimpleNamespace(
@@ -28,7 +32,10 @@ def _client_with_payload(payload: dict):
 
 def _client_with_raw(raw: str):
     response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=raw))]
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content=raw),
+        )]
     )
     return SimpleNamespace(
         chat=SimpleNamespace(
@@ -40,7 +47,10 @@ def _client_with_raw(raw: str):
 def _payload_response(payload: dict):
     return SimpleNamespace(
         choices=[
-            SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(content=json.dumps(payload)),
+            )
         ]
     )
 
@@ -60,19 +70,13 @@ def _client_with_payload_sequence(*payloads: dict):
 def _settings():
     return SimpleNamespace(
         chat_model="test-chat",
+        rerank_model="test-reranker",
+        rerank_structured_output_mode="auto",
+        rerank_disable_thinking=True,
         llm_request_timeout_seconds=10,
         rag_trace_include_content=True,
         rag_trace_include_candidate_details=False,
     )
-
-
-class JointRerankBudgetTests(unittest.TestCase):
-    def test_first_attempt_receives_the_complete_stage_budget(self) -> None:
-        first_attempt, repair_cap = _joint_rerank_attempt_budgets(8)
-
-        self.assertEqual(first_attempt, 8)
-        self.assertGreater(repair_cap, 0)
-        self.assertLess(repair_cap, first_attempt)
 
 
 def _assessment(
@@ -485,7 +489,7 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(grade["bridge_facts"][0]["object"], "D级")
         self.assertEqual(train["contribution_role"], "complement")
 
-    async def test_explicit_stage_timeout_is_not_capped_by_a_hidden_constant(self) -> None:
+    async def test_unprobed_transport_reserves_compatibility_budget_then_caches(self) -> None:
         payload = {
             "selected": [
                 {
@@ -514,8 +518,19 @@ class SmallDocumentSelectionTests(unittest.IsolatedAsyncioTestCase):
         request_timeout = client.chat.completions.create.await_args.kwargs[
             "timeout"
         ]
-        self.assertGreater(request_timeout, 26.9)
-        self.assertLessEqual(request_timeout, 27.0)
+        self.assertGreater(request_timeout, 21.9)
+        self.assertLess(request_timeout, 27.0)
+
+        second_outcome, second_client = await self._run(
+            payload,
+            timeout_seconds=27.0,
+        )
+        self.assertTrue(second_outcome.succeeded)
+        cached_timeout = second_client.chat.completions.create.await_args.kwargs[
+            "timeout"
+        ]
+        self.assertGreater(cached_timeout, 26.9)
+        self.assertLessEqual(cached_timeout, 27.0)
 
     async def test_response_format_rejection_negotiates_to_plain_json(self) -> None:
         class ProviderContractError(Exception):
@@ -876,6 +891,55 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         clear_structured_output_capability_cache()
         clear_rerank_circuit_breakers()
 
+    async def test_connection_probe_rejects_legacy_output_without_resolution_fields(
+        self,
+    ) -> None:
+        payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["r1"],
+                    bridge_facts=[],
+                ),
+                _assessment(
+                    2,
+                    role="related",
+                    contribution="background_only",
+                    supports=[],
+                    bridge_facts=[],
+                ),
+            ],
+            "evidence_sets": [{
+                "id": "employee_page",
+                "candidate_indexes": [1],
+                "joint_answer_support": 0.95,
+                "coverage": [{
+                    "requirement_id": "r1",
+                    "candidate_indexes": [1],
+                }],
+                "coverage_status": "complete",
+                "missing_requirement_ids": [],
+                "reason": "分页接口直接回答问题",
+            }],
+            "selected_set_id": "employee_page",
+        }
+        client = _client_with_payload(payload)
+
+        with self.assertRaises(RerankConnectionProbeError) as raised:
+            await probe_rerank_connection(
+                client,
+                model="test-reranker",
+                provider_identity="https://provider.example/v1",
+                timeout_seconds=10,
+                structured_output_mode="json_object",
+                disable_thinking=True,
+            )
+
+        self.assertEqual(raised.exception.code, "rerank_contract_invalid")
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+
     async def _run(self, query, results, requirements, payload):
         client = _client_with_payload(payload)
         with (
@@ -952,6 +1016,54 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
             2800,
         )
 
+    async def test_joint_request_uses_role_specific_transport_capabilities(self) -> None:
+        requirements = [_requirement("r1", "取得住宿标准")]
+        results = [{"id": "hotel", "content": "D级住宿450元/天。"}]
+        payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["r1"],
+                    bridge_facts=[],
+                )
+            ],
+            "evidence_sets": [{
+                "id": "set_1",
+                "candidate_indexes": [1],
+                "joint_answer_support": 0.9,
+                "coverage": [{
+                    "requirement_id": "r1",
+                    "candidate_indexes": [1],
+                }],
+                "coverage_status": "complete",
+                "missing_requirement_ids": [],
+                "reason": "候选完整支撑住宿标准",
+            }],
+            "selected_set_id": "set_1",
+        }
+        settings = _settings()
+        settings.rerank_structured_output_mode = "json_object"
+        settings.rerank_disable_thinking = False
+        client = _client_with_payload(payload)
+
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=settings),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "D级住宿标准是什么",
+                results,
+                requirements,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        request = client.chat.completions.create.await_args.kwargs
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertNotIn("extra_body", request)
+        self.assertFalse(outcome.thinking_disabled)
+
     async def test_compact_joint_response_safely_omits_irrelevant_candidates(self) -> None:
         requirements = [_requirement("r1", "完整回答普通员工出差标准")]
         results = [
@@ -1004,6 +1116,9 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.succeeded)
         self.assertEqual(outcome.coverage_status, "complete")
         self.assertEqual(outcome.selected_candidate_indexes, selected_indexes)
+        self.assertTrue(outcome.thinking_disabled)
+        self.assertGreater(outcome.output_chars or 0, 0)
+        self.assertEqual(outcome.finish_reason, "stop")
         self.assertEqual(len(outcome.results), 15)
         selected = [item for item in outcome.results if item["jointly_selected"]]
         omitted = [item for item in outcome.results if not item["jointly_selected"]]
@@ -1134,6 +1249,163 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
             "normalized_alias",
         )
         client.chat.completions.create.assert_awaited_once()
+        self.assertFalse(outcome.repair_attempted)
+
+    async def test_inconsistent_semantic_fields_are_repaired_once(self) -> None:
+        requirements = [_requirement("r1", "确定分页查询员工列表接口")]
+        results = [
+            {
+                "id": "employee-page",
+                "content": "分页查询员工列表使用 GET /employees/page。",
+                "score": 0.02,
+            },
+            {
+                "id": "employee-detail",
+                "content": "根据员工 Code 查询员工详情使用 GET /employees/{code}。",
+                "score": 0.01,
+            },
+        ]
+        inconsistent_payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="irrelevant",
+                    contribution="irrelevant",
+                    supports=[],
+                    bridge_facts=[],
+                ),
+                _assessment(
+                    2,
+                    role="irrelevant",
+                    contribution="irrelevant",
+                    supports=[],
+                    bridge_facts=[],
+                ),
+            ],
+            "evidence_sets": [
+                {
+                    "id": "set_1",
+                    "candidate_indexes": [1],
+                    "joint_answer_support": 1.0,
+                    "coverage": [
+                        {"requirement_id": "r1", "candidate_indexes": [1]}
+                    ],
+                    "coverage_status": "complete",
+                    "missing_requirement_ids": [],
+                    "reason": "候选 1 直接给出分页查询接口",
+                }
+            ],
+            "selected_set_id": "set_1",
+        }
+        repaired_payload = json.loads(json.dumps(inconsistent_payload))
+        repaired_payload["results"][0] = _assessment(
+            1,
+            role="direct",
+            contribution="standalone_answer",
+            supports=["r1"],
+            bridge_facts=[],
+        )
+        client = _client_with_payload_sequence(
+            inconsistent_payload,
+            repaired_payload,
+        )
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "分页查询员工列表使用哪个接口",
+                results,
+                requirements,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.coverage_status, "complete")
+        self.assertEqual(outcome.selected_candidate_indexes, (1,))
+        self.assertTrue(outcome.repair_attempted)
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+        self.assertGreater(
+            client.chat.completions.create.await_args_list[1].kwargs["timeout"],
+            8.0,
+        )
+
+    async def test_distinct_complete_interpretations_are_ambiguous(self) -> None:
+        requirements = [_requirement("user_answer", "查询用户列表使用哪个接口")]
+        results = [
+            {
+                "id": "organization-users",
+                "content": "分页查询组织下员工 Code：/organization/employees",
+                "score": 0.02,
+            },
+            {
+                "id": "tag-users",
+                "content": "根据标签查询人员列表：/employees/by-tag",
+                "score": 0.02,
+            },
+        ]
+        payload = {
+            "results": [
+                _assessment(
+                    1,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["user_answer"],
+                    bridge_facts=[],
+                ),
+                _assessment(
+                    2,
+                    role="direct",
+                    contribution="standalone_answer",
+                    supports=["user_answer"],
+                    bridge_facts=[],
+                ),
+            ],
+            "evidence_sets": [
+                {
+                    "id": "organization_scope",
+                    "candidate_indexes": [1],
+                    "joint_answer_support": 0.9,
+                    "coverage": [{
+                        "requirement_id": "user_answer",
+                        "candidate_indexes": [1],
+                    }],
+                    "coverage_status": "complete",
+                    "missing_requirement_ids": [],
+                    "reason": "按组织范围查询人员",
+                },
+                {
+                    "id": "tag_scope",
+                    "candidate_indexes": [2],
+                    "joint_answer_support": 0.9,
+                    "coverage": [{
+                        "requirement_id": "user_answer",
+                        "candidate_indexes": [2],
+                    }],
+                    "coverage_status": "complete",
+                    "missing_requirement_ids": [],
+                    "reason": "按标签范围查询人员",
+                },
+            ],
+            "selected_set_id": None,
+            "resolution_status": "ambiguous",
+            "resolution_reason": "用户未说明按组织还是按标签查询",
+        }
+        client = _client_with_payload(payload)
+        with (
+            patch("core.reranker.get_client", return_value=client),
+            patch("core.reranker.get_settings", return_value=_settings()),
+        ):
+            outcome = await joint_rerank_with_coverage(
+                "查询用户列表使用哪个接口",
+                results,
+                requirements,
+            )
+
+        self.assertTrue(outcome.succeeded)
+        self.assertEqual(outcome.decision_status, "ambiguous")
+        self.assertEqual(outcome.ambiguity_candidate_indexes, (1, 2))
+        self.assertEqual(outcome.selected_candidate_indexes, ())
+        self.assertFalse(any(item["jointly_selected"] for item in outcome.results))
 
     async def test_invalid_constraint_field_keeps_other_candidates_and_uses_code_status(self) -> None:
         requirements = [_requirement("r1", "取得住宿标准")]
@@ -1247,7 +1519,8 @@ class JointCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(invalid["evidence_role"], "irrelevant")
         self.assertFalse(invalid["jointly_selected"])
         self.assertTrue(by_id["travel"]["jointly_selected"])
-        client.chat.completions.create.assert_awaited_once()
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+        self.assertTrue(outcome.repair_attempted)
 
     async def test_coverage_status_wire_alias_is_canonicalized_without_retry(self) -> None:
         requirements = [_requirement("r1", "取得住宿标准")]

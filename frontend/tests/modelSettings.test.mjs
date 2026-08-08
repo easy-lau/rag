@@ -63,6 +63,17 @@ test('思考控制由管理员显式配置而不是根据模型名判断', () =>
   assert.match(modelManagementSource, /llm_disable_thinking: Boolean\(form\.value\.llm_disable_thinking\)/)
 })
 
+test('裁决模型使用独立输出模式和思考控制并执行真实合同测试', () => {
+  assert.match(modelManagementSource, /v-model:value="form\.rerank_structured_output_mode"/)
+  assert.match(modelManagementSource, /v-model:value="form\.rerank_disable_thinking"/)
+  assert.match(modelManagementSource, /payload\.purpose = 'rerank'/)
+  assert.match(modelManagementSource, /payload\.structured_output_mode = form\.value\.rerank_structured_output_mode/)
+  assert.match(modelManagementSource, /payload\.disable_thinking = Boolean\(form\.value\.rerank_disable_thinking\)/)
+  assert.match(modelManagementSource, /payload\.timeout_seconds = form\.value\.rerank_timeout_seconds/)
+  assert.match(modelManagementSource, /rerank_structured_output_mode: form\.value\.rerank_structured_output_mode/)
+  assert.match(modelManagementSource, /rerank_disable_thinking: Boolean\(form\.value\.rerank_disable_thinking\)/)
+})
+
 test('系统设置提供三档知识库未命中兜底策略并随设置保存', () => {
   assert.match(settingsViewSource, /v-model:value="form\.rag_general_fallback_mode"/)
   assert.ok(settingsViewSource.includes("value: 'off'"))

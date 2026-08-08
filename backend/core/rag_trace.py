@@ -101,16 +101,6 @@ _BUSINESS_CONTENT_KEYS = {
     "queryanalysisexecutionplan",
     "queryanalysisrawresponse",
     "queryanalysisvalidated",
-    # ``query_understanding.v3`` carries catalog-selected source and raw model
-    # payloads under its own names.  Even though the strict contract normally
-    # limits a validated result to span IDs, a development trace can still
-    # contain original catalog text or a malformed model echo.  Treat every
-    # captured V3 body field as business content so the existing superadmin
-    # detail/export gate remains fail-closed.
-    "queryunderstandingv3catalog",
-    "queryunderstandingv3executionplan",
-    "queryunderstandingv3rawresponse",
-    "queryunderstandingv3validated",
     "question",
     "rawcontent",
     "requestbody",

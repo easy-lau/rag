@@ -1,4 +1,4 @@
-"""Execute a V3-selected reference to previously displayed document results."""
+"""Execute an authorized reference to previously displayed document results."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, Mapping
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,7 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import get_settings
 from core.llm_stream import stream_with_retry_before_first_delta
 from core.openai_client import get_client
-from core.query_semantics import KnowledgeRequestSemantics
 from core.rag_trace import content_fields, json_safe, trace_event
 from core.structured_output import create_stream_completion
 from core.document_content import render_document_chunks
@@ -24,6 +24,102 @@ from models.db_models import Document, DocumentChunk, KnowledgeBase
 KNOWLEDGE_RESULT_RUNNER_VERSION = "knowledge_result.v1"
 _MAX_SOURCE_CHUNKS = 20
 _MAX_CONTEXT_CHARS = 30_000
+
+
+@dataclass(frozen=True)
+class AuthorizedKnowledgeResult:
+    """Immutable request-local binding between an operation and authorized sources.
+
+    Route/model handles are resolved before this value is created.  Executors
+    consume this binding directly and never infer source identity from mutable
+    conversation state or parse a synthetic handle a second time.
+    """
+
+    operation: Literal["read", "summarize", "compare"]
+    answer_form: Literal[
+        "fact",
+        "enumeration",
+        "procedure",
+        "overview",
+        "comparison",
+        "judgement",
+    ]
+    sources: tuple[dict[str, Any], ...]
+    provenance: str
+    acknowledgement: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.operation not in {"read", "summarize", "compare"}:
+            raise ValueError("authorized result operation is invalid")
+        if self.answer_form not in {
+            "fact",
+            "enumeration",
+            "procedure",
+            "overview",
+            "comparison",
+            "judgement",
+        }:
+            raise ValueError("authorized result answer form is invalid")
+        copied = tuple(dict(item) for item in self.sources if isinstance(item, Mapping))
+        if (
+            not copied
+            or len(copied) > 4
+            or (self.operation in {"read", "summarize"} and len(copied) != 1)
+            or (self.operation == "compare" and len(copied) < 2)
+        ):
+            raise ValueError("authorized result source binding is invalid")
+        identities: set[tuple[str, str]] = set()
+        for source in copied:
+            identity = (
+                str(source.get("kb_id") or "").strip(),
+                str(source.get("doc_id") or "").strip(),
+            )
+            if not all(identity) or identity in identities:
+                raise ValueError("authorized result source identity is invalid")
+            identities.add(identity)
+        provenance = str(self.provenance or "").strip()
+        if not provenance:
+            raise ValueError("authorized result provenance is required")
+        object.__setattr__(self, "sources", copied)
+        object.__setattr__(self, "provenance", provenance)
+        object.__setattr__(
+            self,
+            "acknowledgement",
+            str(self.acknowledgement).strip() if self.acknowledgement else None,
+        )
+
+    def safe_summary(self) -> dict[str, Any]:
+        return {
+            "resource": "document_result",
+            "operation": self.operation,
+            "answer_form": self.answer_form,
+            "result_count": len(self.sources),
+            "provenance": self.provenance,
+        }
+
+
+def authorize_knowledge_result(
+    sources: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    operation: Literal["read", "summarize", "compare"],
+    answer_form: Literal[
+        "fact",
+        "enumeration",
+        "procedure",
+        "overview",
+        "comparison",
+        "judgement",
+    ],
+    provenance: str,
+    acknowledgement: str | None = None,
+) -> AuthorizedKnowledgeResult:
+    return AuthorizedKnowledgeResult(
+        operation=operation,
+        answer_form=answer_form,
+        sources=tuple(sources),
+        provenance=provenance,
+        acknowledgement=acknowledgement,
+    )
 
 
 def _sse(payload: Mapping[str, Any]) -> str:
@@ -114,11 +210,9 @@ async def run_knowledge_result_stream(
     followup_reason: str | None = None,
     task_contract: object | None = None,
     evidence_scope_filter: dict | None = None,
-    knowledge_request: KnowledgeRequestSemantics | None = None,
-    result_sources: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
-    acknowledgement: str | None = None,
+    authorized_result: AuthorizedKnowledgeResult | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Read or synthesize only the documents selected by server-issued handles.
+    """Read or synthesize one immutable, already-bound document selection.
 
     ``acknowledgement`` is a server-produced lead-in for reference-correction
     turns (for example ``第四个不是《钉钉》吗``).  It is prepended verbatim to
@@ -135,13 +229,10 @@ async def run_knowledge_result_stream(
         task_contract,
         evidence_scope_filter,
     )
-    if not isinstance(knowledge_request, KnowledgeRequestSemantics):
-        raise ValueError("result runner requires a knowledge request")
-    if not knowledge_request.is_result_operation:
-        raise ValueError("result runner received a non-result request")
-    bound_sources = list(result_sources or ())
-    if len(bound_sources) != len(knowledge_request.result_handles):
-        raise ValueError("result handle binding is incomplete")
+    if not isinstance(authorized_result, AuthorizedKnowledgeResult):
+        raise ValueError("result runner requires an authorized result")
+    bound_sources = list(authorized_result.sources)
+    acknowledgement = authorized_result.acknowledgement
 
     authorized_kb_ids = set(kb_ids)
     ordered_pairs: list[tuple[uuid.UUID, uuid.UUID]] = []
@@ -254,7 +345,7 @@ async def run_knowledge_result_stream(
         "knowledge.result_reference.resolved",
         trace_id=trace_id,
         runner_version=KNOWLEDGE_RESULT_RUNNER_VERSION,
-        operation=knowledge_request.operation,
+        operation=authorized_result.operation,
         result_count=len(ordered_documents),
         source_chunk_count=len(answer_sources),
         context_chars=len(document_text),
@@ -286,7 +377,7 @@ async def run_knowledge_result_stream(
 
     yield _step("generate", "active")
     generation_started = time.perf_counter()
-    if knowledge_request.operation == "read":
+    if authorized_result.operation == "read":
         answer = document_text
         if acknowledgement:
             answer = f"{acknowledgement}\n\n{answer}"
@@ -303,7 +394,7 @@ async def run_knowledge_result_stream(
     else:
         settings = get_settings()
         model = str(settings.chat_model or "").strip()
-        action = "总结" if knowledge_request.operation == "summarize" else "比较"
+        action = "总结" if authorized_result.operation == "summarize" else "比较"
         messages = [
             {
                 "role": "system",
@@ -396,13 +487,13 @@ async def run_knowledge_result_stream(
         runner_version=KNOWLEDGE_RESULT_RUNNER_VERSION,
         model=model,
         answer_provenance="knowledge_base_result_reference",
-        operation=knowledge_request.operation,
+        operation=authorized_result.operation,
         answer_chars=answer_chars,
         prompt_tokens=(getattr(usage, "prompt_tokens", None) if usage else None),
         completion_tokens=(getattr(usage, "completion_tokens", None) if usage else None),
         total_tokens=(getattr(usage, "total_tokens", None) if usage else None),
         thinking_disabled=(
-            thinking_disabled if knowledge_request.operation != "read" else False
+            thinking_disabled if authorized_result.operation != "read" else False
         ),
         first_token_ms=first_token_ms,
         chunk_count=chunk_count,
@@ -414,4 +505,9 @@ async def run_knowledge_result_stream(
     yield _sse({"type": "done", "conversation_id": conversation_id})
 
 
-__all__ = ["KNOWLEDGE_RESULT_RUNNER_VERSION", "run_knowledge_result_stream"]
+__all__ = [
+    "AuthorizedKnowledgeResult",
+    "KNOWLEDGE_RESULT_RUNNER_VERSION",
+    "authorize_knowledge_result",
+    "run_knowledge_result_stream",
+]

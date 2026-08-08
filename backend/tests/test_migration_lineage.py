@@ -263,7 +263,7 @@ class MigrationLineageTests(unittest.TestCase):
         self.assertFalse(revision.nullable)
         self.assertEqual(str(revision.server_default.arg), "0")
 
-    def test_alembic_has_single_0040_head(self) -> None:
+    def test_alembic_has_single_0041_head(self) -> None:
         config = Config(str(BACKEND_DIR / "alembic.ini"))
         config.set_main_option(
             "script_location",
@@ -271,7 +271,7 @@ class MigrationLineageTests(unittest.TestCase):
         )
         scripts = ScriptDirectory.from_config(config)
 
-        self.assertEqual(scripts.get_heads(), ["0040"])
+        self.assertEqual(scripts.get_heads(), ["0041"])
         self.assertEqual(scripts.get_revision("0032").down_revision, "0031")
         self.assertEqual(scripts.get_revision("0034").down_revision, "0033")
         self.assertEqual(scripts.get_revision("0035").down_revision, "0034")
